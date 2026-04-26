@@ -56,6 +56,7 @@ def init_db():
             ("filename",   "ALTER TABLE downloads ADD COLUMN filename TEXT"),
             ("resolution", "ALTER TABLE downloads ADD COLUMN resolution TEXT"),
             ("filesize",   "ALTER TABLE downloads ADD COLUMN filesize INTEGER"),
+            ("speed",      "ALTER TABLE downloads ADD COLUMN speed REAL"),
         ]:
             if col not in existing_cols:
                 conn.execute(ddl)
@@ -88,7 +89,8 @@ def db_insert_download(download_id, url):
 
 
 def db_update_download(download_id, *, status=None, progress=None,
-                       filename=None, resolution=None, filesize=None):
+                       filename=None, resolution=None, filesize=None,
+                       speed=None):
     fields, values = [], []
     if status is not None:
         fields.append("status = ?"); values.append(status)
@@ -100,6 +102,8 @@ def db_update_download(download_id, *, status=None, progress=None,
         fields.append("resolution = ?"); values.append(resolution)
     if filesize is not None:
         fields.append("filesize = ?"); values.append(filesize)
+    if speed is not None:
+        fields.append("speed = ?"); values.append(speed)
     if not fields:
         return
     values.append(download_id)
@@ -138,7 +142,7 @@ def db_list_downloads():
     with db() as conn:
         rows = conn.execute(
             "SELECT id, url, status, progress, created_at, "
-            "filename, resolution, filesize "
+            "filename, resolution, filesize, speed "
             "FROM downloads ORDER BY created_at ASC"
         ).fetchall()
         return [dict(r) for r in rows]
@@ -197,22 +201,24 @@ def progress_hook(d, download_id):
     if d['status'] == 'downloading':
         total_bytes = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
         downloaded = d.get('downloaded_bytes', 0)
+        speed = d.get('speed')  # bytes/sec, may be None at the very start
         if total_bytes > 0:
             percent = (downloaded / total_bytes) * 100
             db_update_download(
                 download_id,
                 status='downloading',
                 progress=f"{percent:.1f}%",
+                speed=float(speed) if speed else None,
             )
     elif d['status'] == 'finished':
         # 'finished' here means the file was fully written to disk for this
         # format; the post-processor (merge) may still run afterwards. We
         # capture filename + resolution from the info_dict yt-dlp embeds in
         # the hook payload, and re-stat the file at the end of the run to
-        # get the final size after any merge.
+        # get the final size after any merge. Speed is cleared since the
+        # download is no longer active.
         info = d.get('info_dict') or {}
         filename = d.get('filename') or info.get('_filename')
-        width = info.get('width')
         height = info.get('height')
         resolution = f"{height}p" if height else (info.get('format_note') or info.get('format_id'))
         filesize = (info.get('filesize') or info.get('filesize_approx')
@@ -224,6 +230,7 @@ def progress_hook(d, download_id):
             filename=filename,
             resolution=str(resolution) if resolution else None,
             filesize=int(filesize) if filesize else None,
+            speed=0.0,  # use 0 (not None) so the column is touched and cleared
         )
 
 
@@ -289,10 +296,11 @@ HTML_TEMPLATE = """
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Video Downloader</title>
     <style>
-        body { font-family: Arial, sans-serif; max-width: 800px; margin: 40px auto; padding: 20px; }
-        .form-group { margin-bottom: 20px; }
-        input[type="url"], input[type="text"], input[type="number"] { padding: 10px; box-sizing: border-box; }
-        input[type="url"] { width: 70%; }
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 40px auto; padding: 20px; box-sizing: border-box; }
+        *, *::before, *::after { box-sizing: border-box; }
+        .form-group { margin-bottom: 20px; display: flex; gap: 8px; width: 100%; }
+        .form-group input[type="url"] { flex: 1; padding: 10px; }
+        input[type="text"], input[type="number"] { padding: 10px; }
         button { padding: 10px 20px; cursor: pointer; }
         .history-item { border: 1px solid #ccc; padding: 15px; margin-bottom: 10px; border-radius: 5px; }
         .history-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
@@ -309,6 +317,22 @@ HTML_TEMPLATE = """
         .meta { margin-top: 8px; font-size: 0.9em; color: #555; }
         .meta div { margin-top: 2px; }
         .meta .filename { font-family: ui-monospace, Menlo, Consolas, monospace; word-break: break-all; }
+        .speed { margin-top: 6px; font-size: 0.9em; color: #555; }
+        /* Kebab menu */
+        .menu-wrap { position: relative; }
+        .kebab-btn { padding: 6px 10px; background-color: transparent; color: #555; border: 1px solid #ccc; border-radius: 4px; cursor: pointer; font-size: 1.1em; line-height: 1; }
+        .kebab-btn:hover { background-color: #f3f3f3; }
+        .kebab-menu { display: none; position: absolute; right: 0; top: calc(100% + 4px); background: white; border: 1px solid #ccc; border-radius: 4px; box-shadow: 0 2px 8px rgba(0,0,0,0.12); min-width: 140px; z-index: 10; }
+        .kebab-menu.open { display: block; }
+        .kebab-menu button { display: block; width: 100%; text-align: left; padding: 8px 12px; background: none; border: none; cursor: pointer; font-size: 0.95em; }
+        .kebab-menu button:hover { background-color: #f3f3f3; }
+        .kebab-menu button.danger { color: #c0392b; }
+        /* Toolbar alignment: place the Clear button inline with the <summary> */
+        .history-summary { display: flex; justify-content: space-between; align-items: center; cursor: pointer; list-style: none; }
+        .history-summary::-webkit-details-marker { display: none; }
+        .history-summary::before { content: '▶'; display: inline-block; margin-right: 8px; font-size: 0.8em; transition: transform 0.15s; }
+        details[open] > .history-summary::before { transform: rotate(90deg); }
+        .history-summary .title { font-weight: bold; flex: 1; }
         .progress-bar-bg { width: 100%; background-color: #f3f3f3; border-radius: 5px; margin-top: 10px;}
         .progress-bar-fill { height: 20px; background-color: #4caf50; border-radius: 5px; width: 0%; transition: width 0.4s ease;}
         .progress-bar-fill.cancelled, .progress-bar-fill.interrupted { background-color: #e74c3c; }
@@ -355,12 +379,11 @@ HTML_TEMPLATE = """
     </div>
 
     <details id="historySection" open style="display: none;">
-        <summary><strong>Download History</strong></summary>
-        <div class="history-toolbar" style="margin-top: 10px;">
-            <span></span>
-            <button class="clear-btn" onclick="clearHistory()">Clear completed</button>
-        </div>
-        <div id="historyList"></div>
+        <summary class="history-summary">
+            <span class="title">Download History</span>
+            <button class="clear-btn" onclick="event.preventDefault(); event.stopPropagation(); clearHistory();">Clear History</button>
+        </summary>
+        <div id="historyList" style="margin-top: 10px;"></div>
     </details>
 
     <p id="emptyState" style="color: #888;">No downloads yet. Paste a URL above to start.</p>
@@ -411,12 +434,46 @@ HTML_TEMPLATE = """
                 .then(() => fetchHistory());
         }
 
+        // Kebab menu open/close ------------------------------------------------
+        // Track which menu (if any) is currently open. While a menu is open we
+        // pause history polling so the periodic re-render doesn't destroy the
+        // menu's DOM node mid-click.
+        let openMenuId = null;
+
+        function closeAllMenus() {
+            document.querySelectorAll('.kebab-menu.open').forEach(m => m.classList.remove('open'));
+            openMenuId = null;
+        }
+
+        function toggleMenu(id, ev) {
+            ev.stopPropagation();
+            const menu = document.getElementById('menu-' + id);
+            if (!menu) return;
+            const wasOpen = menu.classList.contains('open');
+            closeAllMenus();
+            if (!wasOpen) {
+                menu.classList.add('open');
+                openMenuId = id;
+            }
+        }
+
+        // Click anywhere outside a menu closes it.
+        document.addEventListener('click', (ev) => {
+            if (ev.target.closest('.kebab-menu') || ev.target.closest('.kebab-btn')) return;
+            closeAllMenus();
+        });
+
         function formatBytes(n) {
             if (n == null || isNaN(n)) return null;
             const units = ['B', 'KB', 'MB', 'GB', 'TB'];
             let i = 0, v = Number(n);
             while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
             return v.toFixed(v >= 100 ? 0 : 1) + ' ' + units[i];
+        }
+
+        function formatSpeed(bps) {
+            const s = formatBytes(bps);
+            return s ? s + '/s' : null;
         }
 
         function escapeAttr(s) {
@@ -462,23 +519,58 @@ HTML_TEMPLATE = """
             else statusLabel = info.progress;
 
             const safeUrl = escapeAttr(info.url);
-            let actions = '';
+
+            // ---- Action layout ----
+            // Inline: only Stop (active rows). Everything else goes into the kebab.
+            let primary = '';
+            const menuItems = [];
+
             if (isActive) {
-                actions += `<button class="stop-btn" onclick="stopDownload('${id}')">Stop</button>`;
-            }
-            if (info.status === 'cancelled' || info.status === 'error' || info.status === 'interrupted') {
-                actions += `<button class="reload-btn" onclick="reloadDownload('${id}', '${safeUrl}')">Reload</button>`;
-            }
-            if (isFinished) {
-                actions += `<button class="copy-btn" onclick="copyToClipboard('${safeUrl}', this)">Copy Link</button>`;
-            }
-            if (isTerminal) {
-                actions += `<button class="delete-btn" onclick="deleteDownload('${id}')">Delete</button>`;
+                primary = `<button class="stop-btn" onclick="stopDownload('${id}')">Stop</button>`;
             }
 
-            // Bottom block: progress bar for active/failed rows, metadata for finished rows.
-            let bottom;
-            if (isFinished) {
+            if (isTerminal) {
+                // Reload only for non-finished terminal rows (cancelled/error/interrupted).
+                if (!isFinished) {
+                    menuItems.push(`<button onclick="reloadDownload('${id}', '${safeUrl}')">Reload</button>`);
+                }
+                menuItems.push(`<button onclick="copyToClipboard('${safeUrl}', this)">Copy URL</button>`);
+                menuItems.push(`<button class="danger" onclick="deleteDownload('${id}')">Delete</button>`);
+            }
+
+            const kebab = menuItems.length ? `
+                <div class="menu-wrap">
+                    <button class="kebab-btn" onclick="toggleMenu('${id}', event)" aria-label="More actions">⋮</button>
+                    <div id="menu-${id}" class="kebab-menu">${menuItems.join('')}</div>
+                </div>` : '';
+
+            // ---- Bottom block ----
+            // Active: progress bar + speed; terminal: metadata block (when present).
+            let bottom = '';
+            if (isActive) {
+                let width = String(info.progress).replace('%', '');
+                if (isNaN(width)) width = 0;
+                const speedStr = formatSpeed(info.speed);
+                bottom = `
+                    <div class="progress-bar-bg">
+                        <div class="progress-bar-fill" style="width: ${width}%;"></div>
+                    </div>
+                    ${speedStr ? `<div class="speed"><strong>Speed:</strong> ${speedStr}</div>` : ''}`;
+            } else {
+                // Terminal states: keep a coloured bar for non-finished failures so
+                // the row visually matches its status, plus any captured metadata.
+                if (!isFinished) {
+                    let barClass = 'progress-bar-fill';
+                    if (info.status === 'cancelled') barClass += ' cancelled';
+                    else if (info.status === 'interrupted') barClass += ' interrupted';
+                    else if (info.status === 'error') barClass += ' error';
+                    let width = String(info.progress).replace('%', '');
+                    if (isNaN(width)) width = 0;
+                    bottom += `
+                        <div class="progress-bar-bg">
+                            <div class="${barClass}" style="width: ${width}%;"></div>
+                        </div>`;
+                }
                 const meta = [];
                 if (info.filename) {
                     const base = info.filename.split('/').pop().split('\\\\').pop();
@@ -487,18 +579,7 @@ HTML_TEMPLATE = """
                 if (info.resolution) meta.push(`<div><strong>Resolution:</strong> ${info.resolution}</div>`);
                 const sizeStr = formatBytes(info.filesize);
                 if (sizeStr) meta.push(`<div><strong>Size:</strong> ${sizeStr}</div>`);
-                bottom = meta.length ? `<div class="meta">${meta.join('')}</div>` : '';
-            } else {
-                let width = String(info.progress).replace('%', '');
-                if (isNaN(width)) width = 0;
-                let barClass = 'progress-bar-fill';
-                if (info.status === 'cancelled') barClass += ' cancelled';
-                else if (info.status === 'interrupted') barClass += ' interrupted';
-                else if (info.status === 'error') barClass += ' error';
-                bottom = `
-                    <div class="progress-bar-bg">
-                        <div class="${barClass}" style="width: ${width}%;"></div>
-                    </div>`;
+                if (meta.length) bottom += `<div class="meta">${meta.join('')}</div>`;
             }
 
             return `
@@ -508,7 +589,7 @@ HTML_TEMPLATE = """
                             <strong>URL:</strong> ${info.url}<br>
                             <strong>Status:</strong> ${info.status} (${statusLabel})
                         </div>
-                        <div class="row-actions">${actions}</div>
+                        <div class="row-actions">${primary}${kebab}</div>
                     </div>
                     ${bottom}
                 </div>
@@ -516,6 +597,11 @@ HTML_TEMPLATE = """
         }
 
         function fetchHistory() {
+            // Skip the re-render while a kebab menu is open so the click isn't
+            // swallowed by DOM replacement. The next tick after the menu closes
+            // picks up the latest data.
+            if (openMenuId !== null) return;
+
             fetch('/api/history')
             .then(res => res.json())
             .then(data => {
