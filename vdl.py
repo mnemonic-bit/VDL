@@ -1,6 +1,8 @@
-from flask import Flask, render_template_string, request, jsonify, send_file, abort
+from flask import Flask, render_template_string, request, jsonify, send_file, abort, Response, stream_with_context
 import yt_dlp
 import threading
+import queue
+import json
 import uuid
 import sqlite3
 import os
@@ -10,6 +12,57 @@ import subprocess
 from contextlib import contextmanager
 
 app = Flask(__name__)
+
+# ---------------------------------------------------------------------------
+# Event bus (server -> browser push)
+# ---------------------------------------------------------------------------
+#
+# A tiny in-process pub/sub. Each connected SSE client owns one bounded
+# queue.Queue; producers (DB writers) call `event_bus.publish('change')` after
+# a successful commit, and the SSE generator drains its queue and ships the
+# event to the browser. No external broker needed -- the app is single-process.
+
+class EventBus:
+    def __init__(self):
+        self._subs = set()
+        self._lock = threading.Lock()
+
+    def subscribe(self):
+        # maxsize keeps a stuck/disconnected client from ballooning memory.
+        # If full, we drop the oldest event for that subscriber -- stale clients
+        # always reconcile by refetching /api/history on the next event anyway.
+        q = queue.Queue(maxsize=64)
+        with self._lock:
+            self._subs.add(q)
+        return q
+
+    def unsubscribe(self, q):
+        with self._lock:
+            self._subs.discard(q)
+
+    def publish(self, kind, payload=None):
+        msg = (kind, payload)
+        with self._lock:
+            subs = list(self._subs)
+        for q in subs:
+            try:
+                q.put_nowait(msg)
+            except queue.Full:
+                # Drop the head, push the new event. Subscribers only need the
+                # *latest* signal to trigger a reconcile; missed intermediate
+                # events are harmless because they'd cause the same refetch.
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    q.put_nowait(msg)
+                except queue.Full:
+                    pass
+
+
+event_bus = EventBus()
+
 
 # ---------------------------------------------------------------------------
 # Persistence layer
@@ -93,6 +146,7 @@ def db_insert_download(download_id, url):
             "VALUES (?, ?, 'starting', '0%', ?)",
             (download_id, url, time.time()),
         )
+    event_bus.publish('change', {'reason': 'insert', 'id': download_id})
 
 
 def db_update_download(download_id, *, status=None, progress=None,
@@ -125,6 +179,7 @@ def db_update_download(download_id, *, status=None, progress=None,
             f"UPDATE downloads SET {', '.join(fields)} WHERE id = ?",
             values,
         )
+    event_bus.publish('change', {'reason': 'update', 'id': download_id})
 
 
 def db_get_download(download_id):
@@ -138,7 +193,10 @@ def db_get_download(download_id):
 def db_delete_download(download_id):
     with _db_lock, db() as conn:
         cur = conn.execute("DELETE FROM downloads WHERE id = ?", (download_id,))
-        return cur.rowcount
+        rows = cur.rowcount
+    if rows:
+        event_bus.publish('change', {'reason': 'delete', 'id': download_id})
+    return rows
 
 
 def db_clear_terminal():
@@ -148,7 +206,10 @@ def db_clear_terminal():
             f"DELETE FROM downloads WHERE status IN ({placeholders})",
             TERMINAL_STATUSES,
         )
-        return cur.rowcount
+        rows = cur.rowcount
+    if rows:
+        event_bus.publish('change', {'reason': 'clear', 'count': rows})
+    return rows
 
 
 def db_list_downloads():
@@ -1356,8 +1417,41 @@ HTML_TEMPLATE = """
         }
 
         loadPreferences();
-        setInterval(fetchHistory, 1000);
-        fetchHistory();
+
+        // Server-push instead of polling --------------------------------
+        // The server streams Server-Sent Events on /api/events. Each
+        // 'change' event tells us a download row was inserted, updated
+        // or deleted -- we react by re-fetching /api/history exactly once.
+        // EventSource handles auto-reconnect with backoff, so a brief
+        // server restart fixes itself without our help.
+        //
+        // We coalesce bursts of events (e.g. progress updates firing
+        // multiple times per second) into a single fetch using rAF so
+        // the UI never re-renders more than once per frame.
+        let pendingFetch = false;
+        function scheduleFetch() {
+            if (pendingFetch) return;
+            pendingFetch = true;
+            requestAnimationFrame(() => {
+                pendingFetch = false;
+                fetchHistory();
+            });
+        }
+
+        function connectEventStream() {
+            const es = new EventSource('/api/events');
+            es.addEventListener('ready', scheduleFetch);
+            es.addEventListener('change', scheduleFetch);
+            // EventSource reconnects on its own; this handler is just for
+            // diagnostics in the browser console.
+            es.addEventListener('error', () => {
+                // The browser will retry automatically. Nothing to do.
+            });
+            return es;
+        }
+
+        connectEventStream();
+        fetchHistory();  // first paint; the 'ready' event will follow.
     </script>
 </body>
 </html>
@@ -1445,6 +1539,44 @@ def get_history():
     return jsonify(db_list_downloads())
 
 
+@app.route('/api/events')
+def events():
+    """Server-Sent Events stream. The browser opens one EventSource and we
+    push a 'change' event every time a download row is inserted, updated, or
+    deleted. The client reacts by re-fetching /api/history once -- which is
+    much cheaper than polling every second when nothing is happening.
+
+    Keepalive comments (lines starting with ':') run every ~15s so proxies
+    and the browser don't time the connection out during idle periods.
+    """
+    KEEPALIVE_SECS = 15
+
+    def stream():
+        q = event_bus.subscribe()
+        try:
+            # Greet the client so it knows the stream is live; also nudges it
+            # to do an initial reconcile against /api/history.
+            yield "event: ready\ndata: {}\n\n"
+            while True:
+                try:
+                    kind, payload = q.get(timeout=KEEPALIVE_SECS)
+                except queue.Empty:
+                    # SSE comment line -- ignored by EventSource but keeps the
+                    # TCP connection from being reaped by intermediaries.
+                    yield ": keepalive\n\n"
+                    continue
+                data = json.dumps(payload or {})
+                yield f"event: {kind}\ndata: {data}\n\n"
+        finally:
+            event_bus.unsubscribe(q)
+
+    resp = Response(stream_with_context(stream()), mimetype='text/event-stream')
+    resp.headers['Cache-Control'] = 'no-cache, no-transform'
+    resp.headers['X-Accel-Buffering'] = 'no'  # disable proxy buffering (nginx)
+    resp.headers['Connection'] = 'keep-alive'
+    return resp
+
+
 @app.route('/api/file/<download_id>', methods=['GET'])
 def stream_file(download_id):
     """Serve a finished download to the in-app player. Uses send_file's
@@ -1487,4 +1619,6 @@ init_db()
 if __name__ == '__main__':
     # debug=True triggers a reloader child process. init_db() runs in both
     # parents and children, but it is idempotent so this is fine.
-    app.run(debug=True, port=5000)
+    # threaded=True is required so the long-lived SSE connection on
+    # /api/events doesn't block other requests behind a single worker.
+    app.run(debug=True, port=5000, threaded=True)

@@ -14,5 +14,5 @@
 * [DONE] add a stop-button to the list of current downloads
 * [DONE] add a clear button the the section of finished downloads
 * [PARTIALLY_DONE] add a configuration section for the download helper
-** [IN_PROGRESS] dark-mode
+** [DONE] dark-mode
 ** [DONE] save history
