@@ -409,8 +409,8 @@ HTML_TEMPLATE = """
         .pref-row label { width: 180px; }
         .pref-actions { display: flex; justify-content: flex-end; margin-top: 20px; }
         /* Match Download button styling — the user-agent default look. */
-        #saveBtn { display: inline-flex; align-items: center; }
-        #downloadForm button[type="submit"] { display: inline-flex; align-items: center; }
+        #saveBtn { display: inline-flex; align-items: center; gap: 6px; }
+        #downloadForm button[type="submit"] { display: inline-flex; align-items: center; gap: 6px; }
         .eta { margin-top: 4px; font-size: 0.9em; color: #555; }
         /* Tabs */
         .tabs { display: flex; gap: 0; border-bottom: 1px solid #ccc; margin-bottom: 20px; }
@@ -461,6 +461,13 @@ HTML_TEMPLATE = """
         .kebab-menu button { display: flex !important; align-items: center; gap: 8px; }
         .kebab-menu .menu-icon { width: 14px; height: 14px; flex-shrink: 0; color: #555; }
         .kebab-menu button.danger .menu-icon { color: #c0392b; }
+        /* Error details disclosure on error rows. Subtle until expanded. */
+        .error-details { margin-top: 10px; border-top: 1px solid #f0d6d6; padding-top: 8px; }
+        .error-details > summary { list-style: none; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; color: #c0392b; font-size: 0.92em; user-select: none; }
+        .error-details > summary::-webkit-details-marker { display: none; }
+        .error-details .chev { width: 14px; height: 14px; transition: transform 0.15s; color: #c0392b; flex-shrink: 0; }
+        .error-details[open] > summary .chev { transform: rotate(-180deg); }
+        .error-text { margin: 8px 0 0; padding: 8px 10px; background: #fdecea; border: 1px solid #f5c6c0; border-radius: 4px; color: #6b1f17; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.85em; white-space: pre-wrap; word-break: break-word; max-height: 240px; overflow: auto; }
         /* Player overlay */
         .player-backdrop { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 100; align-items: center; justify-content: center; }
         .player-backdrop.open { display: flex; }
@@ -477,8 +484,27 @@ HTML_TEMPLATE = """
     <svg width="0" height="0" style="position:absolute" aria-hidden="true">
         <defs>
             <symbol id="i-download" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M8 2.5v7.2"/><path d="M4.3 6.2L8 9.9l3.7-3.7"/><path d="M2.8 13.2h10.4"/>
+                </g>
+            </symbol>
+            <symbol id="i-save" viewBox="0 0 16 16">
                 <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M8 2v8"/><path d="M4.5 6.5L8 10l3.5-3.5"/><path d="M2.5 13h11"/>
+                    <path d="M2.5 2.5h8.5l2.5 2.5v8.5a1 1 0 0 1-1 1h-10a1 1 0 0 1-1-1v-10a1 1 0 0 1 1-1z"/>
+                    <path d="M4.5 2.5v3.5h6v-3.5"/>
+                    <rect x="4.5" y="9" width="7" height="5"/>
+                </g>
+            </symbol>
+            <symbol id="i-external" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M9.5 2.5h4v4"/>
+                    <path d="M13.5 2.5l-6 6"/>
+                    <path d="M12 9v3.5a1 1 0 0 1-1 1h-7.5a1 1 0 0 1-1-1v-7.5a1 1 0 0 1 1-1H7"/>
+                </g>
+            </symbol>
+            <symbol id="i-chevron" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M5 6l3 3 3-3"/>
                 </g>
             </symbol>
             <symbol id="i-camera" viewBox="0 0 16 16">
@@ -599,7 +625,7 @@ HTML_TEMPLATE = """
             </select>
         </div>
         <div class="pref-actions">
-            <button id="saveBtn" onclick="savePreferences()"><svg class="btn-icon"><use href="#i-download"/></svg><span>Save</span></button>
+            <button id="saveBtn" onclick="savePreferences()"><svg class="btn-icon"><use href="#i-save"/></svg><span>Save</span></button>
         </div>
     </div>
 
@@ -730,6 +756,15 @@ HTML_TEMPLATE = """
             return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
         }
 
+        function escapeHtml(s) {
+            return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+
+        function openUrl(url) {
+            closeAllMenus();
+            window.open(url, '_blank', 'noopener,noreferrer');
+        }
+
         function copyToClipboard(text, btn) {
             const done = () => {
                 if (!btn) return;
@@ -783,6 +818,9 @@ HTML_TEMPLATE = """
                 primary = `<button class="continue-btn" onclick="continueDownload('${id}', '${safeUrl}')"><svg class="icon"><use href="#i-play"/></svg>Continue</button>`;
             }
 
+            // Open URL in a new tab — available on every row.
+            menuItems.push(`<button onclick="openUrl('${safeUrl}')"><svg class="menu-icon"><use href="#i-external"/></svg>Open URL</button>`);
+
             if (isTerminal) {
                 // Reload only for non-finished terminal rows that don't already
                 // have a primary Continue action (i.e. error/interrupted).
@@ -791,6 +829,9 @@ HTML_TEMPLATE = """
                 }
                 menuItems.push(`<button onclick="copyToClipboard('${safeUrl}', this)"><svg class="menu-icon"><use href="#i-copy"/></svg>Copy URL</button>`);
                 menuItems.push(`<button class="danger" onclick="deleteDownload('${id}')"><svg class="menu-icon"><use href="#i-trash"/></svg>Delete</button>`);
+            } else {
+                // Active rows: also offer Copy URL for convenience.
+                menuItems.push(`<button onclick="copyToClipboard('${safeUrl}', this)"><svg class="menu-icon"><use href="#i-copy"/></svg>Copy URL</button>`);
             }
 
             // Play button shows for finished rows that have a captured filename.
@@ -856,6 +897,17 @@ HTML_TEMPLATE = """
 
             const warn = isCancelled ? '<span class="warn-icon" title="Action required"></span>' : '';
 
+            // Error details: collapsed by default, expandable via chevron.
+            let errorBlock = '';
+            if (info.status === 'error' && info.progress) {
+                const detail = String(info.progress);
+                errorBlock = `
+                    <details class="error-details">
+                        <summary><svg class="chev"><use href="#i-chevron"/></svg><strong>Error details</strong></summary>
+                        <pre class="error-text">${escapeHtml(detail)}</pre>
+                    </details>`;
+            }
+
             return `
                 <div class="history-item" data-row-id="${id}">
                     <div class="history-header">
@@ -866,6 +918,7 @@ HTML_TEMPLATE = """
                         <div class="row-actions">${primary}${kebab}</div>
                     </div>
                     ${bottom}
+                    ${errorBlock}
                 </div>
             `;
         }
