@@ -120,6 +120,11 @@ def init_db():
             # starts, so the UI can show alternatives when the requested
             # format is unavailable.
             ("formats",    "ALTER TABLE downloads ADD COLUMN formats TEXT"),
+            # The yt-dlp 'format' selector string that was used to start
+            # this download (e.g. 'bestvideo+bestaudio/best'). Persisted so
+            # the History tab can explain *why* a 'Requested format is not
+            # available' error happened.
+            ("requested_format", "ALTER TABLE downloads ADD COLUMN requested_format TEXT"),
         ]:
             if col not in existing_cols:
                 conn.execute(ddl)
@@ -157,7 +162,7 @@ def db_insert_download(download_id, url):
 def db_update_download(download_id, *, status=None, progress=None,
                        filename=None, resolution=None, filesize=None,
                        speed=None, eta=None, title=None, finished_at=None,
-                       formats=None):
+                       formats=None, requested_format=None):
     fields, values = [], []
     if status is not None:
         fields.append("status = ?"); values.append(status)
@@ -179,6 +184,8 @@ def db_update_download(download_id, *, status=None, progress=None,
         fields.append("finished_at = ?"); values.append(finished_at)
     if formats is not None:
         fields.append("formats = ?"); values.append(formats)
+    if requested_format is not None:
+        fields.append("requested_format = ?"); values.append(requested_format)
     if not fields:
         return
     values.append(download_id)
@@ -224,7 +231,8 @@ def db_list_downloads():
     with db() as conn:
         rows = conn.execute(
             "SELECT id, url, status, progress, created_at, "
-            "filename, resolution, filesize, speed, eta, title, finished_at, formats "
+            "filename, resolution, filesize, speed, eta, title, finished_at, "
+            "formats, requested_format "
             "FROM downloads ORDER BY created_at ASC"
         ).fetchall()
         return [dict(r) for r in rows]
@@ -406,6 +414,12 @@ def background_download(url, download_id):
         # restarting from byte zero.
         'continuedl': True,
     }
+
+    # Persist the yt-dlp format selector that we're about to use, so the
+    # History tab can show *what was asked for* whenever a download fails
+    # with 'Requested format is not available'. Saved up-front (not only
+    # on success) so it sticks even if the probe phase below blows up.
+    db_update_download(download_id, requested_format=fmt)
 
     try:
         # ---- Probe phase --------------------------------------------------
@@ -769,6 +783,8 @@ HTML_TEMPLATE = """
         .formats-table th, .formats-table td { padding: 4px 8px; text-align: left; border-bottom: 1px solid var(--border-soft); white-space: nowrap; }
         .formats-table th { position: sticky; top: 0; background: var(--surface-2); font-weight: 600; color: var(--muted); }
         .formats-table tbody tr:hover { background: var(--surface-hover); }
+        /* Inline code chip used for the Requested-format selector string. */
+        .fmt-code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.9em; padding: 1px 6px; border-radius: 3px; background: var(--surface-2); border: 1px solid var(--border-soft); color: var(--fg); }
         /* Player overlay */
         .player-backdrop { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 100; align-items: center; justify-content: center; }
         .player-backdrop.open { display: flex; }
@@ -1291,6 +1307,9 @@ HTML_TEMPLATE = """
                                    : 'Ended';
                     meta.push(`<div><strong>${finLabel}:</strong> ${finishedStr}</div>`);
                 }
+                if (info.requested_format) {
+                    meta.push(`<div><strong>Requested format:</strong> <code class="fmt-code">${escapeHtml(info.requested_format)}</code></div>`);
+                }
                 if (meta.length) bottom += `<div class="meta">${meta.join('')}</div>`;
             }
 
@@ -1298,15 +1317,22 @@ HTML_TEMPLATE = """
 
             // Error details: collapsed by default, expandable via chevron.
             // Restore prior open state across periodic re-renders.
+            //
+            // The available-formats table is only useful when yt-dlp told
+            // the user to consult --list-formats -- which is exactly the
+            // "Requested format is not available" path. For other errors
+            // (network, private video, geo block, ...) the listing would
+            // be noise, so we suppress it.
             let errorBlock = '';
             if (info.status === 'error' && info.progress) {
                 const detail = String(info.progress);
                 const openAttr = openErrorIds.has(id) ? ' open' : '';
+                const showFormats = /--list-formats/i.test(detail);
                 errorBlock = `
                     <details class="error-details"${openAttr} ontoggle="onErrorDetailsToggle('${id}', this)">
                         <summary><svg class="chev"><use href="#i-chevron"/></svg><strong>Error details</strong></summary>
                         <pre class="error-text">${escapeHtml(detail)}</pre>
-                        ${renderFormatsTable(info)}
+                        ${showFormats ? renderFormatsTable(info) : ''}
                     </details>`;
             }
 
