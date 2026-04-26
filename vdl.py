@@ -71,6 +71,7 @@ def init_db():
             "format": "best",
             "max_concurrent": "3",
             "player_mode": "overlay",
+            "theme": "system",
         }
         for k, v in defaults.items():
             conn.execute(
@@ -368,7 +369,80 @@ HTML_TEMPLATE = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Video Downloader</title>
+    <!-- Apply the saved theme as early as possible to avoid a flash of the
+         wrong theme. We mirror the server-side preference into localStorage
+         on save, then read it here before the rest of the page paints. -->
+    <script>
+        (function () {
+            try {
+                const stored = localStorage.getItem('theme') || 'system';
+                const sysDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+                const effective = (stored === 'system') ? (sysDark ? 'dark' : 'light') : stored;
+                document.documentElement.setAttribute('data-theme', effective);
+                document.documentElement.dataset.themePref = stored;
+            } catch (e) { /* localStorage may be blocked — fall through to default light */ }
+        })();
+    </script>
     <style>
+        /* Theme tokens. Light values are the defaults; the [data-theme="dark"]
+           override block below redefines them. Theme is applied to <html> via
+           the `data-theme` attribute, set early in <head> to avoid a flash of
+           the wrong theme. */
+        :root {
+            --bg:           #ffffff;
+            --fg:           #1a1a1a;
+            --muted:        #555555;
+            --muted-2:      #888888;
+            --border:       #cccccc;
+            --border-soft:  #e5e5e5;
+            --surface:      #ffffff;
+            --surface-2:    #f6f6f6;
+            --surface-3:    #f3f3f3;
+            --surface-hover: #ececec;
+            --progress-bg:  #f3f3f3;
+            --menu-shadow:  rgba(0,0,0,0.12);
+            --link:         #3498db;
+            --error-fg:     #c0392b;
+            --error-bg:     #fdecea;
+            --error-border: #f5c6c0;
+            --error-text:   #6b1f17;
+            --warn:         #f1c40f;
+            --warn-text:    #000000;
+            --accent:       #4caf50;
+            --danger:       #e74c3c;
+            --danger-2:     #c0392b;
+            --orange:       #f39c12;
+            --orange-2:     #d68910;
+            --tab-bg:       #ffffff;
+        }
+        html[data-theme="dark"] {
+            --bg:           #1a1d21;
+            --fg:           #e6e6e6;
+            --muted:        #a8acb3;
+            --muted-2:      #7a7f87;
+            --border:       #3a3f47;
+            --border-soft:  #2a2e34;
+            --surface:      #23272d;
+            --surface-2:    #2a2e34;
+            --surface-3:    #2f343b;
+            --surface-hover: #353b43;
+            --progress-bg:  #2a2e34;
+            --menu-shadow:  rgba(0,0,0,0.5);
+            --link:         #5dade2;
+            --error-fg:     #ff7066;
+            --error-bg:     #3a2020;
+            --error-border: #5a2a28;
+            --error-text:   #f5c6c0;
+            --warn:         #f1c40f;
+            --warn-text:    #000000;
+            --accent:       #4caf50;
+            --danger:       #e74c3c;
+            --danger-2:     #c0392b;
+            --orange:       #f39c12;
+            --orange-2:     #d68910;
+            --tab-bg:       #23272d;
+        }
+        html, body { background: var(--bg); color: var(--fg); }
         body { font-family: Arial, sans-serif; max-width: 800px; margin: 40px auto; padding: 20px; box-sizing: border-box; }
         *, *::before, *::after { box-sizing: border-box; }
         /* URL + Download fused into one segmented control. The input has no
@@ -377,34 +451,42 @@ HTML_TEMPLATE = """
         .form-group { margin-bottom: 20px; display: flex; width: 100%; }
         .form-group input[type="url"] {
             flex: 1; padding: 10px 12px; font-size: 1em;
-            border: 1px solid #ccc; border-right: none;
+            border: 1px solid var(--border); border-right: none;
             border-radius: 4px 0 0 4px;
-            background: white;
+            background: var(--surface); color: var(--fg);
         }
-        .form-group input[type="url"]:focus { outline: none; border-color: #888; }
+        .form-group input[type="url"]:focus { outline: none; border-color: var(--muted); }
         .form-group button[type="submit"] {
             padding: 0 16px; font-size: 1em; line-height: 1;
-            border: 1px solid #ccc;
+            border: 1px solid var(--border);
             border-radius: 0 4px 4px 0;
-            background-color: #f6f6f6; color: #222; cursor: pointer;
+            background-color: var(--surface-2); color: var(--fg); cursor: pointer;
             display: inline-flex; align-items: center; gap: 6px;
         }
-        .form-group button[type="submit"]:hover { background-color: #ececec; }
+        .form-group button[type="submit"]:hover { background-color: var(--surface-hover); }
         /* When the input is focused, also darken the button border so the
            seam reads as one control. */
         .form-group:focus-within input[type="url"],
-        .form-group:focus-within button[type="submit"] { border-color: #888; }
+        .form-group:focus-within button[type="submit"] { border-color: var(--muted); }
+        input[type="text"], input[type="number"], select, textarea {
+            background: var(--surface); color: var(--fg); border: 1px solid var(--border); border-radius: 4px;
+        }
+        input[type="text"]:focus, input[type="number"]:focus, select:focus, textarea:focus { outline: none; border-color: var(--muted); }
         input[type="text"], input[type="number"] { padding: 10px; }
         button { padding: 10px 20px; cursor: pointer; }
-        .history-item { position: relative; border: 1px solid #ccc; padding: 15px; margin-bottom: 10px; border-radius: 5px; }
+        .history-item { position: relative; border: 1px solid var(--border); background: var(--surface); padding: 15px; margin-bottom: 10px; border-radius: 5px; }
         /* Pin the row actions to the top-right of the whole item so they sit
            on the title's row, not below it. The padding-right on text
            content keeps it from sliding under the buttons on narrow widths. */
         .history-item > .row-actions { position: absolute; top: 12px; right: 12px; }
+        /* Reserve horizontal room for the pinned action-group on every
+           sibling that could render alongside the buttons (title, meta
+           block). The buffer is generous enough that wrapped URL lines
+           stay clear of the buttons on the first couple of lines. */
         .history-item > .item-title,
-        .history-item > .history-header { padding-right: 96px; }
-        .history-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
-        .history-header > div:first-child { flex: 1; word-break: break-all; }
+        .history-item > .meta { padding-right: 110px; }
+        /* Force long URLs / filenames to break inside the meta block. */
+        .history-item .meta { overflow-wrap: anywhere; word-break: break-word; }
         .row-actions { display: flex; gap: 6px; }
         .stop-btn, .continue-btn { padding: 0 12px; height: 32px; color: white; border: none; border-radius: 4px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; line-height: 1; font-size: 1em; }
         .stop-btn { background-color: #e74c3c; }
@@ -420,26 +502,26 @@ HTML_TEMPLATE = """
         .delete-btn:hover { background-color: #5d6d6e; }
         .copy-btn { padding: 6px 12px; background-color: #16a085; color: white; border: none; border-radius: 4px; cursor: pointer; }
         .copy-btn:hover { background-color: #117a65; }
-        .meta { margin-top: 8px; font-size: 0.9em; color: #555; }
+        .meta { margin-top: 8px; font-size: 0.9em; color: var(--muted); }
         .meta div { margin-top: 2px; }
         .meta .filename { font-family: ui-monospace, Menlo, Consolas, monospace; word-break: break-all; }
-        .speed { margin-top: 6px; font-size: 0.9em; color: #555; }
+        .speed { margin-top: 6px; font-size: 0.9em; color: var(--muted); }
         /* Kebab menu */
         .menu-wrap { position: relative; }
-        .kebab-btn { padding: 6px 10px; background-color: transparent; color: #555; border: 1px solid #ccc; border-radius: 4px; cursor: pointer; font-size: 1.1em; line-height: 1; }
-        .kebab-btn:hover { background-color: #f3f3f3; }
-        .kebab-menu { display: none; position: absolute; right: 0; top: calc(100% + 4px); background: white; border: 1px solid #ccc; border-radius: 4px; box-shadow: 0 2px 8px rgba(0,0,0,0.12); min-width: 140px; z-index: 10; }
+        .kebab-btn { padding: 6px 10px; background-color: transparent; color: var(--muted); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; font-size: 1.1em; line-height: 1; }
+        .kebab-btn:hover { background-color: var(--surface-3); }
+        .kebab-menu { display: none; position: absolute; right: 0; top: calc(100% + 4px); background: var(--surface); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; box-shadow: 0 2px 8px var(--menu-shadow); min-width: 140px; z-index: 10; }
         .kebab-menu.open { display: block; }
-        .kebab-menu button { display: block; width: 100%; text-align: left; padding: 8px 12px; background: none; border: none; cursor: pointer; font-size: 0.95em; }
-        .kebab-menu button:hover { background-color: #f3f3f3; }
-        .kebab-menu button.danger { color: #c0392b; }
+        .kebab-menu button { display: block; width: 100%; text-align: left; padding: 8px 12px; background: none; border: none; color: var(--fg); cursor: pointer; font-size: 0.95em; }
+        .kebab-menu button:hover { background-color: var(--surface-3); }
+        .kebab-menu button.danger { color: var(--error-fg); }
         /* Toolbar alignment: place the Clear button inline with the <summary> */
         .history-summary { display: flex; justify-content: space-between; align-items: center; cursor: pointer; list-style: none; }
         .history-summary::-webkit-details-marker { display: none; }
         .history-summary::before { content: '▶'; display: inline-block; margin-right: 8px; font-size: 0.8em; transition: transform 0.15s; }
         details[open] > .history-summary::before { transform: rotate(90deg); }
         .history-summary .title { font-weight: bold; flex: 1; }
-        .progress-bar-bg { width: 100%; background-color: #f3f3f3; border-radius: 5px; margin-top: 10px;}
+        .progress-bar-bg { width: 100%; background-color: var(--progress-bg); border-radius: 5px; margin-top: 10px;}
         .progress-bar-fill { height: 20px; background-color: #4caf50; border-radius: 5px; width: 0%; transition: width 0.4s ease;}
         .progress-bar-fill.cancelled, .progress-bar-fill.interrupted { background-color: #e74c3c; }
         .progress-bar-fill.error { background-color: #c0392b; }
@@ -448,33 +530,44 @@ HTML_TEMPLATE = """
         .clear-btn:hover { background-color: #7f8c8d; }
         .pref-row { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
         .pref-row label { width: 180px; }
+        /* Make selects and text inputs inside the Preferences panel share
+           the same box dimensions so the column lines up visually. */
+        .pref-row input[type="text"],
+        .pref-row input[type="number"],
+        .pref-row select {
+            height: 40px; padding: 0 10px; font-size: 1em; line-height: 1.2;
+            border: 1px solid var(--border); border-radius: 4px;
+            background: var(--surface); color: var(--fg);
+            box-sizing: border-box;
+        }
+        .pref-row select { padding-right: 28px; }
         .pref-actions { display: flex; justify-content: flex-end; margin-top: 20px; }
         /* Match Download button styling — the user-agent default look. */
         #saveBtn { display: inline-flex; align-items: center; gap: 6px; }
         #downloadForm button[type="submit"] { display: inline-flex; align-items: center; gap: 6px; }
-        .eta { margin-top: 4px; font-size: 0.9em; color: #555; }
+        .eta { margin-top: 4px; font-size: 0.9em; color: var(--muted); }
         /* Active-row progress: bar + ETA/speed on the same line. */
         .progress-row { display: flex; align-items: center; gap: 10px; margin-top: 4px; }
         .progress-row .progress-bar-bg { flex: 1; margin: 0; }
-        .progress-inline { font-size: 0.9em; color: #555; white-space: nowrap; flex-shrink: 0; }
+        .progress-inline { font-size: 0.9em; color: var(--muted); white-space: nowrap; flex-shrink: 0; }
         /* Tabs */
-        .tabs { display: flex; gap: 0; border-bottom: 1px solid #ccc; margin-bottom: 20px; }
-        .tab { padding: 10px 18px; background: none; border: 1px solid transparent; border-bottom: none; border-radius: 5px 5px 0 0; cursor: pointer; font-size: 1em; color: #555; margin-bottom: -1px; }
-        .tab:hover { color: #000; }
-        .tab.active { background: white; border-color: #ccc; color: #000; font-weight: bold; }
-        .tab .badge { display: inline-block; min-width: 18px; padding: 1px 6px; margin-left: 6px; border-radius: 9px; background: #3498db; color: white; font-size: 0.8em; font-weight: bold; text-align: center; }
+        .tabs { display: flex; gap: 0; border-bottom: 1px solid var(--border); margin-bottom: 20px; }
+        .tab { padding: 10px 18px; background: none; border: 1px solid transparent; border-bottom: none; border-radius: 5px 5px 0 0; cursor: pointer; font-size: 1em; color: var(--muted); margin-bottom: -1px; }
+        .tab:hover { color: var(--fg); }
+        .tab.active { background: var(--tab-bg); border-color: var(--border); color: var(--fg); font-weight: bold; }
+        .tab .badge { display: inline-block; min-width: 18px; padding: 1px 6px; margin-left: 6px; border-radius: 9px; background: var(--link); color: white; font-size: 0.8em; font-weight: bold; text-align: center; }
         .tab-panel { display: none; }
         .tab-panel.active { display: block; }
         .tab-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
         .tab-header h3 { margin: 0; }
-        .pager { display: flex; justify-content: center; align-items: center; gap: 10px; margin-top: 12px; color: #555; font-size: 0.95em; }
-        .pager button { padding: 4px 12px; font-size: 1.1em; line-height: 1; background: #fff; border: 1px solid #ccc; border-radius: 4px; cursor: pointer; min-width: 36px; }
+        .pager { display: flex; justify-content: center; align-items: center; gap: 10px; margin-top: 12px; color: var(--muted); font-size: 0.95em; }
+        .pager button { padding: 4px 12px; font-size: 1.1em; line-height: 1; background: var(--surface); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; min-width: 36px; }
         .pager button:disabled { opacity: 0.4; cursor: default; }
-        .pager button:hover:not(:disabled) { background: #f0f0f0; }
-        .empty { color: #888; padding: 20px 0; }
+        .pager button:hover:not(:disabled) { background: var(--surface-3); }
+        .empty { color: var(--muted-2); padding: 20px 0; }
         /* Item title — prominent header derived from the page title yt-dlp
            returns. Truncates with an ellipsis when too long. */
-        .item-title { font-weight: 600; font-size: 1.05em; color: #1a1a1a; margin-bottom: 6px; padding-right: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .item-title { font-weight: 600; font-size: 1.05em; color: var(--fg); margin-bottom: 6px; padding-right: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         /* Segmented action group: Play and Kebab share a border so they look
            like one control with an extra menu attached on the right. */
         .action-group { display: inline-flex; align-items: stretch; }
@@ -483,14 +576,14 @@ HTML_TEMPLATE = """
            by virtue of the :not() and keep their own background. */
         .action-group > button:not(.stop-btn):not(.continue-btn),
         .action-group > .menu-wrap > .kebab-btn {
-            border: 1px solid #ccc; background-color: transparent; color: #555;
+            border: 1px solid var(--border); background-color: transparent; color: var(--muted);
             cursor: pointer; padding: 0 10px; font-size: 1em; line-height: 1;
             display: inline-flex; align-items: center; justify-content: center;
             border-radius: 0;
             height: 32px; box-sizing: border-box;
         }
         .action-group > button:not(.stop-btn):not(.continue-btn):hover,
-        .action-group > .menu-wrap > .kebab-btn:hover { background-color: #f3f3f3; }
+        .action-group > .menu-wrap > .kebab-btn:hover { background-color: var(--surface-3); }
         /* Colored buttons drop their own border-radius so the group can apply
            the segmented one, and lose their right border so it merges flat. */
         .action-group > .stop-btn,
@@ -508,27 +601,27 @@ HTML_TEMPLATE = """
         .action-group.action-group > :last-child > button,
         .action-group.action-group > button:last-child  { border-radius: 0 4px 4px 0; border-left: none; }
         .action-group.action-group > :only-child > button,
-        .action-group.action-group > button:only-child  { border-radius: 4px; border-left: 1px solid #ccc; }
+        .action-group.action-group > button:only-child  { border-radius: 4px; border-left: 1px solid var(--border); }
         /* When a colored button (Stop/Continue) leads the group, the kebab on
            its right gets a faint white border-left so the seam is visible on
            the colored background without clashing. */
         .action-group > .stop-btn + .menu-wrap > .kebab-btn,
-        .action-group > .continue-btn + .menu-wrap > .kebab-btn { border-left-color: #ccc; }
+        .action-group > .continue-btn + .menu-wrap > .kebab-btn { border-left-color: var(--border); }
         .action-group .icon { width: 18px; height: 18px; display: block; }
         /* Kebab now uses an SVG glyph, so no font-size hack needed. */
         /* Inline icon used inside primary buttons (Download / Save). */
         .btn-icon { width: 16px; height: 16px; }
         /* Menu items in the kebab dropdown get a matching leading icon. */
         .kebab-menu button { display: flex !important; align-items: center; gap: 8px; }
-        .kebab-menu .menu-icon { width: 14px; height: 14px; flex-shrink: 0; color: #555; }
-        .kebab-menu button.danger .menu-icon { color: #c0392b; }
+        .kebab-menu .menu-icon { width: 14px; height: 14px; flex-shrink: 0; color: var(--muted); }
+        .kebab-menu button.danger .menu-icon { color: var(--error-fg); }
         /* Error details disclosure on error rows. Subtle until expanded. */
         .error-details { margin-top: 10px; }
-        .error-details > summary { list-style: none; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; color: #c0392b; font-size: 0.92em; user-select: none; }
+        .error-details > summary { list-style: none; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; color: var(--error-fg); font-size: 0.92em; user-select: none; }
         .error-details > summary::-webkit-details-marker { display: none; }
-        .error-details .chev { width: 14px; height: 14px; transition: transform 0.15s; color: #c0392b; flex-shrink: 0; }
+        .error-details .chev { width: 14px; height: 14px; transition: transform 0.15s; color: var(--error-fg); flex-shrink: 0; }
         .error-details[open] > summary .chev { transform: rotate(-180deg); }
-        .error-text { margin: 8px 0 0; padding: 8px 10px; background: #fdecea; border: 1px solid #f5c6c0; border-radius: 4px; color: #6b1f17; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.85em; white-space: pre-wrap; word-break: break-word; max-height: 240px; overflow: auto; }
+        .error-text { margin: 8px 0 0; padding: 8px 10px; background: var(--error-bg); border: 1px solid var(--error-border); border-radius: 4px; color: var(--error-text); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.85em; white-space: pre-wrap; word-break: break-word; max-height: 240px; overflow: auto; }
         /* Player overlay */
         .player-backdrop { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 100; align-items: center; justify-content: center; }
         .player-backdrop.open { display: flex; }
@@ -662,7 +755,7 @@ HTML_TEMPLATE = """
         </div>
         <div class="pref-row">
             <label for="prefFormat">Quality</label>
-            <select id="prefFormat" style="width: 320px; padding: 10px;">
+            <select id="prefFormat" style="width: 320px;">
                 <option value="bestvideo+bestaudio/best">Best available (video + audio merged)</option>
                 <option value="best">Best single file (no merge needed)</option>
                 <option value="bestvideo[height<=2160]+bestaudio/best">Up to 2160p (4K)</option>
@@ -685,9 +778,17 @@ HTML_TEMPLATE = """
         </div>
         <div class="pref-row">
             <label for="prefPlayer">Play videos in</label>
-            <select id="prefPlayer" style="width: 320px; padding: 10px;">
+            <select id="prefPlayer" style="width: 320px;">
                 <option value="overlay">Overlay on this page</option>
                 <option value="new_tab">New browser tab</option>
+            </select>
+        </div>
+        <div class="pref-row">
+            <label for="prefTheme">Theme</label>
+            <select id="prefTheme" style="width: 320px;">
+                <option value="system">System (follow OS setting)</option>
+                <option value="light">Light</option>
+                <option value="dark">Dark</option>
             </select>
         </div>
         <div class="pref-actions">
@@ -1025,16 +1126,19 @@ HTML_TEMPLATE = """
                 ? `<div class="item-title" title="${escapeAttr(displayTitle)}">${escapeHtml(displayTitle)}</div>`
                 : '';
 
+            // URL + Status as meta rows (same visual treatment as File /
+            // Quality / Size). Rendered above the `bottom` meta so the
+            // identifying info leads the item.
+            const headMeta = `<div class="meta">
+                <div>${warn}<strong>URL:</strong> ${escapeHtml(info.url)}</div>
+                <div><strong>Status:</strong> ${info.status} (${statusLabel})</div>
+            </div>`;
+
             return `
                 <div class="history-item" data-row-id="${id}">
                     <div class="row-actions">${actions}</div>
                     ${titleRow}
-                    <div class="history-header">
-                        <div>
-                            ${warn}<strong>URL:</strong> ${info.url}<br>
-                            <strong>Status:</strong> ${info.status} (${statusLabel})
-                        </div>
-                    </div>
+                    ${headMeta}
                     ${bottom}
                     ${errorBlock}
                 </div>
@@ -1164,6 +1268,30 @@ HTML_TEMPLATE = """
         // Script is at end of body, so the elements exist already.
         document.getElementById('prefFormat').addEventListener('change', refreshCustomVisibility);
 
+        // Theme handling --------------------------------------------------
+        // Three modes: 'light', 'dark', 'system'. The boot script in <head>
+        // already applied the cached choice; these helpers keep the UI in
+        // sync afterwards and react to live changes.
+        function applyTheme(pref) {
+            const sysDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+            const effective = (pref === 'system') ? (sysDark ? 'dark' : 'light') : pref;
+            document.documentElement.setAttribute('data-theme', effective);
+            document.documentElement.dataset.themePref = pref;
+            try { localStorage.setItem('theme', pref); } catch (e) {}
+        }
+
+        // When the user picks 'system', track the OS preference live.
+        if (window.matchMedia) {
+            const mq = window.matchMedia('(prefers-color-scheme: dark)');
+            const onChange = () => {
+                if (document.documentElement.dataset.themePref === 'system') {
+                    applyTheme('system');
+                }
+            };
+            if (mq.addEventListener) mq.addEventListener('change', onChange);
+            else if (mq.addListener) mq.addListener(onChange);
+        }
+
         function loadPreferences() {
             fetch('/api/preferences').then(r => r.json()).then(p => {
                 document.getElementById('prefDir').value = p.download_dir || '';
@@ -1182,8 +1310,20 @@ HTML_TEMPLATE = """
 
                 playerMode = (p.player_mode === 'new_tab') ? 'new_tab' : 'overlay';
                 document.getElementById('prefPlayer').value = playerMode;
+
+                const theme = ['light', 'dark', 'system'].includes(p.theme) ? p.theme : 'system';
+                document.getElementById('prefTheme').value = theme;
+                // Reconcile the cached value with the server's authoritative one.
+                applyTheme(theme);
             });
         }
+
+        // Apply theme immediately on dropdown change for instant feedback;
+        // the choice is persisted only on Save, but the visual switch happens
+        // right away as the user picks an option.
+        document.getElementById('prefTheme').addEventListener('change', (ev) => {
+            applyTheme(ev.target.value);
+        });
 
         function savePreferences() {
             const sel = document.getElementById('prefFormat');
@@ -1196,8 +1336,10 @@ HTML_TEMPLATE = """
                 format: fmt || 'best',
                 max_concurrent: document.getElementById('prefMax').value,
                 player_mode: document.getElementById('prefPlayer').value,
+                theme: document.getElementById('prefTheme').value,
             };
             playerMode = body.player_mode;
+            applyTheme(body.theme);
             fetch('/api/preferences', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -1328,7 +1470,7 @@ def preferences():
     if request.method == 'GET':
         return jsonify(db_get_preferences())
     data = request.json or {}
-    allowed = {'download_dir', 'format', 'max_concurrent', 'player_mode'}
+    allowed = {'download_dir', 'format', 'max_concurrent', 'player_mode', 'theme'}
     updates = {k: v for k, v in data.items() if k in allowed and v is not None}
     if not updates:
         return jsonify({"error": "No valid preference fields provided"}), 400
