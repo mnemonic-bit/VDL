@@ -267,6 +267,10 @@ def background_download(url, download_id):
         'progress_hooks': [lambda d: progress_hook(d, download_id)],
         'quiet': True,
         'noprogress': True,
+        # continuedl is default-True in yt-dlp, but make it explicit so a
+        # resumed download picks up the existing .part file rather than
+        # restarting from byte zero.
+        'continuedl': True,
     }
 
     try:
@@ -482,15 +486,10 @@ HTML_TEMPLATE = """
         }
 
         function continueDownload(id, url) {
-            // Resume = drop the cancelled row and start a fresh download for the
-            // same URL. yt-dlp picks up partially-downloaded fragments where
-            // available; otherwise it starts over.
-            fetch('/api/remove/' + encodeURIComponent(id), { method: 'POST' })
-                .then(() => fetch('/api/download', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ url: url })
-                }))
+            // Real resume: same row id, same output path. yt-dlp's continuedl
+            // detects the existing .part file and continues from where the
+            // previous worker stopped.
+            fetch('/api/resume/' + encodeURIComponent(id), { method: 'POST' })
                 .then(() => fetchHistory());
         }
 
@@ -834,6 +833,27 @@ def add_download():
     thread.start()
 
     return jsonify({"message": "Download started", "id": download_id})
+
+
+@app.route('/api/resume/<download_id>', methods=['POST'])
+def resume_download(download_id):
+    """Restart the worker for a cancelled download, keeping the same id so
+    yt-dlp's continuedl logic finds and reuses the existing .part file."""
+    entry = db_get_download(download_id)
+    if entry is None:
+        return jsonify({"error": "Unknown download id"}), 404
+    if entry['status'] != 'cancelled':
+        return jsonify({"error": f"Cannot resume from status '{entry['status']}'"}), 409
+
+    # Clear stale cancel flag, mark the row as starting, then spawn the worker.
+    clear_cancel(download_id)
+    db_update_download(download_id, status='starting', progress='0%')
+    thread = threading.Thread(
+        target=background_download, args=(entry['url'], download_id)
+    )
+    thread.daemon = True
+    thread.start()
+    return jsonify({"message": "Resumed", "id": download_id})
 
 
 @app.route('/api/stop/<download_id>', methods=['POST'])
