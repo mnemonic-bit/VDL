@@ -208,6 +208,16 @@ def progress_hook(d, download_id):
         downloaded = d.get('downloaded_bytes', 0)
         speed = d.get('speed')  # bytes/sec, may be None at the very start
         eta = d.get('eta')      # seconds remaining, may be None
+        # Capture resolution as soon as it's known so the Current tab can
+        # show it during the download, not only after completion.
+        info = d.get('info_dict') or {}
+        height = info.get('height')
+        width = info.get('width')
+        live_resolution = None
+        if height:
+            live_resolution = f"{height}p"
+        elif width and height:
+            live_resolution = f"{width}x{height}"
         if total_bytes > 0:
             percent = (downloaded / total_bytes) * 100
             db_update_download(
@@ -216,6 +226,8 @@ def progress_hook(d, download_id):
                 progress=f"{percent:.1f}%",
                 speed=float(speed) if speed else None,
                 eta=int(eta) if eta else None,
+                filesize=int(total_bytes),
+                resolution=live_resolution,
             )
     elif d['status'] == 'finished':
         # 'finished' here means the file was fully written to disk for this
@@ -390,19 +402,25 @@ HTML_TEMPLATE = """
         .empty { color: #888; padding: 20px 0; }
         /* Segmented action group: Play and Kebab share a border so they look
            like one control with an extra menu attached on the right. */
-        .action-group { display: inline-flex; }
+        .action-group { display: inline-flex; align-items: stretch; }
         /* Only style the segment buttons themselves — the play button (direct
            child) and the kebab button (inside .menu-wrap). Crucially, do not
            cascade into the dropdown menu items. */
         .action-group > button,
         .action-group > .menu-wrap > .kebab-btn {
             border: 1px solid #ccc; background-color: transparent; color: #555;
-            cursor: pointer; padding: 6px 10px; font-size: 1em; line-height: 1;
+            cursor: pointer; padding: 0 10px; font-size: 1em; line-height: 1;
             display: inline-flex; align-items: center; justify-content: center;
             border-radius: 0;
+            height: 32px; box-sizing: border-box;
         }
         .action-group > button:hover,
         .action-group > .menu-wrap > .kebab-btn:hover { background-color: #f3f3f3; }
+        /* Make the kebab wrap stretch to the same height and not overflow.
+           Without this, .menu-wrap (position:relative) paints above the play
+           button and intercepts clicks on the camera's right edge. */
+        .action-group > .menu-wrap { display: inline-flex; }
+        .action-group > .menu-wrap > .kebab-btn { width: 100%; }
         /* Rounded outer corners; flat inner edge between Play and Kebab.
            Specificity bumped with .action-group repeated so these rules win
            over the base .action-group > button block above. */
@@ -413,6 +431,8 @@ HTML_TEMPLATE = """
         .action-group.action-group > :only-child > button,
         .action-group.action-group > button:only-child  { border-radius: 4px; border-left: 1px solid #ccc; }
         .action-group .icon { width: 18px; height: 18px; display: block; }
+        /* Match optical weight of the kebab dots character. */
+        .action-group .kebab-btn { font-size: 1.2em; }
         /* Inline icon used inside primary buttons (Download / Save). */
         .btn-icon { width: 16px; height: 16px; vertical-align: -3px; margin-right: 6px; }
         /* Player overlay */
@@ -731,12 +751,15 @@ HTML_TEMPLATE = """
                 if (isNaN(width)) width = 0;
                 const speedStr = formatSpeed(info.speed);
                 const etaStr = formatEta(info.eta);
+                const sizeStr = formatBytes(info.filesize);
+                const resStr = info.resolution;
                 bottom = `
                     <div class="progress-bar-bg">
                         <div class="progress-bar-fill" style="width: ${width}%;"></div>
                     </div>
                     ${speedStr ? `<div class="speed"><strong>Speed:</strong> ${speedStr}</div>` : ''}
-                    ${etaStr ? `<div class="eta"><strong>Time remaining:</strong> ${etaStr}</div>` : ''}`;
+                    ${etaStr  ? `<div class="eta"><strong>Time remaining:</strong> ${etaStr}</div>` : ''}
+                    ${sizeStr ? `<div class="meta"><div><strong>Total size:</strong> ${sizeStr}</div>${resStr ? `<div><strong>Quality:</strong> ${resStr}</div>` : ''}</div>` : ''}`;
             } else {
                 // Terminal states: keep a coloured bar for non-finished failures so
                 // the row visually matches its status, plus any captured metadata.
@@ -757,7 +780,7 @@ HTML_TEMPLATE = """
                     const base = info.filename.split('/').pop().split('\\\\').pop();
                     meta.push(`<div><strong>File:</strong> <span class="filename">${base}</span></div>`);
                 }
-                if (info.resolution) meta.push(`<div><strong>Resolution:</strong> ${info.resolution}</div>`);
+                if (info.resolution) meta.push(`<div><strong>Quality:</strong> ${info.resolution}</div>`);
                 const sizeStr = formatBytes(info.filesize);
                 if (sizeStr) meta.push(`<div><strong>Size:</strong> ${sizeStr}</div>`);
                 if (meta.length) bottom += `<div class="meta">${meta.join('')}</div>`;
