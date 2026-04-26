@@ -57,6 +57,7 @@ def init_db():
             ("resolution", "ALTER TABLE downloads ADD COLUMN resolution TEXT"),
             ("filesize",   "ALTER TABLE downloads ADD COLUMN filesize INTEGER"),
             ("speed",      "ALTER TABLE downloads ADD COLUMN speed REAL"),
+            ("eta",        "ALTER TABLE downloads ADD COLUMN eta INTEGER"),
         ]:
             if col not in existing_cols:
                 conn.execute(ddl)
@@ -90,7 +91,7 @@ def db_insert_download(download_id, url):
 
 def db_update_download(download_id, *, status=None, progress=None,
                        filename=None, resolution=None, filesize=None,
-                       speed=None):
+                       speed=None, eta=None):
     fields, values = [], []
     if status is not None:
         fields.append("status = ?"); values.append(status)
@@ -104,6 +105,8 @@ def db_update_download(download_id, *, status=None, progress=None,
         fields.append("filesize = ?"); values.append(filesize)
     if speed is not None:
         fields.append("speed = ?"); values.append(speed)
+    if eta is not None:
+        fields.append("eta = ?"); values.append(eta)
     if not fields:
         return
     values.append(download_id)
@@ -142,7 +145,7 @@ def db_list_downloads():
     with db() as conn:
         rows = conn.execute(
             "SELECT id, url, status, progress, created_at, "
-            "filename, resolution, filesize, speed "
+            "filename, resolution, filesize, speed, eta "
             "FROM downloads ORDER BY created_at ASC"
         ).fetchall()
         return [dict(r) for r in rows]
@@ -202,6 +205,7 @@ def progress_hook(d, download_id):
         total_bytes = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
         downloaded = d.get('downloaded_bytes', 0)
         speed = d.get('speed')  # bytes/sec, may be None at the very start
+        eta = d.get('eta')      # seconds remaining, may be None
         if total_bytes > 0:
             percent = (downloaded / total_bytes) * 100
             db_update_download(
@@ -209,6 +213,7 @@ def progress_hook(d, download_id):
                 status='downloading',
                 progress=f"{percent:.1f}%",
                 speed=float(speed) if speed else None,
+                eta=int(eta) if eta else None,
             )
     elif d['status'] == 'finished':
         # 'finished' here means the file was fully written to disk for this
@@ -231,6 +236,7 @@ def progress_hook(d, download_id):
             resolution=str(resolution) if resolution else None,
             filesize=int(filesize) if filesize else None,
             speed=0.0,  # use 0 (not None) so the column is touched and cleared
+            eta=0,
         )
 
 
@@ -340,10 +346,20 @@ HTML_TEMPLATE = """
         .history-toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
         .clear-btn { padding: 8px 14px; background-color: #95a5a6; color: white; border: none; border-radius: 4px; cursor: pointer; }
         .clear-btn:hover { background-color: #7f8c8d; }
-        details { margin-bottom: 20px; border: 1px solid #ddd; border-radius: 5px; padding: 10px 15px; }
-        details summary { cursor: pointer; font-weight: bold; }
         .pref-row { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
         .pref-row label { width: 180px; }
+        .eta { margin-top: 4px; font-size: 0.9em; color: #555; }
+        /* Tabs */
+        .tabs { display: flex; gap: 0; border-bottom: 1px solid #ccc; margin-bottom: 20px; }
+        .tab { padding: 10px 18px; background: none; border: 1px solid transparent; border-bottom: none; border-radius: 5px 5px 0 0; cursor: pointer; font-size: 1em; color: #555; margin-bottom: -1px; }
+        .tab:hover { color: #000; }
+        .tab.active { background: white; border-color: #ccc; color: #000; font-weight: bold; }
+        .tab .badge { display: inline-block; min-width: 18px; padding: 1px 6px; margin-left: 6px; border-radius: 9px; background: #3498db; color: white; font-size: 0.8em; font-weight: bold; text-align: center; }
+        .tab-panel { display: none; }
+        .tab-panel.active { display: block; }
+        .tab-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+        .tab-header h3 { margin: 0; }
+        .empty { color: #888; padding: 20px 0; }
     </style>
 </head>
 <body>
@@ -353,40 +369,58 @@ HTML_TEMPLATE = """
         <button type="submit">Download</button>
     </form>
 
-    <details>
-        <summary>Preferences</summary>
+    <div class="tabs" role="tablist">
+        <button class="tab active" data-tab="current" onclick="switchTab('current')">Current<span id="currentBadge" class="badge" style="display: none;">0</span></button>
+        <button class="tab" data-tab="history" onclick="switchTab('history')">Download History</button>
+        <button class="tab" data-tab="preferences" onclick="switchTab('preferences')">Preferences</button>
+    </div>
+
+    <div id="tab-current" class="tab-panel active">
+        <div id="activeList"></div>
+        <p id="currentEmpty" class="empty">No active downloads. Paste a URL above to start.</p>
+    </div>
+
+    <div id="tab-history" class="tab-panel">
+        <div class="tab-header">
+            <h3>Download History</h3>
+            <button class="clear-btn" onclick="clearHistory()">Clear History</button>
+        </div>
+        <div id="historyList"></div>
+        <p id="historyEmpty" class="empty">No completed downloads yet.</p>
+    </div>
+
+    <div id="tab-preferences" class="tab-panel">
         <div class="pref-row">
             <label for="prefDir">Download directory</label>
             <input type="text" id="prefDir" style="width: 300px;">
         </div>
         <div class="pref-row">
-            <label for="prefFormat">yt-dlp format</label>
-            <input type="text" id="prefFormat" style="width: 300px;">
+            <label for="prefFormat">Quality</label>
+            <select id="prefFormat" style="width: 320px; padding: 10px;">
+                <option value="bestvideo+bestaudio/best">Best available (video + audio merged)</option>
+                <option value="best">Best single file (no merge needed)</option>
+                <option value="bestvideo[height<=2160]+bestaudio/best">Up to 2160p (4K)</option>
+                <option value="bestvideo[height<=1440]+bestaudio/best">Up to 1440p (2K)</option>
+                <option value="bestvideo[height<=1080]+bestaudio/best">Up to 1080p (Full HD)</option>
+                <option value="bestvideo[height<=720]+bestaudio/best">Up to 720p (HD)</option>
+                <option value="bestvideo[height<=480]+bestaudio/best">Up to 480p (SD)</option>
+                <option value="worstvideo+worstaudio/worst">Smallest file (lowest quality)</option>
+                <option value="bestaudio/best">Audio only (best)</option>
+                <option value="__custom__">Custom (advanced)</option>
+            </select>
+        </div>
+        <div class="pref-row" id="customFormatRow" style="display: none;">
+            <label for="prefFormatCustom">Custom format</label>
+            <input type="text" id="prefFormatCustom" style="width: 320px;" placeholder="e.g. bestvideo[ext=mp4]+bestaudio[ext=m4a]">
         </div>
         <div class="pref-row">
             <label for="prefMax">Max concurrent</label>
             <input type="number" id="prefMax" min="1" style="width: 80px;">
         </div>
         <div class="pref-row">
-            <button onclick="savePreferences()">Save preferences</button>
-            <span id="prefStatus" style="margin-left: 10px; color: #27ae60;"></span>
+            <button id="saveBtn" onclick="savePreferences()">Save</button>
         </div>
-    </details>
-
-    <div id="activeSection" style="display: none;">
-        <h3>Current Downloads</h3>
-        <div id="activeList"></div>
     </div>
-
-    <details id="historySection" open style="display: none;">
-        <summary class="history-summary">
-            <span class="title">Download History</span>
-            <button class="clear-btn" onclick="event.preventDefault(); event.stopPropagation(); clearHistory();">Clear History</button>
-        </summary>
-        <div id="historyList" style="margin-top: 10px;"></div>
-    </details>
-
-    <p id="emptyState" style="color: #888;">No downloads yet. Paste a URL above to start.</p>
 
     <script>
         const ACTIVE_STATUSES = new Set(['starting', 'downloading']);
@@ -424,8 +458,18 @@ HTML_TEMPLATE = """
         }
 
         function deleteDownload(id) {
+            // Optimistic UI: close the menu and yank the row immediately, then
+            // fire the API call. If the server rejects (e.g. row is somehow
+            // active), re-fetch to restore truth.
+            closeAllMenus();
+            const row = document.querySelector(`[data-row-id="${id}"]`);
+            if (row) row.remove();
+
             fetch('/api/remove/' + encodeURIComponent(id), { method: 'POST' })
-                .then(() => fetchHistory());
+                .then(res => {
+                    if (!res.ok) fetchHistory();
+                })
+                .catch(() => fetchHistory());
         }
 
         function clearHistory() {
@@ -474,6 +518,18 @@ HTML_TEMPLATE = """
         function formatSpeed(bps) {
             const s = formatBytes(bps);
             return s ? s + '/s' : null;
+        }
+
+        function formatEta(seconds) {
+            if (seconds == null || isNaN(seconds) || seconds < 0) return null;
+            const s = Math.round(Number(seconds));
+            if (s < 60) return s + 's';
+            const m = Math.floor(s / 60);
+            const rem = s % 60;
+            if (m < 60) return m + 'm ' + rem + 's';
+            const h = Math.floor(m / 60);
+            const mm = m % 60;
+            return h + 'h ' + mm + 'm ' + rem + 's';
         }
 
         function escapeAttr(s) {
@@ -551,11 +607,13 @@ HTML_TEMPLATE = """
                 let width = String(info.progress).replace('%', '');
                 if (isNaN(width)) width = 0;
                 const speedStr = formatSpeed(info.speed);
+                const etaStr = formatEta(info.eta);
                 bottom = `
                     <div class="progress-bar-bg">
                         <div class="progress-bar-fill" style="width: ${width}%;"></div>
                     </div>
-                    ${speedStr ? `<div class="speed"><strong>Speed:</strong> ${speedStr}</div>` : ''}`;
+                    ${speedStr ? `<div class="speed"><strong>Speed:</strong> ${speedStr}</div>` : ''}
+                    ${etaStr ? `<div class="eta"><strong>Time remaining:</strong> ${etaStr}</div>` : ''}`;
             } else {
                 // Terminal states: keep a coloured bar for non-finished failures so
                 // the row visually matches its status, plus any captured metadata.
@@ -583,7 +641,7 @@ HTML_TEMPLATE = """
             }
 
             return `
-                <div class="history-item">
+                <div class="history-item" data-row-id="${id}">
                     <div class="history-header">
                         <div>
                             <strong>URL:</strong> ${info.url}<br>
@@ -613,25 +671,75 @@ HTML_TEMPLATE = """
                 document.getElementById('activeList').innerHTML = active.map(renderItem).join('');
                 document.getElementById('historyList').innerHTML = done.map(renderItem).join('');
 
-                document.getElementById('activeSection').style.display  = active.length ? '' : 'none';
-                document.getElementById('historySection').style.display = done.length   ? '' : 'none';
-                document.getElementById('emptyState').style.display =
-                    (active.length || done.length) ? 'none' : '';
+                document.getElementById('currentEmpty').style.display = active.length ? 'none' : '';
+                document.getElementById('historyEmpty').style.display = done.length ? 'none' : '';
+
+                const badge = document.getElementById('currentBadge');
+                if (active.length) {
+                    badge.textContent = active.length;
+                    badge.style.display = '';
+                } else {
+                    badge.style.display = 'none';
+                }
             });
         }
+
+        // Tabs ---------------------------------------------------------------
+        function switchTab(name) {
+            document.querySelectorAll('.tab').forEach(t => {
+                t.classList.toggle('active', t.dataset.tab === name);
+            });
+            document.querySelectorAll('.tab-panel').forEach(p => {
+                p.classList.toggle('active', p.id === 'tab-' + name);
+            });
+            closeAllMenus();
+        }
+
+        // Quality preset handling -------------------------------------------
+        // The <select> exposes curated yt-dlp format strings. If the value
+        // currently stored in the DB is one of the presets, select it. Anything
+        // else (typed in by an advanced user) shows the Custom field instead.
+        function isPresetValue(v) {
+            const sel = document.getElementById('prefFormat');
+            return Array.from(sel.options).some(o => o.value === v && o.value !== '__custom__');
+        }
+
+        function refreshCustomVisibility() {
+            const sel = document.getElementById('prefFormat');
+            const row = document.getElementById('customFormatRow');
+            row.style.display = sel.value === '__custom__' ? '' : 'none';
+        }
+
+        // Script is at end of body, so the elements exist already.
+        document.getElementById('prefFormat').addEventListener('change', refreshCustomVisibility);
 
         function loadPreferences() {
             fetch('/api/preferences').then(r => r.json()).then(p => {
                 document.getElementById('prefDir').value = p.download_dir || '';
-                document.getElementById('prefFormat').value = p.format || '';
                 document.getElementById('prefMax').value = p.max_concurrent || '';
+
+                const stored = p.format || 'bestvideo+bestaudio/best';
+                const sel = document.getElementById('prefFormat');
+                if (isPresetValue(stored)) {
+                    sel.value = stored;
+                    document.getElementById('prefFormatCustom').value = '';
+                } else {
+                    sel.value = '__custom__';
+                    document.getElementById('prefFormatCustom').value = stored;
+                }
+                refreshCustomVisibility();
             });
         }
 
         function savePreferences() {
+            const sel = document.getElementById('prefFormat');
+            const fmt = sel.value === '__custom__'
+                ? document.getElementById('prefFormatCustom').value.trim()
+                : sel.value;
+
             const body = {
                 download_dir: document.getElementById('prefDir').value,
-                format: document.getElementById('prefFormat').value,
+                format: fmt || 'best',
                 max_concurrent: document.getElementById('prefMax').value,
             };
             fetch('/api/preferences', {
@@ -639,9 +747,13 @@ HTML_TEMPLATE = """
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(body),
             }).then(() => {
-                const s = document.getElementById('prefStatus');
-                s.textContent = 'Saved';
-                setTimeout(() => s.textContent = '', 2000);
+                const btn = document.getElementById('saveBtn');
+                btn.textContent = 'Saved ✓';
+                btn.disabled = true;
+                setTimeout(() => {
+                    btn.textContent = 'Save';
+                    btn.disabled = false;
+                }, 4000);
             });
         }
 
