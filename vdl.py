@@ -397,29 +397,92 @@ def summarize_formats(info_dict):
     return out
 
 
+def pick_best_format_id(formats_summary):
+    """Choose the best concrete format_id from the summarised formats list
+    captured by `summarize_formats()`. "Best" means: highest video height;
+    ties broken by total bitrate, then fps, then filesize. If there are no
+    video formats, we fall back to the audio entry with the highest abr/tbr
+    so audio-only sources still work.
+
+    Returns the format_id string, or None if nothing usable was found.
+    """
+    if not formats_summary:
+        return None
+
+    def has_video(f):
+        v = f.get('vcodec')
+        return bool(v) and v != 'none'
+
+    def has_audio(f):
+        a = f.get('acodec')
+        return bool(a) and a != 'none'
+
+    def num(v):
+        try:
+            return float(v) if v is not None else -1
+        except (TypeError, ValueError):
+            return -1
+
+    video = [f for f in formats_summary if has_video(f) and f.get('format_id')]
+    if video:
+        video.sort(key=lambda f: (
+            num(f.get('height')),
+            num(f.get('tbr')),
+            num(f.get('fps')),
+            num(f.get('filesize')),
+        ), reverse=True)
+        return video[0].get('format_id')
+
+    audio = [f for f in formats_summary if has_audio(f) and f.get('format_id')]
+    if audio:
+        audio.sort(key=lambda f: (
+            num(f.get('abr')),
+            num(f.get('tbr')),
+            num(f.get('filesize')),
+        ), reverse=True)
+        return audio[0].get('format_id')
+
+    return None
+
+
+def _is_format_unavailable_error(exc):
+    """True iff `exc` is a yt-dlp error caused by an unsatisfiable format
+    selector. Matches the canonical message yt-dlp prints for that case;
+    we deliberately do NOT match generic 'ffmpeg not installed' / network
+    errors because retrying with a different format wouldn't help those.
+    """
+    msg = str(exc) if exc else ''
+    return ('Requested format is not available' in msg
+            or '--list-formats' in msg)
+
+
 def background_download(url, download_id):
     prefs = db_get_preferences()
     output_dir = prefs.get("download_dir", ".")
     fmt = prefs.get("format", "best")
     os.makedirs(output_dir, exist_ok=True)
 
-    ydl_opts = {
-        'format': fmt,
-        'outtmpl': os.path.join(output_dir, f'%(title)s_{download_id}.%(ext)s'),
-        'progress_hooks': [lambda d: progress_hook(d, download_id)],
-        'quiet': True,
-        'noprogress': True,
-        # continuedl is default-True in yt-dlp, but make it explicit so a
-        # resumed download picks up the existing .part file rather than
-        # restarting from byte zero.
-        'continuedl': True,
-    }
+    def build_opts(format_selector):
+        return {
+            'format': format_selector,
+            'outtmpl': os.path.join(output_dir, f'%(title)s_{download_id}.%(ext)s'),
+            'progress_hooks': [lambda d: progress_hook(d, download_id)],
+            'quiet': True,
+            'noprogress': True,
+            # continuedl is default-True in yt-dlp, but make it explicit so a
+            # resumed download picks up the existing .part file rather than
+            # restarting from byte zero.
+            'continuedl': True,
+        }
 
     # Persist the yt-dlp format selector that we're about to use, so the
     # History tab can show *what was asked for* whenever a download fails
     # with 'Requested format is not available'. Saved up-front (not only
     # on success) so it sticks even if the probe phase below blows up.
     db_update_download(download_id, requested_format=fmt)
+
+    formats_summary = None  # captured during the probe phase, used as
+                            # the fallback source if the first attempt fails.
 
     try:
         # ---- Probe phase --------------------------------------------------
@@ -428,7 +491,8 @@ def background_download(url, download_id):
         # 'format' selector. If the selector is unsatisfiable, the download
         # phase below will raise "Requested format is not available" -- but
         # by then the row already carries the alternatives, so the UI can
-        # show them in the error block.
+        # show them in the error block AND we can pick a working format and
+        # retry automatically.
         #
         # extract_info() also yields a clean title/resolution we can persist
         # immediately, which means freshly-queued items show useful metadata
@@ -436,10 +500,10 @@ def background_download(url, download_id):
         try:
             with yt_dlp.YoutubeDL({'quiet': True, 'noprogress': True, 'skip_download': True}) as probe:
                 info = probe.extract_info(url, download=False)
-            fmts = summarize_formats(info)
+            formats_summary = summarize_formats(info)
             updates = {}
-            if fmts is not None:
-                updates['formats'] = json.dumps(fmts)
+            if formats_summary is not None:
+                updates['formats'] = json.dumps(formats_summary)
             probe_title = info.get('title') if info else None
             if probe_title:
                 updates['title'] = probe_title
@@ -453,8 +517,27 @@ def background_download(url, download_id):
             pass
 
         # ---- Download phase ----------------------------------------------
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+        # First attempt with the user's configured format selector.
+        try:
+            with yt_dlp.YoutubeDL(build_opts(fmt)) as ydl:
+                ydl.download([url])
+        except yt_dlp.utils.DownloadError as e:
+            # Auto-fallback: if yt-dlp tells the user to consult
+            # --list-formats, we already have that table from the probe
+            # phase. Pick the best concrete format_id and retry once with
+            # an explicit selector. This mirrors what the user would
+            # otherwise have to do by hand.
+            if (is_cancel_requested(download_id)
+                    or not _is_format_unavailable_error(e)
+                    or not formats_summary):
+                raise
+            best_id = pick_best_format_id(formats_summary)
+            if not best_id or best_id == fmt:
+                # Nothing better to try -- surface the original error.
+                raise
+            db_update_download(download_id, requested_format=best_id)
+            with yt_dlp.YoutubeDL(build_opts(best_id)) as ydl:
+                ydl.download([url])
         # Re-stat the final file (post-processing may have changed it,
         # e.g. ffmpeg merging .f137 + .f140 into a single .mp4).
         entry = db_get_download(download_id)
