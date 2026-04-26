@@ -979,9 +979,11 @@ HTML_TEMPLATE = """
         </div>
         <div id="historyList"></div>
         <div id="historyPager" class="pager" style="display:none;">
+            <button id="pagerFirst" onclick="goToPage(0)" aria-label="Jump to first page">«</button>
             <button id="pagerPrev" onclick="changePage(-1)" aria-label="Previous page">‹</button>
             <span id="pagerInfo"></span>
             <button id="pagerNext" onclick="changePage(1)" aria-label="Next page">›</button>
+            <button id="pagerLast" onclick="goToPage(Infinity)" aria-label="Jump to last page">»</button>
         </div>
         <p id="historyEmpty" class="empty">No completed downloads yet.</p>
     </div>
@@ -1463,6 +1465,15 @@ HTML_TEMPLATE = """
             fetchHistory();
         }
 
+        // Used by the « / » buttons. Pass 0 for first page, Infinity for last.
+        function goToPage(target) {
+            const maxPage = Math.max(0, Math.ceil(historyTotal / HISTORY_PAGE_SIZE) - 1);
+            const next = Math.min(maxPage, Math.max(0, target));
+            if (next === historyPage) return;
+            historyPage = next;
+            fetchHistory();
+        }
+
         function fetchHistory() {
             // Skip the re-render while a kebab menu is open so the click isn't
             // swallowed by DOM replacement. The next tick after the menu closes
@@ -1498,6 +1509,16 @@ HTML_TEMPLATE = """
                         `Page ${historyPage + 1} of ${maxPage + 1} · ${historyTotal} items`;
                     document.getElementById('pagerPrev').disabled = historyPage <= 0;
                     document.getElementById('pagerNext').disabled = historyPage >= maxPage;
+                    // The First/Last jump buttons only earn their keep when
+                    // there are more than two pages -- otherwise « and ‹ (and
+                    // » and ›) would do exactly the same thing.
+                    const showJump = maxPage >= 2;  // i.e. >2 pages total
+                    const first = document.getElementById('pagerFirst');
+                    const last = document.getElementById('pagerLast');
+                    first.style.display = showJump ? '' : 'none';
+                    last.style.display  = showJump ? '' : 'none';
+                    first.disabled = historyPage <= 0;
+                    last.disabled  = historyPage >= maxPage;
                 } else {
                     pager.style.display = 'none';
                 }
