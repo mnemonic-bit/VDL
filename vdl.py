@@ -115,6 +115,11 @@ def init_db():
             ("eta",        "ALTER TABLE downloads ADD COLUMN eta INTEGER"),
             ("title",      "ALTER TABLE downloads ADD COLUMN title TEXT"),
             ("finished_at", "ALTER TABLE downloads ADD COLUMN finished_at REAL"),
+            # 'formats' stores a JSON array of available format descriptors
+            # captured from yt_dlp.extract_info() before the actual download
+            # starts, so the UI can show alternatives when the requested
+            # format is unavailable.
+            ("formats",    "ALTER TABLE downloads ADD COLUMN formats TEXT"),
         ]:
             if col not in existing_cols:
                 conn.execute(ddl)
@@ -151,7 +156,8 @@ def db_insert_download(download_id, url):
 
 def db_update_download(download_id, *, status=None, progress=None,
                        filename=None, resolution=None, filesize=None,
-                       speed=None, eta=None, title=None, finished_at=None):
+                       speed=None, eta=None, title=None, finished_at=None,
+                       formats=None):
     fields, values = [], []
     if status is not None:
         fields.append("status = ?"); values.append(status)
@@ -171,6 +177,8 @@ def db_update_download(download_id, *, status=None, progress=None,
         fields.append("title = ?"); values.append(title)
     if finished_at is not None:
         fields.append("finished_at = ?"); values.append(finished_at)
+    if formats is not None:
+        fields.append("formats = ?"); values.append(formats)
     if not fields:
         return
     values.append(download_id)
@@ -216,7 +224,7 @@ def db_list_downloads():
     with db() as conn:
         rows = conn.execute(
             "SELECT id, url, status, progress, created_at, "
-            "filename, resolution, filesize, speed, eta, title, finished_at "
+            "filename, resolution, filesize, speed, eta, title, finished_at, formats "
             "FROM downloads ORDER BY created_at ASC"
         ).fetchall()
         return [dict(r) for r in rows]
@@ -342,6 +350,45 @@ def progress_hook(d, download_id):
         )
 
 
+def summarize_formats(info_dict):
+    """Reduce yt-dlp's info_dict['formats'] to a compact, JSON-serialisable
+    list of descriptors. Only the fields useful for display or future
+    fallback-format selection are kept; per-format URLs and cookies are
+    intentionally dropped.
+
+    Returns None if no formats are listed (e.g. extractors that yield a
+    single direct URL without a format table).
+    """
+    if not info_dict:
+        return None
+    raw = info_dict.get('formats') or []
+    if not raw:
+        return None
+    out = []
+    for f in raw:
+        if not isinstance(f, dict):
+            continue
+        out.append({
+            'format_id':   f.get('format_id'),
+            'ext':         f.get('ext'),
+            'resolution':  f.get('resolution') or (
+                f"{f.get('width')}x{f.get('height')}"
+                if f.get('width') and f.get('height') else None
+            ),
+            'height':      f.get('height'),
+            'fps':         f.get('fps'),
+            'vcodec':      f.get('vcodec'),
+            'acodec':      f.get('acodec'),
+            'abr':         f.get('abr'),
+            'tbr':         f.get('tbr'),
+            'filesize':    f.get('filesize') or f.get('filesize_approx'),
+            'format_note': f.get('format_note'),
+            'protocol':    f.get('protocol'),
+            'format':      f.get('format'),  # human-readable summary line
+        })
+    return out
+
+
 def background_download(url, download_id):
     prefs = db_get_preferences()
     output_dir = prefs.get("download_dir", ".")
@@ -361,6 +408,37 @@ def background_download(url, download_id):
     }
 
     try:
+        # ---- Probe phase --------------------------------------------------
+        # Run extract_info(download=False) up front so the available format
+        # table is captured *before* yt-dlp tries to honour the user's
+        # 'format' selector. If the selector is unsatisfiable, the download
+        # phase below will raise "Requested format is not available" -- but
+        # by then the row already carries the alternatives, so the UI can
+        # show them in the error block.
+        #
+        # extract_info() also yields a clean title/resolution we can persist
+        # immediately, which means freshly-queued items show useful metadata
+        # in the Current tab even before the first byte arrives.
+        try:
+            with yt_dlp.YoutubeDL({'quiet': True, 'noprogress': True, 'skip_download': True}) as probe:
+                info = probe.extract_info(url, download=False)
+            fmts = summarize_formats(info)
+            updates = {}
+            if fmts is not None:
+                updates['formats'] = json.dumps(fmts)
+            probe_title = info.get('title') if info else None
+            if probe_title:
+                updates['title'] = probe_title
+            if updates:
+                db_update_download(download_id, **updates)
+        except DownloadCancelled:
+            raise
+        except Exception:
+            # Probe failures are non-fatal; the download phase will surface
+            # the real error (geo block, private video, network, etc.).
+            pass
+
+        # ---- Download phase ----------------------------------------------
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
         # Re-stat the final file (post-processing may have changed it,
@@ -683,6 +761,14 @@ HTML_TEMPLATE = """
         .error-details .chev { width: 14px; height: 14px; transition: transform 0.15s; color: var(--error-fg); flex-shrink: 0; }
         .error-details[open] > summary .chev { transform: rotate(-180deg); }
         .error-text { margin: 8px 0 0; padding: 8px 10px; background: var(--error-bg); border: 1px solid var(--error-border); border-radius: 4px; color: var(--error-text); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.85em; white-space: pre-wrap; word-break: break-word; max-height: 240px; overflow: auto; }
+        /* Available-formats listing inside the error-details panel. */
+        .formats-block { margin-top: 10px; }
+        .formats-title { font-size: 0.9em; color: var(--muted); margin-bottom: 4px; }
+        .formats-scroll { max-height: 280px; overflow: auto; border: 1px solid var(--border); border-radius: 4px; background: var(--surface); }
+        .formats-table { width: 100%; border-collapse: collapse; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.85em; color: var(--fg); }
+        .formats-table th, .formats-table td { padding: 4px 8px; text-align: left; border-bottom: 1px solid var(--border-soft); white-space: nowrap; }
+        .formats-table th { position: sticky; top: 0; background: var(--surface-2); font-weight: 600; color: var(--muted); }
+        .formats-table tbody tr:hover { background: var(--surface-hover); }
         /* Player overlay */
         .player-backdrop { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 100; align-items: center; justify-content: center; }
         .player-backdrop.open { display: flex; }
@@ -932,6 +1018,54 @@ HTML_TEMPLATE = """
         // pause history polling so the periodic re-render doesn't destroy the
         // menu's DOM node mid-click.
         let openMenuId = null;
+        // Compact human-readable view of the available-formats list captured
+        // by extract_info(). Rendered inside the error-details panel so the
+        // user can see what *was* available when their requested format
+        // selector failed.
+        function renderFormatsTable(info) {
+            let formats = info.formats;
+            if (!formats) return '';
+            if (typeof formats === 'string') {
+                try { formats = JSON.parse(formats); } catch (e) { return ''; }
+            }
+            if (!Array.isArray(formats) || formats.length === 0) return '';
+
+            const fmtSize = (n) => {
+                if (!n || isNaN(n)) return '';
+                const u = ['B','KB','MB','GB','TB']; let i = 0; let v = Number(n);
+                while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+                return v.toFixed(v >= 100 ? 0 : 1) + ' ' + u[i];
+            };
+            const cells = (f) => {
+                const av = [];
+                if (f.vcodec && f.vcodec !== 'none') av.push('video');
+                if (f.acodec && f.acodec !== 'none') av.push('audio');
+                const kind = av.join('+') || '—';
+                const res = f.resolution || (f.height ? f.height + 'p' : '') || '';
+                const fps = f.fps ? f.fps + 'fps' : '';
+                const note = f.format_note || '';
+                return [
+                    f.format_id || '',
+                    f.ext || '',
+                    kind,
+                    [res, fps].filter(Boolean).join(' '),
+                    fmtSize(f.filesize),
+                    note,
+                ];
+            };
+            const head = ['ID','Ext','Kind','Resolution','Size','Note'];
+            const rows = formats.map(cells);
+            const th = head.map(h => `<th>${escapeHtml(h)}</th>`).join('');
+            const tr = rows.map(r => `<tr>${r.map(c => `<td>${escapeHtml(String(c))}</td>`).join('')}</tr>`).join('');
+            return `
+                <div class="formats-block">
+                    <div class="formats-title">Available formats (${formats.length})</div>
+                    <div class="formats-scroll">
+                        <table class="formats-table"><thead><tr>${th}</tr></thead><tbody>${tr}</tbody></table>
+                    </div>
+                </div>`;
+        }
+
         // Track which error-details panels the user has expanded, so the
         // periodic fetchHistory() re-render doesn't snap them shut.
         const openErrorIds = new Set();
@@ -1172,6 +1306,7 @@ HTML_TEMPLATE = """
                     <details class="error-details"${openAttr} ontoggle="onErrorDetailsToggle('${id}', this)">
                         <summary><svg class="chev"><use href="#i-chevron"/></svg><strong>Error details</strong></summary>
                         <pre class="error-text">${escapeHtml(detail)}</pre>
+                        ${renderFormatsTable(info)}
                     </details>`;
             }
 
