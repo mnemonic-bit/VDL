@@ -50,6 +50,15 @@ def init_db():
                 value TEXT NOT NULL
             );
         """)
+        # --- lightweight migrations: add new columns if missing ---
+        existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(downloads)")}
+        for col, ddl in [
+            ("filename",   "ALTER TABLE downloads ADD COLUMN filename TEXT"),
+            ("resolution", "ALTER TABLE downloads ADD COLUMN resolution TEXT"),
+            ("filesize",   "ALTER TABLE downloads ADD COLUMN filesize INTEGER"),
+        ]:
+            if col not in existing_cols:
+                conn.execute(ddl)
         # Seed defaults only if missing.
         defaults = {
             "download_dir": ".",
@@ -78,14 +87,19 @@ def db_insert_download(download_id, url):
         )
 
 
-def db_update_download(download_id, *, status=None, progress=None):
+def db_update_download(download_id, *, status=None, progress=None,
+                       filename=None, resolution=None, filesize=None):
     fields, values = [], []
     if status is not None:
-        fields.append("status = ?")
-        values.append(status)
+        fields.append("status = ?"); values.append(status)
     if progress is not None:
-        fields.append("progress = ?")
-        values.append(progress)
+        fields.append("progress = ?"); values.append(progress)
+    if filename is not None:
+        fields.append("filename = ?"); values.append(filename)
+    if resolution is not None:
+        fields.append("resolution = ?"); values.append(resolution)
+    if filesize is not None:
+        fields.append("filesize = ?"); values.append(filesize)
     if not fields:
         return
     values.append(download_id)
@@ -123,7 +137,8 @@ def db_clear_terminal():
 def db_list_downloads():
     with db() as conn:
         rows = conn.execute(
-            "SELECT id, url, status, progress, created_at "
+            "SELECT id, url, status, progress, created_at, "
+            "filename, resolution, filesize "
             "FROM downloads ORDER BY created_at ASC"
         ).fetchall()
         return [dict(r) for r in rows]
@@ -190,9 +205,26 @@ def progress_hook(d, download_id):
                 progress=f"{percent:.1f}%",
             )
     elif d['status'] == 'finished':
-        # 'finished' here means the file was fully written to disk by
-        # this format; the post-processor (merge) may still run after.
-        db_update_download(download_id, status='finished', progress='100%')
+        # 'finished' here means the file was fully written to disk for this
+        # format; the post-processor (merge) may still run afterwards. We
+        # capture filename + resolution from the info_dict yt-dlp embeds in
+        # the hook payload, and re-stat the file at the end of the run to
+        # get the final size after any merge.
+        info = d.get('info_dict') or {}
+        filename = d.get('filename') or info.get('_filename')
+        width = info.get('width')
+        height = info.get('height')
+        resolution = f"{height}p" if height else (info.get('format_note') or info.get('format_id'))
+        filesize = (info.get('filesize') or info.get('filesize_approx')
+                    or d.get('total_bytes') or d.get('total_bytes_estimate'))
+        db_update_download(
+            download_id,
+            status='finished',
+            progress='100%',
+            filename=filename,
+            resolution=str(resolution) if resolution else None,
+            filesize=int(filesize) if filesize else None,
+        )
 
 
 def background_download(url, download_id):
@@ -212,6 +244,26 @@ def background_download(url, download_id):
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
+        # Re-stat the final file (post-processing may have changed it,
+        # e.g. ffmpeg merging .f137 + .f140 into a single .mp4).
+        entry = db_get_download(download_id)
+        if entry and entry.get('filename'):
+            final_path = entry['filename']
+            # If extension changed during merge (e.g. .webm -> .mp4),
+            # try the prefix-matched candidate.
+            if not os.path.exists(final_path):
+                base, _ = os.path.splitext(final_path)
+                for ext in ('.mp4', '.mkv', '.webm', '.m4a'):
+                    cand = base + ext
+                    if os.path.exists(cand):
+                        final_path = cand
+                        break
+            if os.path.exists(final_path):
+                db_update_download(
+                    download_id,
+                    filename=final_path,
+                    filesize=os.path.getsize(final_path),
+                )
     except DownloadCancelled:
         db_update_download(download_id, status='cancelled', progress='Cancelled by user')
     except yt_dlp.utils.DownloadError as e:
@@ -252,6 +304,11 @@ HTML_TEMPLATE = """
         .reload-btn:hover { background-color: #2980b9; }
         .delete-btn { padding: 6px 12px; background-color: #7f8c8d; color: white; border: none; border-radius: 4px; cursor: pointer; }
         .delete-btn:hover { background-color: #5d6d6e; }
+        .copy-btn { padding: 6px 12px; background-color: #16a085; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        .copy-btn:hover { background-color: #117a65; }
+        .meta { margin-top: 8px; font-size: 0.9em; color: #555; }
+        .meta div { margin-top: 2px; }
+        .meta .filename { font-family: ui-monospace, Menlo, Consolas, monospace; word-break: break-all; }
         .progress-bar-bg { width: 100%; background-color: #f3f3f3; border-radius: 5px; margin-top: 10px;}
         .progress-bar-fill { height: 20px; background-color: #4caf50; border-radius: 5px; width: 0%; transition: width 0.4s ease;}
         .progress-bar-fill.cancelled, .progress-bar-fill.interrupted { background-color: #e74c3c; }
@@ -292,11 +349,21 @@ HTML_TEMPLATE = """
         </div>
     </details>
 
-    <div class="history-toolbar">
-        <h3 style="margin: 0;">Download History</h3>
-        <button class="clear-btn" onclick="clearHistory()">Clear completed</button>
+    <div id="activeSection" style="display: none;">
+        <h3>Current Downloads</h3>
+        <div id="activeList"></div>
     </div>
-    <div id="historyList"></div>
+
+    <details id="historySection" open style="display: none;">
+        <summary><strong>Download History</strong></summary>
+        <div class="history-toolbar" style="margin-top: 10px;">
+            <span></span>
+            <button class="clear-btn" onclick="clearHistory()">Clear completed</button>
+        </div>
+        <div id="historyList"></div>
+    </details>
+
+    <p id="emptyState" style="color: #888;">No downloads yet. Paste a URL above to start.</p>
 
     <script>
         const ACTIVE_STATUSES = new Set(['starting', 'downloading']);
@@ -344,60 +411,126 @@ HTML_TEMPLATE = """
                 .then(() => fetchHistory());
         }
 
+        function formatBytes(n) {
+            if (n == null || isNaN(n)) return null;
+            const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+            let i = 0, v = Number(n);
+            while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+            return v.toFixed(v >= 100 ? 0 : 1) + ' ' + units[i];
+        }
+
+        function escapeAttr(s) {
+            return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        }
+
+        function copyToClipboard(text, btn) {
+            const done = () => {
+                if (!btn) return;
+                const original = btn.textContent;
+                btn.textContent = 'Copied';
+                setTimeout(() => { btn.textContent = original; }, 1500);
+            };
+            if (navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard.writeText(text).then(done, () => fallback(text, done));
+            } else {
+                fallback(text, done);
+            }
+        }
+
+        function fallback(text, done) {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.position = 'fixed';
+            ta.style.opacity = '0';
+            document.body.appendChild(ta);
+            ta.select();
+            try { document.execCommand('copy'); done(); } catch (e) {}
+            document.body.removeChild(ta);
+        }
+
+        function renderItem(info) {
+            const id = info.id;
+            const isActive = ACTIVE_STATUSES.has(info.status);
+            const isTerminal = TERMINAL_STATUSES.has(info.status);
+            const isFinished = info.status === 'finished';
+
+            let statusLabel;
+            if (isFinished) statusLabel = 'Complete';
+            else if (info.status === 'error') statusLabel = 'Error';
+            else if (info.status === 'cancelled') statusLabel = 'Cancelled';
+            else if (info.status === 'interrupted') statusLabel = 'Interrupted';
+            else statusLabel = info.progress;
+
+            const safeUrl = escapeAttr(info.url);
+            let actions = '';
+            if (isActive) {
+                actions += `<button class="stop-btn" onclick="stopDownload('${id}')">Stop</button>`;
+            }
+            if (info.status === 'cancelled' || info.status === 'error' || info.status === 'interrupted') {
+                actions += `<button class="reload-btn" onclick="reloadDownload('${id}', '${safeUrl}')">Reload</button>`;
+            }
+            if (isFinished) {
+                actions += `<button class="copy-btn" onclick="copyToClipboard('${safeUrl}', this)">Copy Link</button>`;
+            }
+            if (isTerminal) {
+                actions += `<button class="delete-btn" onclick="deleteDownload('${id}')">Delete</button>`;
+            }
+
+            // Bottom block: progress bar for active/failed rows, metadata for finished rows.
+            let bottom;
+            if (isFinished) {
+                const meta = [];
+                if (info.filename) {
+                    const base = info.filename.split('/').pop().split('\\\\').pop();
+                    meta.push(`<div><strong>File:</strong> <span class="filename">${base}</span></div>`);
+                }
+                if (info.resolution) meta.push(`<div><strong>Resolution:</strong> ${info.resolution}</div>`);
+                const sizeStr = formatBytes(info.filesize);
+                if (sizeStr) meta.push(`<div><strong>Size:</strong> ${sizeStr}</div>`);
+                bottom = meta.length ? `<div class="meta">${meta.join('')}</div>` : '';
+            } else {
+                let width = String(info.progress).replace('%', '');
+                if (isNaN(width)) width = 0;
+                let barClass = 'progress-bar-fill';
+                if (info.status === 'cancelled') barClass += ' cancelled';
+                else if (info.status === 'interrupted') barClass += ' interrupted';
+                else if (info.status === 'error') barClass += ' error';
+                bottom = `
+                    <div class="progress-bar-bg">
+                        <div class="${barClass}" style="width: ${width}%;"></div>
+                    </div>`;
+            }
+
+            return `
+                <div class="history-item">
+                    <div class="history-header">
+                        <div>
+                            <strong>URL:</strong> ${info.url}<br>
+                            <strong>Status:</strong> ${info.status} (${statusLabel})
+                        </div>
+                        <div class="row-actions">${actions}</div>
+                    </div>
+                    ${bottom}
+                </div>
+            `;
+        }
+
         function fetchHistory() {
             fetch('/api/history')
             .then(res => res.json())
             .then(data => {
-                const list = document.getElementById('historyList');
-                list.innerHTML = '';
                 // Newest first.
-                data.slice().reverse().forEach(info => {
-                    const id = info.id;
-                    const isActive = ACTIVE_STATUSES.has(info.status);
-                    const isTerminal = TERMINAL_STATUSES.has(info.status);
+                const reversed = data.slice().reverse();
+                const active = reversed.filter(i => ACTIVE_STATUSES.has(i.status));
+                const done   = reversed.filter(i => TERMINAL_STATUSES.has(i.status));
 
-                    let progressText;
-                    if (info.status === 'finished') progressText = 'Complete';
-                    else if (info.status === 'error') progressText = 'Error';
-                    else if (info.status === 'cancelled') progressText = 'Cancelled';
-                    else if (info.status === 'interrupted') progressText = 'Interrupted';
-                    else progressText = info.progress;
+                document.getElementById('activeList').innerHTML = active.map(renderItem).join('');
+                document.getElementById('historyList').innerHTML = done.map(renderItem).join('');
 
-                    let width = String(progressText).replace('%', '');
-                    if (isNaN(width)) width = info.status === 'finished' ? 100 : 0;
-
-                    let barClass = 'progress-bar-fill';
-                    if (info.status === 'cancelled') barClass += ' cancelled';
-                    else if (info.status === 'interrupted') barClass += ' interrupted';
-                    else if (info.status === 'error') barClass += ' error';
-
-                    const safeUrl = info.url.replace(/'/g, "\\\\'");
-                    let actions = '';
-                    if (isActive) {
-                        actions += `<button class="stop-btn" onclick="stopDownload('${id}')">Stop</button>`;
-                    }
-                    if (info.status === 'cancelled' || info.status === 'error' || info.status === 'interrupted') {
-                        actions += `<button class="reload-btn" onclick="reloadDownload('${id}', '${safeUrl}')">Reload</button>`;
-                    }
-                    if (isTerminal) {
-                        actions += `<button class="delete-btn" onclick="deleteDownload('${id}')">Delete</button>`;
-                    }
-
-                    list.innerHTML += `
-                        <div class="history-item">
-                            <div class="history-header">
-                                <div>
-                                    <strong>URL:</strong> ${info.url}<br>
-                                    <strong>Status:</strong> ${info.status} (${progressText})
-                                </div>
-                                <div class="row-actions">${actions}</div>
-                            </div>
-                            <div class="progress-bar-bg">
-                                <div class="${barClass}" style="width: ${width}%;"></div>
-                            </div>
-                        </div>
-                    `;
-                });
+                document.getElementById('activeSection').style.display  = active.length ? '' : 'none';
+                document.getElementById('historySection').style.display = done.length   ? '' : 'none';
+                document.getElementById('emptyState').style.display =
+                    (active.length || done.length) ? 'none' : '';
             });
         }
 
