@@ -6,6 +6,7 @@ import sqlite3
 import os
 import re
 import time
+import subprocess
 from contextlib import contextmanager
 
 app = Flask(__name__)
@@ -60,6 +61,7 @@ def init_db():
             ("speed",      "ALTER TABLE downloads ADD COLUMN speed REAL"),
             ("eta",        "ALTER TABLE downloads ADD COLUMN eta INTEGER"),
             ("title",      "ALTER TABLE downloads ADD COLUMN title TEXT"),
+            ("finished_at", "ALTER TABLE downloads ADD COLUMN finished_at REAL"),
         ]:
             if col not in existing_cols:
                 conn.execute(ddl)
@@ -94,7 +96,7 @@ def db_insert_download(download_id, url):
 
 def db_update_download(download_id, *, status=None, progress=None,
                        filename=None, resolution=None, filesize=None,
-                       speed=None, eta=None, title=None):
+                       speed=None, eta=None, title=None, finished_at=None):
     fields, values = [], []
     if status is not None:
         fields.append("status = ?"); values.append(status)
@@ -112,6 +114,8 @@ def db_update_download(download_id, *, status=None, progress=None,
         fields.append("eta = ?"); values.append(eta)
     if title is not None:
         fields.append("title = ?"); values.append(title)
+    if finished_at is not None:
+        fields.append("finished_at = ?"); values.append(finished_at)
     if not fields:
         return
     values.append(download_id)
@@ -150,7 +154,7 @@ def db_list_downloads():
     with db() as conn:
         rows = conn.execute(
             "SELECT id, url, status, progress, created_at, "
-            "filename, resolution, filesize, speed, eta, title "
+            "filename, resolution, filesize, speed, eta, title, finished_at "
             "FROM downloads ORDER BY created_at ASC"
         ).fetchall()
         return [dict(r) for r in rows]
@@ -272,6 +276,7 @@ def progress_hook(d, download_id):
             speed=0.0,  # use 0 (not None) so the column is touched and cleared
             eta=0,
             title=title,
+            finished_at=time.time(),
         )
 
 
@@ -311,22 +316,45 @@ def background_download(url, download_id):
                         final_path = cand
                         break
             if os.path.exists(final_path):
+                # Probe the merged file with ffprobe for the authoritative
+                # resolution. yt-dlp's progress hook reports the per-stream
+                # resolution, which is None for the audio half of a merged
+                # download — leaving the resolution column unset for some
+                # extractors. ffprobe always reflects the final container.
+                final_res = ffprobe_resolution(final_path)
                 db_update_download(
                     download_id,
                     filename=final_path,
                     filesize=os.path.getsize(final_path),
+                    resolution=final_res,
                 )
     except DownloadCancelled:
-        db_update_download(download_id, status='cancelled', progress='Cancelled by user')
+        db_update_download(download_id, status='cancelled', progress='Cancelled by user', finished_at=time.time())
     except yt_dlp.utils.DownloadError as e:
         if is_cancel_requested(download_id):
-            db_update_download(download_id, status='cancelled', progress='Cancelled by user')
+            db_update_download(download_id, status='cancelled', progress='Cancelled by user', finished_at=time.time())
         else:
-            db_update_download(download_id, status='error', progress=str(e))
+            db_update_download(download_id, status='error', progress=str(e), finished_at=time.time())
     except Exception as e:
-        db_update_download(download_id, status='error', progress=str(e))
+        db_update_download(download_id, status='error', progress=str(e), finished_at=time.time())
     finally:
         clear_cancel(download_id)
+
+
+def ffprobe_resolution(path):
+    """Return e.g. '1080p' for the first video stream in `path`, or None."""
+    try:
+        out = subprocess.run(
+            ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+             '-show_entries', 'stream=height', '-of', 'csv=p=0', path],
+            capture_output=True, text=True, timeout=10,
+        )
+        h = out.stdout.strip()
+        if h.isdigit() and int(h) > 0:
+            return f"{int(h)}p"
+    except Exception:
+        pass
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -439,6 +467,10 @@ HTML_TEMPLATE = """
         .tab-panel.active { display: block; }
         .tab-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
         .tab-header h3 { margin: 0; }
+        .pager { display: flex; justify-content: center; align-items: center; gap: 10px; margin-top: 12px; color: #555; font-size: 0.95em; }
+        .pager button { padding: 4px 12px; font-size: 1.1em; line-height: 1; background: #fff; border: 1px solid #ccc; border-radius: 4px; cursor: pointer; min-width: 36px; }
+        .pager button:disabled { opacity: 0.4; cursor: default; }
+        .pager button:hover:not(:disabled) { background: #f0f0f0; }
         .empty { color: #888; padding: 20px 0; }
         /* Item title — prominent header derived from the page title yt-dlp
            returns. Truncates with an ellipsis when too long. */
@@ -607,6 +639,11 @@ HTML_TEMPLATE = """
             <button class="clear-btn" onclick="clearHistory()" style="margin-left:auto;">Clear History</button>
         </div>
         <div id="historyList"></div>
+        <div id="historyPager" class="pager" style="display:none;">
+            <button id="pagerPrev" onclick="changePage(-1)" aria-label="Previous page">‹</button>
+            <span id="pagerInfo"></span>
+            <button id="pagerNext" onclick="changePage(1)" aria-label="Next page">›</button>
+        </div>
         <p id="historyEmpty" class="empty">No completed downloads yet.</p>
     </div>
 
@@ -661,10 +698,11 @@ HTML_TEMPLATE = """
     <script>
         // Statuses that count as "in flight" (the worker thread is alive).
         const RUNNING_STATUSES = new Set(['starting', 'downloading']);
-        // Statuses shown under the Current tab. Cancelled stays here so the
-        // user can resume it; everything else terminal goes to History.
-        const CURRENT_TAB_STATUSES = new Set(['starting', 'downloading', 'cancelled']);
-        const HISTORY_TAB_STATUSES = new Set(['finished', 'error', 'interrupted']);
+        // Statuses shown under the Current tab. Cancelled and interrupted
+        // stay here so the user can resume them; everything else terminal
+        // goes to History.
+        const CURRENT_TAB_STATUSES = new Set(['starting', 'downloading', 'cancelled', 'interrupted']);
+        const HISTORY_TAB_STATUSES = new Set(['finished', 'error']);
         const TERMINAL_STATUSES = new Set(['finished', 'error', 'cancelled', 'interrupted']);
 
         function startDownload(event) {
@@ -763,6 +801,17 @@ HTML_TEMPLATE = """
             closeAllMenus();
         });
 
+        function formatDateTime(epochSeconds) {
+            if (epochSeconds == null || isNaN(epochSeconds)) return null;
+            const d = new Date(Number(epochSeconds) * 1000);
+            if (isNaN(d.getTime())) return null;
+            // Locale-aware short date + time, e.g. 26.04.2026, 17:42 (de-DE).
+            return d.toLocaleString(undefined, {
+                year: 'numeric', month: '2-digit', day: '2-digit',
+                hour: '2-digit', minute: '2-digit',
+            });
+        }
+
         function formatBytes(n) {
             if (n == null || isNaN(n)) return null;
             const units = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -850,7 +899,7 @@ HTML_TEMPLATE = """
 
             if (isRunning) {
                 primary = `<button class="stop-btn" onclick="stopDownload('${id}')"><svg class="icon"><use href="#i-stop"/></svg>Stop</button>`;
-            } else if (isCancelled) {
+            } else if (isCancelled || info.status === 'interrupted') {
                 primary = `<button class="continue-btn" onclick="continueDownload('${id}', '${safeUrl}')"><svg class="icon"><use href="#i-play"/></svg>Continue</button>`;
             }
 
@@ -859,8 +908,8 @@ HTML_TEMPLATE = """
 
             if (isTerminal) {
                 // Reload only for non-finished terminal rows that don't already
-                // have a primary Continue action (i.e. error/interrupted).
-                if (!isFinished && !isCancelled) {
+                // have a primary Continue action (i.e. error).
+                if (!isFinished && !isCancelled && info.status !== 'interrupted') {
                     menuItems.push(`<button onclick="reloadDownload('${id}', '${safeUrl}')"><svg class="menu-icon"><use href="#i-sync"/></svg>Reload</button>`);
                 }
                 menuItems.push(`<button onclick="copyToClipboard('${safeUrl}', this)"><svg class="menu-icon"><use href="#i-copy"/></svg>Copy URL</button>`);
@@ -936,10 +985,20 @@ HTML_TEMPLATE = """
                 if (info.resolution) meta.push(`<div><strong>Quality:</strong> ${info.resolution}</div>`);
                 const sizeStr = formatBytes(info.filesize);
                 if (sizeStr) meta.push(`<div><strong>Size:</strong> ${sizeStr}</div>`);
+                const startedStr = formatDateTime(info.created_at);
+                if (startedStr) meta.push(`<div><strong>Started:</strong> ${startedStr}</div>`);
+                const finishedStr = formatDateTime(info.finished_at);
+                if (finishedStr) {
+                    const finLabel = info.status === 'finished' ? 'Finished'
+                                   : info.status === 'error' ? 'Failed'
+                                   : info.status === 'cancelled' ? 'Cancelled'
+                                   : 'Ended';
+                    meta.push(`<div><strong>${finLabel}:</strong> ${finishedStr}</div>`);
+                }
                 if (meta.length) bottom += `<div class="meta">${meta.join('')}</div>`;
             }
 
-            const warn = isCancelled ? '<span class="warn-icon" title="Action required"></span>' : '';
+            const warn = (isCancelled || info.status === 'interrupted') ? '<span class="warn-icon" title="Action required"></span>' : '';
 
             // Error details: collapsed by default, expandable via chevron.
             // Restore prior open state across periodic re-renders.
@@ -982,6 +1041,19 @@ HTML_TEMPLATE = """
             `;
         }
 
+        // History pagination state.
+        const HISTORY_PAGE_SIZE = 10;
+        let historyPage = 0;     // zero-based
+        let historyTotal = 0;    // count of rows in the History tab
+
+        function changePage(delta) {
+            const maxPage = Math.max(0, Math.ceil(historyTotal / HISTORY_PAGE_SIZE) - 1);
+            const next = Math.min(maxPage, Math.max(0, historyPage + delta));
+            if (next === historyPage) return;
+            historyPage = next;
+            fetchHistory();
+        }
+
         function fetchHistory() {
             // Skip the re-render while a kebab menu is open so the click isn't
             // swallowed by DOM replacement. The next tick after the menu closes
@@ -996,11 +1068,30 @@ HTML_TEMPLATE = """
                 const active = reversed.filter(i => CURRENT_TAB_STATUSES.has(i.status));
                 const done   = reversed.filter(i => HISTORY_TAB_STATUSES.has(i.status));
 
+                // Clamp pagination after deletes/clears.
+                historyTotal = done.length;
+                const maxPage = Math.max(0, Math.ceil(historyTotal / HISTORY_PAGE_SIZE) - 1);
+                if (historyPage > maxPage) historyPage = maxPage;
+                const start = historyPage * HISTORY_PAGE_SIZE;
+                const pageItems = done.slice(start, start + HISTORY_PAGE_SIZE);
+
                 document.getElementById('activeList').innerHTML = active.map(renderItem).join('');
-                document.getElementById('historyList').innerHTML = done.map(renderItem).join('');
+                document.getElementById('historyList').innerHTML = pageItems.map(renderItem).join('');
 
                 document.getElementById('currentEmpty').style.display = active.length ? 'none' : '';
                 document.getElementById('historyEmpty').style.display = done.length ? 'none' : '';
+
+                // Pager visibility + state.
+                const pager = document.getElementById('historyPager');
+                if (historyTotal > HISTORY_PAGE_SIZE) {
+                    pager.style.display = '';
+                    document.getElementById('pagerInfo').textContent =
+                        `Page ${historyPage + 1} of ${maxPage + 1} · ${historyTotal} items`;
+                    document.getElementById('pagerPrev').disabled = historyPage <= 0;
+                    document.getElementById('pagerNext').disabled = historyPage >= maxPage;
+                } else {
+                    pager.style.display = 'none';
+                }
 
                 const badge = document.getElementById('currentBadge');
                 if (active.length) {
@@ -1159,12 +1250,13 @@ def add_download():
 
 @app.route('/api/resume/<download_id>', methods=['POST'])
 def resume_download(download_id):
-    """Restart the worker for a cancelled download, keeping the same id so
-    yt-dlp's continuedl logic finds and reuses the existing .part file."""
+    """Restart the worker for a cancelled or interrupted download, keeping the
+    same id so yt-dlp's continuedl logic finds and reuses the existing .part
+    file."""
     entry = db_get_download(download_id)
     if entry is None:
         return jsonify({"error": "Unknown download id"}), 404
-    if entry['status'] != 'cancelled':
+    if entry['status'] not in ('cancelled', 'interrupted'):
         return jsonify({"error": f"Cannot resume from status '{entry['status']}'"}), 409
 
     # Clear stale cancel flag, mark the row as starting, then spawn the worker.
