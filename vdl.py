@@ -336,18 +336,41 @@ HTML_TEMPLATE = """
     <style>
         body { font-family: Arial, sans-serif; max-width: 800px; margin: 40px auto; padding: 20px; box-sizing: border-box; }
         *, *::before, *::after { box-sizing: border-box; }
-        .form-group { margin-bottom: 20px; display: flex; gap: 8px; width: 100%; }
-        .form-group input[type="url"] { flex: 1; padding: 10px; }
+        /* URL + Download fused into one segmented control. The input has no
+           right border / right radius; the button has no left radius and
+           sits flush. They share the same height. */
+        .form-group { margin-bottom: 20px; display: flex; width: 100%; }
+        .form-group input[type="url"] {
+            flex: 1; padding: 10px 12px; font-size: 1em;
+            border: 1px solid #ccc; border-right: none;
+            border-radius: 4px 0 0 4px;
+            background: white;
+        }
+        .form-group input[type="url"]:focus { outline: none; border-color: #888; }
+        .form-group button[type="submit"] {
+            padding: 0 16px; font-size: 1em; line-height: 1;
+            border: 1px solid #ccc;
+            border-radius: 0 4px 4px 0;
+            background-color: #f6f6f6; color: #222; cursor: pointer;
+            display: inline-flex; align-items: center; gap: 6px;
+        }
+        .form-group button[type="submit"]:hover { background-color: #ececec; }
+        /* When the input is focused, also darken the button border so the
+           seam reads as one control. */
+        .form-group:focus-within input[type="url"],
+        .form-group:focus-within button[type="submit"] { border-color: #888; }
         input[type="text"], input[type="number"] { padding: 10px; }
         button { padding: 10px 20px; cursor: pointer; }
         .history-item { border: 1px solid #ccc; padding: 15px; margin-bottom: 10px; border-radius: 5px; }
         .history-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
         .history-header > div:first-child { flex: 1; word-break: break-all; }
         .row-actions { display: flex; gap: 6px; }
-        .stop-btn { padding: 6px 12px; background-color: #e74c3c; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        .stop-btn, .continue-btn { padding: 0 12px; height: 32px; color: white; border: none; border-radius: 4px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; line-height: 1; font-size: 1em; }
+        .stop-btn { background-color: #e74c3c; }
         .stop-btn:hover { background-color: #c0392b; }
-        .continue-btn { padding: 6px 12px; background-color: #f39c12; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        .continue-btn { background-color: #f39c12; }
         .continue-btn:hover { background-color: #d68910; }
+        .stop-btn .icon, .continue-btn .icon { width: 14px; height: 14px; display: block; }
         .warn-icon { display: inline-block; width: 0; height: 0; border-left: 9px solid transparent; border-right: 9px solid transparent; border-bottom: 16px solid #f1c40f; position: relative; vertical-align: middle; margin-right: 8px; }
         .warn-icon::after { content: '!'; position: absolute; left: 50%; top: 4px; transform: translateX(-50%); color: #000; font-weight: bold; font-size: 11px; line-height: 1; font-family: Arial, sans-serif; }
         .reload-btn { padding: 6px 12px; background-color: #3498db; color: white; border: none; border-radius: 4px; cursor: pointer; }
@@ -431,10 +454,13 @@ HTML_TEMPLATE = """
         .action-group.action-group > :only-child > button,
         .action-group.action-group > button:only-child  { border-radius: 4px; border-left: 1px solid #ccc; }
         .action-group .icon { width: 18px; height: 18px; display: block; }
-        /* Match optical weight of the kebab dots character. */
-        .action-group .kebab-btn { font-size: 1.2em; }
+        /* Kebab now uses an SVG glyph, so no font-size hack needed. */
         /* Inline icon used inside primary buttons (Download / Save). */
-        .btn-icon { width: 16px; height: 16px; vertical-align: -3px; margin-right: 6px; }
+        .btn-icon { width: 16px; height: 16px; }
+        /* Menu items in the kebab dropdown get a matching leading icon. */
+        .kebab-menu button { display: flex !important; align-items: center; gap: 8px; }
+        .kebab-menu .menu-icon { width: 14px; height: 14px; flex-shrink: 0; color: #555; }
+        .kebab-menu button.danger .menu-icon { color: #c0392b; }
         /* Player overlay */
         .player-backdrop { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 100; align-items: center; justify-content: center; }
         .player-backdrop.open { display: flex; }
@@ -445,18 +471,60 @@ HTML_TEMPLATE = """
     </style>
 </head>
 <body>
-    <!-- Reusable inline SVGs (mono-stroke, currentColor) -->
+    <!-- Octicon-style icon set: 16x16 viewBox, currentColor, stroke 1.6.
+         Designed to read consistently at the small sizes used in toolbars
+         and inline buttons. -->
     <svg width="0" height="0" style="position:absolute" aria-hidden="true">
         <defs>
-            <symbol id="i-download" viewBox="0 0 24 24">
-                <g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M12 4v12"/><path d="M6 12l6 6 6-6"/><path d="M5 20h14"/>
+            <symbol id="i-download" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M8 2v8"/><path d="M4.5 6.5L8 10l3.5-3.5"/><path d="M2.5 13h11"/>
                 </g>
             </symbol>
-            <symbol id="i-camera" viewBox="0 0 24 24">
-                <g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M3 8.5h11a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2z"/>
-                    <path d="M16 12l5-3v8l-5-3z"/>
+            <symbol id="i-camera" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="1.5" y="4.5" width="8" height="7" rx="1"/>
+                    <path d="M9.5 7.5l5-2.5v6l-5-2.5z"/>
+                </g>
+            </symbol>
+            <symbol id="i-copy" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="5" y="5" width="9" height="9" rx="1.2"/>
+                    <path d="M11 5V3a1 1 0 0 0-1-1H3a1 1 0 0 0-1 1v7a1 1 0 0 0 1 1h2"/>
+                </g>
+            </symbol>
+            <symbol id="i-trash" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M2.5 4h11"/>
+                    <path d="M6 4V2.5a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1V4"/>
+                    <path d="M3.5 4l.7 9a1 1 0 0 0 1 .9h5.6a1 1 0 0 0 1-.9l.7-9"/>
+                    <path d="M6.5 7v4"/><path d="M9.5 7v4"/>
+                </g>
+            </symbol>
+            <symbol id="i-play" viewBox="0 0 16 16">
+                <g fill="currentColor" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round">
+                    <path d="M5 3.5v9l8-4.5z"/>
+                </g>
+            </symbol>
+            <symbol id="i-sync" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9"/>
+                    <path d="M13.5 2v3h-3"/>
+                </g>
+            </symbol>
+            <symbol id="i-kebab" viewBox="0 0 16 16">
+                <g fill="currentColor">
+                    <circle cx="8" cy="3" r="1.4"/>
+                    <circle cx="8" cy="8" r="1.4"/>
+                    <circle cx="8" cy="13" r="1.4"/>
+                </g>
+            </symbol>
+            <symbol id="i-stop" viewBox="0 0 16 16">
+                <rect x="3.5" y="3.5" width="9" height="9" rx="1" fill="currentColor"/>
+            </symbol>
+            <symbol id="i-x" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+                    <path d="M4 4l8 8"/><path d="M12 4l-8 8"/>
                 </g>
             </symbol>
         </defs>
@@ -465,7 +533,7 @@ HTML_TEMPLATE = """
     <h2>Download Video</h2>
     <form id="downloadForm" class="form-group" onsubmit="startDownload(event)">
         <input type="url" id="urlInput" placeholder="Enter video URL here..." required>
-        <button type="submit"><svg class="btn-icon"><use href="#i-download"/></svg>Download</button>
+        <button type="submit"><svg class="btn-icon"><use href="#i-download"/></svg><span>Download</span></button>
     </form>
 
     <div class="tabs" role="tablist">
@@ -490,7 +558,7 @@ HTML_TEMPLATE = """
     <div id="playerBackdrop" class="player-backdrop" onclick="closePlayer(event)">
         <div class="player-box" onclick="event.stopPropagation()">
             <div id="playerTitle" class="player-title"></div>
-            <button class="player-close" onclick="closePlayer()" aria-label="Close player">×</button>
+            <button class="player-close" onclick="closePlayer()" aria-label="Close player"><svg style="width:24px;height:24px"><use href="#i-x"/></svg></button>
             <video id="playerVideo" controls autoplay></video>
         </div>
     </div>
@@ -531,7 +599,7 @@ HTML_TEMPLATE = """
             </select>
         </div>
         <div class="pref-actions">
-            <button id="saveBtn" onclick="savePreferences()"><svg class="btn-icon"><use href="#i-download"/></svg>Save</button>
+            <button id="saveBtn" onclick="savePreferences()"><svg class="btn-icon"><use href="#i-download"/></svg><span>Save</span></button>
         </div>
     </div>
 
@@ -710,19 +778,19 @@ HTML_TEMPLATE = """
             const menuItems = [];
 
             if (isRunning) {
-                primary = `<button class="stop-btn" onclick="stopDownload('${id}')">Stop</button>`;
+                primary = `<button class="stop-btn" onclick="stopDownload('${id}')"><svg class="icon"><use href="#i-stop"/></svg>Stop</button>`;
             } else if (isCancelled) {
-                primary = `<button class="continue-btn" onclick="continueDownload('${id}', '${safeUrl}')">Continue</button>`;
+                primary = `<button class="continue-btn" onclick="continueDownload('${id}', '${safeUrl}')"><svg class="icon"><use href="#i-play"/></svg>Continue</button>`;
             }
 
             if (isTerminal) {
                 // Reload only for non-finished terminal rows that don't already
                 // have a primary Continue action (i.e. error/interrupted).
                 if (!isFinished && !isCancelled) {
-                    menuItems.push(`<button onclick="reloadDownload('${id}', '${safeUrl}')">Reload</button>`);
+                    menuItems.push(`<button onclick="reloadDownload('${id}', '${safeUrl}')"><svg class="menu-icon"><use href="#i-sync"/></svg>Reload</button>`);
                 }
-                menuItems.push(`<button onclick="copyToClipboard('${safeUrl}', this)">Copy URL</button>`);
-                menuItems.push(`<button class="danger" onclick="deleteDownload('${id}')">Delete</button>`);
+                menuItems.push(`<button onclick="copyToClipboard('${safeUrl}', this)"><svg class="menu-icon"><use href="#i-copy"/></svg>Copy URL</button>`);
+                menuItems.push(`<button class="danger" onclick="deleteDownload('${id}')"><svg class="menu-icon"><use href="#i-trash"/></svg>Delete</button>`);
             }
 
             // Play button shows for finished rows that have a captured filename.
@@ -734,7 +802,7 @@ HTML_TEMPLATE = """
 
             const kebabInner = menuItems.length ? `
                 <div class="menu-wrap">
-                    <button class="kebab-btn" onclick="toggleMenu('${id}', event)" aria-label="More actions">⋮</button>
+                    <button class="kebab-btn" onclick="toggleMenu('${id}', event)" aria-label="More actions"><svg class="icon"><use href="#i-kebab"/></svg></button>
                     <div id="menu-${id}" class="kebab-menu">${menuItems.join('')}</div>
                 </div>` : '';
 
