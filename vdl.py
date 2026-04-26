@@ -59,6 +59,7 @@ def init_db():
             ("filesize",   "ALTER TABLE downloads ADD COLUMN filesize INTEGER"),
             ("speed",      "ALTER TABLE downloads ADD COLUMN speed REAL"),
             ("eta",        "ALTER TABLE downloads ADD COLUMN eta INTEGER"),
+            ("title",      "ALTER TABLE downloads ADD COLUMN title TEXT"),
         ]:
             if col not in existing_cols:
                 conn.execute(ddl)
@@ -93,7 +94,7 @@ def db_insert_download(download_id, url):
 
 def db_update_download(download_id, *, status=None, progress=None,
                        filename=None, resolution=None, filesize=None,
-                       speed=None, eta=None):
+                       speed=None, eta=None, title=None):
     fields, values = [], []
     if status is not None:
         fields.append("status = ?"); values.append(status)
@@ -109,6 +110,8 @@ def db_update_download(download_id, *, status=None, progress=None,
         fields.append("speed = ?"); values.append(speed)
     if eta is not None:
         fields.append("eta = ?"); values.append(eta)
+    if title is not None:
+        fields.append("title = ?"); values.append(title)
     if not fields:
         return
     values.append(download_id)
@@ -147,7 +150,7 @@ def db_list_downloads():
     with db() as conn:
         rows = conn.execute(
             "SELECT id, url, status, progress, created_at, "
-            "filename, resolution, filesize, speed, eta "
+            "filename, resolution, filesize, speed, eta, title "
             "FROM downloads ORDER BY created_at ASC"
         ).fetchall()
         return [dict(r) for r in rows]
@@ -208,8 +211,8 @@ def progress_hook(d, download_id):
         downloaded = d.get('downloaded_bytes', 0)
         speed = d.get('speed')  # bytes/sec, may be None at the very start
         eta = d.get('eta')      # seconds remaining, may be None
-        # Capture resolution as soon as it's known so the Current tab can
-        # show it during the download, not only after completion.
+        # Capture resolution + title as soon as they're known so the Current
+        # tab can show them during the download, not only after completion.
         info = d.get('info_dict') or {}
         height = info.get('height')
         width = info.get('width')
@@ -218,6 +221,7 @@ def progress_hook(d, download_id):
             live_resolution = f"{height}p"
         elif width and height:
             live_resolution = f"{width}x{height}"
+        live_title = info.get('title') or info.get('fulltitle')
         if total_bytes > 0:
             percent = (downloaded / total_bytes) * 100
             db_update_download(
@@ -228,6 +232,7 @@ def progress_hook(d, download_id):
                 eta=int(eta) if eta else None,
                 filesize=int(total_bytes),
                 resolution=live_resolution,
+                title=live_title,
             )
     elif d['status'] == 'finished':
         # 'finished' here means the file was fully written to disk for this
@@ -256,6 +261,7 @@ def progress_hook(d, download_id):
                     break
         filesize = (info.get('filesize') or info.get('filesize_approx')
                     or d.get('total_bytes') or d.get('total_bytes_estimate'))
+        title = info.get('title') or info.get('fulltitle')
         db_update_download(
             download_id,
             status='finished',
@@ -265,6 +271,7 @@ def progress_hook(d, download_id):
             filesize=int(filesize) if filesize else None,
             speed=0.0,  # use 0 (not None) so the column is touched and cleared
             eta=0,
+            title=title,
         )
 
 
@@ -361,7 +368,13 @@ HTML_TEMPLATE = """
         .form-group:focus-within button[type="submit"] { border-color: #888; }
         input[type="text"], input[type="number"] { padding: 10px; }
         button { padding: 10px 20px; cursor: pointer; }
-        .history-item { border: 1px solid #ccc; padding: 15px; margin-bottom: 10px; border-radius: 5px; }
+        .history-item { position: relative; border: 1px solid #ccc; padding: 15px; margin-bottom: 10px; border-radius: 5px; }
+        /* Pin the row actions to the top-right of the whole item so they sit
+           on the title's row, not below it. The padding-right on text
+           content keeps it from sliding under the buttons on narrow widths. */
+        .history-item > .row-actions { position: absolute; top: 12px; right: 12px; }
+        .history-item > .item-title,
+        .history-item > .history-header { padding-right: 96px; }
         .history-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
         .history-header > div:first-child { flex: 1; word-break: break-all; }
         .row-actions { display: flex; gap: 6px; }
@@ -427,13 +440,16 @@ HTML_TEMPLATE = """
         .tab-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
         .tab-header h3 { margin: 0; }
         .empty { color: #888; padding: 20px 0; }
+        /* Item title — prominent header derived from the page title yt-dlp
+           returns. Truncates with an ellipsis when too long. */
+        .item-title { font-weight: 600; font-size: 1.05em; color: #1a1a1a; margin-bottom: 6px; padding-right: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         /* Segmented action group: Play and Kebab share a border so they look
            like one control with an extra menu attached on the right. */
         .action-group { display: inline-flex; align-items: stretch; }
-        /* Only style the segment buttons themselves — the play button (direct
-           child) and the kebab button (inside .menu-wrap). Crucially, do not
-           cascade into the dropdown menu items. */
-        .action-group > button,
+        /* Default styling for neutral segment buttons (play, kebab). Colored
+           buttons like .stop-btn / .continue-btn opt out of these defaults
+           by virtue of the :not() and keep their own background. */
+        .action-group > button:not(.stop-btn):not(.continue-btn),
         .action-group > .menu-wrap > .kebab-btn {
             border: 1px solid #ccc; background-color: transparent; color: #555;
             cursor: pointer; padding: 0 10px; font-size: 1em; line-height: 1;
@@ -441,8 +457,12 @@ HTML_TEMPLATE = """
             border-radius: 0;
             height: 32px; box-sizing: border-box;
         }
-        .action-group > button:hover,
+        .action-group > button:not(.stop-btn):not(.continue-btn):hover,
         .action-group > .menu-wrap > .kebab-btn:hover { background-color: #f3f3f3; }
+        /* Colored buttons drop their own border-radius so the group can apply
+           the segmented one, and lose their right border so it merges flat. */
+        .action-group > .stop-btn,
+        .action-group > .continue-btn { border-radius: 0; height: 32px; box-sizing: border-box; }
         /* Make the kebab wrap stretch to the same height and not overflow.
            Without this, .menu-wrap (position:relative) paints above the play
            button and intercepts clicks on the camera's right edge. */
@@ -457,6 +477,11 @@ HTML_TEMPLATE = """
         .action-group.action-group > button:last-child  { border-radius: 0 4px 4px 0; border-left: none; }
         .action-group.action-group > :only-child > button,
         .action-group.action-group > button:only-child  { border-radius: 4px; border-left: 1px solid #ccc; }
+        /* When a colored button (Stop/Continue) leads the group, the kebab on
+           its right gets a faint white border-left so the seam is visible on
+           the colored background without clashing. */
+        .action-group > .stop-btn + .menu-wrap > .kebab-btn,
+        .action-group > .continue-btn + .menu-wrap > .kebab-btn { border-left-color: #ccc; }
         .action-group .icon { width: 18px; height: 18px; display: block; }
         /* Kebab now uses an SVG glyph, so no font-size hack needed. */
         /* Inline icon used inside primary buttons (Download / Save). */
@@ -858,9 +883,11 @@ HTML_TEMPLATE = """
                     <div id="menu-${id}" class="kebab-menu">${menuItems.join('')}</div>
                 </div>` : '';
 
-            // Wrap Play + Kebab together so they share borders and look unified.
-            const kebab = (hasPlay || menuItems.length)
-                ? `<div class="action-group">${playBtn}${kebabInner}</div>`
+            // Wrap leading button (Stop/Continue/Play) + Kebab together so they
+            // share borders and look unified.
+            const leading = primary || playBtn;
+            const actions = (leading || menuItems.length)
+                ? `<div class="action-group">${leading}${kebabInner}</div>`
                 : '';
 
             // ---- Bottom block ----
@@ -927,14 +954,27 @@ HTML_TEMPLATE = """
                     </details>`;
             }
 
+            // Display title — prefer the captured page title, fall back to the
+            // bare filename (after stripping the path), so older rows from
+            // before the title column existed still get a sensible header.
+            let displayTitle = info.title || '';
+            if (!displayTitle && info.filename) {
+                const base = info.filename.split('/').pop().split('\\\\').pop();
+                displayTitle = base.replace(/\.[^.]+$/, '');
+            }
+            const titleRow = displayTitle
+                ? `<div class="item-title" title="${escapeAttr(displayTitle)}">${escapeHtml(displayTitle)}</div>`
+                : '';
+
             return `
                 <div class="history-item" data-row-id="${id}">
+                    <div class="row-actions">${actions}</div>
+                    ${titleRow}
                     <div class="history-header">
                         <div>
                             ${warn}<strong>URL:</strong> ${info.url}<br>
                             <strong>Status:</strong> ${info.status} (${statusLabel})
                         </div>
-                        <div class="row-actions">${primary}${kebab}</div>
                     </div>
                     ${bottom}
                     ${errorBlock}
