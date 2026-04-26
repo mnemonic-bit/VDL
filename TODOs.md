@@ -1,7 +1,7 @@
 # Further things to add to the download helper
 
-* start download when pressing enter in the form field for the URL
-* make the button rounded-edges; add an icon like a downward arrow which signifies that this is the download button left to the Download label of the button
+OK: start download when pressing enter in the form field for the URL
+OK: make the button rounded-edges; add an icon like a downward arrow which signifies that this is the download button left to the Download label of the button
 * Fav icon for the site which looks like the download symbol added to the button
 * Reload button for failed downloads
 * more verbose error message for failed downloads in a section that can be fold with an arror 
