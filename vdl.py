@@ -1,4 +1,4 @@
-from flask import Flask, render_template_string, request, jsonify
+from flask import Flask, render_template_string, request, jsonify, send_file, abort
 import yt_dlp
 import threading
 import uuid
@@ -67,6 +67,7 @@ def init_db():
             "download_dir": ".",
             "format": "best",
             "max_concurrent": "3",
+            "player_mode": "overlay",
         }
         for k, v in defaults.items():
             conn.execute(
@@ -383,6 +384,15 @@ HTML_TEMPLATE = """
         .tab-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
         .tab-header h3 { margin: 0; }
         .empty { color: #888; padding: 20px 0; }
+        .play-btn { padding: 6px 10px; background-color: transparent; color: #555; border: 1px solid #ccc; border-radius: 4px; cursor: pointer; font-size: 1em; line-height: 1; }
+        .play-btn:hover { background-color: #f3f3f3; }
+        /* Player overlay */
+        .player-backdrop { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 100; align-items: center; justify-content: center; }
+        .player-backdrop.open { display: flex; }
+        .player-box { position: relative; max-width: 90vw; max-height: 90vh; }
+        .player-box video { display: block; max-width: 90vw; max-height: 90vh; background: black; border-radius: 4px; }
+        .player-close { position: absolute; top: -36px; right: 0; background: transparent; color: white; border: none; font-size: 1.6em; cursor: pointer; line-height: 1; }
+        .player-title { position: absolute; top: -32px; left: 0; color: #ddd; font-size: 0.95em; max-width: calc(90vw - 40px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, Menlo, Consolas, monospace; }
     </style>
 </head>
 <body>
@@ -412,6 +422,14 @@ HTML_TEMPLATE = """
         <p id="historyEmpty" class="empty">No completed downloads yet.</p>
     </div>
 
+    <div id="playerBackdrop" class="player-backdrop" onclick="closePlayer(event)">
+        <div class="player-box" onclick="event.stopPropagation()">
+            <div id="playerTitle" class="player-title"></div>
+            <button class="player-close" onclick="closePlayer()" aria-label="Close player">×</button>
+            <video id="playerVideo" controls autoplay></video>
+        </div>
+    </div>
+
     <div id="tab-preferences" class="tab-panel">
         <div class="pref-row">
             <label for="prefDir">Download directory</label>
@@ -439,6 +457,13 @@ HTML_TEMPLATE = """
         <div class="pref-row">
             <label for="prefMax">Max concurrent</label>
             <input type="number" id="prefMax" min="1" style="width: 80px;">
+        </div>
+        <div class="pref-row">
+            <label for="prefPlayer">Play videos in</label>
+            <select id="prefPlayer" style="width: 320px; padding: 10px;">
+                <option value="overlay">Overlay on this page</option>
+                <option value="new_tab">New browser tab</option>
+            </select>
         </div>
         <div class="pref-row">
             <button id="saveBtn" onclick="savePreferences()">Save</button>
@@ -635,6 +660,12 @@ HTML_TEMPLATE = """
                 menuItems.push(`<button class="danger" onclick="deleteDownload('${id}')">Delete</button>`);
             }
 
+            // Play button shows for finished rows that have a captured filename.
+            if (isFinished && info.filename) {
+                const fileLabel = info.filename.split('/').pop().split('\\\\').pop();
+                primary = `<button class="play-btn" onclick="playVideo('${id}', '${escapeAttr(fileLabel)}')" aria-label="Play" title="Play">🎥</button>` + primary;
+            }
+
             const kebab = menuItems.length ? `
                 <div class="menu-wrap">
                     <button class="kebab-btn" onclick="toggleMenu('${id}', event)" aria-label="More actions">⋮</button>
@@ -727,6 +758,38 @@ HTML_TEMPLATE = """
             });
         }
 
+        // Player -------------------------------------------------------------
+        let playerMode = 'overlay';
+
+        function playVideo(id, label) {
+            const url = '/api/file/' + encodeURIComponent(id);
+            if (playerMode === 'new_tab') {
+                window.open(url, '_blank', 'noopener');
+                return;
+            }
+            const video = document.getElementById('playerVideo');
+            document.getElementById('playerTitle').textContent = label || '';
+            video.src = url;
+            document.getElementById('playerBackdrop').classList.add('open');
+        }
+
+        function closePlayer(ev) {
+            // Backdrop click bubbles here; ignore clicks that originated on the
+            // box itself (those call event.stopPropagation in the handler).
+            const backdrop = document.getElementById('playerBackdrop');
+            const video = document.getElementById('playerVideo');
+            video.pause();
+            video.removeAttribute('src');
+            video.load();
+            backdrop.classList.remove('open');
+        }
+
+        document.addEventListener('keydown', (ev) => {
+            if (ev.key === 'Escape' && document.getElementById('playerBackdrop').classList.contains('open')) {
+                closePlayer();
+            }
+        });
+
         // Tabs ---------------------------------------------------------------
         function switchTab(name) {
             document.querySelectorAll('.tab').forEach(t => {
@@ -771,6 +834,9 @@ HTML_TEMPLATE = """
                     document.getElementById('prefFormatCustom').value = stored;
                 }
                 refreshCustomVisibility();
+
+                playerMode = (p.player_mode === 'new_tab') ? 'new_tab' : 'overlay';
+                document.getElementById('prefPlayer').value = playerMode;
             });
         }
 
@@ -784,7 +850,9 @@ HTML_TEMPLATE = """
                 download_dir: document.getElementById('prefDir').value,
                 format: fmt || 'best',
                 max_concurrent: document.getElementById('prefMax').value,
+                player_mode: document.getElementById('prefPlayer').value,
             };
+            playerMode = body.player_mode;
             fetch('/api/preferences', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -889,12 +957,32 @@ def get_history():
     return jsonify(db_list_downloads())
 
 
+@app.route('/api/file/<download_id>', methods=['GET'])
+def stream_file(download_id):
+    """Serve a finished download to the in-app player. Uses send_file's
+    conditional/range response so the <video> element can seek."""
+    entry = db_get_download(download_id)
+    if entry is None or entry.get('status') != 'finished':
+        abort(404)
+    path = entry.get('filename')
+    if not path or not os.path.isfile(path):
+        abort(404)
+    # Confine the served path to the configured download directory so a
+    # tampered DB row can't be used to read arbitrary files.
+    prefs = db_get_preferences()
+    base = os.path.realpath(prefs.get('download_dir', '.'))
+    real = os.path.realpath(path)
+    if os.path.commonpath([real, base]) != base:
+        abort(403)
+    return send_file(real, conditional=True)
+
+
 @app.route('/api/preferences', methods=['GET', 'POST'])
 def preferences():
     if request.method == 'GET':
         return jsonify(db_get_preferences())
     data = request.json or {}
-    allowed = {'download_dir', 'format', 'max_concurrent'}
+    allowed = {'download_dir', 'format', 'max_concurrent', 'player_mode'}
     updates = {k: v for k, v in data.items() if k in allowed and v is not None}
     if not updates:
         return jsonify({"error": "No valid preference fields provided"}), 400
