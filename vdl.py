@@ -412,6 +412,10 @@ HTML_TEMPLATE = """
         #saveBtn { display: inline-flex; align-items: center; gap: 6px; }
         #downloadForm button[type="submit"] { display: inline-flex; align-items: center; gap: 6px; }
         .eta { margin-top: 4px; font-size: 0.9em; color: #555; }
+        /* Active-row progress: bar + ETA/speed on the same line. */
+        .progress-row { display: flex; align-items: center; gap: 10px; margin-top: 4px; }
+        .progress-row .progress-bar-bg { flex: 1; margin: 0; }
+        .progress-inline { font-size: 0.9em; color: #555; white-space: nowrap; flex-shrink: 0; }
         /* Tabs */
         .tabs { display: flex; gap: 0; border-bottom: 1px solid #ccc; margin-bottom: 20px; }
         .tab { padding: 10px 18px; background: none; border: 1px solid transparent; border-bottom: none; border-radius: 5px 5px 0 0; cursor: pointer; font-size: 1em; color: #555; margin-bottom: -1px; }
@@ -462,7 +466,7 @@ HTML_TEMPLATE = """
         .kebab-menu .menu-icon { width: 14px; height: 14px; flex-shrink: 0; color: #555; }
         .kebab-menu button.danger .menu-icon { color: #c0392b; }
         /* Error details disclosure on error rows. Subtle until expanded. */
-        .error-details { margin-top: 10px; border-top: 1px solid #f0d6d6; padding-top: 8px; }
+        .error-details { margin-top: 10px; }
         .error-details > summary { list-style: none; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; color: #c0392b; font-size: 0.92em; user-select: none; }
         .error-details > summary::-webkit-details-marker { display: none; }
         .error-details .chev { width: 14px; height: 14px; transition: transform 0.15s; color: #c0392b; flex-shrink: 0; }
@@ -703,6 +707,13 @@ HTML_TEMPLATE = """
         // pause history polling so the periodic re-render doesn't destroy the
         // menu's DOM node mid-click.
         let openMenuId = null;
+        // Track which error-details panels the user has expanded, so the
+        // periodic fetchHistory() re-render doesn't snap them shut.
+        const openErrorIds = new Set();
+        function onErrorDetailsToggle(id, el) {
+            if (el.open) openErrorIds.add(id);
+            else openErrorIds.delete(id);
+        }
 
         function closeAllMenus() {
             document.querySelectorAll('.kebab-menu.open').forEach(m => m.classList.remove('open'));
@@ -853,7 +864,8 @@ HTML_TEMPLATE = """
                 : '';
 
             // ---- Bottom block ----
-            // Active: progress bar + speed; terminal: metadata block (when present).
+            // Active: single-line progress bar with ETA + speed inline.
+            // Terminal: status-coloured bar (skipped for errors) + metadata.
             let bottom = '';
             if (isRunning) {
                 let width = String(info.progress).replace('%', '');
@@ -862,21 +874,26 @@ HTML_TEMPLATE = """
                 const etaStr = formatEta(info.eta);
                 const sizeStr = formatBytes(info.filesize);
                 const resStr = info.resolution;
+                const inlineParts = [];
+                if (etaStr) inlineParts.push(etaStr);
+                if (speedStr) inlineParts.push(speedStr);
+                const inline = inlineParts.length ? `<span class="progress-inline">${inlineParts.join(' · ')}</span>` : '';
                 bottom = `
-                    <div class="progress-bar-bg">
-                        <div class="progress-bar-fill" style="width: ${width}%;"></div>
+                    <div class="progress-row">
+                        <div class="progress-bar-bg">
+                            <div class="progress-bar-fill" style="width: ${width}%;"></div>
+                        </div>
+                        ${inline}
                     </div>
-                    ${speedStr ? `<div class="speed"><strong>Speed:</strong> ${speedStr}</div>` : ''}
-                    ${etaStr  ? `<div class="eta"><strong>Time remaining:</strong> ${etaStr}</div>` : ''}
-                    ${sizeStr ? `<div class="meta"><div><strong>Total size:</strong> ${sizeStr}</div>${resStr ? `<div><strong>Quality:</strong> ${resStr}</div>` : ''}</div>` : ''}`;
+                    ${(sizeStr || resStr) ? `<div class="meta">${sizeStr ? `<div><strong>Total size:</strong> ${sizeStr}</div>` : ''}${resStr ? `<div><strong>Quality:</strong> ${resStr}</div>` : ''}</div>` : ''}`;
             } else {
-                // Terminal states: keep a coloured bar for non-finished failures so
-                // the row visually matches its status, plus any captured metadata.
-                if (!isFinished) {
+                // Terminal states: keep a coloured bar for cancelled/interrupted
+                // (where the row visually mirrors its status). Errors get no bar
+                // — the dedicated error-details panel speaks for itself.
+                if (!isFinished && info.status !== 'error') {
                     let barClass = 'progress-bar-fill';
                     if (info.status === 'cancelled') barClass += ' cancelled';
                     else if (info.status === 'interrupted') barClass += ' interrupted';
-                    else if (info.status === 'error') barClass += ' error';
                     let width = String(info.progress).replace('%', '');
                     if (isNaN(width)) width = 0;
                     bottom += `
@@ -898,11 +915,13 @@ HTML_TEMPLATE = """
             const warn = isCancelled ? '<span class="warn-icon" title="Action required"></span>' : '';
 
             // Error details: collapsed by default, expandable via chevron.
+            // Restore prior open state across periodic re-renders.
             let errorBlock = '';
             if (info.status === 'error' && info.progress) {
                 const detail = String(info.progress);
+                const openAttr = openErrorIds.has(id) ? ' open' : '';
                 errorBlock = `
-                    <details class="error-details">
+                    <details class="error-details"${openAttr} ontoggle="onErrorDetailsToggle('${id}', this)">
                         <summary><svg class="chev"><use href="#i-chevron"/></svg><strong>Error details</strong></summary>
                         <pre class="error-text">${escapeHtml(detail)}</pre>
                     </details>`;
