@@ -372,6 +372,10 @@ HTML_TEMPLATE = """
         .clear-btn:hover { background-color: #7f8c8d; }
         .pref-row { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
         .pref-row label { width: 180px; }
+        .pref-actions { display: flex; justify-content: flex-end; margin-top: 20px; }
+        /* Match Download button styling — the user-agent default look. */
+        #saveBtn { display: inline-flex; align-items: center; }
+        #downloadForm button[type="submit"] { display: inline-flex; align-items: center; }
         .eta { margin-top: 4px; font-size: 0.9em; color: #555; }
         /* Tabs */
         .tabs { display: flex; gap: 0; border-bottom: 1px solid #ccc; margin-bottom: 20px; }
@@ -384,8 +388,33 @@ HTML_TEMPLATE = """
         .tab-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
         .tab-header h3 { margin: 0; }
         .empty { color: #888; padding: 20px 0; }
-        .play-btn { padding: 6px 10px; background-color: transparent; color: #555; border: 1px solid #ccc; border-radius: 4px; cursor: pointer; font-size: 1em; line-height: 1; }
-        .play-btn:hover { background-color: #f3f3f3; }
+        /* Segmented action group: Play and Kebab share a border so they look
+           like one control with an extra menu attached on the right. */
+        .action-group { display: inline-flex; }
+        /* Only style the segment buttons themselves — the play button (direct
+           child) and the kebab button (inside .menu-wrap). Crucially, do not
+           cascade into the dropdown menu items. */
+        .action-group > button,
+        .action-group > .menu-wrap > .kebab-btn {
+            border: 1px solid #ccc; background-color: transparent; color: #555;
+            cursor: pointer; padding: 6px 10px; font-size: 1em; line-height: 1;
+            display: inline-flex; align-items: center; justify-content: center;
+            border-radius: 0;
+        }
+        .action-group > button:hover,
+        .action-group > .menu-wrap > .kebab-btn:hover { background-color: #f3f3f3; }
+        /* Rounded outer corners; flat inner edge between Play and Kebab.
+           Specificity bumped with .action-group repeated so these rules win
+           over the base .action-group > button block above. */
+        .action-group.action-group > :first-child > button,
+        .action-group.action-group > button:first-child { border-radius: 4px 0 0 4px; }
+        .action-group.action-group > :last-child > button,
+        .action-group.action-group > button:last-child  { border-radius: 0 4px 4px 0; border-left: none; }
+        .action-group.action-group > :only-child > button,
+        .action-group.action-group > button:only-child  { border-radius: 4px; border-left: 1px solid #ccc; }
+        .action-group .icon { width: 18px; height: 18px; display: block; }
+        /* Inline icon used inside primary buttons (Download / Save). */
+        .btn-icon { width: 16px; height: 16px; vertical-align: -3px; margin-right: 6px; }
         /* Player overlay */
         .player-backdrop { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 100; align-items: center; justify-content: center; }
         .player-backdrop.open { display: flex; }
@@ -396,10 +425,27 @@ HTML_TEMPLATE = """
     </style>
 </head>
 <body>
+    <!-- Reusable inline SVGs (mono-stroke, currentColor) -->
+    <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+        <defs>
+            <symbol id="i-download" viewBox="0 0 24 24">
+                <g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M12 4v12"/><path d="M6 12l6 6 6-6"/><path d="M5 20h14"/>
+                </g>
+            </symbol>
+            <symbol id="i-camera" viewBox="0 0 24 24">
+                <g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M3 8.5h11a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2z"/>
+                    <path d="M16 12l5-3v8l-5-3z"/>
+                </g>
+            </symbol>
+        </defs>
+    </svg>
+
     <h2>Download Video</h2>
     <form id="downloadForm" class="form-group" onsubmit="startDownload(event)">
         <input type="url" id="urlInput" placeholder="Enter video URL here..." required>
-        <button type="submit">Download</button>
+        <button type="submit"><svg class="btn-icon"><use href="#i-download"/></svg>Download</button>
     </form>
 
     <div class="tabs" role="tablist">
@@ -415,8 +461,7 @@ HTML_TEMPLATE = """
 
     <div id="tab-history" class="tab-panel">
         <div class="tab-header">
-            <h3>Download History</h3>
-            <button class="clear-btn" onclick="clearHistory()">Clear History</button>
+            <button class="clear-btn" onclick="clearHistory()" style="margin-left:auto;">Clear History</button>
         </div>
         <div id="historyList"></div>
         <p id="historyEmpty" class="empty">No completed downloads yet.</p>
@@ -465,8 +510,8 @@ HTML_TEMPLATE = """
                 <option value="new_tab">New browser tab</option>
             </select>
         </div>
-        <div class="pref-row">
-            <button id="saveBtn" onclick="savePreferences()">Save</button>
+        <div class="pref-actions">
+            <button id="saveBtn" onclick="savePreferences()"><svg class="btn-icon"><use href="#i-download"/></svg>Save</button>
         </div>
     </div>
 
@@ -661,16 +706,22 @@ HTML_TEMPLATE = """
             }
 
             // Play button shows for finished rows that have a captured filename.
-            if (isFinished && info.filename) {
-                const fileLabel = info.filename.split('/').pop().split('\\\\').pop();
-                primary = `<button class="play-btn" onclick="playVideo('${id}', '${escapeAttr(fileLabel)}')" aria-label="Play" title="Play">🎥</button>` + primary;
-            }
+            // It joins the kebab into a single segmented control.
+            const hasPlay = isFinished && info.filename;
+            const playBtn = hasPlay
+                ? `<button onclick="playVideo('${id}', '${escapeAttr(info.filename.split('/').pop().split('\\\\').pop())}')" aria-label="Play" title="Play"><svg class="icon"><use href="#i-camera"/></svg></button>`
+                : '';
 
-            const kebab = menuItems.length ? `
+            const kebabInner = menuItems.length ? `
                 <div class="menu-wrap">
                     <button class="kebab-btn" onclick="toggleMenu('${id}', event)" aria-label="More actions">⋮</button>
                     <div id="menu-${id}" class="kebab-menu">${menuItems.join('')}</div>
                 </div>` : '';
+
+            // Wrap Play + Kebab together so they share borders and look unified.
+            const kebab = (hasPlay || menuItems.length)
+                ? `<div class="action-group">${playBtn}${kebabInner}</div>`
+                : '';
 
             // ---- Bottom block ----
             // Active: progress bar + speed; terminal: metadata block (when present).
