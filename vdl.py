@@ -4,6 +4,7 @@ import threading
 import uuid
 import sqlite3
 import os
+import re
 import time
 from contextlib import contextmanager
 
@@ -225,7 +226,21 @@ def progress_hook(d, download_id):
         info = d.get('info_dict') or {}
         filename = d.get('filename') or info.get('_filename')
         height = info.get('height')
-        resolution = f"{height}p" if height else (info.get('format_note') or info.get('format_id'))
+        width = info.get('width')
+        # Resolution: prefer height ("720p"), else width x height, else accept
+        # only resolution-shaped fallbacks like "720p" / "1920x1080". Avoid
+        # generic format_id strings like "video_url" that yt-dlp uses for
+        # opaque sources (e.g. some HLS extractors).
+        resolution = None
+        if height:
+            resolution = f"{height}p"
+        elif width and height:
+            resolution = f"{width}x{height}"
+        else:
+            for cand in (info.get('format_note'), info.get('resolution')):
+                if cand and re.fullmatch(r'\d{3,5}p|\d+x\d+', str(cand)):
+                    resolution = str(cand)
+                    break
         filesize = (info.get('filesize') or info.get('filesize_approx')
                     or d.get('total_bytes') or d.get('total_bytes_estimate'))
         db_update_download(
@@ -233,7 +248,7 @@ def progress_hook(d, download_id):
             status='finished',
             progress='100%',
             filename=filename,
-            resolution=str(resolution) if resolution else None,
+            resolution=resolution,
             filesize=int(filesize) if filesize else None,
             speed=0.0,  # use 0 (not None) so the column is touched and cleared
             eta=0,
@@ -314,6 +329,10 @@ HTML_TEMPLATE = """
         .row-actions { display: flex; gap: 6px; }
         .stop-btn { padding: 6px 12px; background-color: #e74c3c; color: white; border: none; border-radius: 4px; cursor: pointer; }
         .stop-btn:hover { background-color: #c0392b; }
+        .continue-btn { padding: 6px 12px; background-color: #f39c12; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        .continue-btn:hover { background-color: #d68910; }
+        .warn-icon { display: inline-block; width: 0; height: 0; border-left: 9px solid transparent; border-right: 9px solid transparent; border-bottom: 16px solid #f1c40f; position: relative; vertical-align: middle; margin-right: 8px; }
+        .warn-icon::after { content: '!'; position: absolute; left: 50%; top: 4px; transform: translateX(-50%); color: #000; font-weight: bold; font-size: 11px; line-height: 1; font-family: Arial, sans-serif; }
         .reload-btn { padding: 6px 12px; background-color: #3498db; color: white; border: none; border-radius: 4px; cursor: pointer; }
         .reload-btn:hover { background-color: #2980b9; }
         .delete-btn { padding: 6px 12px; background-color: #7f8c8d; color: white; border: none; border-radius: 4px; cursor: pointer; }
@@ -423,7 +442,12 @@ HTML_TEMPLATE = """
     </div>
 
     <script>
-        const ACTIVE_STATUSES = new Set(['starting', 'downloading']);
+        // Statuses that count as "in flight" (the worker thread is alive).
+        const RUNNING_STATUSES = new Set(['starting', 'downloading']);
+        // Statuses shown under the Current tab. Cancelled stays here so the
+        // user can resume it; everything else terminal goes to History.
+        const CURRENT_TAB_STATUSES = new Set(['starting', 'downloading', 'cancelled']);
+        const HISTORY_TAB_STATUSES = new Set(['finished', 'error', 'interrupted']);
         const TERMINAL_STATUSES = new Set(['finished', 'error', 'cancelled', 'interrupted']);
 
         function startDownload(event) {
@@ -448,6 +472,19 @@ HTML_TEMPLATE = """
         }
 
         function reloadDownload(id, url) {
+            fetch('/api/remove/' + encodeURIComponent(id), { method: 'POST' })
+                .then(() => fetch('/api/download', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url: url })
+                }))
+                .then(() => fetchHistory());
+        }
+
+        function continueDownload(id, url) {
+            // Resume = drop the cancelled row and start a fresh download for the
+            // same URL. yt-dlp picks up partially-downloaded fragments where
+            // available; otherwise it starts over.
             fetch('/api/remove/' + encodeURIComponent(id), { method: 'POST' })
                 .then(() => fetch('/api/download', {
                     method: 'POST',
@@ -563,7 +600,8 @@ HTML_TEMPLATE = """
 
         function renderItem(info) {
             const id = info.id;
-            const isActive = ACTIVE_STATUSES.has(info.status);
+            const isRunning = RUNNING_STATUSES.has(info.status);
+            const isCancelled = info.status === 'cancelled';
             const isTerminal = TERMINAL_STATUSES.has(info.status);
             const isFinished = info.status === 'finished';
 
@@ -577,17 +615,21 @@ HTML_TEMPLATE = """
             const safeUrl = escapeAttr(info.url);
 
             // ---- Action layout ----
-            // Inline: only Stop (active rows). Everything else goes into the kebab.
+            // Inline: Stop on running rows, Continue on cancelled rows.
+            // Everything else goes into the kebab.
             let primary = '';
             const menuItems = [];
 
-            if (isActive) {
+            if (isRunning) {
                 primary = `<button class="stop-btn" onclick="stopDownload('${id}')">Stop</button>`;
+            } else if (isCancelled) {
+                primary = `<button class="continue-btn" onclick="continueDownload('${id}', '${safeUrl}')">Continue</button>`;
             }
 
             if (isTerminal) {
-                // Reload only for non-finished terminal rows (cancelled/error/interrupted).
-                if (!isFinished) {
+                // Reload only for non-finished terminal rows that don't already
+                // have a primary Continue action (i.e. error/interrupted).
+                if (!isFinished && !isCancelled) {
                     menuItems.push(`<button onclick="reloadDownload('${id}', '${safeUrl}')">Reload</button>`);
                 }
                 menuItems.push(`<button onclick="copyToClipboard('${safeUrl}', this)">Copy URL</button>`);
@@ -603,7 +645,7 @@ HTML_TEMPLATE = """
             // ---- Bottom block ----
             // Active: progress bar + speed; terminal: metadata block (when present).
             let bottom = '';
-            if (isActive) {
+            if (isRunning) {
                 let width = String(info.progress).replace('%', '');
                 if (isNaN(width)) width = 0;
                 const speedStr = formatSpeed(info.speed);
@@ -640,11 +682,13 @@ HTML_TEMPLATE = """
                 if (meta.length) bottom += `<div class="meta">${meta.join('')}</div>`;
             }
 
+            const warn = isCancelled ? '<span class="warn-icon" title="Action required"></span>' : '';
+
             return `
                 <div class="history-item" data-row-id="${id}">
                     <div class="history-header">
                         <div>
-                            <strong>URL:</strong> ${info.url}<br>
+                            ${warn}<strong>URL:</strong> ${info.url}<br>
                             <strong>Status:</strong> ${info.status} (${statusLabel})
                         </div>
                         <div class="row-actions">${primary}${kebab}</div>
@@ -665,8 +709,8 @@ HTML_TEMPLATE = """
             .then(data => {
                 // Newest first.
                 const reversed = data.slice().reverse();
-                const active = reversed.filter(i => ACTIVE_STATUSES.has(i.status));
-                const done   = reversed.filter(i => TERMINAL_STATUSES.has(i.status));
+                const active = reversed.filter(i => CURRENT_TAB_STATUSES.has(i.status));
+                const done   = reversed.filter(i => HISTORY_TAB_STATUSES.has(i.status));
 
                 document.getElementById('activeList').innerHTML = active.map(renderItem).join('');
                 document.getElementById('historyList').innerHTML = done.map(renderItem).join('');
