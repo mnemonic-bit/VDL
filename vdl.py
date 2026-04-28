@@ -953,6 +953,14 @@ HTML_TEMPLATE = """
                     <path d="M4 4l8 8"/><path d="M12 4l-8 8"/>
                 </g>
             </symbol>
+            <!-- Success indicator: white tick on a green disc.
+                 Colours are baked in (not currentColor) so the icon stays
+                 readable regardless of the surrounding text colour. -->
+            <symbol id="i-check-circle" viewBox="0 0 16 16">
+                <circle cx="8" cy="8" r="7" fill="#1f8a3b"/>
+                <path d="M4.5 8.2 L7 10.6 L11.6 5.6" fill="none" stroke="#fff"
+                      stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+            </symbol>
         </defs>
     </svg>
 
@@ -1247,12 +1255,25 @@ HTML_TEMPLATE = """
             window.open(url, '_blank', 'noopener,noreferrer');
         }
 
+        // Markup for the kebab-menu Copy URL item, in both states. Centralised
+        // so the success indicator and the resting state share exactly one
+        // source of truth -- the previous bug was caused by setting
+        // btn.textContent, which wiped the inner <svg> icon and never
+        // restored it.
+        const COPY_URL_HTML    = '<svg class="menu-icon"><use href="#i-copy"/></svg>Copy URL';
+        const COPIED_HTML      = '<svg class="menu-icon"><use href="#i-check-circle"/></svg>Copied';
+
         function copyToClipboard(text, btn) {
             const done = () => {
                 if (!btn) return;
-                const original = btn.textContent;
-                btn.textContent = 'Copied';
-                setTimeout(() => { btn.textContent = original; }, 1500);
+                // Track which timer this button is currently running so a
+                // double-click doesn't leave the button stuck in 'Copied'.
+                if (btn._copyTimer) clearTimeout(btn._copyTimer);
+                btn.innerHTML = COPIED_HTML;
+                btn._copyTimer = setTimeout(() => {
+                    btn.innerHTML = COPY_URL_HTML;
+                    btn._copyTimer = null;
+                }, 1500);
             };
             if (navigator.clipboard && window.isSecureContext) {
                 navigator.clipboard.writeText(text).then(done, () => fallback(text, done));
