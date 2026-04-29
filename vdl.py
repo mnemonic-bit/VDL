@@ -1994,19 +1994,45 @@ def events():
 @app.route('/api/file/<download_id>', methods=['GET'])
 def stream_file(download_id):
     """Serve a finished download to the in-app player. Uses send_file's
-    conditional/range response so the <video> element can seek."""
+    conditional/range response so the <video> element can seek.
+
+    The absolute path captured by yt-dlp at download time is stored in the
+    `filename` column. We trust that path (rather than rebuilding it from
+    the *current* download_dir preference) so playback keeps working after
+    the user changes the download directory mid-history.
+
+    Path-traversal protection: instead of confining to the current
+    `download_dir`, we confine to the union of every directory that has
+    ever been used by a finished row. A tampered DB row pointing outside
+    those directories is still rejected.
+    """
     entry = db_get_download(download_id)
     if entry is None or entry.get('status') != 'finished':
         abort(404)
     path = entry.get('filename')
     if not path or not os.path.isfile(path):
         abort(404)
-    # Confine the served path to the configured download directory so a
-    # tampered DB row can't be used to read arbitrary files.
-    prefs = db_get_preferences()
-    base = os.path.realpath(prefs.get('download_dir', '.'))
     real = os.path.realpath(path)
-    if os.path.commonpath([real, base]) != base:
+
+    # Build the allow-list of base directories: the current preference plus
+    # every distinct parent directory of finished downloads on record.
+    prefs = db_get_preferences()
+    allowed_bases = {os.path.realpath(prefs.get('download_dir', '.'))}
+    with _db_lock, sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT filename FROM downloads "
+            "WHERE status = 'finished' AND filename IS NOT NULL"
+        ).fetchall()
+    for (fn,) in rows:
+        try:
+            allowed_bases.add(os.path.realpath(os.path.dirname(fn)))
+        except (TypeError, ValueError):
+            continue
+
+    if not any(
+        os.path.commonpath([real, base]) == base
+        for base in allowed_bases
+    ):
         abort(403)
     return send_file(real, conditional=True)
 
