@@ -800,7 +800,14 @@ HTML_TEMPLATE = """
         /* Rename control: looks like a disabled text input plus an edit icon
            button. The display element is intentionally non-interactive --
            clicking it does NOT place a cursor; the user has to use the Edit
-           button to enter edit mode. */
+           button to enter edit mode.
+
+           Sizing: in display mode the value is shown verbatim (the box hugs
+           its text). In edit mode the input is sized via the `size`
+           attribute to match the value's character count, so the visible
+           width stays the same as the display variant. The wrap is allowed
+           to use the full row width; if the input + tick + cross don't fit,
+           the input shrinks via `min-width: 0` rather than overflowing. */
         .rename-wrap { display: inline-flex; align-items: stretch; gap: 0; max-width: 100%; vertical-align: middle; }
         .rename-display, .rename-input {
             font-family: ui-monospace, Menlo, Consolas, monospace;
@@ -810,12 +817,22 @@ HTML_TEMPLATE = """
             background: var(--surface-2);
             color: var(--fg);
             border-radius: 3px 0 0 3px;
-            min-width: 0; max-width: 380px;
             line-height: 1.3;
-            word-break: break-all;
+            box-sizing: border-box;
         }
-        .rename-display { user-select: none; -webkit-user-select: none; cursor: default; }
-        .rename-input { background: var(--surface); outline: none; }
+        .rename-display {
+            user-select: none; -webkit-user-select: none; cursor: default;
+            white-space: nowrap;
+            max-width: none;
+        }
+        .rename-input {
+            background: var(--surface); outline: none;
+            /* Allow shrinking inside the inline-flex container if the row
+               doesn't have enough horizontal space for the value + both
+               buttons. The `size` attribute sets the preferred width. */
+            min-width: 0;
+            flex: 0 1 auto;
+        }
         .rename-input:focus { border-color: var(--accent, #1f8a3b); }
         .rename-btn {
             display: inline-flex; align-items: center; justify-content: center;
@@ -824,6 +841,9 @@ HTML_TEMPLATE = """
             background: var(--surface-3); color: var(--fg);
             border: 1px solid var(--border); border-left: none;
             cursor: pointer;
+            /* Buttons must never shrink: the input gives up width first when
+               the row is too narrow. */
+            flex: 0 0 28px;
         }
         .rename-btn:hover { background: var(--border); }
         .rename-btn:last-child { border-radius: 0 3px 3px 0; }
@@ -1202,8 +1222,13 @@ HTML_TEMPLATE = """
         function renderRenameControl(id, basename) {
             if (renameDrafts.has(id)) {
                 const draft = renameDrafts.get(id);
+                // `size` reserves enough character columns for the *original*
+                // basename. That makes the input visually match the display
+                // box width-wise; the wrap's max-width: 100% then prevents
+                // overflow if the row is too narrow.
+                const sizeAttr = Math.max(8, basename.length);
                 return `<span class="rename-wrap" data-rename-id="${id}" data-mode="edit">
-                    <input class="rename-input" type="text" value="${escapeAttr(draft)}" data-orig="${escapeAttr(basename)}" oninput="renameDrafts.set('${id}', this.value)" />
+                    <input class="rename-input" type="text" size="${sizeAttr}" value="${escapeAttr(draft)}" data-orig="${escapeAttr(basename)}" oninput="renameDrafts.set('${id}', this.value)" />
                     <button class="rename-btn confirm" type="button" title="Save" aria-label="Save" onclick="renameCommit('${id}')">
                         <svg class="icon"><use href="#i-check"/></svg>
                     </button>
