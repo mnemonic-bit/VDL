@@ -68,7 +68,18 @@ event_bus = EventBus()
 # Persistence layer
 # ---------------------------------------------------------------------------
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads.db")
+# DB_PATH is overridable via the DOWNLOADS_DB env var so the container can
+# point it at a mounted volume (e.g. /data/downloads.db). Falls back to a
+# file living next to app.py for plain `python app.py` runs.
+DB_PATH = os.environ.get(
+    "DOWNLOADS_DB",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads.db"),
+)
+
+# Default download directory used when the preferences row doesn't exist yet.
+# Configurable so the Docker image can ship a sensible writable default
+# (/downloads) without forcing the user to set it on first run.
+DEFAULT_DOWNLOAD_DIR = os.environ.get("DOWNLOADS_DIR", ".")
 TERMINAL_STATUSES = ('finished', 'error', 'cancelled', 'interrupted')
 
 # A single lock serialises writes from background threads. SQLite itself is
@@ -130,7 +141,7 @@ def init_db():
                 conn.execute(ddl)
         # Seed defaults only if missing.
         defaults = {
-            "download_dir": ".",
+            "download_dir": DEFAULT_DOWNLOAD_DIR,
             "format": "best",
             "max_concurrent": "3",
             "player_mode": "overlay",
@@ -143,9 +154,11 @@ def init_db():
             )
 
         # Any download that was active when the app died is now orphaned.
+        # 'paused' counts as active for this purpose -- the worker thread
+        # was holding the connection open and is gone now.
         conn.execute(
             "UPDATE downloads SET status = 'interrupted', progress = 'Interrupted' "
-            "WHERE status IN ('starting', 'downloading')"
+            "WHERE status IN ('starting', 'downloading', 'paused')"
         )
 
 
@@ -263,15 +276,22 @@ class DownloadCancelled(Exception):
     pass
 
 
-# Cancel flags only need to live in memory: a download is only cancellable
-# while its thread is alive in this process.
+# Cancel and pause flags only need to live in memory: a download is only
+# cancellable / pausable while its worker thread is alive in this process.
+# Pause is implemented by stalling inside progress_hook -- yt-dlp invokes
+# the hook between every chunk written, so spinning here effectively halts
+# the underlying HTTP/HLS reader without tearing the connection down.
 _cancel_flags = {}
-_cancel_lock = threading.Lock()
+_pause_flags  = {}
+_cancel_lock  = threading.Lock()  # guards both maps
 
 
 def request_cancel(download_id):
     with _cancel_lock:
         _cancel_flags[download_id] = True
+        # A paused download must wake up so the hook sees the cancel
+        # flag and raises DownloadCancelled on its next iteration.
+        _pause_flags.pop(download_id, None)
 
 
 def is_cancel_requested(download_id):
@@ -284,9 +304,40 @@ def clear_cancel(download_id):
         _cancel_flags.pop(download_id, None)
 
 
+def request_pause(download_id):
+    with _cancel_lock:
+        _pause_flags[download_id] = True
+
+
+def is_pause_requested(download_id):
+    with _cancel_lock:
+        return _pause_flags.get(download_id, False)
+
+
+def clear_pause(download_id):
+    with _cancel_lock:
+        _pause_flags.pop(download_id, None)
+
+
 def progress_hook(d, download_id):
+    # Cancel takes precedence over pause -- if the user hit Stop while paused,
+    # we want to abort, not silently sleep forever.
     if is_cancel_requested(download_id):
         raise DownloadCancelled()
+
+    # Honour pause requests by parking the worker thread here. The hook is
+    # called between yt-dlp's HTTP read chunks, so this pauses the network
+    # transfer without aborting the connection. We keep the row's status
+    # at 'paused' for the duration; it flips back to 'downloading' on the
+    # very next hook call after the flag clears.
+    if is_pause_requested(download_id):
+        # Mark the row paused once on entry; avoid hammering the DB on
+        # every iteration of the wait loop.
+        db_update_download(download_id, status='paused', speed=None, eta=None)
+        while is_pause_requested(download_id):
+            if is_cancel_requested(download_id):
+                raise DownloadCancelled()
+            time.sleep(0.25)
 
     if d['status'] == 'downloading':
         total_bytes = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
@@ -576,6 +627,7 @@ def background_download(url, download_id):
         db_update_download(download_id, status='error', progress=str(e), finished_at=time.time())
     finally:
         clear_cancel(download_id)
+        clear_pause(download_id)
 
 
 def ffprobe_resolution(path):
@@ -605,6 +657,10 @@ HTML_TEMPLATE = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Video Downloader</title>
+    <!-- Favicon: green disc with the same download arrow used on the
+         primary submit button. Inlined as a data: URL so we don't need
+         a dedicated route. -->
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7.5' fill='%231f8a3b'/><g fill='none' stroke='white' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M8 4v5.5'/><path d='M5 7l3 3 3-3'/><path d='M4.5 12.5h7'/></g></svg>">
     <!-- Apply the saved theme as early as possible to avoid a flash of the
          wrong theme. We mirror the server-side preference into localStorage
          on save, then read it here before the rest of the page paints. -->
@@ -948,6 +1004,12 @@ HTML_TEMPLATE = """
             <symbol id="i-stop" viewBox="0 0 16 16">
                 <rect x="3.5" y="3.5" width="9" height="9" rx="1" fill="currentColor"/>
             </symbol>
+            <symbol id="i-pause" viewBox="0 0 16 16">
+                <g fill="currentColor">
+                    <rect x="4" y="3.5" width="2.6" height="9" rx="0.5"/>
+                    <rect x="9.4" y="3.5" width="2.6" height="9" rx="0.5"/>
+                </g>
+            </symbol>
             <symbol id="i-x" viewBox="0 0 16 16">
                 <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
                     <path d="M4 4l8 8"/><path d="M12 4l-8 8"/>
@@ -1058,7 +1120,7 @@ HTML_TEMPLATE = """
         // Statuses shown under the Current tab. Cancelled and interrupted
         // stay here so the user can resume them; everything else terminal
         // goes to History.
-        const CURRENT_TAB_STATUSES = new Set(['starting', 'downloading', 'cancelled', 'interrupted']);
+        const CURRENT_TAB_STATUSES = new Set(['starting', 'downloading', 'paused', 'cancelled', 'interrupted']);
         const HISTORY_TAB_STATUSES = new Set(['finished', 'error']);
         const TERMINAL_STATUSES = new Set(['finished', 'error', 'cancelled', 'interrupted']);
 
@@ -1080,6 +1142,20 @@ HTML_TEMPLATE = """
 
         function stopDownload(id) {
             fetch('/api/stop/' + encodeURIComponent(id), { method: 'POST' })
+                .then(() => fetchHistory());
+        }
+
+        function pauseDownload(id) {
+            // Sets a pause flag on the worker; the next progress_hook tick
+            // will park the worker on a sleep loop until unpause/cancel.
+            closeAllMenus();
+            fetch('/api/pause/' + encodeURIComponent(id), { method: 'POST' })
+                .then(() => fetchHistory());
+        }
+
+        function unpauseDownload(id) {
+            // Same worker thread keeps running -- we just clear the flag.
+            fetch('/api/unpause/' + encodeURIComponent(id), { method: 'POST' })
                 .then(() => fetchHistory());
         }
 
@@ -1293,9 +1369,10 @@ HTML_TEMPLATE = """
             document.body.removeChild(ta);
         }
 
-        function renderItem(info) {
+        function renderItem(info, inHistoryView = false) {
             const id = info.id;
             const isRunning = RUNNING_STATUSES.has(info.status);
+            const isPaused = info.status === 'paused';
             const isCancelled = info.status === 'cancelled';
             const isTerminal = TERMINAL_STATUSES.has(info.status);
             const isFinished = info.status === 'finished';
@@ -1305,6 +1382,7 @@ HTML_TEMPLATE = """
             else if (info.status === 'error') statusLabel = 'Error';
             else if (info.status === 'cancelled') statusLabel = 'Cancelled';
             else if (info.status === 'interrupted') statusLabel = 'Interrupted';
+            else if (isPaused) statusLabel = 'Paused';
             else statusLabel = info.progress;
 
             const safeUrl = escapeAttr(info.url);
@@ -1317,12 +1395,28 @@ HTML_TEMPLATE = """
 
             if (isRunning) {
                 primary = `<button class="stop-btn" onclick="stopDownload('${id}')"><svg class="icon"><use href="#i-stop"/></svg>Stop</button>`;
+            } else if (isPaused) {
+                // Where Stop normally lives, show Resume instead. The worker
+                // thread is still alive -- this just clears the pause flag.
+                primary = `<button class="continue-btn" onclick="unpauseDownload('${id}')"><svg class="icon"><use href="#i-play"/></svg>Resume</button>`;
             } else if (isCancelled || info.status === 'interrupted') {
                 primary = `<button class="continue-btn" onclick="continueDownload('${id}', '${safeUrl}')"><svg class="icon"><use href="#i-play"/></svg>Continue</button>`;
             }
 
             // Open URL in a new tab — available on every row.
             menuItems.push(`<button onclick="openUrl('${safeUrl}')"><svg class="menu-icon"><use href="#i-external"/></svg>Open URL</button>`);
+
+            if (isRunning) {
+                // Pause is offered only while the worker is actively
+                // transferring; once paused, the Resume action lives on the
+                // primary button instead.
+                menuItems.push(`<button onclick="pauseDownload('${id}')"><svg class="menu-icon"><use href="#i-pause"/></svg>Pause</button>`);
+            }
+
+            if (isPaused) {
+                // Paused rows can be cancelled outright via the kebab.
+                menuItems.push(`<button onclick="stopDownload('${id}')"><svg class="menu-icon"><use href="#i-stop"/></svg>Stop</button>`);
+            }
 
             if (isTerminal) {
                 // Reload only for non-finished terminal rows that don't already
@@ -1457,10 +1551,17 @@ HTML_TEMPLATE = """
             // URL + Status as meta rows (same visual treatment as File /
             // Quality / Size). Rendered above the `bottom` meta so the
             // identifying info leads the item.
-            const headMeta = `<div class="meta">
-                <div>${warn}<strong>URL:</strong> ${escapeHtml(info.url)}</div>
-                <div><strong>Status:</strong> ${info.status} (${statusLabel})</div>
-            </div>`;
+            //
+            // In the History tab we hide the URL line -- it's noisy on
+            // completed rows, and users can still grab it via the Copy URL
+            // entry in the kebab menu.
+            const urlLine = inHistoryView
+                ? (warn ? `<div>${warn}<strong>Status:</strong> ${info.status} (${statusLabel})</div>` : '')
+                : `<div>${warn}<strong>URL:</strong> ${escapeHtml(info.url)}</div>
+                   <div><strong>Status:</strong> ${info.status} (${statusLabel})</div>`;
+            const headMeta = inHistoryView
+                ? (warn ? `<div class="meta">${urlLine}</div>` : '')
+                : `<div class="meta">${urlLine}</div>`;
 
             return `
                 <div class="history-item" data-row-id="${id}">
@@ -1516,8 +1617,8 @@ HTML_TEMPLATE = """
                 const start = historyPage * HISTORY_PAGE_SIZE;
                 const pageItems = done.slice(start, start + HISTORY_PAGE_SIZE);
 
-                document.getElementById('activeList').innerHTML = active.map(renderItem).join('');
-                document.getElementById('historyList').innerHTML = pageItems.map(renderItem).join('');
+                document.getElementById('activeList').innerHTML = active.map(i => renderItem(i, false)).join('');
+                document.getElementById('historyList').innerHTML = pageItems.map(i => renderItem(i, true)).join('');
 
                 document.getElementById('currentEmpty').style.display = active.length ? 'none' : '';
                 document.getElementById('historyEmpty').style.display = done.length ? 'none' : '';
@@ -1797,10 +1898,37 @@ def stop_download(download_id):
     entry = db_get_download(download_id)
     if entry is None:
         return jsonify({"error": "Unknown download id"}), 404
-    if entry['status'] not in ('starting', 'downloading'):
+    # Stopping a paused download is also valid -- request_cancel() drops the
+    # pause flag so the worker wakes up and aborts cleanly.
+    if entry['status'] not in ('starting', 'downloading', 'paused'):
         return jsonify({"message": "Download is not active", "status": entry['status']}), 200
     request_cancel(download_id)
     return jsonify({"message": "Stop requested", "id": download_id})
+
+
+@app.route('/api/pause/<download_id>', methods=['POST'])
+def pause_download(download_id):
+    entry = db_get_download(download_id)
+    if entry is None:
+        return jsonify({"error": "Unknown download id"}), 404
+    if entry['status'] not in ('starting', 'downloading'):
+        return jsonify({"error": f"Cannot pause from status '{entry['status']}'"}), 409
+    request_pause(download_id)
+    return jsonify({"message": "Pause requested", "id": download_id})
+
+
+@app.route('/api/unpause/<download_id>', methods=['POST'])
+def unpause_download(download_id):
+    """Wake a paused worker. Distinct from /api/resume, which restarts the
+    worker thread for cancelled/interrupted rows -- here the worker is still
+    alive, so we just clear the flag and the progress_hook loop exits."""
+    entry = db_get_download(download_id)
+    if entry is None:
+        return jsonify({"error": "Unknown download id"}), 404
+    if entry['status'] != 'paused':
+        return jsonify({"error": f"Cannot unpause from status '{entry['status']}'"}), 409
+    clear_pause(download_id)
+    return jsonify({"message": "Unpaused", "id": download_id})
 
 
 @app.route('/api/remove/<download_id>', methods=['POST'])
@@ -1808,7 +1936,7 @@ def remove_download(download_id):
     entry = db_get_download(download_id)
     if entry is None:
         return jsonify({"error": "Unknown download id"}), 404
-    if entry['status'] in ('starting', 'downloading'):
+    if entry['status'] in ('starting', 'downloading', 'paused'):
         return jsonify({"error": "Cannot remove an active download. Stop it first."}), 409
     db_delete_download(download_id)
     return jsonify({"message": "Removed", "id": download_id})
@@ -1903,8 +2031,10 @@ def preferences():
 init_db()
 
 if __name__ == '__main__':
-    # debug=True triggers a reloader child process. init_db() runs in both
-    # parents and children, but it is idempotent so this is fine.
-    # threaded=True is required so the long-lived SSE connection on
-    # /api/events doesn't block other requests behind a single worker.
-    app.run(debug=True, port=5000, threaded=True)
+    # Configurable via env so the same image can be used in dev (debug on)
+    # and prod (debug off, bind 0.0.0.0). threaded=True is required so the
+    # long-lived SSE connection on /api/events doesn't block other requests.
+    host  = os.environ.get("HOST", "127.0.0.1")
+    port  = int(os.environ.get("PORT", "5000"))
+    debug = os.environ.get("FLASK_DEBUG", "1") == "1"
+    app.run(host=host, port=port, debug=debug, threaded=True)
