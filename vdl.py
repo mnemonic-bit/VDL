@@ -809,27 +809,40 @@ HTML_TEMPLATE = """
            to use the full row width; if the input + tick + cross don't fit,
            the input shrinks via `min-width: 0` rather than overflowing. */
         .rename-wrap { display: inline-flex; align-items: stretch; gap: 0; max-width: 100%; vertical-align: middle; }
-        .rename-display, .rename-input {
+        /* Display and input must be visually identical apart from the
+           background tint and the cursor: same font, same metrics, same
+           padding, same height. Both use border-box so border + padding
+           are folded into the declared height/width. */
+        /* Note: the `input[type="text"]` rule earlier in this stylesheet has
+           higher specificity than `.rename-input`, so we use the same
+           attribute selector here to override its padding. */
+        .rename-display, input[type="text"].rename-input {
             font-family: ui-monospace, Menlo, Consolas, monospace;
             font-size: 0.95em;
-            padding: 3px 8px;
+            padding: 0 8px;
             border: 1px solid var(--border);
             background: var(--surface-2);
             color: var(--fg);
             border-radius: 3px 0 0 3px;
-            line-height: 1.3;
+            height: 28px;
+            line-height: 26px; /* 28 - 2*1px border */
             box-sizing: border-box;
+            margin: 0;
+            vertical-align: middle;
         }
         .rename-display {
             user-select: none; -webkit-user-select: none; cursor: default;
             white-space: nowrap;
-            max-width: none;
+            display: inline-block;
         }
-        .rename-input {
+        input[type="text"].rename-input {
             background: var(--surface); outline: none;
+            -webkit-appearance: none; appearance: none;
             /* Allow shrinking inside the inline-flex container if the row
                doesn't have enough horizontal space for the value + both
-               buttons. The `size` attribute sets the preferred width. */
+               buttons. The pixel width is set inline by JS to match the
+               display box exactly so the tick button lands where the
+               pencil was. */
             min-width: 0;
             flex: 0 1 auto;
         }
@@ -1214,21 +1227,20 @@ HTML_TEMPLATE = """
         // Live element so we don't have to wait for the next SSE re-render
         // after toggling between modes.
 
-        // Map<id, draft string> -- rows currently in edit mode. Survives the
-        // re-renders triggered by SSE updates from other downloads, so the
-        // user doesn't lose their text.
+        // Map<id, { value: string, width: number }> -- rows currently in
+        // edit mode. Survives the re-renders triggered by SSE updates from
+        // other downloads, so the user doesn't lose their text or focus.
+        // `width` is the captured pixel width of the display box at the
+        // moment Edit was clicked, so the input renders at exactly that
+        // size and the tick button lands where the pencil was.
         const renameDrafts = new Map();
 
         function renderRenameControl(id, basename) {
             if (renameDrafts.has(id)) {
                 const draft = renameDrafts.get(id);
-                // `size` reserves enough character columns for the *original*
-                // basename. That makes the input visually match the display
-                // box width-wise; the wrap's max-width: 100% then prevents
-                // overflow if the row is too narrow.
-                const sizeAttr = Math.max(8, basename.length);
+                const widthStyle = draft.width ? `style="width:${draft.width}px"` : '';
                 return `<span class="rename-wrap" data-rename-id="${id}" data-mode="edit">
-                    <input class="rename-input" type="text" size="${sizeAttr}" value="${escapeAttr(draft)}" data-orig="${escapeAttr(basename)}" oninput="renameDrafts.set('${id}', this.value)" />
+                    <input class="rename-input" type="text" ${widthStyle} value="${escapeAttr(draft.value)}" data-orig="${escapeAttr(basename)}" oninput="renameOnInput('${id}', this.value)" />
                     <button class="rename-btn confirm" type="button" title="Save" aria-label="Save" onclick="renameCommit('${id}')">
                         <svg class="icon"><use href="#i-check"/></svg>
                     </button>
@@ -1244,6 +1256,13 @@ HTML_TEMPLATE = """
                     <svg class="icon"><use href="#i-pencil"/></svg>
                 </button>
             </span>`;
+        }
+
+        function renameOnInput(id, value) {
+            // Update the draft, preserving the captured width.
+            const cur = renameDrafts.get(id);
+            if (!cur) return;
+            cur.value = value;
         }
 
         // Re-bind the per-row keyboard shortcuts (Enter / Escape) after every
@@ -1267,7 +1286,12 @@ HTML_TEMPLATE = """
             if (!wrap) return;
             const disp = wrap.querySelector('.rename-display');
             const orig = disp ? disp.dataset.orig : '';
-            renameDrafts.set(id, orig);
+            // Capture the display box's exact rendered width so the input
+            // can be rendered at the same pixel width. This keeps the tick
+            // button at the same position the pencil button was at.
+            const dispRect = disp ? disp.getBoundingClientRect() : null;
+            const width = dispRect ? Math.round(dispRect.width) : 0;
+            renameDrafts.set(id, { value: orig, width });
             // Re-render via fetchHistory() so the markup reflects the draft
             // map. We then focus the new input and select its stem.
             fetchHistory().then(() => {
@@ -1290,7 +1314,11 @@ HTML_TEMPLATE = """
             if (!wrap) { renameDrafts.delete(id); return; }
             const input = wrap.querySelector('.rename-input');
             if (!input) { renameDrafts.delete(id); return; }
-            const newName = (input.value || '').trim();
+            // Prefer the live input value; fall back to the draft cache (if
+            // the user hits Enter while the input was momentarily detached).
+            const draft = renameDrafts.get(id);
+            const newName = ((input.value !== undefined ? input.value
+                : (draft && draft.value) || '') || '').trim();
             const orig = input.dataset.orig || '';
             if (!newName || newName === orig) {
                 renameDrafts.delete(id);
@@ -1803,9 +1831,44 @@ HTML_TEMPLATE = """
                 const start = historyPage * HISTORY_PAGE_SIZE;
                 const pageItems = done.slice(start, start + HISTORY_PAGE_SIZE);
 
+                // --- Focus preservation across the wholesale innerHTML
+                // rebuild. SSE fires fetchHistory on every server-side
+                // change (e.g. another row's progress tick). Without this
+                // block, the input the user is typing into gets replaced
+                // mid-keystroke and loses focus + caret position.
+                let focusRestore = null;
+                const ae = document.activeElement;
+                if (ae && ae.classList && ae.classList.contains('rename-input')) {
+                    const wrap = ae.closest('.rename-wrap');
+                    if (wrap && wrap.dataset.renameId) {
+                        focusRestore = {
+                            id: wrap.dataset.renameId,
+                            selStart: ae.selectionStart,
+                            selEnd: ae.selectionEnd,
+                            value: ae.value,
+                        };
+                        // Make sure the latest typed value is in the draft
+                        // map so re-render keeps it.
+                        const cur = renameDrafts.get(focusRestore.id);
+                        if (cur) cur.value = ae.value;
+                    }
+                }
+
                 document.getElementById('activeList').innerHTML = active.map(i => renderItem(i, false)).join('');
                 document.getElementById('historyList').innerHTML = pageItems.map(i => renderItem(i, true)).join('');
                 bindRenameInputs();
+
+                if (focusRestore) {
+                    const newInput = document.querySelector(
+                        `.rename-wrap[data-rename-id="${focusRestore.id}"] .rename-input`);
+                    if (newInput) {
+                        newInput.focus();
+                        try {
+                            newInput.setSelectionRange(
+                                focusRestore.selStart, focusRestore.selEnd);
+                        } catch (e) { /* selection ranges fail on some types */ }
+                    }
+                }
 
                 document.getElementById('currentEmpty').style.display = active.length ? 'none' : '';
                 document.getElementById('historyEmpty').style.display = done.length ? 'none' : '';
