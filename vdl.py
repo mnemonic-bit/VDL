@@ -797,6 +797,39 @@ HTML_TEMPLATE = """
         .meta { margin-top: 8px; font-size: 0.9em; color: var(--muted); }
         .meta div { margin-top: 2px; }
         .meta .filename { font-family: ui-monospace, Menlo, Consolas, monospace; word-break: break-all; }
+        /* Rename control: looks like a disabled text input plus an edit icon
+           button. The display element is intentionally non-interactive --
+           clicking it does NOT place a cursor; the user has to use the Edit
+           button to enter edit mode. */
+        .rename-wrap { display: inline-flex; align-items: stretch; gap: 0; max-width: 100%; vertical-align: middle; }
+        .rename-display, .rename-input {
+            font-family: ui-monospace, Menlo, Consolas, monospace;
+            font-size: 0.95em;
+            padding: 3px 8px;
+            border: 1px solid var(--border);
+            background: var(--surface-2);
+            color: var(--fg);
+            border-radius: 3px 0 0 3px;
+            min-width: 0; max-width: 380px;
+            line-height: 1.3;
+            word-break: break-all;
+        }
+        .rename-display { user-select: none; -webkit-user-select: none; cursor: default; }
+        .rename-input { background: var(--surface); outline: none; }
+        .rename-input:focus { border-color: var(--accent, #1f8a3b); }
+        .rename-btn {
+            display: inline-flex; align-items: center; justify-content: center;
+            width: 28px; height: 28px;
+            padding: 0;
+            background: var(--surface-3); color: var(--fg);
+            border: 1px solid var(--border); border-left: none;
+            cursor: pointer;
+        }
+        .rename-btn:hover { background: var(--border); }
+        .rename-btn:last-child { border-radius: 0 3px 3px 0; }
+        .rename-btn .icon { width: 14px; height: 14px; display: block; }
+        .rename-btn.confirm { color: #1f8a3b; }
+        .rename-btn.cancel { color: #c0392b; }
         .speed { margin-top: 6px; font-size: 0.9em; color: var(--muted); }
         /* Kebab menu */
         .menu-wrap { position: relative; }
@@ -1010,6 +1043,15 @@ HTML_TEMPLATE = """
                     <rect x="9.4" y="3.5" width="2.6" height="9" rx="0.5"/>
                 </g>
             </symbol>
+            <symbol id="i-pencil" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round">
+                    <path d="M11.5 2.5l2 2-7.5 7.5-2.5.5.5-2.5z"/>
+                    <path d="M10 4l2 2"/>
+                </g>
+            </symbol>
+            <symbol id="i-check" viewBox="0 0 16 16">
+                <path d="M3.5 8.5l3 3 6-6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+            </symbol>
             <symbol id="i-x" viewBox="0 0 16 16">
                 <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
                     <path d="M4 4l8 8"/><path d="M12 4l-8 8"/>
@@ -1143,6 +1185,116 @@ HTML_TEMPLATE = """
         function stopDownload(id) {
             fetch('/api/stop/' + encodeURIComponent(id), { method: 'POST' })
                 .then(() => fetchHistory());
+        }
+
+        // ----- Rename control --------------------------------------------
+        // The display state shows a non-editable, input-styled box with an
+        // Edit (pencil) button on the right. The edit state replaces it
+        // with a real <input> plus tick (confirm) and cross (cancel).
+        // Live element so we don't have to wait for the next SSE re-render
+        // after toggling between modes.
+
+        // Map<id, draft string> -- rows currently in edit mode. Survives the
+        // re-renders triggered by SSE updates from other downloads, so the
+        // user doesn't lose their text.
+        const renameDrafts = new Map();
+
+        function renderRenameControl(id, basename) {
+            if (renameDrafts.has(id)) {
+                const draft = renameDrafts.get(id);
+                return `<span class="rename-wrap" data-rename-id="${id}" data-mode="edit">
+                    <input class="rename-input" type="text" value="${escapeAttr(draft)}" data-orig="${escapeAttr(basename)}" oninput="renameDrafts.set('${id}', this.value)" />
+                    <button class="rename-btn confirm" type="button" title="Save" aria-label="Save" onclick="renameCommit('${id}')">
+                        <svg class="icon"><use href="#i-check"/></svg>
+                    </button>
+                    <button class="rename-btn cancel" type="button" title="Cancel" aria-label="Cancel" onclick="renameCancel('${id}')">
+                        <svg class="icon"><use href="#i-x"/></svg>
+                    </button>
+                </span>`;
+            }
+            // Display mode: input-styled, non-editable box plus Edit pencil.
+            return `<span class="rename-wrap" data-rename-id="${id}" data-mode="display">
+                <span class="rename-display" data-orig="${escapeAttr(basename)}">${escapeHtml(basename)}</span>
+                <button class="rename-btn" type="button" title="Edit name" aria-label="Edit name" onclick="renameStart('${id}')">
+                    <svg class="icon"><use href="#i-pencil"/></svg>
+                </button>
+            </span>`;
+        }
+
+        // Re-bind the per-row keyboard shortcuts (Enter / Escape) after every
+        // re-render. Called from fetchHistory() once both lists are written.
+        function bindRenameInputs() {
+            document.querySelectorAll('.rename-wrap[data-mode="edit"] .rename-input').forEach((input) => {
+                if (input.dataset.bound === '1') return;
+                input.dataset.bound = '1';
+                const wrap = input.closest('.rename-wrap');
+                const id = wrap && wrap.dataset.renameId;
+                if (!id) return;
+                input.addEventListener('keydown', (ev) => {
+                    if (ev.key === 'Enter') { ev.preventDefault(); renameCommit(id); }
+                    else if (ev.key === 'Escape') { ev.preventDefault(); renameCancel(id); }
+                });
+            });
+        }
+
+        function renameStart(id) {
+            const wrap = document.querySelector(`.rename-wrap[data-rename-id="${id}"]`);
+            if (!wrap) return;
+            const disp = wrap.querySelector('.rename-display');
+            const orig = disp ? disp.dataset.orig : '';
+            renameDrafts.set(id, orig);
+            // Re-render via fetchHistory() so the markup reflects the draft
+            // map. We then focus the new input and select its stem.
+            fetchHistory().then(() => {
+                const input = document.querySelector(`.rename-wrap[data-rename-id="${id}"] .rename-input`);
+                if (!input) return;
+                input.focus();
+                const dot = orig.lastIndexOf('.');
+                if (dot > 0) input.setSelectionRange(0, dot);
+                else input.select();
+            });
+        }
+
+        function renameCancel(id) {
+            renameDrafts.delete(id);
+            fetchHistory();
+        }
+
+        function renameCommit(id) {
+            const wrap = document.querySelector(`.rename-wrap[data-rename-id="${id}"]`);
+            if (!wrap) { renameDrafts.delete(id); return; }
+            const input = wrap.querySelector('.rename-input');
+            if (!input) { renameDrafts.delete(id); return; }
+            const newName = (input.value || '').trim();
+            const orig = input.dataset.orig || '';
+            if (!newName || newName === orig) {
+                renameDrafts.delete(id);
+                fetchHistory();
+                return;
+            }
+            // Disable controls while in flight so a user can't double-submit.
+            input.disabled = true;
+            wrap.querySelectorAll('button').forEach(b => b.disabled = true);
+            fetch('/api/rename/' + encodeURIComponent(id), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ filename: newName }),
+            }).then(async (r) => {
+                if (!r.ok) {
+                    const data = await r.json().catch(() => ({}));
+                    alert('Rename failed: ' + (data.error || r.statusText));
+                    // Keep the draft so the user can fix it; just re-enable.
+                    input.disabled = false;
+                    wrap.querySelectorAll('button').forEach(b => b.disabled = false);
+                    return;
+                }
+                renameDrafts.delete(id);
+                fetchHistory();
+            }).catch((err) => {
+                alert('Rename failed: ' + err);
+                input.disabled = false;
+                wrap.querySelectorAll('button').forEach(b => b.disabled = false);
+            });
         }
 
         function pauseDownload(id) {
@@ -1492,7 +1644,16 @@ HTML_TEMPLATE = """
                 const meta = [];
                 if (info.filename) {
                     const base = info.filename.split('/').pop().split('\\\\').pop();
-                    meta.push(`<div><strong>File:</strong> <span class="filename">${base}</span></div>`);
+                    if (isFinished) {
+                        // Editable display for finished rows. The display
+                        // element looks like a disabled input but is not
+                        // focusable, so a mouse click won't place a cursor;
+                        // the user has to hit the Edit (pencil) button to
+                        // switch into edit mode.
+                        meta.push(`<div><strong>File:</strong> ${renderRenameControl(id, base)}</div>`);
+                    } else {
+                        meta.push(`<div><strong>File:</strong> <span class="filename">${escapeHtml(base)}</span></div>`);
+                    }
                 }
                 if (info.resolution) meta.push(`<div><strong>Quality:</strong> ${info.resolution}</div>`);
                 const sizeStr = formatBytes(info.filesize);
@@ -1600,9 +1761,9 @@ HTML_TEMPLATE = """
             // Skip the re-render while a kebab menu is open so the click isn't
             // swallowed by DOM replacement. The next tick after the menu closes
             // picks up the latest data.
-            if (openMenuId !== null) return;
+            if (openMenuId !== null) return Promise.resolve();
 
-            fetch('/api/history')
+            return fetch('/api/history')
             .then(res => res.json())
             .then(data => {
                 // Newest first.
@@ -1619,6 +1780,7 @@ HTML_TEMPLATE = """
 
                 document.getElementById('activeList').innerHTML = active.map(i => renderItem(i, false)).join('');
                 document.getElementById('historyList').innerHTML = pageItems.map(i => renderItem(i, true)).join('');
+                bindRenameInputs();
 
                 document.getElementById('currentEmpty').style.display = active.length ? 'none' : '';
                 document.getElementById('historyEmpty').style.display = done.length ? 'none' : '';
@@ -1929,6 +2091,63 @@ def unpause_download(download_id):
         return jsonify({"error": f"Cannot unpause from status '{entry['status']}'"}), 409
     clear_pause(download_id)
     return jsonify({"message": "Unpaused", "id": download_id})
+
+
+@app.route('/api/rename/<download_id>', methods=['POST'])
+def rename_download(download_id):
+    """Rename the file for a finished download. Body: {"filename": "new"}.
+
+    The user only edits the basename -- the file stays in its original
+    directory (so playback and the path-traversal guard keep working). The
+    extension is preserved automatically: if the user typed a basename
+    without (or with a different) extension we re-append the original one.
+    """
+    entry = db_get_download(download_id)
+    if entry is None:
+        return jsonify({"error": "Unknown download id"}), 404
+    if entry.get('status') != 'finished':
+        return jsonify({"error": "Only finished downloads can be renamed"}), 409
+    old_path = entry.get('filename')
+    if not old_path or not os.path.isfile(old_path):
+        return jsonify({"error": "Original file is missing on disk"}), 410
+
+    payload = request.get_json(silent=True) or {}
+    new_name = (payload.get('filename') or '').strip()
+    if not new_name:
+        return jsonify({"error": "Filename must not be empty"}), 400
+    # Reject anything that tries to escape the current directory or smuggle
+    # control bytes. We accept only a bare basename.
+    if ('/' in new_name or '\\' in new_name or '\x00' in new_name
+            or new_name in ('.', '..')):
+        return jsonify({"error": "Filename must not contain path separators"}), 400
+
+    directory = os.path.dirname(old_path) or '.'
+    _, old_ext = os.path.splitext(old_path)
+    # Preserve the original extension. If the user typed their own (matching
+    # or different) we still force the original one back -- the file's
+    # bytes haven't changed, so the extension shouldn't either.
+    new_base, _typed_ext = os.path.splitext(new_name)
+    if not new_base:
+        return jsonify({"error": "Filename must not be empty"}), 400
+    final_name = new_base + old_ext
+    new_path = os.path.join(directory, final_name)
+
+    # No-op if the user submitted the same name.
+    if os.path.realpath(new_path) == os.path.realpath(old_path):
+        return jsonify({"message": "Unchanged", "id": download_id,
+                        "filename": old_path})
+
+    if os.path.exists(new_path):
+        return jsonify({"error": "A file with that name already exists"}), 409
+
+    try:
+        os.rename(old_path, new_path)
+    except OSError as exc:
+        return jsonify({"error": f"Rename failed: {exc}"}), 500
+
+    db_update_download(download_id, filename=new_path)
+    return jsonify({"message": "Renamed", "id": download_id,
+                    "filename": new_path})
 
 
 @app.route('/api/remove/<download_id>', methods=['POST'])

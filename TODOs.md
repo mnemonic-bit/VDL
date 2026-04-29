@@ -18,3 +18,10 @@
 * [DONE] add a configuration section for the download helper
 ** [DONE] dark-mode
 ** [DONE] save history
+
+
+## Components to Install in Docker
+
+* ffmpeg
+* Python yt-dlp, flask
+* vlc (this might be important due to codecs that ship with VLC, but its unclear at the moment if this only seemed to have helped on my MacOS)
