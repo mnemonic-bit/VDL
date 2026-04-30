@@ -9,6 +9,7 @@ import os
 import re
 import time
 import subprocess
+import mimetypes
 from contextlib import contextmanager
 
 app = Flask(__name__)
@@ -1917,6 +1918,7 @@ HTML_TEMPLATE = """
             const video = document.getElementById('playerVideo');
             document.getElementById('playerTitle').textContent = label || '';
             video.src = url;
+            video.load();
             document.getElementById('playerBackdrop').classList.add('open');
         }
 
@@ -2341,7 +2343,10 @@ def stream_file(download_id):
         for base in allowed_bases
     ):
         abort(403)
-    return send_file(real, conditional=True)
+    # Explicitly detect and provide MIME type for better browser compatibility,
+    # especially on Firefox. Defaults to 'application/octet-stream' if unknown.
+    mimetype, _ = mimetypes.guess_type(real)
+    return send_file(real, mimetype=mimetype, conditional=True)
 
 
 @app.route('/api/preferences', methods=['GET', 'POST'])
