@@ -1273,6 +1273,7 @@ HTML_TEMPLATE = """
         // ----- Options panel (probe video for available formats) -----------
         let probeTimeout;
         const urlInput = document.getElementById('urlInput');
+        const optionsDetails = document.querySelector('#optionsContainer details');
         
         urlInput.addEventListener('input', () => {
             clearTimeout(probeTimeout);
@@ -1281,12 +1282,32 @@ HTML_TEMPLATE = """
                 resetOptions();
                 return;
             }
+            if (optionsDetails) {
+                optionsDetails.open = true;
+            }
             // Debounce the probe request
             probeTimeout = setTimeout(() => probeVideoUrl(url), 500);
+        });
+
+        urlInput.addEventListener('paste', () => {
+            setTimeout(() => {
+                const url = urlInput.value.trim();
+                if (!url) {
+                    resetOptions();
+                    return;
+                }
+                if (optionsDetails) {
+                    optionsDetails.open = true;
+                }
+                probeVideoUrl(url);
+            }, 0);
         });
         
         function probeVideoUrl(url) {
             const qualityDiv = document.getElementById('optionsQuality');
+            if (optionsDetails) {
+                optionsDetails.open = true;
+            }
             qualityDiv.innerHTML = '<div class="options-loading">Loading available qualities...</div>';
             
             fetch('/api/probe', {
