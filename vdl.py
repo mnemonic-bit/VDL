@@ -777,11 +777,9 @@ HTML_TEMPLATE = """
         .options-row { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
         .options-row label { width: 120px; flex-shrink: 0; color: var(--muted); font-size: 0.95em; }
         .options-row select, .options-row input[type="text"] { flex: 1; }
-        .quality-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); gap: 8px; margin-top: 8px; }
-        .quality-btn { padding: 8px 12px; border: 1px solid var(--border); background: var(--surface-2); color: var(--fg); border-radius: 4px; cursor: pointer; font-size: 0.9em; transition: all 0.15s; }
-        .quality-btn:hover { background: var(--surface-hover); }
-        .quality-btn.selected { background: var(--accent); color: white; border-color: var(--accent); }
+        .options-select { width: 100%; max-width: 420px; padding: 10px; border-radius: 4px; border: 1px solid var(--border); background: var(--surface); color: var(--fg); }
         .options-loading { color: var(--muted); font-size: 0.9em; font-style: italic; }
+        .options-error { color: var(--error-fg); background: var(--error-bg); padding: 8px; border-radius: 3px; font-size: 0.9em; border: 1px solid var(--error-border); }
         .options-error { color: var(--error-fg); background: var(--error-bg); padding: 8px; border-radius: 3px; font-size: 0.9em; border: 1px solid var(--error-border); }
         input[type="text"], input[type="number"], select, textarea {
             background: var(--surface); color: var(--fg); border: 1px solid var(--border); border-radius: 4px;
@@ -1140,14 +1138,17 @@ HTML_TEMPLATE = """
             </summary>
             <div class="options-content">
                 <div class="options-row">
-                    <label>Quality</label>
-                    <div id="optionsQuality" style="flex: 1;">
-                        <div class="options-loading">Select a URL to see available qualities</div>
+                    <label for="optionsQualitySelect">Quality</label>
+                    <div style="flex: 1; display: flex; flex-direction: column; gap: 8px;">
+                        <select id="optionsQualitySelect" class="options-select" disabled>
+                            <option value="">Use default preference</option>
+                        </select>
+                        <div id="optionsQualityStatus" class="options-loading">Select a URL to see available qualities</div>
                     </div>
                 </div>
                 <div class="options-row">
-                    <label>Title/Filename</label>
-                    <input type="text" id="optionsFilename" placeholder="Will be auto-filled from video title">
+                    <label for="optionsFilename">Title/Filename</label>
+                    <input type="text" id="optionsFilename" placeholder="Will be auto-filled from video title" style="flex: 1;">
                 </div>
             </div>
         </details>
@@ -1249,7 +1250,7 @@ HTML_TEMPLATE = """
             if (event) event.preventDefault();
             const url = document.getElementById('urlInput').value;
             if (!url) return alert('Please enter a URL');
-            const selectedQuality = document.querySelector('.quality-btn.selected');
+            const selectedFormat = document.getElementById('optionsQualitySelect').value;
             const customFilename = document.getElementById('optionsFilename').value;
             
             fetch('/api/download', {
@@ -1257,7 +1258,7 @@ HTML_TEMPLATE = """
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     url: url,
-                    format: selectedQuality ? selectedQuality.dataset.format : undefined,
+                    format: selectedFormat || undefined,
                     filename: customFilename || undefined
                 })
             })
@@ -1265,7 +1266,9 @@ HTML_TEMPLATE = """
             .then(() => {
                 document.getElementById('urlInput').value = '';
                 document.getElementById('optionsFilename').value = '';
-                document.querySelectorAll('.quality-btn').forEach(btn => btn.classList.remove('selected'));
+                const select = document.getElementById('optionsQualitySelect');
+                select.selectedIndex = 0;
+                resetOptions();
                 fetchHistory();
             });
         }
@@ -1290,6 +1293,7 @@ HTML_TEMPLATE = """
         });
 
         urlInput.addEventListener('paste', () => {
+            clearTimeout(probeTimeout);
             setTimeout(() => {
                 const url = urlInput.value.trim();
                 if (!url) {
@@ -1299,16 +1303,21 @@ HTML_TEMPLATE = """
                 if (optionsDetails) {
                     optionsDetails.open = true;
                 }
-                probeVideoUrl(url);
+                // Debounce the probe request
+                probeTimeout = setTimeout(() => probeVideoUrl(url), 500);
             }, 0);
         });
         
         function probeVideoUrl(url) {
-            const qualityDiv = document.getElementById('optionsQuality');
+            const select = document.getElementById('optionsQualitySelect');
+            const status = document.getElementById('optionsQualityStatus');
             if (optionsDetails) {
                 optionsDetails.open = true;
             }
-            qualityDiv.innerHTML = '<div class="options-loading">Loading available qualities...</div>';
+            select.disabled = true;
+            select.innerHTML = '<option value="">Use default preference</option>';
+            status.textContent = 'Loading available qualities...';
+            status.className = 'options-loading';
             
             fetch('/api/probe', {
                 method: 'POST',
@@ -1318,7 +1327,13 @@ HTML_TEMPLATE = """
             .then(res => res.json())
             .then(data => {
                 if (data.error) {
-                    qualityDiv.innerHTML = `<div class="options-error">Error: ${escapeHtml(data.error)}</div>`;
+                    select.disabled = true;
+                    const errorOption = document.createElement('option');
+                    errorOption.value = '';
+                    errorOption.textContent = 'Probe failed';
+                    select.appendChild(errorOption);
+                    status.textContent = `Error: ${data.error}`;
+                    status.className = 'options-error';
                     return;
                 }
                 
@@ -1327,37 +1342,43 @@ HTML_TEMPLATE = """
                     document.getElementById('optionsFilename').placeholder = `Will be auto-filled: ${escapeHtml(data.title)}`;
                 }
                 
-                // Display quality buttons
                 if (data.resolutions && data.resolutions.length > 0) {
-                    let html = '<div class="quality-list">';
                     data.resolutions.forEach(res => {
-                        // Generate yt-dlp format selector for this resolution
                         const height = parseInt(res);
                         const formatSelector = `bestvideo[height<=${height}]+bestaudio/best`;
-                        html += `<button type="button" class="quality-btn" data-format="${escapeAttr(formatSelector)}">${escapeHtml(res)}</button>`;
+                        const option = document.createElement('option');
+                        option.value = formatSelector;
+                        option.textContent = res;
+                        select.appendChild(option);
                     });
-                    html += '</div>';
-                    qualityDiv.innerHTML = html;
-                    
-                    // Add click handlers to quality buttons
-                    qualityDiv.querySelectorAll('.quality-btn').forEach(btn => {
-                        btn.addEventListener('click', (e) => {
-                            e.preventDefault();
-                            qualityDiv.querySelectorAll('.quality-btn').forEach(b => b.classList.remove('selected'));
-                            btn.classList.add('selected');
-                        });
-                    });
+                    select.disabled = false;
+                    status.textContent = 'Select a quality or use default preference';
+                    status.className = 'options-loading';
                 } else {
-                    qualityDiv.innerHTML = '<div class="options-loading">No video formats detected</div>';
+                    const option = document.createElement('option');
+                    option.value = '';
+                    option.textContent = 'No video formats detected';
+                    select.appendChild(option);
+                    select.disabled = true;
+                    status.textContent = 'No video formats detected';
+                    status.className = 'options-error';
                 }
             })
             .catch(err => {
-                qualityDiv.innerHTML = `<div class="options-error">Probe failed: ${escapeHtml(err.message)}</div>`;
+                select.disabled = true;
+                select.innerHTML = '<option value="">Use default preference</option>';
+                status.textContent = `Probe failed: ${escapeHtml(err.message)}`;
+                status.className = 'options-error';
             });
         }
         
         function resetOptions() {
-            document.getElementById('optionsQuality').innerHTML = '<div class="options-loading">Select a URL to see available qualities</div>';
+            const select = document.getElementById('optionsQualitySelect');
+            const status = document.getElementById('optionsQualityStatus');
+            select.innerHTML = '<option value="">Use default preference</option>';
+            select.disabled = true;
+            status.textContent = 'Select a URL to see available qualities';
+            status.className = 'options-loading';
             document.getElementById('optionsFilename').value = '';
             document.getElementById('optionsFilename').placeholder = 'Will be auto-filled from video title';
         }
