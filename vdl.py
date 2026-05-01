@@ -1147,6 +1147,12 @@ HTML_TEMPLATE = """
                     </div>
                 </div>
                 <div class="options-row">
+                    <label for="optionsFormatSelect">Container Format</label>
+                    <select id="optionsFormatSelect" class="options-select" disabled>
+                        <option value="">Use best available</option>
+                    </select>
+                </div>
+                <div class="options-row">
                     <label for="optionsFilename">Title/Filename</label>
                     <input type="text" id="optionsFilename" placeholder="Will be auto-filled from video title" style="flex: 1;">
                 </div>
@@ -1250,7 +1256,17 @@ HTML_TEMPLATE = """
             if (event) event.preventDefault();
             const url = document.getElementById('urlInput').value;
             if (!url) return alert('Please enter a URL');
-            const selectedFormat = document.getElementById('optionsQualitySelect').value;
+            const selectedQuality = document.getElementById('optionsQualitySelect').value;
+            const selectedFormat = document.getElementById('optionsFormatSelect').value;
+            
+            // Combine quality and format preferences into a single format selector
+            let finalFormat = selectedQuality;
+            if (finalFormat && selectedFormat) {
+                // Insert the format preference into the quality selector
+                finalFormat = finalFormat
+                    .replace('bestvideo', `bestvideo[ext=${selectedFormat}]`)
+                    .replace('bestaudio', `bestaudio[ext=${selectedFormat}]`);
+            }
             const customFilename = document.getElementById('optionsFilename').value;
             
             fetch('/api/download', {
@@ -1258,7 +1274,7 @@ HTML_TEMPLATE = """
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     url: url,
-                    format: selectedFormat || undefined,
+                    format: finalFormat || undefined,
                     filename: customFilename || undefined
                 })
             })
@@ -1266,8 +1282,10 @@ HTML_TEMPLATE = """
             .then(() => {
                 document.getElementById('urlInput').value = '';
                 document.getElementById('optionsFilename').value = '';
-                const select = document.getElementById('optionsQualitySelect');
-                select.selectedIndex = 0;
+                const selectQuality = document.getElementById('optionsQualitySelect');
+                const selectFormat = document.getElementById('optionsFormatSelect');
+                selectQuality.selectedIndex = 0;
+                selectFormat.selectedIndex = 0;
                 resetOptions();
                 fetchHistory();
             });
@@ -1309,13 +1327,16 @@ HTML_TEMPLATE = """
         });
         
         function probeVideoUrl(url) {
-            const select = document.getElementById('optionsQualitySelect');
+            const selectQuality = document.getElementById('optionsQualitySelect');
+            const selectFormat = document.getElementById('optionsFormatSelect');
             const status = document.getElementById('optionsQualityStatus');
             if (optionsDetails) {
                 optionsDetails.open = true;
             }
-            select.disabled = true;
-            select.innerHTML = '<option value="">Use default preference</option>';
+            selectQuality.disabled = true;
+            selectFormat.disabled = true;
+            selectQuality.innerHTML = '<option value="">Use default preference</option>';
+            selectFormat.innerHTML = '<option value="">Use best available</option>';
             status.textContent = 'Loading available qualities...';
             status.className = 'options-loading';
             
@@ -1327,11 +1348,12 @@ HTML_TEMPLATE = """
             .then(res => res.json())
             .then(data => {
                 if (data.error) {
-                    select.disabled = true;
+                    selectQuality.disabled = true;
+                    selectFormat.disabled = true;
                     const errorOption = document.createElement('option');
                     errorOption.value = '';
                     errorOption.textContent = 'Probe failed';
-                    select.appendChild(errorOption);
+                    selectQuality.appendChild(errorOption);
                     status.textContent = `Error: ${data.error}`;
                     status.className = 'options-error';
                     return;
@@ -1342,6 +1364,17 @@ HTML_TEMPLATE = """
                     document.getElementById('optionsFilename').placeholder = `Will be auto-filled: ${escapeHtml(data.title)}`;
                 }
                 
+                // Populate container format selector
+                if (data.containers && data.containers.length > 0) {
+                    data.containers.forEach(ext => {
+                        const option = document.createElement('option');
+                        option.value = ext;
+                        option.textContent = ext.toUpperCase();
+                        selectFormat.appendChild(option);
+                    });
+                    selectFormat.disabled = false;
+                }
+                
                 if (data.resolutions && data.resolutions.length > 0) {
                     data.resolutions.forEach(res => {
                         const height = parseInt(res);
@@ -1349,17 +1382,17 @@ HTML_TEMPLATE = """
                         const option = document.createElement('option');
                         option.value = formatSelector;
                         option.textContent = res;
-                        select.appendChild(option);
+                        selectQuality.appendChild(option);
                     });
-                    select.disabled = false;
-                    status.textContent = 'Select a quality or use default preference';
+                    selectQuality.disabled = false;
+                    status.textContent = 'Select quality and format or use defaults';
                     status.className = 'options-loading';
                 } else {
                     const option = document.createElement('option');
                     option.value = '';
                     option.textContent = 'No video formats detected';
-                    select.appendChild(option);
-                    select.disabled = true;
+                    selectQuality.appendChild(option);
+                    selectQuality.disabled = true;
                     status.textContent = 'No video formats detected';
                     status.className = 'options-error';
                 }
@@ -1373,10 +1406,13 @@ HTML_TEMPLATE = """
         }
         
         function resetOptions() {
-            const select = document.getElementById('optionsQualitySelect');
+            const selectQuality = document.getElementById('optionsQualitySelect');
+            const selectFormat = document.getElementById('optionsFormatSelect');
             const status = document.getElementById('optionsQualityStatus');
-            select.innerHTML = '<option value="">Use default preference</option>';
-            select.disabled = true;
+            selectQuality.innerHTML = '<option value="">Use default preference</option>';
+            selectQuality.disabled = true;
+            selectFormat.innerHTML = '<option value="">Use best available</option>';
+            selectFormat.disabled = true;
             status.textContent = 'Select a URL to see available qualities';
             status.className = 'options-loading';
             document.getElementById('optionsFilename').value = '';
@@ -2338,10 +2374,24 @@ def probe_url():
         
         resolutions_list.sort(key=get_height, reverse=True)
 
+        # Collect unique container formats (extensions)
+        formats_set = set()
+        if formats_summary:
+            for fmt in formats_summary:
+                ext = fmt.get('ext')
+                if ext:
+                    formats_set.add(ext)
+        
+        # Order common formats first
+        common_order = ['mp4', 'webm', 'mkv', 'm4a', 'aac', 'opus']
+        formats_list = [f for f in common_order if f in formats_set]
+        formats_list.extend(sorted(formats_set - set(common_order)))
+
         return jsonify({
             "title": title,
             "resolutions": resolutions_list,
-            "formats": formats_summary
+            "formats": formats_summary,
+            "containers": formats_list
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 400
