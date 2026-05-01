@@ -511,7 +511,11 @@ def _is_format_unavailable_error(exc):
 def background_download(url, download_id):
     prefs = db_get_preferences()
     output_dir = prefs.get("download_dir", ".")
-    fmt = prefs.get("format", "best")
+    
+    # Check if there's a format override from quality selection; otherwise use preference
+    entry = db_get_download(download_id)
+    fmt = (entry.get('requested_format') if entry else None) or prefs.get("format", "best")
+    
     os.makedirs(output_dir, exist_ok=True)
 
     def build_opts(format_selector):
@@ -761,6 +765,24 @@ HTML_TEMPLATE = """
            seam reads as one control. */
         .form-group:focus-within input[type="url"],
         .form-group:focus-within button[type="submit"] { border-color: var(--muted); }
+        /* Options section: collapsible panel below the download form */
+        #optionsContainer { margin-bottom: 20px; }
+        .options-panel { border: 1px solid var(--border); background: var(--surface); border-radius: 4px; }
+        .options-summary { display: flex; align-items: center; padding: 12px 15px; cursor: pointer; user-select: none; list-style: none; }
+        .options-summary::before { content: '▶'; display: inline-block; margin-right: 8px; font-size: 0.8em; transition: transform 0.15s; }
+        details[open] > .options-summary::before { transform: rotate(90deg); }
+        .options-summary .chev { width: 14px; height: 14px; transition: transform 0.15s; color: var(--muted); flex-shrink: 0; margin-right: 6px; }
+        details[open] > .options-summary .chev { transform: rotate(-180deg); }
+        .options-content { padding: 15px; border-top: 1px solid var(--border-soft); }
+        .options-row { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+        .options-row label { width: 120px; flex-shrink: 0; color: var(--muted); font-size: 0.95em; }
+        .options-row select, .options-row input[type="text"] { flex: 1; }
+        .quality-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); gap: 8px; margin-top: 8px; }
+        .quality-btn { padding: 8px 12px; border: 1px solid var(--border); background: var(--surface-2); color: var(--fg); border-radius: 4px; cursor: pointer; font-size: 0.9em; transition: all 0.15s; }
+        .quality-btn:hover { background: var(--surface-hover); }
+        .quality-btn.selected { background: var(--accent); color: white; border-color: var(--accent); }
+        .options-loading { color: var(--muted); font-size: 0.9em; font-style: italic; }
+        .options-error { color: var(--error-fg); background: var(--error-bg); padding: 8px; border-radius: 3px; font-size: 0.9em; border: 1px solid var(--error-border); }
         input[type="text"], input[type="number"], select, textarea {
             background: var(--surface); color: var(--fg); border: 1px solid var(--border); border-radius: 4px;
         }
@@ -1108,6 +1130,29 @@ HTML_TEMPLATE = """
         <button type="submit"><svg class="btn-icon"><use href="#i-download"/></svg><span>Download</span></button>
     </form>
 
+    <div id="optionsContainer">
+        <details class="options-panel">
+            <summary class="options-summary">
+                <svg class="chev" viewBox="0 0 16 16" width="16" height="16">
+                    <path fill="currentColor" d="M8 12.3L1 5.5l1.4-1.4L8 9.5l5.6-5.4L15 5.5z"/>
+                </svg>
+                Download Options
+            </summary>
+            <div class="options-content">
+                <div class="options-row">
+                    <label>Quality</label>
+                    <div id="optionsQuality" style="flex: 1;">
+                        <div class="options-loading">Select a URL to see available qualities</div>
+                    </div>
+                </div>
+                <div class="options-row">
+                    <label>Title/Filename</label>
+                    <input type="text" id="optionsFilename" placeholder="Will be auto-filled from video title">
+                </div>
+            </div>
+        </details>
+    </div>
+
     <div class="tabs" role="tablist">
         <button class="tab active" data-tab="current" onclick="switchTab('current')">Current<span id="currentBadge" class="badge" style="display: none;">0</span></button>
         <button class="tab" data-tab="history" onclick="switchTab('history')">Download History</button>
@@ -1204,16 +1249,96 @@ HTML_TEMPLATE = """
             if (event) event.preventDefault();
             const url = document.getElementById('urlInput').value;
             if (!url) return alert('Please enter a URL');
+            const selectedQuality = document.querySelector('.quality-btn.selected');
+            const customFilename = document.getElementById('optionsFilename').value;
+            
             fetch('/api/download', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    url: url,
+                    format: selectedQuality ? selectedQuality.dataset.format : undefined,
+                    filename: customFilename || undefined
+                })
+            })
+            .then(res => res.json())
+            .then(() => {
+                document.getElementById('urlInput').value = '';
+                document.getElementById('optionsFilename').value = '';
+                document.querySelectorAll('.quality-btn').forEach(btn => btn.classList.remove('selected'));
+                fetchHistory();
+            });
+        }
+
+        // ----- Options panel (probe video for available formats) -----------
+        let probeTimeout;
+        const urlInput = document.getElementById('urlInput');
+        
+        urlInput.addEventListener('input', () => {
+            clearTimeout(probeTimeout);
+            const url = urlInput.value.trim();
+            if (!url) {
+                resetOptions();
+                return;
+            }
+            // Debounce the probe request
+            probeTimeout = setTimeout(() => probeVideoUrl(url), 500);
+        });
+        
+        function probeVideoUrl(url) {
+            const qualityDiv = document.getElementById('optionsQuality');
+            qualityDiv.innerHTML = '<div class="options-loading">Loading available qualities...</div>';
+            
+            fetch('/api/probe', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ url: url })
             })
             .then(res => res.json())
-            .then(() => {
-                document.getElementById('urlInput').value = '';
-                fetchHistory();
+            .then(data => {
+                if (data.error) {
+                    qualityDiv.innerHTML = `<div class="options-error">Error: ${escapeHtml(data.error)}</div>`;
+                    return;
+                }
+                
+                // Update filename if available
+                if (data.title) {
+                    document.getElementById('optionsFilename').placeholder = `Will be auto-filled: ${escapeHtml(data.title)}`;
+                }
+                
+                // Display quality buttons
+                if (data.resolutions && data.resolutions.length > 0) {
+                    let html = '<div class="quality-list">';
+                    data.resolutions.forEach(res => {
+                        // Generate yt-dlp format selector for this resolution
+                        const height = parseInt(res);
+                        const formatSelector = `bestvideo[height<=${height}]+bestaudio/best`;
+                        html += `<button type="button" class="quality-btn" data-format="${escapeAttr(formatSelector)}">${escapeHtml(res)}</button>`;
+                    });
+                    html += '</div>';
+                    qualityDiv.innerHTML = html;
+                    
+                    // Add click handlers to quality buttons
+                    qualityDiv.querySelectorAll('.quality-btn').forEach(btn => {
+                        btn.addEventListener('click', (e) => {
+                            e.preventDefault();
+                            qualityDiv.querySelectorAll('.quality-btn').forEach(b => b.classList.remove('selected'));
+                            btn.classList.add('selected');
+                        });
+                    });
+                } else {
+                    qualityDiv.innerHTML = '<div class="options-loading">No video formats detected</div>';
+                }
+            })
+            .catch(err => {
+                qualityDiv.innerHTML = `<div class="options-error">Probe failed: ${escapeHtml(err.message)}</div>`;
             });
+        }
+        
+        function resetOptions() {
+            document.getElementById('optionsQuality').innerHTML = '<div class="options-loading">Select a URL to see available qualities</div>';
+            document.getElementById('optionsFilename').value = '';
+            document.getElementById('optionsFilename').placeholder = 'Will be auto-filled from video title';
         }
 
         function stopDownload(id) {
@@ -2116,11 +2241,68 @@ def add_download():
     download_id = str(uuid.uuid4())[:8]
     db_insert_download(download_id, url)
 
+    # Store per-download format override if provided (selected quality)
+    format_override = data.get('format')
+    if format_override:
+        db_update_download(download_id, requested_format=format_override)
+
     thread = threading.Thread(target=background_download, args=(url, download_id))
     thread.daemon = True
     thread.start()
 
     return jsonify({"message": "Download started", "id": download_id})
+
+
+@app.route('/api/probe', methods=['POST'])
+def probe_url():
+    """Probe a video URL to extract available formats and basic info (title)
+    without downloading. Returns available qualities/formats and video title."""
+    data = request.json or {}
+    url = data.get('url')
+    if not url:
+        return jsonify({"error": "URL is required"}), 400
+
+    try:
+        with yt_dlp.YoutubeDL({'quiet': True, 'noprogress': True, 'skip_download': True}) as probe:
+            info = probe.extract_info(url, download=False)
+
+        # Extract title
+        title = info.get('title') or info.get('fulltitle')
+
+        # Build list of formats with resolution info
+        formats_summary = summarize_formats(info)
+        
+        # Collect resolutions in order (highest first)
+        resolutions_list = []
+        seen_res = set()
+        if formats_summary:
+            for fmt in formats_summary:
+                res_str = None
+                if fmt.get('height'):
+                    res_str = f"{fmt['height']}p"
+                elif fmt.get('resolution'):
+                    res_str = fmt['resolution']
+                
+                if res_str and res_str not in seen_res:
+                    seen_res.add(res_str)
+                    resolutions_list.append(res_str)
+        
+        # Sort by height (descending)
+        def get_height(res_str):
+            try:
+                return int(res_str.rstrip('p'))
+            except:
+                return 0
+        
+        resolutions_list.sort(key=get_height, reverse=True)
+
+        return jsonify({
+            "title": title,
+            "resolutions": resolutions_list,
+            "formats": formats_summary
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
 
 
 @app.route('/api/resume/<download_id>', methods=['POST'])
