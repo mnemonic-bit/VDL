@@ -769,6 +769,7 @@ HTML_TEMPLATE = """
         #optionsContainer { margin-bottom: 20px; }
         .options-panel { border: 1px solid var(--border); background: var(--surface); border-radius: 4px; }
         .options-summary { display: flex; align-items: center; padding: 12px 15px; cursor: pointer; user-select: none; list-style: none; }
+        .options-summary::-webkit-details-marker, .options-summary::marker { display: none; }
         .options-summary::before { content: '▶'; display: inline-block; margin-right: 8px; font-size: 0.8em; transition: transform 0.15s; }
         details[open] > .options-summary::before { transform: rotate(90deg); }
         .options-summary .chev { width: 14px; height: 14px; transition: transform 0.15s; color: var(--muted); flex-shrink: 0; margin-right: 6px; }
@@ -1263,10 +1264,21 @@ HTML_TEMPLATE = """
             const selectedContainer = document.getElementById('optionsContainerSelect').value;
             const customFilename = document.getElementById('optionsFilename').value;
             
-            // If container is specified, append it to the format selector
+            // Build a format selector that applies the container filter correctly.
             let finalFormat = selectedQuality;
-            if (selectedContainer && selectedQuality) {
-                finalFormat = `${selectedQuality}[ext=${selectedContainer}]`;
+            if (selectedContainer) {
+                const container = selectedContainer;
+                const audioExt = container === 'mp4' ? 'm4a' : container;
+                if (selectedQuality) {
+                    const qualityMatch = selectedQuality.match(/^(bestvideo\[height<=\d+\])\+bestaudio\/best$/);
+                    if (qualityMatch) {
+                        finalFormat = `${qualityMatch[1]}[ext=${container}]+bestaudio[ext=${audioExt}]/best[ext=${container}]`;
+                    } else {
+                        finalFormat = `${selectedQuality}[ext=${container}]`;
+                    }
+                } else {
+                    finalFormat = `bestvideo[ext=${container}]+bestaudio[ext=${audioExt}]/best[ext=${container}]`;
+                }
             }
             
             fetch('/api/download', {
