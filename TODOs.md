@@ -20,6 +20,9 @@
 ** [DONE] save history
 * Save button in Preferences: color does not match the scheme
 * Save button in Preferences: Disk symbol does not appear back when the Tick vanishes after 4 seconds after saving
+* Make the Tick in the menu when the URL has been copied to the clipbard appear without a green circle around it
+* Reorder the item in the Current section:
+** 
 * Error message missing, if the server is down and the app cannot communicate with the server any longer
 * Use keep-alive to check periodically if the server is still alive, otherwise dislay a dialogue
 * The Download Options section has two triangles, the first (solid) triange should be removed.
