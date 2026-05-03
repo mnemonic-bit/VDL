@@ -22,7 +22,9 @@
 * Save button in Preferences: Disk symbol does not appear back when the Tick vanishes after 4 seconds after saving
 * Make the Tick in the menu when the URL has been copied to the clipbard appear without a green circle around it
 * Reorder the item in the Current section:
-** 
+** put the Progress bar all over the botton of the item
+** Status: downloading (percentage) and then at the right end of that same line the time remaining
+** put Total size, and Quality on the same line
 * Error message missing, if the server is down and the app cannot communicate with the server any longer
 * Use keep-alive to check periodically if the server is still alive, otherwise dislay a dialogue
 * The Download Options section has two triangles, the first (solid) triange should be removed.

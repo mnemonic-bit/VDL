@@ -769,7 +769,9 @@ HTML_TEMPLATE = """
         #optionsContainer { margin-bottom: 20px; }
         .options-panel { border: 1px solid var(--border); background: var(--surface); border-radius: 4px; }
         .options-summary { display: flex; align-items: center; padding: 12px 15px; cursor: pointer; user-select: none; list-style: none; }
-        .options-summary::-webkit-details-marker, .options-summary::marker { display: none; }
+        .options-summary::-webkit-details-marker,
+        .options-summary::marker,
+        .options-summary::-moz-list-bullet { display: none; }
         .options-summary::before { content: '▶'; display: inline-block; margin-right: 8px; font-size: 0.8em; transition: transform 0.15s; }
         details[open] > .options-summary::before { transform: rotate(90deg); }
         .options-summary .chev { width: 14px; height: 14px; transition: transform 0.15s; color: var(--muted); flex-shrink: 0; margin-right: 6px; }
