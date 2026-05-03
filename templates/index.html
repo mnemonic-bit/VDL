@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Video Downloader</title>
+    <!-- Favicon: green disc with the same download arrow used on the
+         primary submit button. Inlined as a data: URL so we don't need
+         a dedicated route. -->
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7.5' fill='%231f8a3b'/><g fill='none' stroke='white' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M8 4v5.5'/><path d='M5 7l3 3 3-3'/><path d='M4.5 12.5h7'/></g></svg>">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+    <script>
+        (function () {
+            try {
+                const stored = localStorage.getItem('theme') || 'system';
+                const sysDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+                const effective = (stored === 'system') ? (sysDark ? 'dark' : 'light') : stored;
+                document.documentElement.setAttribute('data-theme', effective);
+                document.documentElement.dataset.themePref = stored;
+            } catch (e) { /* localStorage may be blocked — fall through to default light */ }
+        })();
+    </script>
+</head>
+<body>
+    <!-- Octicon-style icon set: 16x16 viewBox, currentColor, stroke 1.6.
+         Designed to read consistently at the small sizes used in toolbars
+         and inline buttons. -->
+    <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+        <defs>
+            <symbol id="i-download" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M8 2.5v7.2"/><path d="M4.3 6.2L8 9.9l3.7-3.7"/><path d="M2.8 13.2h10.4"/>
+                </g>
+            </symbol>
+            <symbol id="i-save" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M2.5 2.5h8.5l2.5 2.5v8.5a1 1 0 0 1-1 1h-10a1 1 0 0 1-1-1v-10a1 1 0 0 1 1-1z"/>
+                    <path d="M4.5 2.5v3.5h6v-3.5"/>
+                    <rect x="4.5" y="9" width="7" height="5"/>
+                </g>
+            </symbol>
+            <symbol id="i-external" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M9.5 2.5h4v4"/>
+                    <path d="M13.5 2.5l-6 6"/>
+                    <path d="M12 9v3.5a1 1 0 0 1-1 1h-7.5a1 1 0 0 1-1-1v-7.5a1 1 0 0 1 1-1H7"/>
+                </g>
+            </symbol>
+            <symbol id="i-chevron" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M5 6l3 3 3-3"/>
+                </g>
+            </symbol>
+            <symbol id="i-camera" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="1.5" y="4.5" width="8" height="7" rx="1"/>
+                    <path d="M9.5 7.5l5-2.5v6l-5-2.5z"/>
+                </g>
+            </symbol>
+            <symbol id="i-copy" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="5" y="5" width="9" height="9" rx="1.2"/>
+                    <path d="M11 5V3a1 1 0 0 0-1-1H3a1 1 0 0 0-1 1v7a1 1 0 0 0 1 1h2"/>
+                </g>
+            </symbol>
+            <symbol id="i-trash" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M2.5 4h11"/>
+                    <path d="M6 4V2.5a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1V4"/>
+                    <path d="M3.5 4l.7 9a1 1 0 0 0 1 .9h5.6a1 1 0 0 0 1-.9l.7-9"/>
+                    <path d="M6.5 7v4"/><path d="M9.5 7v4"/>
+                </g>
+            </symbol>
+            <symbol id="i-play" viewBox="0 0 16 16">
+                <g fill="currentColor" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round">
+                    <path d="M5 3.5v9l8-4.5z"/>
+                </g>
+            </symbol>
+            <symbol id="i-sync" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9"/>
+                    <path d="M13.5 2v3h-3"/>
+                </g>
+            </symbol>
+            <symbol id="i-kebab" viewBox="0 0 16 16">
+                <g fill="currentColor">
+                    <circle cx="8" cy="3" r="1.4"/>
+                    <circle cx="8" cy="8" r="1.4"/>
+                    <circle cx="8" cy="13" r="1.4"/>
+                </g>
+            </symbol>
+            <symbol id="i-stop" viewBox="0 0 16 16">
+                <rect x="3.5" y="3.5" width="9" height="9" rx="1" fill="currentColor"/>
+            </symbol>
+            <symbol id="i-pause" viewBox="0 0 16 16">
+                <g fill="currentColor">
+                    <rect x="4" y="3.5" width="2.6" height="9" rx="0.5"/>
+                    <rect x="9.4" y="3.5" width="2.6" height="9" rx="0.5"/>
+                </g>
+            </symbol>
+            <symbol id="i-pencil" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round">
+                    <path d="M11.5 2.5l2 2-7.5 7.5-2.5.5.5-2.5z"/>
+                    <path d="M10 4l2 2"/>
+                </g>
+            </symbol>
+            <symbol id="i-check" viewBox="0 0 16 16">
+                <path d="M3.5 8.5l3 3 6-6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+            </symbol>
+            <symbol id="i-x" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+                    <path d="M4 4l8 8"/><path d="M12 4l-8 8"/>
+                </g>
+            </symbol>
+            <symbol id="i-check-circle" viewBox="0 0 16 16">
+                <circle cx="8" cy="8" r="7" fill="#1f8a3b"/>
+                <path d="M4.5 8.2 L7 10.6 L11.6 5.6" fill="none" stroke="#fff"
+                      stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+            </symbol>
+        </defs>
+    </svg>
+
+    <h2>Download Video</h2>
+    <form id="downloadForm" class="form-group" onsubmit="startDownload(event)">
+        <input type="url" id="urlInput" placeholder="Enter video URL here..." required>
+        <button type="submit"><svg class="btn-icon"><use href="#i-download"/></svg><span>Download</span></button>
+    </form>
+
+    <div id="optionsContainer">
+        <details class="options-panel">
+            <summary class="options-summary">
+                <svg class="chev" viewBox="0 0 16 16" width="16" height="16">
+                    <path fill="currentColor" d="M8 12.3L1 5.5l1.4-1.4L8 9.5l5.6-5.4L15 5.5z"/>
+                </svg>
+                Download Options
+            </summary>
+            <div class="options-content">
+                <div class="options-row">
+                    <label for="optionsQualitySelect">Quality</label>
+                    <div style="flex: 1; display: flex; flex-direction: column; gap: 8px;">
+                        <select id="optionsQualitySelect" class="options-select" disabled>
+                            <option value="">Use default preference</option>
+                        </select>
+                        <div id="optionsQualityStatus" class="options-loading">Select a URL to see available qualities</div>
+                    </div>
+                </div>
+                <div class="options-row">
+                    <label for="optionsContainerSelect">Container Format</label>
+                    <div style="flex: 1; display: flex; flex-direction: column; gap: 8px;">
+                        <select id="optionsContainerSelect" class="options-select" disabled>
+                            <option value="">Automatic</option>
+                        </select>
+                        <div id="optionsContainerStatus" class="options-loading">Select a URL to see available formats</div>
+                    </div>
+                </div>
+                <div class="options-row">
+                    <label for="optionsFilename">Title/Filename</label>
+                    <input type="text" id="optionsFilename" placeholder="Will be auto-filled from video title" style="flex: 1;">
+                </div>
+            </div>
+        </details>
+    </div>
+
+    <div class="tabs" role="tablist">
+        <button class="tab active" data-tab="current" onclick="switchTab('current')">Current<span id="currentBadge" class="badge" style="display: none;">0</span></button>
+        <button class="tab" data-tab="history" onclick="switchTab('history')">Download History</button>
+        <button class="tab" data-tab="preferences" onclick="switchTab('preferences')">Preferences</button>
+    </div>
+
+    <div id="tab-current" class="tab-panel active">
+        <div id="activeList"></div>
+        <p id="currentEmpty" class="empty">No active downloads. Paste a URL above to start.</p>
+    </div>
+
+    <div id="tab-history" class="tab-panel">
+        <div class="tab-header">
+            <button class="clear-btn" onclick="clearHistory()" style="margin-left:auto;">Clear History</button>
+        </div>
+        <div id="historyList"></div>
+        <div id="historyPager" class="pager" style="display:none;">
+            <button id="pagerFirst" onclick="goToPage(0)" aria-label="Jump to first page">«</button>
+            <button id="pagerPrev" onclick="changePage(-1)" aria-label="Previous page">‹</button>
+            <span id="pagerInfo"></span>
+            <button id="pagerNext" onclick="changePage(1)" aria-label="Next page">›</button>
+            <button id="pagerLast" onclick="goToPage(Infinity)" aria-label="Jump to last page">»</button>
+        </div>
+        <p id="historyEmpty" class="empty">No completed downloads yet.</p>
+    </div>
+
+    <div id="playerBackdrop" class="player-backdrop" onclick="closePlayer(event)">
+        <div class="player-box" onclick="event.stopPropagation()">
+            <div id="playerTitle" class="player-title"></div>
+            <button class="player-close" onclick="closePlayer()" aria-label="Close player"><svg style="width:24px;height:24px"><use href="#i-x"/></svg></button>
+            <video id="playerVideo" controls autoplay></video>
+        </div>
+    </div>
+
+    <div id="tab-preferences" class="tab-panel">
+        <div class="pref-row">
+            <label for="prefDir">Download directory</label>
+            <input type="text" id="prefDir" style="width: 300px;">
+        </div>
+        <div class="pref-row">
+            <label for="prefFormat">Quality</label>
+            <select id="prefFormat" style="width: 320px;">
+                <option value="bestvideo+bestaudio/best">Best available (video + audio merged)</option>
+                <option value="best">Best single file (no merge needed)</option>
+                <option value="bestvideo[height<=2160]+bestaudio/best">Up to 2160p (4K)</option>
+                <option value="bestvideo[height<=1440]+bestaudio/best">Up to 1440p (2K)</option>
+                <option value="bestvideo[height<=1080]+bestaudio/best">Up to 1080p (Full HD)</option>
+                <option value="bestvideo[height<=720]+bestaudio/best">Up to 720p (HD)</option>
+                <option value="bestvideo[height<=480]+bestaudio/best">Up to 480p (SD)</option>
+                <option value="worstvideo+worstaudio/worst">Smallest file (lowest quality)</option>
+                <option value="bestaudio/best">Audio only (best)</option>
+                <option value="__custom__">Custom (advanced)</option>
+            </select>
+        </div>
+        <div class="pref-row" id="customFormatRow" style="display: none;">
+            <label for="prefFormatCustom">Custom format</label>
+            <input type="text" id="prefFormatCustom" style="width: 320px;" placeholder="e.g. bestvideo[ext=mp4]+bestaudio[ext=m4a]">
+        </div>
+        <div class="pref-row">
+            <label for="prefMax">Max concurrent</label>
+            <input type="number" id="prefMax" min="1" style="width: 80px;">
+        </div>
+        <div class="pref-row">
+            <label for="prefPlayer">Play videos in</label>
+            <select id="prefPlayer" style="width: 320px;">
+                <option value="overlay">Overlay on this page</option>
+                <option value="new_tab">New browser tab</option>
+            </select>
+        </div>
+        <div class="pref-row">
+            <label for="prefTheme">Theme</label>
+            <select id="prefTheme" style="width: 320px;">
+                <option value="system">System (follow OS setting)</option>
+                <option value="light">Light</option>
+                <option value="dark">Dark</option>
+            </select>
+        </div>
+        <div class="pref-actions">
+            <button id="saveBtn" onclick="savePreferences()"><svg class="btn-icon"><use href="#i-save"/></svg><span>Save</span></button>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
