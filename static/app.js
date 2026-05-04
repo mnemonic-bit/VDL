@@ -573,24 +573,31 @@ function renderItem(info, inHistoryView = false) {
 
     let bottom = '';
     if (isRunning) {
+        // Layout (top → bottom): "Status (left) ↔ ETA (right)" row,
+        // then "Total size · Quality" on one line, then a full-width
+        // progress bar at the very bottom of the item with no rows below.
         let width = String(info.progress).replace('%', '');
         if (isNaN(width)) width = 0;
-        const speedStr = formatSpeed(info.speed);
         const etaStr = formatEta(info.eta);
         const sizeStr = formatBytes(info.filesize);
         const resStr = info.resolution;
-        const inlineParts = [];
-        if (etaStr) inlineParts.push(etaStr);
-        if (speedStr) inlineParts.push(speedStr);
-        const inline = inlineParts.length ? `<span class="progress-inline">${inlineParts.join(' · ')}</span>` : '';
+        const statusRow = `<div class="status-row">
+                        <span><strong>Status:</strong> ${info.status} (${statusLabel})</span>
+                        ${etaStr ? `<span class="eta-right">${etaStr}</span>` : ''}
+                    </div>`;
+        const sizeQualityParts = [];
+        if (sizeStr) sizeQualityParts.push(`<strong>Total size:</strong> ${sizeStr}`);
+        if (resStr)  sizeQualityParts.push(`<strong>Quality:</strong> ${resStr}`);
+        const sizeQualityRow = sizeQualityParts.length
+            ? `<div class="meta">${sizeQualityParts.join(' &middot; ')}</div>`
+            : '';
+        // class="progress-bar-bottom" keeps the bar pinned to the bottom.
         bottom = `
-                    <div class="progress-row">
-                        <div class="progress-bar-bg">
-                            <div class="progress-bar-fill" style="width: ${width}%;"></div>
-                        </div>
-                        ${inline}
-                    </div>
-                    ${(sizeStr || resStr) ? `<div class="meta">${sizeStr ? `<div><strong>Total size:</strong> ${sizeStr}</div>` : ''}${resStr ? `<div><strong>Quality:</strong> ${resStr}</div>` : ''}</div>` : ''}`;
+                    ${statusRow}
+                    ${sizeQualityRow}
+                    <div class="progress-bar-bg progress-bar-bottom">
+                        <div class="progress-bar-fill" style="width: ${width}%;"></div>
+                    </div>`;
     } else {
         if (!isFinished && info.status !== 'error') {
             let barClass = 'progress-bar-fill';
@@ -657,7 +664,9 @@ function renderItem(info, inHistoryView = false) {
 
     const urlLine = inHistoryView
         ? (warn ? `<div>${warn}<strong>Status:</strong> ${info.status} (${statusLabel})</div>` : '')
-        : `<div>${warn}<strong>URL:</strong> ${escapeHtml(info.url)}</div>
+        : isRunning
+            ? `<div>${warn}<strong>URL:</strong> ${escapeHtml(info.url)}</div>`
+            : `<div>${warn}<strong>URL:</strong> ${escapeHtml(info.url)}</div>
                    <div><strong>Status:</strong> ${info.status} (${statusLabel})</div>`;
     const headMeta = inHistoryView
         ? (warn ? `<div class="meta">${urlLine}</div>` : '')

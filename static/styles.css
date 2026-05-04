@@ -216,6 +216,9 @@ details[open] > .history-summary::before { transform: rotate(90deg); }
 .progress-row { display: flex; align-items: center; gap: 10px; margin-top: 4px; }
 .progress-row .progress-bar-bg { flex: 1; margin: 0; }
 .progress-inline { font-size: 0.9em; color: var(--muted); white-space: nowrap; flex-shrink: 0; }
+.status-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 8px; font-size: 0.9em; color: var(--muted); }
+.status-row .eta-right { color: var(--muted); flex-shrink: 0; }
+.progress-bar-bottom { margin-top: 12px; }
 .tabs { display: flex; gap: 0; border-bottom: 1px solid var(--border); margin-bottom: 20px; }
 .tab { padding: 10px 18px; background: none; border: 1px solid transparent; border-bottom: none; border-radius: 5px 5px 0 0; cursor: pointer; font-size: 1em; color: var(--muted); margin-bottom: -1px; }
 .tab:hover { color: var(--fg); }
