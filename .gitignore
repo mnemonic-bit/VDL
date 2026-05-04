@@ -5,3 +5,6 @@ media/
 
 downloads.db
 
+# for OpenCode
+.sisyphus/
+.playwright-mcp/
