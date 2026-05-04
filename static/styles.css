@@ -117,10 +117,10 @@ button { padding: 10px 20px; cursor: pointer; }
 .meta { margin-top: 8px; font-size: 0.9em; color: var(--muted); }
 .meta div { margin-top: 2px; }
 .meta .filename { font-family: ui-monospace, Menlo, Consolas, monospace; word-break: break-all; }
-.file-meta-row { display: flex; align-items: center; gap: 6px; min-width: 0; overflow: hidden; }
+.file-meta-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .file-meta-row > strong { flex-shrink: 0; }
 .file-meta-row > .rename-wrap[data-mode="display"] { flex: 0 1 auto; min-width: 0; overflow: hidden; }
-.file-meta-row > .rename-wrap[data-mode="edit"] { flex: 1 1 auto; min-width: 0; }
+.file-meta-row > .rename-wrap[data-mode="edit"] { flex: 0 0 auto; }
 .rename-wrap { display: inline-flex; align-items: stretch; gap: 0; max-width: 100%; vertical-align: middle; }
 .rename-display, input[type="text"].rename-input {
     font-family: ui-monospace, Menlo, Consolas, monospace;
@@ -148,7 +148,7 @@ input[type="text"].rename-input {
     background: var(--surface); outline: none;
     -webkit-appearance: none; appearance: none;
     min-width: 0;
-    flex: 1 1 0;
+    flex: 0 0 auto;
 }
 .rename-input:focus { border-color: var(--accent, #1f8a3b); }
 .rename-btn {
