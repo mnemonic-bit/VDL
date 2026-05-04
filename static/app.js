@@ -614,7 +614,7 @@ function renderItem(info, inHistoryView = false) {
         if (info.filename) {
             const base = info.filename.split('/').pop().split('\\').pop();
             if (isFinished) {
-                meta.push(`<div><strong>File:</strong> ${renderRenameControl(id, base)}</div>`);
+                meta.push(`<div class="file-meta-row"><strong>File:</strong>${renderRenameControl(id, base)}</div>`);
             } else {
                 meta.push(`<div><strong>File:</strong> <span class="filename">${escapeHtml(base)}</span></div>`);
             }
