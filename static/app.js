@@ -904,12 +904,12 @@ function savePreferences() {
         body: JSON.stringify(body),
     }).then(() => {
         const btn = document.getElementById('saveBtn');
-        btn.textContent = 'Saved ✓';
+        btn.innerHTML = '<svg class="btn-icon"><use href="#i-check"/></svg><span>Saved</span>';
         btn.disabled = true;
         setTimeout(() => {
-            btn.textContent = 'Save';
+            btn.innerHTML = '<svg class="btn-icon"><use href="#i-save"/></svg><span>Save</span>';
             btn.disabled = false;
-        }, 4000);
+        }, 1500);
     });
 }
 
