@@ -476,7 +476,7 @@ function openUrl(url) {
 }
 
 const COPY_URL_HTML    = '<svg class="menu-icon"><use href="#i-copy"/></svg>Copy URL';
-const COPIED_HTML      = '<svg class="menu-icon"><use href="#i-check-circle"/></svg>Copied';
+const COPIED_HTML      = '<svg class="menu-icon"><use href="#i-check"/></svg>Copied';
 
 function copyToClipboard(text, btn) {
     const done = () => {
