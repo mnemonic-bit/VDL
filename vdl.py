@@ -553,8 +553,16 @@ def background_download(url, download_id):
         # extract_info() also yields a clean title/resolution we can persist
         # immediately, which means freshly-queued items show useful metadata
         # in the Current tab even before the first byte arrives.
+        if is_cancel_requested(download_id):
+            raise DownloadCancelled()
         try:
-            with yt_dlp.YoutubeDL({'quiet': True, 'noprogress': True, 'skip_download': True}) as probe:
+            probe_opts = {
+                'quiet': True,
+                'noprogress': True,
+                'skip_download': True,
+                'progress_hooks': [lambda d: progress_hook(d, download_id)],
+            }
+            with yt_dlp.YoutubeDL(probe_opts) as probe:
                 info = probe.extract_info(url, download=False)
             formats_summary = summarize_formats(info)
             updates = {}
@@ -622,10 +630,10 @@ def background_download(url, download_id):
                     resolution=final_res,
                 )
     except DownloadCancelled:
-        db_update_download(download_id, status='cancelled', progress='Cancelled by user', finished_at=time.time())
+        db_update_download(download_id, status='cancelled', finished_at=time.time())
     except yt_dlp.utils.DownloadError as e:
         if is_cancel_requested(download_id):
-            db_update_download(download_id, status='cancelled', progress='Cancelled by user', finished_at=time.time())
+            db_update_download(download_id, status='cancelled', finished_at=time.time())
         else:
             db_update_download(download_id, status='error', progress=str(e), finished_at=time.time())
     except Exception as e:
@@ -873,6 +881,13 @@ def remove_download(download_id):
         return jsonify({"error": "Unknown download id"}), 404
     if entry['status'] in ('starting', 'downloading', 'paused'):
         return jsonify({"error": "Cannot remove an active download. Stop it first."}), 409
+    filename = entry.get('filename')
+    if filename:
+        for path in (filename, filename + '.part'):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
     db_delete_download(download_id)
     return jsonify({"message": "Removed", "id": download_id})
 

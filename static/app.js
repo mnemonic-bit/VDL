@@ -201,6 +201,7 @@ function resetOptions() {
 }
 
 function stopDownload(id) {
+    closeAllMenus();
     fetch('/api/stop/' + encodeURIComponent(id), { method: 'POST' })
         .then(() => fetchHistory());
 }
@@ -316,11 +317,13 @@ function pauseDownload(id) {
 }
 
 function unpauseDownload(id) {
+    closeAllMenus();
     fetch('/api/unpause/' + encodeURIComponent(id), { method: 'POST' })
         .then(() => fetchHistory());
 }
 
 function reloadDownload(id, url) {
+    closeAllMenus();
     fetch('/api/remove/' + encodeURIComponent(id), { method: 'POST' })
         .then(() => fetch('/api/download', {
             method: 'POST',
@@ -331,6 +334,7 @@ function reloadDownload(id, url) {
 }
 
 function continueDownload(id, url) {
+    closeAllMenus();
     fetch('/api/resume/' + encodeURIComponent(id), { method: 'POST' })
         .then(() => fetchHistory());
 }
@@ -513,6 +517,7 @@ function renderItem(info, inHistoryView = false) {
     const isCancelled = info.status === 'cancelled';
     const isTerminal = TERMINAL_STATUSES.has(info.status);
     const isFinished = info.status === 'finished';
+    const isCurrentTabStopped = !inHistoryView && (isCancelled || info.status === 'interrupted');
 
     let statusLabel;
     if (isFinished) statusLabel = 'Complete';
@@ -572,13 +577,10 @@ function renderItem(info, inHistoryView = false) {
         : '';
 
     let bottom = '';
-    if (isRunning) {
-        // Layout (top → bottom): "Status (left) ↔ ETA (right)" row,
-        // then "Total size · Quality" on one line, then a full-width
-        // progress bar at the very bottom of the item with no rows below.
+    if (isRunning || isCurrentTabStopped) {
         let width = String(info.progress).replace('%', '');
         if (isNaN(width)) width = 0;
-        const etaStr = formatEta(info.eta);
+        const etaStr = isRunning ? formatEta(info.eta) : '';
         const sizeStr = formatBytes(info.filesize);
         const resStr = info.resolution;
         const statusRow = `<div class="status-row">
@@ -591,12 +593,14 @@ function renderItem(info, inHistoryView = false) {
         const sizeQualityRow = sizeQualityParts.length
             ? `<div class="meta">${sizeQualityParts.join(' &middot; ')}</div>`
             : '';
-        // class="progress-bar-bottom" keeps the bar pinned to the bottom.
+        let barClass = 'progress-bar-fill';
+        if (isCancelled) barClass += ' cancelled';
+        else if (info.status === 'interrupted') barClass += ' interrupted';
         bottom = `
                     ${statusRow}
                     ${sizeQualityRow}
                     <div class="progress-bar-bg progress-bar-bottom">
-                        <div class="progress-bar-fill" style="width: ${width}%;"></div>
+                        <div class="${barClass}" style="width: ${width}%;"></div>
                     </div>`;
     } else {
         if (!isFinished && info.status !== 'error') {
@@ -664,7 +668,7 @@ function renderItem(info, inHistoryView = false) {
 
     const urlLine = inHistoryView
         ? (warn ? `<div>${warn}<strong>Status:</strong> ${info.status} (${statusLabel})</div>` : '')
-        : isRunning
+        : (isRunning || isCurrentTabStopped)
             ? `<div>${warn}<strong>URL:</strong> ${escapeHtml(info.url)}</div>`
             : `<div>${warn}<strong>URL:</strong> ${escapeHtml(info.url)}</div>
                    <div><strong>Status:</strong> ${info.status} (${statusLabel})</div>`;
