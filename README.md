@@ -26,6 +26,43 @@ python vdl.py
 
 Then open `http://127.0.0.1:5000` in your browser.
 
+## Docker
+
+Build the image (note: the file is named `Dockerfile.vdl`, not `Dockerfile`):
+
+```bash
+docker build -f Dockerfile.vdl -t vdl .
+```
+
+Run the container, mounting host directories for persistence across restarts:
+
+```bash
+docker run -d \
+  -p 5000:5000 \
+  -v /path/to/downloads:/downloads \
+  -v /path/to/data:/data \
+  vdl
+```
+
+Then open `http://localhost:5000` in your browser.
+
+- `/downloads` — where downloaded files are saved (`DOWNLOADS_DIR`)
+- `/data` — where `downloads.db` (SQLite state) is stored (`DOWNLOADS_DB`)
+
+Both paths are baked into the image as defaults; the `-v` mounts simply persist them on the host so data survives container restarts.
+
+To override defaults, pass `-e` flags:
+
+```bash
+docker run -d \
+  -p 5000:5000 \
+  -v /path/to/downloads:/downloads \
+  -v /path/to/data:/data \
+  -e PORT=8080 \
+  -e FLASK_DEBUG=1 \
+  vdl
+```
+
 ## Notes
 
 - The app stores its SQLite state in `downloads.db` by default.
