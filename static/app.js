@@ -93,6 +93,7 @@ urlClear.addEventListener('click', () => {
     urlInput.value = '';
     clearTimeout(probeTimeout);
     resetOptions();
+    if (optionsDetails && !optionsOpenedManually) setOptionsOpen(false);
     updateUrlClear();
     urlInput.focus();
 });
