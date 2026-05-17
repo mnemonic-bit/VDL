@@ -79,9 +79,9 @@ body { font-family: Arial, sans-serif; max-width: 800px; margin: 40px auto; padd
 .options-summary::-webkit-details-marker,
 .options-summary::marker,
 .options-summary::-moz-list-bullet { display: none; }
-.options-summary .chev { width: 14px; height: 14px; transition: transform 0.15s; color: var(--muted); flex-shrink: 0; margin-right: 6px; }
+.options-summary .chev { width: 14px; height: 14px; transition: transform 0.25s ease; color: var(--muted); flex-shrink: 0; margin-right: 6px; }
 details[open] > .options-summary .chev { transform: rotate(-180deg); }
-.options-content { padding: 15px; border-top: 1px solid var(--border-soft); position: relative; }
+.options-content { padding: 15px; border-top: 1px solid var(--border-soft); position: relative; overflow: hidden; max-height: 0; transition: max-height 0.25s ease; }
 .options-overlay {
     position: absolute;
     inset: 0;

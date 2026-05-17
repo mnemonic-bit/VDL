@@ -56,7 +56,36 @@ function startDownload(event) {
 let probeTimeout;
 const urlInput = document.getElementById('urlInput');
 const optionsDetails = document.querySelector('#optionsContainer details');
-        
+
+// Drive the options panel open/close with a max-height animation instead of
+// the native instant toggle, so the content slides rather than snapping.
+function setOptionsOpen(open) {
+    const content = optionsDetails.querySelector('.options-content');
+    if (open) {
+        optionsDetails.open = true;          // put content in DOM flow first
+        content.style.maxHeight = content.scrollHeight + 'px';
+    } else {
+        content.style.maxHeight = '0';
+        // Remove [open] after the slide-up finishes so the chevron resets
+        content.addEventListener('transitionend', () => {
+            optionsDetails.open = false;
+        }, { once: true });
+    }
+}
+
+// Intercept summary clicks to use the animated helper instead of native toggle
+if (optionsDetails) {
+    optionsDetails.querySelector('.options-summary').addEventListener('click', (e) => {
+        e.preventDefault();
+        setOptionsOpen(!optionsDetails.open);
+    });
+    // Sync initial state in case the panel starts open
+    if (optionsDetails.open) {
+        const content = optionsDetails.querySelector('.options-content');
+        content.style.maxHeight = content.scrollHeight + 'px';
+    }
+}
+
 urlInput.addEventListener('input', () => {
     clearTimeout(probeTimeout);
     const url = urlInput.value.trim();
@@ -65,7 +94,7 @@ urlInput.addEventListener('input', () => {
         return;
     }
     if (optionsDetails) {
-        optionsDetails.open = true;
+        setOptionsOpen(true);
     }
     const overlay = document.getElementById('optionsOverlay');
     if (overlay) overlay.classList.add('hidden');
@@ -81,7 +110,7 @@ urlInput.addEventListener('paste', () => {
             return;
         }
         if (optionsDetails) {
-            optionsDetails.open = true;
+            setOptionsOpen(true);
         }
         const overlay = document.getElementById('optionsOverlay');
         if (overlay) overlay.classList.add('hidden');
@@ -95,7 +124,7 @@ function probeVideoUrl(url) {
 
     const select = document.getElementById('optionsQualitySelect');
     if (optionsDetails) {
-        optionsDetails.open = true;
+        setOptionsOpen(true);
     }
     select.disabled = true;
     select.innerHTML = '<option value="">Use default preference</option>';
