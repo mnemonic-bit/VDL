@@ -424,8 +424,10 @@ function continueDownload(id, url) {
 function deleteDownload(id) {
     closeAllMenus();
     const row = document.querySelector(`[data-row-id="${id}"]`);
-    if (row) row.remove();
-
+    if (row) {
+        row.classList.add('item-fade-out');
+        row.addEventListener('animationend', () => row.remove(), { once: true });
+    }
     apiFetch('/api/remove/' + encodeURIComponent(id), { method: 'POST' })
         .then(res => {
             if (!res.ok) fetchHistory();
@@ -791,6 +793,8 @@ function renderItem(info, inHistoryView = false) {
 const HISTORY_PAGE_SIZE = 10;
 let historyPage = 0;
 let historyTotal = 0;
+let _renderedActiveIds  = new Set();
+let _renderedHistoryIds = new Set();
 
 function changePage(delta) {
     const maxPage = Math.max(0, Math.ceil(historyTotal / HISTORY_PAGE_SIZE) - 1);
@@ -840,8 +844,35 @@ function fetchHistory() {
             }
         }
 
-        document.getElementById('activeList').innerHTML = active.map(i => renderItem(i, false)).join('');
+        const activeTabVisible   = document.getElementById('tab-current').classList.contains('active');
+        const historyTabVisible  = document.getElementById('tab-history').classList.contains('active');
+
+        const newActiveIds  = new Set(active.map(i => String(i.id)));
+        const newHistoryIds = new Set(pageItems.map(i => String(i.id)));
+
+        document.getElementById('activeList').innerHTML  = active.map(i => renderItem(i, false)).join('');
         document.getElementById('historyList').innerHTML = pageItems.map(i => renderItem(i, true)).join('');
+
+        if (activeTabVisible) {
+            newActiveIds.forEach(id => {
+                if (!_renderedActiveIds.has(id)) {
+                    const el = document.querySelector(`#activeList [data-row-id="${id}"]`);
+                    if (el) el.classList.add('item-fade-in');
+                }
+            });
+        }
+        if (historyTabVisible) {
+            newHistoryIds.forEach(id => {
+                if (!_renderedHistoryIds.has(id)) {
+                    const el = document.querySelector(`#historyList [data-row-id="${id}"]`);
+                    if (el) el.classList.add('item-fade-in');
+                }
+            });
+        }
+
+        _renderedActiveIds  = newActiveIds;
+        _renderedHistoryIds = newHistoryIds;
+
         bindRenameInputs();
 
         if (focusRestore) {
