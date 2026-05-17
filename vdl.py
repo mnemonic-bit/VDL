@@ -984,9 +984,28 @@ def stream_file(download_id):
         for base in allowed_bases
     ):
         abort(403)
-    # Explicitly detect and provide MIME type for better browser compatibility,
-    # especially on Firefox. Defaults to 'application/octet-stream' if unknown.
-    mimetype, _ = mimetypes.guess_type(real)
+    # Resolve MIME type for the browser's <video> element. mimetypes.guess_type
+    # relies on the OS MIME database, which may lack entries for .webm or .mkv
+    # on minimal systems (e.g. Docker, some Linux distros). The hardcoded map
+    # below covers every container yt-dlp can produce; the OS lookup is the
+    # fallback for anything exotic.
+    _MIME_MAP = {
+        '.mp4':  'video/mp4',
+        '.m4v':  'video/mp4',
+        '.webm': 'video/webm',
+        '.mkv':  'video/x-matroska',
+        '.ogg':  'video/ogg',
+        '.ogv':  'video/ogg',
+        '.mov':  'video/quicktime',
+        '.avi':  'video/x-msvideo',
+        '.m4a':  'audio/mp4',
+        '.mp3':  'audio/mpeg',
+        '.opus': 'audio/ogg; codecs=opus',
+        '.flac': 'audio/flac',
+        '.wav':  'audio/wav',
+    }
+    ext = os.path.splitext(real)[1].lower()
+    mimetype = _MIME_MAP.get(ext) or mimetypes.guess_type(real)[0] or 'application/octet-stream'
     return send_file(real, mimetype=mimetype, conditional=True)
 
 
