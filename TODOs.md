@@ -27,7 +27,7 @@
 ** [DONE] put Total size, and Quality on the same line
 * Error message missing, if the server is down and the app cannot communicate with the server any longer
 * Use keep-alive to check periodically if the server is still alive, otherwise dislay a dialogue
-* The Download Options section has two triangles, the first (solid) triange should be removed.
+* [DONE] The Download Options section has two triangles, the first (solid) triange should be removed.
 * If no URL was entered, the Options section should be empty, with a message stating that more options will appear once an URL has been provided
 * ESC-key to close the overlay video also escapes the full-screen mode on MacOS. Can this be fixed? This works better if the video has been selected with the mouse before, and if not it excapes the full-screen mode of the app instead.
 * Can Ctrl-V be captured and used to insert the contens of the clipboard, if its in an URL format?

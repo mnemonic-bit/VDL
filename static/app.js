@@ -67,6 +67,8 @@ urlInput.addEventListener('input', () => {
     if (optionsDetails) {
         optionsDetails.open = true;
     }
+    const overlay = document.getElementById('optionsOverlay');
+    if (overlay) overlay.classList.add('hidden');
     probeTimeout = setTimeout(() => probeVideoUrl(url), 500);
 });
 
@@ -81,20 +83,22 @@ urlInput.addEventListener('paste', () => {
         if (optionsDetails) {
             optionsDetails.open = true;
         }
+        const overlay = document.getElementById('optionsOverlay');
+        if (overlay) overlay.classList.add('hidden');
         probeTimeout = setTimeout(() => probeVideoUrl(url), 500);
     }, 0);
 });
         
 function probeVideoUrl(url) {
+    const overlay = document.getElementById('optionsOverlay');
+    if (overlay) overlay.classList.add('hidden');
+
     const select = document.getElementById('optionsQualitySelect');
-    const status = document.getElementById('optionsQualityStatus');
     if (optionsDetails) {
         optionsDetails.open = true;
     }
     select.disabled = true;
     select.innerHTML = '<option value="">Use default preference</option>';
-    status.textContent = 'Loading available qualities...';
-    status.className = 'options-loading';
     
     fetch('/api/probe', {
         method: 'POST',
@@ -109,15 +113,10 @@ function probeVideoUrl(url) {
             errorOption.value = '';
             errorOption.textContent = 'Probe failed';
             select.appendChild(errorOption);
-            status.textContent = `Error: ${data.error}`;
-            status.className = 'options-error';
                     
             const containerSelect = document.getElementById('optionsContainerSelect');
-            const containerStatus = document.getElementById('optionsContainerStatus');
             containerSelect.innerHTML = '<option value="">Automatic</option>';
             containerSelect.disabled = true;
-            containerStatus.textContent = `Error: ${data.error}`;
-            containerStatus.className = 'options-error';
             return;
         }
                 
@@ -135,20 +134,15 @@ function probeVideoUrl(url) {
                 select.appendChild(option);
             });
             select.disabled = false;
-            status.textContent = 'Select a quality or use default preference';
-            status.className = 'options-loading';
         } else {
             const option = document.createElement('option');
             option.value = '';
             option.textContent = 'No video formats detected';
             select.appendChild(option);
             select.disabled = true;
-            status.textContent = 'No video formats detected';
-            status.className = 'options-error';
         }
                 
         const containerSelect = document.getElementById('optionsContainerSelect');
-        const containerStatus = document.getElementById('optionsContainerStatus');
         containerSelect.innerHTML = '<option value="">Automatic</option>';
         if (data.containers && data.containers.length > 0) {
             data.containers.forEach(ext => {
@@ -158,46 +152,33 @@ function probeVideoUrl(url) {
                 containerSelect.appendChild(option);
             });
             containerSelect.disabled = false;
-            containerStatus.textContent = 'Select a container format or use automatic';
-            containerStatus.className = 'options-loading';
         } else {
             containerSelect.disabled = true;
-            containerStatus.textContent = 'No container formats detected';
-            containerStatus.className = 'options-error';
         }
     })
     .catch(err => {
         select.disabled = true;
         select.innerHTML = '<option value="">Use default preference</option>';
-        status.textContent = `Probe failed: ${escapeHtml(err.message)}`;
-        status.className = 'options-error';
                 
         const containerSelect = document.getElementById('optionsContainerSelect');
-        const containerStatus = document.getElementById('optionsContainerStatus');
         containerSelect.innerHTML = '<option value="">Automatic</option>';
         containerSelect.disabled = true;
-        containerStatus.textContent = 'Probe failed';
-        containerStatus.className = 'options-error';
     });
 }
         
 function resetOptions() {
     const qualitySelect = document.getElementById('optionsQualitySelect');
-    const qualityStatus = document.getElementById('optionsQualityStatus');
     qualitySelect.innerHTML = '<option value="">Use default preference</option>';
     qualitySelect.disabled = true;
-    qualityStatus.textContent = 'Select a URL to see available qualities';
-    qualityStatus.className = 'options-loading';
     
     const containerSelect = document.getElementById('optionsContainerSelect');
-    const containerStatus = document.getElementById('optionsContainerStatus');
     containerSelect.innerHTML = '<option value="">Automatic</option>';
     containerSelect.disabled = true;
-    containerStatus.textContent = 'Select a URL to see available formats';
-    containerStatus.className = 'options-loading';
     
     document.getElementById('optionsFilename').value = '';
     document.getElementById('optionsFilename').placeholder = 'Will be auto-filled from video title';
+    const overlay = document.getElementById('optionsOverlay');
+    if (overlay) overlay.classList.remove('hidden');
 }
 
 function stopDownload(id) {

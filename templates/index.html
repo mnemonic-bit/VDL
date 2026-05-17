@@ -135,23 +135,20 @@
                 Download Options
             </summary>
             <div class="options-content">
+                <div id="optionsOverlay" class="options-overlay">
+                    <span class="options-overlay-msg">Select a URL to see available qualities</span>
+                </div>
                 <div class="options-row">
                     <label for="optionsQualitySelect">Quality</label>
-                    <div style="flex: 1; display: flex; flex-direction: column; gap: 8px;">
-                        <select id="optionsQualitySelect" class="options-select" disabled>
-                            <option value="">Use default preference</option>
-                        </select>
-                        <div id="optionsQualityStatus" class="options-loading">Select a URL to see available qualities</div>
-                    </div>
+                    <select id="optionsQualitySelect" class="options-select" style="flex: 1;" disabled>
+                        <option value="">Use default preference</option>
+                    </select>
                 </div>
                 <div class="options-row">
                     <label for="optionsContainerSelect">Container Format</label>
-                    <div style="flex: 1; display: flex; flex-direction: column; gap: 8px;">
-                        <select id="optionsContainerSelect" class="options-select" disabled>
-                            <option value="">Automatic</option>
-                        </select>
-                        <div id="optionsContainerStatus" class="options-loading">Select a URL to see available formats</div>
-                    </div>
+                    <select id="optionsContainerSelect" class="options-select" style="flex: 1;" disabled>
+                        <option value="">Automatic</option>
+                    </select>
                 </div>
                 <div class="options-row">
                     <label for="optionsFilename">Title/Filename</label>
