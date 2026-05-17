@@ -55,7 +55,20 @@ function startDownload(event) {
 
 let probeTimeout;
 const urlInput = document.getElementById('urlInput');
+const urlClear = document.getElementById('urlClear');
 const optionsDetails = document.querySelector('#optionsContainer details');
+
+function updateUrlClear() {
+    urlClear.style.display = urlInput.value ? '' : 'none';
+}
+
+urlClear.addEventListener('click', () => {
+    urlInput.value = '';
+    clearTimeout(probeTimeout);
+    resetOptions();
+    updateUrlClear();
+    urlInput.focus();
+});
 
 // Drive the options panel open/close with a max-height animation instead of
 // the native instant toggle, so the content slides rather than snapping.
@@ -92,6 +105,7 @@ if (optionsDetails) {
 
 urlInput.addEventListener('input', () => {
     clearTimeout(probeTimeout);
+    updateUrlClear();
     const url = urlInput.value.trim();
     if (!url) {
         resetOptions();
@@ -108,6 +122,7 @@ urlInput.addEventListener('input', () => {
 urlInput.addEventListener('paste', () => {
     clearTimeout(probeTimeout);
     setTimeout(() => {
+        updateUrlClear();
         const url = urlInput.value.trim();
         if (!url) {
             resetOptions();
