@@ -43,12 +43,14 @@ function startDownload(event) {
     .then(res => res.json())
     .then(() => {
         document.getElementById('urlInput').value = '';
+        updateUrlClear();
         document.getElementById('optionsFilename').value = '';
         const qualitySelect = document.getElementById('optionsQualitySelect');
         qualitySelect.selectedIndex = 0;
         const containerSelect = document.getElementById('optionsContainerSelect');
         containerSelect.selectedIndex = 0;
         resetOptions();
+        if (optionsDetails && !optionsOpenedManually) setOptionsOpen(false);
         fetchHistory();
     });
 }
@@ -78,23 +80,44 @@ function setOptionsOpen(open) {
         optionsDetails.open = true;          // put content in DOM flow first
         content.style.maxHeight = content.scrollHeight + 'px';
     } else {
+        optionsOpenedManually = false;
+        // If the content is already at zero height (e.g. the panel was never
+        // fully opened, or a previous close left it collapsed), there is no
+        // transition to wait for — set [open]=false immediately so the chevron
+        // and toggle state stay consistent.
+        if (!content.style.maxHeight || content.style.maxHeight === '0px' || content.style.maxHeight === '0') {
+            optionsDetails.open = false;
+            return;
+        }
         content.style.maxHeight = '0';
         // Remove [open] after the slide-up finishes so the chevron resets.
         // Filter by target and propertyName so bubbled transitionend events
         // from child elements (e.g. the overlay's opacity transition) don't
-        // fire this handler prematurely.
+        // fire this handler prematurely. The setTimeout fallback guarantees
+        // [open] is cleared even if transitionend is suppressed (e.g. when
+        // the DOM is mutated mid-transition by resetOptions()).
+        const closePanel = () => { optionsDetails.open = false; };
         content.addEventListener('transitionend', (ev) => {
             if (ev.target !== content || ev.propertyName !== 'max-height') return;
-            optionsDetails.open = false;
+            clearTimeout(closeFallback);
+            closePanel();
         }, { once: true });
+        const closeFallback = setTimeout(closePanel, 300);
     }
 }
+
+// Tracks whether the user explicitly opened the panel by clicking the summary,
+// as opposed to it being opened automatically when a URL is typed. Used by
+// startDownload to decide whether to collapse the panel after submitting.
+let optionsOpenedManually = false;
 
 // Intercept summary clicks to use the animated helper instead of native toggle
 if (optionsDetails) {
     optionsDetails.querySelector('.options-summary').addEventListener('click', (e) => {
         e.preventDefault();
-        setOptionsOpen(!optionsDetails.open);
+        const opening = !optionsDetails.open;
+        if (opening) optionsOpenedManually = true;
+        setOptionsOpen(opening);
     });
     // Sync initial state in case the panel starts open
     if (optionsDetails.open) {
