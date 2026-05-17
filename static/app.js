@@ -939,6 +939,27 @@ document.addEventListener('keydown', (ev) => {
     if (ev.key === 'Escape' && document.getElementById('playerBackdrop').classList.contains('open')) {
         closePlayer();
     }
+
+    const isPaste = (ev.key === 'v' || ev.key === 'V') && (ev.ctrlKey || ev.metaKey) && !ev.shiftKey && !ev.altKey;
+    if (!isPaste) return;
+
+    const active = document.activeElement;
+    const tag = active ? active.tagName : '';
+    const isEditable = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT'
+        || (active && active.isContentEditable);
+    if (isEditable) return;
+
+    if (!navigator.clipboard || !navigator.clipboard.readText) return;
+    ev.preventDefault();
+    navigator.clipboard.readText().then(text => {
+        const trimmed = text.trim();
+        if (!trimmed) return;
+        urlInput.value = trimmed;
+        urlInput.focus();
+        urlInput.dispatchEvent(new Event('input', { bubbles: true }));
+    }).catch(() => {
+        urlInput.focus();
+    });
 });
 
 function switchTab(name) {
