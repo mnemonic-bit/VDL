@@ -231,14 +231,26 @@ def db_delete_download(download_id):
 def db_clear_terminal():
     placeholders = ",".join("?" * len(TERMINAL_STATUSES))
     with _db_lock, db() as conn:
+        filenames = [
+            r[0] for r in conn.execute(
+                f"SELECT filename FROM downloads WHERE status IN ({placeholders}) AND filename IS NOT NULL",
+                TERMINAL_STATUSES,
+            ).fetchall()
+        ]
         cur = conn.execute(
             f"DELETE FROM downloads WHERE status IN ({placeholders})",
             TERMINAL_STATUSES,
         )
         rows = cur.rowcount
+    for path in filenames:
+        for candidate in (path, path + '.part'):
+            try:
+                os.remove(candidate)
+            except OSError:
+                pass
     if rows:
         event_bus.publish('change', {'reason': 'clear', 'count': rows})
-    return rows
+    return rows, len(filenames)
 
 
 def db_list_downloads():
@@ -892,10 +904,21 @@ def remove_download(download_id):
     return jsonify({"message": "Removed", "id": download_id})
 
 
+@app.route('/api/clear/preview', methods=['GET'])
+def clear_history_preview():
+    placeholders = ",".join("?" * len(TERMINAL_STATUSES))
+    with db() as conn:
+        rows = conn.execute(
+            f"SELECT COUNT(*), COUNT(filename) FROM downloads WHERE status IN ({placeholders})",
+            TERMINAL_STATUSES,
+        ).fetchone()
+    return jsonify({"entries": rows[0], "with_files": rows[1]})
+
+
 @app.route('/api/clear', methods=['POST'])
 def clear_history():
-    removed = db_clear_terminal()
-    return jsonify({"message": "Cleared", "removed": removed})
+    removed, files_deleted = db_clear_terminal()
+    return jsonify({"message": "Cleared", "removed": removed, "files_deleted": files_deleted})
 
 
 @app.route('/api/history', methods=['GET'])

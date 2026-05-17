@@ -78,7 +78,11 @@ function setOptionsOpen(open) {
     const content = optionsDetails.querySelector('.options-content');
     if (open) {
         optionsDetails.open = true;          // put content in DOM flow first
-        content.style.maxHeight = content.scrollHeight + 'px';
+        // Read scrollHeight after a rAF so the browser has laid out the newly
+        // visible content; without this the height can be 0 on the first open.
+        requestAnimationFrame(() => {
+            content.style.maxHeight = content.scrollHeight + 'px';
+        });
     } else {
         optionsOpenedManually = false;
         // If the content is already at zero height (e.g. the panel was never
@@ -102,7 +106,7 @@ function setOptionsOpen(open) {
             clearTimeout(closeFallback);
             closePanel();
         }, { once: true });
-        const closeFallback = setTimeout(closePanel, 300);
+        const closeFallback = setTimeout(closePanel, 250);
     }
 }
 
@@ -404,9 +408,20 @@ function deleteDownload(id) {
 }
 
 function clearHistory() {
-    if (!confirm('Remove all completed, cancelled, errored, and interrupted entries?')) return;
-    fetch('/api/clear', { method: 'POST' })
-        .then(() => fetchHistory());
+    fetch('/api/clear/preview')
+        .then(r => r.json())
+        .then(data => {
+            const entries = data.entries || 0;
+            if (!entries) { fetchHistory(); return; }
+            const files = data.with_files || 0;
+            const fileLine = files > 0
+                ? ` and delete ${files} file${files !== 1 ? 's' : ''} from disk`
+                : '';
+            const msg = `Remove ${entries} history entr${entries !== 1 ? 'ies' : 'y'}${fileLine}?`;
+            if (!confirm(msg)) return;
+            fetch('/api/clear', { method: 'POST' })
+                .then(() => fetchHistory());
+        });
 }
 
 let openMenuId = null;
