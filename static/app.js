@@ -949,17 +949,8 @@ document.addEventListener('keydown', (ev) => {
         || (active && active.isContentEditable);
     if (isEditable) return;
 
-    if (!navigator.clipboard || !navigator.clipboard.readText) return;
-    ev.preventDefault();
-    navigator.clipboard.readText().then(text => {
-        const trimmed = text.trim();
-        if (!trimmed) return;
-        urlInput.value = trimmed;
-        urlInput.focus();
-        urlInput.dispatchEvent(new Event('input', { bubbles: true }));
-    }).catch(() => {
-        urlInput.focus();
-    });
+    urlInput.focus();
+    urlInput.select();
 });
 
 function switchTab(name) {

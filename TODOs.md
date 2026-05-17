@@ -30,8 +30,10 @@
 * [DONE] The Download Options section has two triangles, the first (solid) triange should be removed.
 * If no URL was entered, the Options section should be empty, with a message stating that more options will appear once an URL has been provided
 * ESC-key to close the overlay video also escapes the full-screen mode on MacOS. Can this be fixed? This works better if the video has been selected with the mouse before, and if not it excapes the full-screen mode of the app instead.
-* Can Ctrl-V be captured and used to insert the contens of the clipboard, if its in an URL format?
+* [IN_PROGRESS] Can Ctrl-V be captured and used to insert the contens of the clipboard, if its in an URL format?
 * Add Option: Audio Only
+* Add "Auto-Start" option to the Preferences, i.e. as soon as a URL is entered into the input field, the download should start with the preferred options set as parameters. The Options pane should not open in that case.
+* Animation: when a video has been downloaded successfully and is added to the History, the new item should be added with an animation, that is, making room, and then making the new item visible.
 
 
 ## Components to Install in Docker
