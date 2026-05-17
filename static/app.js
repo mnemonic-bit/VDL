@@ -584,7 +584,7 @@ function renderItem(info, inHistoryView = false) {
 
     const hasPlay = isFinished && info.filename;
     const playBtn = hasPlay
-        ? `<button onclick="playVideo('${id}', '${escapeJs(info.filename.split('/').pop().split('\\').pop())}')" aria-label="Play" title="Play"><svg class="icon"><use href="#i-camera"/></svg></button>`
+        ? `<button onclick="playVideo('${id}', '${escapeJs(info.filename.split('/').pop().split('\\').pop())}', '${escapeJs(info.filename.split('.').pop().toLowerCase())}')" aria-label="Play" title="Play"><svg class="icon"><use href="#i-camera"/></svg></button>`
         : '';
 
     const kebabInner = menuItems.length ? `
@@ -810,7 +810,20 @@ function fetchHistory() {
 
 let playerMode = 'overlay';
 
-function playVideo(id, label) {
+// MIME types for <source type="..."> — tells the browser the codec upfront so
+// it doesn't have to sniff, which is required for WEBM on some browsers.
+const _VIDEO_MIME = {
+    mp4: 'video/mp4', m4v: 'video/mp4',
+    webm: 'video/webm',
+    mkv: 'video/x-matroska',
+    ogg: 'video/ogg', ogv: 'video/ogg',
+    mov: 'video/quicktime',
+    m4a: 'audio/mp4', mp3: 'audio/mpeg',
+    opus: 'audio/ogg; codecs=opus',
+    flac: 'audio/flac', wav: 'audio/wav',
+};
+
+function playVideo(id, label, ext) {
     const url = '/api/file/' + encodeURIComponent(id);
     if (playerMode === 'new_tab') {
         window.open(url, '_blank', 'noopener');
@@ -818,7 +831,17 @@ function playVideo(id, label) {
     }
     const video = document.getElementById('playerVideo');
     document.getElementById('playerTitle').textContent = label || '';
-    video.src = url;
+    // Clear any previous <source> children and src attribute before reloading.
+    // Setting video.src directly doesn't carry a type hint; using a <source>
+    // element with an explicit type lets the browser decide playability before
+    // fetching, which is what makes WEBM work on browsers that need the hint.
+    video.removeAttribute('src');
+    video.innerHTML = '';
+    const source = document.createElement('source');
+    source.src = url;
+    const mime = _VIDEO_MIME[ext] || null;
+    if (mime) source.type = mime;
+    video.appendChild(source);
     video.load();
     document.getElementById('playerBackdrop').classList.add('open');
 }
@@ -828,6 +851,7 @@ function closePlayer(ev) {
     const video = document.getElementById('playerVideo');
     video.pause();
     video.removeAttribute('src');
+    video.innerHTML = '';
     video.load();
     backdrop.classList.remove('open');
 }
