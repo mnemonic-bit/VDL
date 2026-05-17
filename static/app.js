@@ -66,8 +66,12 @@ function setOptionsOpen(open) {
         content.style.maxHeight = content.scrollHeight + 'px';
     } else {
         content.style.maxHeight = '0';
-        // Remove [open] after the slide-up finishes so the chevron resets
-        content.addEventListener('transitionend', () => {
+        // Remove [open] after the slide-up finishes so the chevron resets.
+        // Filter by target and propertyName so bubbled transitionend events
+        // from child elements (e.g. the overlay's opacity transition) don't
+        // fire this handler prematurely.
+        content.addEventListener('transitionend', (ev) => {
+            if (ev.target !== content || ev.propertyName !== 'max-height') return;
             optionsDetails.open = false;
         }, { once: true });
     }
@@ -480,6 +484,14 @@ function escapeAttr(s) {
     return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
+// Escape a string for use as a single-quoted JS literal inside an HTML
+// attribute (e.g. onclick="fn('...')"). HTML-entity escaping alone is not
+// enough: the browser decodes entities before the JS engine sees the string,
+// so an apostrophe in a filename would break the surrounding JS string literal.
+function escapeJs(s) {
+    return String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}
+
 function escapeHtml(s) {
     return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
@@ -572,7 +584,7 @@ function renderItem(info, inHistoryView = false) {
 
     const hasPlay = isFinished && info.filename;
     const playBtn = hasPlay
-        ? `<button onclick="playVideo('${id}', '${escapeAttr(info.filename.split('/').pop().split('\\').pop())}')" aria-label="Play" title="Play"><svg class="icon"><use href="#i-camera"/></svg></button>`
+        ? `<button onclick="playVideo('${id}', '${escapeJs(info.filename.split('/').pop().split('\\').pop())}')" aria-label="Play" title="Play"><svg class="icon"><use href="#i-camera"/></svg></button>`
         : '';
 
     const kebabInner = menuItems.length ? `
