@@ -7,6 +7,31 @@ const CURRENT_TAB_STATUSES = new Set(['starting', 'downloading', 'paused', 'canc
 const HISTORY_TAB_STATUSES = new Set(['finished', 'error']);
 const TERMINAL_STATUSES = new Set(['finished', 'error', 'cancelled', 'interrupted']);
 
+let _bannerDismissed = false;
+
+function showServerBanner() {
+    _bannerDismissed = false;
+    document.getElementById('serverBanner').style.display = '';
+}
+
+function hideServerBanner() {
+    document.getElementById('serverBanner').style.display = 'none';
+}
+
+function apiFetch(url, options) {
+    return fetch(url, options).then(res => {
+        hideServerBanner();
+        return res;
+    }).catch(err => {
+        showServerBanner();
+        throw err;
+    });
+}
+
+setInterval(() => {
+    apiFetch('/api/health').catch(() => {});
+}, 30000);
+
 function startDownload(event) {
     if (event) event.preventDefault();
     const url = document.getElementById('urlInput').value;
@@ -31,7 +56,7 @@ function startDownload(event) {
         }
     }
     
-    fetch('/api/download', {
+    apiFetch('/api/download', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -175,7 +200,7 @@ function probeVideoUrl(url) {
     select.disabled = true;
     select.innerHTML = '<option value="">Use default preference</option>';
     
-    fetch('/api/probe', {
+    apiFetch('/api/probe', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: url })
@@ -258,7 +283,7 @@ function resetOptions() {
 
 function stopDownload(id) {
     closeAllMenus();
-    fetch('/api/stop/' + encodeURIComponent(id), { method: 'POST' })
+    apiFetch('/api/stop/' + encodeURIComponent(id), { method: 'POST' })
         .then(() => fetchHistory());
 }
 
@@ -345,7 +370,7 @@ function renameCommit(id) {
     }
     input.disabled = true;
     wrap.querySelectorAll('button').forEach(b => b.disabled = true);
-    fetch('/api/rename/' + encodeURIComponent(id), {
+    apiFetch('/api/rename/' + encodeURIComponent(id), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ filename: newName }),
@@ -368,20 +393,20 @@ function renameCommit(id) {
 
 function pauseDownload(id) {
     closeAllMenus();
-    fetch('/api/pause/' + encodeURIComponent(id), { method: 'POST' })
+    apiFetch('/api/pause/' + encodeURIComponent(id), { method: 'POST' })
         .then(() => fetchHistory());
 }
 
 function unpauseDownload(id) {
     closeAllMenus();
-    fetch('/api/unpause/' + encodeURIComponent(id), { method: 'POST' })
+    apiFetch('/api/unpause/' + encodeURIComponent(id), { method: 'POST' })
         .then(() => fetchHistory());
 }
 
 function reloadDownload(id, url) {
     closeAllMenus();
-    fetch('/api/remove/' + encodeURIComponent(id), { method: 'POST' })
-        .then(() => fetch('/api/download', {
+    apiFetch('/api/remove/' + encodeURIComponent(id), { method: 'POST' })
+        .then(() => apiFetch('/api/download', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ url: url })
@@ -391,7 +416,7 @@ function reloadDownload(id, url) {
 
 function continueDownload(id, url) {
     closeAllMenus();
-    fetch('/api/resume/' + encodeURIComponent(id), { method: 'POST' })
+    apiFetch('/api/resume/' + encodeURIComponent(id), { method: 'POST' })
         .then(() => fetchHistory());
 }
 
@@ -400,7 +425,7 @@ function deleteDownload(id) {
     const row = document.querySelector(`[data-row-id="${id}"]`);
     if (row) row.remove();
 
-    fetch('/api/remove/' + encodeURIComponent(id), { method: 'POST' })
+    apiFetch('/api/remove/' + encodeURIComponent(id), { method: 'POST' })
         .then(res => {
             if (!res.ok) fetchHistory();
         })
@@ -408,7 +433,7 @@ function deleteDownload(id) {
 }
 
 function clearHistory() {
-    fetch('/api/clear/preview')
+    apiFetch('/api/clear/preview')
         .then(r => r.json())
         .then(data => {
             const entries = data.entries || 0;
@@ -419,7 +444,7 @@ function clearHistory() {
                 : '';
             const msg = `Remove ${entries} history entr${entries !== 1 ? 'ies' : 'y'}${fileLine}?`;
             if (!confirm(msg)) return;
-            fetch('/api/clear', { method: 'POST' })
+            apiFetch('/api/clear', { method: 'POST' })
                 .then(() => fetchHistory());
         });
 }
@@ -785,7 +810,7 @@ function goToPage(target) {
 function fetchHistory() {
     if (openMenuId !== null) return Promise.resolve();
 
-    return fetch('/api/history')
+    return apiFetch('/api/history')
     .then(res => res.json())
     .then(data => {
         const reversed = data.slice().reverse();
@@ -958,7 +983,7 @@ if (window.matchMedia) {
 }
 
 function loadPreferences() {
-    fetch('/api/preferences').then(r => r.json()).then(p => {
+    apiFetch('/api/preferences').then(r => r.json()).then(p => {
         document.getElementById('prefDir').value = p.download_dir || '';
         document.getElementById('prefMax').value = p.max_concurrent || '';
 
@@ -1001,7 +1026,7 @@ function savePreferences() {
     };
     playerMode = body.player_mode;
     applyTheme(body.theme);
-    fetch('/api/preferences', {
+    apiFetch('/api/preferences', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
@@ -1033,6 +1058,7 @@ function connectEventStream() {
     es.addEventListener('ready', scheduleFetch);
     es.addEventListener('change', scheduleFetch);
     es.addEventListener('error', () => {
+        showServerBanner();
     });
     return es;
 }

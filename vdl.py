@@ -686,6 +686,11 @@ def index():
     return render_template('index.html')
 
 
+@app.route('/api/health', methods=['GET'])
+def health():
+    return jsonify({"ok": True})
+
+
 @app.route('/api/download', methods=['POST'])
 def add_download():
     data = request.json or {}
