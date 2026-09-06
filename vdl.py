@@ -381,12 +381,10 @@ def progress_hook(d, download_id):
                 title=live_title,
             )
     elif d['status'] == 'finished':
-        # 'finished' here means the file was fully written to disk for this
-        # format; the post-processor (merge) may still run afterwards. We
-        # capture filename + resolution from the info_dict yt-dlp embeds in
-        # the hook payload, and re-stat the file at the end of the run to
-        # get the final size after any merge. Speed is cleared since the
-        # download is no longer active.
+        # 'finished' here applies to one downloaded format, not necessarily
+        # the whole job: a separate audio stream and ffmpeg merge may still
+        # follow. Keep the row active until background_download has observed
+        # the post-processor's final path and re-statted that output.
         info = d.get('info_dict') or {}
         filename = d.get('filename') or info.get('_filename')
         height = info.get('height')
@@ -410,7 +408,7 @@ def progress_hook(d, download_id):
         title = info.get('title') or info.get('fulltitle')
         db_update_download(
             download_id,
-            status='finished',
+            status='downloading',
             progress='100%',
             filename=filename,
             resolution=resolution,
@@ -418,7 +416,6 @@ def progress_hook(d, download_id):
             speed=0.0,  # use 0 (not None) so the column is touched and cleared
             eta=0,
             title=title,
-            finished_at=time.time(),
         )
 
 
@@ -530,11 +527,26 @@ def background_download(url, download_id):
     
     os.makedirs(output_dir, exist_ok=True)
 
+    # Progress hooks report the paths of individual downloaded formats. The
+    # post-processor hook is the first authoritative source for the merged or
+    # remuxed output path, so retain its last completed path until yt-dlp has
+    # returned and the file is safe to expose through History.
+    postprocessed_paths = []
+
+    def capture_postprocessed_path(payload):
+        if payload.get('status') != 'finished':
+            return
+        info = payload.get('info_dict') or {}
+        path = info.get('filepath') or info.get('_filename')
+        if path:
+            postprocessed_paths.append(path)
+
     def build_opts(format_selector):
         return {
             'format': format_selector,
             'outtmpl': os.path.join(output_dir, f'%(title)s_{download_id}.%(ext)s'),
             'progress_hooks': [lambda d: progress_hook(d, download_id)],
+            'postprocessor_hooks': [capture_postprocessed_path],
             'quiet': True,
             'noprogress': True,
             # continuedl is default-True in yt-dlp, but make it explicit so a
@@ -617,18 +629,21 @@ def background_download(url, download_id):
         # Re-stat the final file (post-processing may have changed it,
         # e.g. ffmpeg merging .f137 + .f140 into a single .mp4).
         entry = db_get_download(download_id)
-        if entry and entry.get('filename'):
-            final_path = entry['filename']
+        if entry:
+            final_path = (
+                postprocessed_paths[-1]
+                if postprocessed_paths else entry.get('filename')
+            )
             # If extension changed during merge (e.g. .webm -> .mp4),
             # try the prefix-matched candidate.
-            if not os.path.exists(final_path):
+            if final_path and not os.path.exists(final_path):
                 base, _ = os.path.splitext(final_path)
                 for ext in ('.mp4', '.mkv', '.webm', '.m4a'):
                     cand = base + ext
                     if os.path.exists(cand):
                         final_path = cand
                         break
-            if os.path.exists(final_path):
+            if final_path and os.path.exists(final_path):
                 # Probe the merged file with ffprobe for the authoritative
                 # resolution. yt-dlp's progress hook reports the per-stream
                 # resolution, which is None for the audio half of a merged
@@ -637,9 +652,18 @@ def background_download(url, download_id):
                 final_res = ffprobe_resolution(final_path)
                 db_update_download(
                     download_id,
+                    status='finished',
+                    progress='100%',
                     filename=final_path,
                     filesize=os.path.getsize(final_path),
                     resolution=final_res,
+                    speed=0.0,
+                    eta=0,
+                    finished_at=time.time(),
+                )
+            else:
+                raise FileNotFoundError(
+                    'Download completed but the final output file is missing'
                 )
     except DownloadCancelled:
         db_update_download(download_id, status='cancelled', finished_at=time.time())
