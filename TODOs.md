@@ -34,6 +34,7 @@
 * Add Option: Audio Only
 * Add "Auto-Start" option to the Preferences, i.e. as soon as a URL is entered into the input field, the download should start with the preferred options set as parameters. The Options pane should not open in that case.
 * [DONE] Animation: when a video has been downloaded successfully and is added to the History, the new item should be added with an animation, that is, making room, and then making the new item visible.
+* [DONE] Allow the listening port to be configured at startup with the `--port` command-line parameter (for example, `python vdl.py --port 8080`).
 
 
 ## Components to Install in Docker

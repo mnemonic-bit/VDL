@@ -1,3 +1,5 @@
+import argparse
+
 from flask import Flask, render_template, request, jsonify, send_file, abort, Response, stream_with_context
 import yt_dlp
 import threading
@@ -1080,11 +1082,46 @@ def preferences():
 
 init_db()
 
-if __name__ == '__main__':
-    # Configurable via env so the same image can be used in dev (debug on)
-    # and prod (debug off, bind 0.0.0.0). threaded=True is required so the
-    # long-lived SSE connection on /api/events doesn't block other requests.
+
+def _port_number(value):
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(
+            'port must be an integer between 1 and 65535'
+        )
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError(
+            'port must be an integer between 1 and 65535'
+        )
+    return port
+
+
+def parse_startup_args(argv=None):
+    parser = argparse.ArgumentParser(
+        prog='vdl.py',
+        description='Run the VDL server.',
+    )
+    parser.add_argument(
+        '-p', '--port',
+        type=_port_number,
+        default=os.environ.get('PORT', '5000'),
+        metavar='PORT',
+        help='port to listen on (default: PORT environment variable or 5000)',
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_startup_args(argv)
+    # Environment defaults keep the same image useful in dev and production;
+    # an explicit CLI port wins when a one-off launch needs a different bind.
+    # threaded=True is required so the long-lived SSE connection on
+    # /api/events doesn't block other requests.
     host  = os.environ.get("HOST", "127.0.0.1")
-    port  = int(os.environ.get("PORT", "5000"))
     debug = os.environ.get("FLASK_DEBUG", "1") == "1"
-    app.run(host=host, port=port, debug=debug, threaded=True)
+    app.run(host=host, port=args.port, debug=debug, threaded=True)
+
+
+if __name__ == '__main__':
+    main()
