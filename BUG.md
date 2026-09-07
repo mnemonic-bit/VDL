@@ -1,16 +1,20 @@
 # Known Bugs
 
-These issues were confirmed during the container feature audit performed on
-2026-09-06 against commit `73214c1`. The complete audit and its limits are in
+Issues 1-8 were found during the container feature audit performed on
+2026-09-06 against commit `73214c1`. They were rechecked on 2026-09-07 against
+commit `957d4c9`; issue 1 is resolved and issues 2-8 remain open. Issues 9-13
+were found during that recheck. The original audit and its limits are in
 [`feature-audit/REPORT.md`](feature-audit/REPORT.md).
 
-## 1. Merged downloads keep the deleted temporary audio filename
+## 1. [Resolved] Merged downloads kept the deleted temporary audio filename
 
 **Severity:** High
 
-When yt-dlp downloads separate video and audio streams, ffmpeg successfully
-creates the merged MP4. The download history row nevertheless keeps the path
-of the temporary audio stream, such as:
+**Status:** Resolved by commit `aca3d58` and verified on 2026-09-07.
+
+Before the fix, when yt-dlp downloaded separate video and audio streams,
+ffmpeg successfully created the merged MP4. The download history row
+nevertheless kept the path of the temporary audio stream, such as:
 
 ```text
 /downloads/manifest_6b9f8195.f2.m4a
@@ -23,7 +27,7 @@ is present at a path such as:
 /downloads/manifest_6b9f8195.mp4
 ```
 
-This leaves the entry marked `finished`, but:
+This left the entry marked `finished`, but:
 
 - playback through `/api/file/<id>` returns HTTP 404;
 - inline rename returns HTTP 410, "Original file is missing on disk";
@@ -31,9 +35,9 @@ This leaves the entry marked `finished`, but:
   orphaned file on disk;
 - final size and resolution probing may operate on the wrong path.
 
-The progress hook stores the filename reported when an individual stream
-finishes. The post-download recovery then removes only the stored extension
-and tries common extensions. For a stored name ending in `.f2.m4a`, it looks
+The progress hook stored the filename reported when an individual stream
+finished. The post-download recovery then removed only the stored extension
+and tried common extensions. For a stored name ending in `.f2.m4a`, it looked
 for paths beginning with `.f2`, while ffmpeg wrote the merged file without
 that format suffix.
 
@@ -47,6 +51,10 @@ entry to report `finished`, then try Play or Rename.
 Evidence: [focused result](feature-audit/evidence/merge-evidence.json),
 [failing reproduction](feature-audit/evidence/merge-repro.log), and
 [orphaned-file result](feature-audit/evidence/deletion-evidence.json).
+
+The fix now waits for post-processing to finish and stores the path reported
+by the postprocessor. A current real DASH merge stored the resulting MP4 path;
+playback returned HTTP 200, rename succeeded, and removal deleted the file.
 
 ## 2. Maximum concurrent downloads setting is not enforced
 
@@ -146,6 +154,104 @@ marked complete.
 record the tab-based design as the accepted replacement.
 
 Evidence: [supplemental results](feature-audit/evidence/supplement.json).
+
+## 9. Download URLs can inject JavaScript into row actions
+
+**Severity:** High
+
+Download URLs are HTML-escaped and then interpolated into inline `onclick`
+handlers for Open URL, Continue, Reload, and Copy URL. HTML entity decoding
+happens before the JavaScript handler is compiled, so an apostrophe in a URL
+breaks the handler. A crafted URL can append and execute arbitrary JavaScript
+when one of these actions is clicked.
+
+The recheck used a harmless payload that set a marker on `window`. Clicking
+Reload executed the marker, confirming stored script execution in the VDL
+origin. A URL containing only an apostrophe also produced a JavaScript syntax
+error and prevented Reload from sending a request.
+
+**Expected:** Treat URLs as data rather than executable markup. Row actions
+must work for valid URLs containing apostrophes, and no URL text may execute as
+JavaScript.
+
+**Reproduction:** Submit a URL containing an apostrophe and allow it to reach a
+terminal state. Open its action menu and click Reload, Continue, Open URL, or
+Copy URL. Inspect the inline handler and the browser's page errors.
+
+## 10. Stale URL probes overwrite newer or cleared Download Options
+
+**Severity:** Medium
+
+Each URL edit starts an asynchronous `/api/probe` request, but responses are
+not associated with the URL that initiated them. If probe A is slow and probe
+B finishes first, A can later append its title, qualities, and containers to
+B's options. Clearing the URL while a probe is in flight also allows the late
+response to repopulate and re-enable the otherwise-empty Options panel.
+
+The recheck delayed probe A and allowed probe B to return immediately. The
+input still contained B, but the filename hint showed A and the Quality menu
+contained results from both requests. In a second run, clearing the input was
+followed by A's qualities reappearing in an enabled selector.
+
+**Expected:** Only the latest probe may update Download Options. Clearing or
+changing the URL must cancel or invalidate all earlier responses.
+
+**Reproduction:** Enter URL A, wait for its probe to start, then enter URL B or
+clear the input before A completes. Arrange for A to respond last and inspect
+the title hint and quality selector.
+
+## 11. An open row menu can leave live download state stale
+
+**Severity:** Medium
+
+`fetchHistory()` returns immediately whenever any row action menu is open.
+SSE change events received during that interval are discarded, and closing
+the menu does not schedule a reconciliation. If a download finishes while its
+menu is open, the UI can continue showing it in Current indefinitely even
+though the API reports `finished`.
+
+The recheck held a menu open until a slow download completed. The API reported
+`finished`, but the item stayed in Current after the menu closed. Calling
+`fetchHistory()` manually moved it to History.
+
+**Expected:** Defer one refresh while a menu is open and run it when the menu
+closes, or update the row without disrupting the open menu.
+
+**Reproduction:** Start a slow download, open its action menu, and keep it open
+until `/api/history` reports `finished`. Close the menu and observe that the
+row remains in Current until another refresh occurs.
+
+## 12. Failed download submissions silently clear the form
+
+**Severity:** Medium
+
+The submit handler parses every `/api/download` response and resets the URL and
+options without checking `response.ok`. An HTTP error response is therefore
+treated like a successful start. The user's URL disappears, no error is shown,
+and the unavailable-server banner stays hidden because the server did respond.
+
+The recheck intercepted `/api/download` with an HTTP 500 JSON response. The URL
+field was cleared and the response's error message was absent from the page.
+
+**Expected:** Preserve the entered URL and options after a rejected request and
+show the server-provided error message.
+
+**Reproduction:** Make `/api/download` return HTTP 400 or 500 with a JSON error,
+then submit a valid-looking URL through the form.
+
+## 13. Special characters are double-escaped in the filename hint
+
+**Severity:** Low
+
+The title returned by `/api/probe` is HTML-escaped before being assigned to the
+input's `placeholder` property. Property assignment does not need HTML
+escaping, so characters such as `&` and `<` appear as literal `&amp;` and
+`&lt;` text.
+
+**Expected:** The filename hint should display the title's original text.
+
+**Reproduction:** Probe a source whose title contains `&` or `<` and inspect
+the Title/Filename placeholder.
 
 ## Minor UI differences
 

@@ -91,6 +91,13 @@ TERMINAL_STATUSES = ('finished', 'error', 'cancelled', 'interrupted')
 # per operation and guard writes with this lock.
 _db_lock = threading.Lock()
 
+# Workers wait here before entering yt-dlp. A FIFO queue keeps a burst in
+# worker-arrival order while the counter lets preference changes take
+# effect without replacing a fixed-size semaphore.
+_worker_condition = threading.Condition()
+_worker_queue = []
+_active_worker_count = 0
+
 
 @contextmanager
 def db():
@@ -280,6 +287,9 @@ def db_set_preferences(updates: dict):
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (k, str(v)),
             )
+    if "max_concurrent" in updates:
+        with _worker_condition:
+            _worker_condition.notify_all()
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +317,10 @@ def request_cancel(download_id):
         # A paused download must wake up so the hook sees the cancel
         # flag and raises DownloadCancelled on its next iteration.
         _pause_flags.pop(download_id, None)
+    # A queued worker is asleep on the slot condition rather than inside a
+    # progress hook, so wake it to observe the cancellation immediately.
+    with _worker_condition:
+        _worker_condition.notify_all()
 
 
 def is_cancel_requested(download_id):
@@ -332,6 +346,45 @@ def is_pause_requested(download_id):
 def clear_pause(download_id):
     with _cancel_lock:
         _pause_flags.pop(download_id, None)
+
+
+def _configured_worker_limit():
+    value = db_get_preferences().get("max_concurrent", "3")
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return 3
+
+
+def _acquire_worker_slot(download_id):
+    global _active_worker_count
+
+    ticket = object()
+    with _worker_condition:
+        _worker_queue.append(ticket)
+        try:
+            while True:
+                if is_cancel_requested(download_id):
+                    return False
+                if (_worker_queue[0] is ticket
+                        and _active_worker_count < _configured_worker_limit()):
+                    _worker_queue.pop(0)
+                    _active_worker_count += 1
+                    _worker_condition.notify_all()
+                    return True
+                _worker_condition.wait()
+        finally:
+            if ticket in _worker_queue:
+                _worker_queue.remove(ticket)
+                _worker_condition.notify_all()
+
+
+def _release_worker_slot():
+    global _active_worker_count
+
+    with _worker_condition:
+        _active_worker_count -= 1
+        _worker_condition.notify_all()
 
 
 def progress_hook(d, download_id):
@@ -566,6 +619,12 @@ def background_download(url, download_id):
     formats_summary = None  # captured during the probe phase, used as
                             # the fallback source if the first attempt fails.
 
+    if not _acquire_worker_slot(download_id):
+        db_update_download(download_id, status='cancelled', finished_at=time.time())
+        clear_cancel(download_id)
+        clear_pause(download_id)
+        return
+
     try:
         # ---- Probe phase --------------------------------------------------
         # Run extract_info(download=False) up front so the available format
@@ -679,6 +738,7 @@ def background_download(url, download_id):
     finally:
         clear_cancel(download_id)
         clear_pause(download_id)
+        _release_worker_slot()
 
 
 def ffprobe_resolution(path):
