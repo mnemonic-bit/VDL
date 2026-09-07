@@ -522,6 +522,25 @@ function toggleMenu(id, ev) {
 }
 
 document.addEventListener('click', (ev) => {
+    const urlAction = ev.target.closest('[data-url-action]');
+    if (urlAction) {
+        const url = urlAction.dataset.url;
+        const id = urlAction.dataset.downloadId;
+        switch (urlAction.dataset.urlAction) {
+            case 'open':
+                openUrl(url);
+                break;
+            case 'continue':
+                continueDownload(id, url);
+                break;
+            case 'reload':
+                reloadDownload(id, url);
+                break;
+            case 'copy':
+                copyToClipboard(url, urlAction);
+                break;
+        }
+    }
     if (ev.target.closest('.kebab-menu') || ev.target.closest('.kebab-btn')) return;
     closeAllMenus();
 });
@@ -562,7 +581,12 @@ function formatEta(seconds) {
 }
 
 function escapeAttr(s) {
-    return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
 }
 
 // Escape a string for use as a single-quoted JS literal inside an HTML
@@ -579,7 +603,13 @@ function escapeHtml(s) {
 
 function openUrl(url) {
     closeAllMenus();
-    window.open(url, '_blank', 'noopener,noreferrer');
+    try {
+        const parsed = new URL(url);
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return;
+        window.open(parsed.href, '_blank', 'noopener,noreferrer');
+    } catch (e) {
+        // Invalid or relative download URLs have nowhere safe to open.
+    }
 }
 
 const COPY_URL_HTML    = '<svg class="menu-icon"><use href="#i-copy"/></svg>Copy URL';
@@ -630,7 +660,11 @@ function renderItem(info, inHistoryView = false) {
     else if (isPaused) statusLabel = 'Paused';
     else statusLabel = info.progress;
 
+    // URLs stay in data attributes and are read through dataset by the
+    // delegated click handler. Putting them inside inline JavaScript would
+    // let HTML entity decoding turn an apostrophe back into executable code.
     const safeUrl = escapeAttr(info.url);
+    const urlData = `data-url="${safeUrl}"`;
 
     let primary = '';
     const menuItems = [];
@@ -640,10 +674,10 @@ function renderItem(info, inHistoryView = false) {
     } else if (isPaused) {
         primary = `<button class="continue-btn" onclick="unpauseDownload('${id}')"><svg class="icon"><use href="#i-play"/></svg>Resume</button>`;
     } else if (isCancelled || info.status === 'interrupted') {
-        primary = `<button class="continue-btn" onclick="continueDownload('${id}', '${safeUrl}')"><svg class="icon"><use href="#i-play"/></svg>Continue</button>`;
+        primary = `<button class="continue-btn" data-url-action="continue" data-download-id="${id}" ${urlData}><svg class="icon"><use href="#i-play"/></svg>Continue</button>`;
     }
 
-    menuItems.push(`<button onclick="openUrl('${safeUrl}')"><svg class="menu-icon"><use href="#i-external"/></svg>Open URL</button>`);
+    menuItems.push(`<button data-url-action="open" ${urlData}><svg class="menu-icon"><use href="#i-external"/></svg>Open URL</button>`);
 
     if (isRunning) {
         menuItems.push(`<button onclick="pauseDownload('${id}')"><svg class="menu-icon"><use href="#i-pause"/></svg>Pause</button>`);
@@ -655,12 +689,12 @@ function renderItem(info, inHistoryView = false) {
 
     if (isTerminal) {
         if (!isFinished && !isCancelled && info.status !== 'interrupted') {
-            menuItems.push(`<button onclick="reloadDownload('${id}', '${safeUrl}')"><svg class="menu-icon"><use href="#i-sync"/></svg>Reload</button>`);
+            menuItems.push(`<button data-url-action="reload" data-download-id="${id}" ${urlData}><svg class="menu-icon"><use href="#i-sync"/></svg>Reload</button>`);
         }
-        menuItems.push(`<button onclick="copyToClipboard('${safeUrl}', this)"><svg class="menu-icon"><use href="#i-copy"/></svg>Copy URL</button>`);
+        menuItems.push(`<button data-url-action="copy" ${urlData}><svg class="menu-icon"><use href="#i-copy"/></svg>Copy URL</button>`);
         menuItems.push(`<button class="danger" onclick="deleteDownload('${id}')"><svg class="menu-icon"><use href="#i-trash"/></svg>Delete</button>`);
     } else {
-        menuItems.push(`<button onclick="copyToClipboard('${safeUrl}', this)"><svg class="menu-icon"><use href="#i-copy"/></svg>Copy URL</button>`);
+        menuItems.push(`<button data-url-action="copy" ${urlData}><svg class="menu-icon"><use href="#i-copy"/></svg>Copy URL</button>`);
     }
 
     const hasPlay = isFinished && info.filename;

@@ -2,9 +2,9 @@
 
 Issues 1-8 were found during the container feature audit performed on
 2026-09-06 against commit `73214c1`. They were rechecked on 2026-09-07 against
-commit `957d4c9`; issue 1 is resolved and issues 2-8 remain open. Issues 9-13
-were found during that recheck. The original audit and its limits are in
-[`feature-audit/REPORT.md`](feature-audit/REPORT.md).
+commit `957d4c9`; issues 1 and 2 are resolved and issues 3-8 remain open.
+Issues 9-13 were found during that recheck. The original audit and its limits
+are in [`feature-audit/REPORT.md`](feature-audit/REPORT.md).
 
 ## 1. [Resolved] Merged downloads kept the deleted temporary audio filename
 
@@ -56,18 +56,26 @@ The fix now waits for post-processing to finish and stores the path reported
 by the postprocessor. A current real DASH merge stored the resulting MP4 path;
 playback returned HTTP 200, rename succeeded, and removal deleted the file.
 
-## 2. Maximum concurrent downloads setting is not enforced
+## 2. [Resolved] Maximum concurrent downloads setting was not enforced
 
 **Severity:** High
 
-The `max_concurrent` preference is saved and displayed, but every accepted
-download starts a new worker thread immediately. With the value set to `1`,
-two test downloads simultaneously reached `downloading` at 9.9%.
+**Status:** Resolved by commit `a70d006` and verified on 2026-09-07.
+
+Before the fix, the `max_concurrent` preference was saved and displayed, but
+every accepted download started a new worker thread immediately. With the
+value set to `1`, two test downloads simultaneously reached `downloading` at
+9.9%.
 
 **Expected:** At most the configured number of downloads should run; excess
 downloads should remain queued until a worker slot is available.
 
 Evidence: [browser audit results](feature-audit/evidence/results.json).
+
+Workers now wait in FIFO order for a dynamically sized slot before entering
+the probe and download phases. Focused tests verify that the configured limit
+is enforced, queued downloads can be cancelled, and raising the limit wakes a
+waiting download.
 
 ## 3. Download Options ignores the custom Title/Filename
 
@@ -155,15 +163,17 @@ record the tab-based design as the accepted replacement.
 
 Evidence: [supplemental results](feature-audit/evidence/supplement.json).
 
-## 9. Download URLs can inject JavaScript into row actions
+## 9. [Resolved] Download URLs could inject JavaScript into row actions
 
 **Severity:** High
 
-Download URLs are HTML-escaped and then interpolated into inline `onclick`
-handlers for Open URL, Continue, Reload, and Copy URL. HTML entity decoding
-happens before the JavaScript handler is compiled, so an apostrophe in a URL
-breaks the handler. A crafted URL can append and execute arbitrary JavaScript
-when one of these actions is clicked.
+**Status:** Resolved and verified on 2026-09-07.
+
+Before the fix, download URLs were HTML-escaped and then interpolated into
+inline `onclick` handlers for Open URL, Continue, Reload, and Copy URL. HTML
+entity decoding happened before the JavaScript handler was compiled, so an
+apostrophe in a URL broke the handler. A crafted URL could append and execute
+arbitrary JavaScript when one of these actions was clicked.
 
 The recheck used a harmless payload that set a marker on `window`. Clicking
 Reload executed the marker, confirming stored script execution in the VDL
@@ -177,6 +187,11 @@ JavaScript.
 **Reproduction:** Submit a URL containing an apostrophe and allow it to reach a
 terminal state. Open its action menu and click Reload, Continue, Open URL, or
 Copy URL. Inspect the inline handler and the browser's page errors.
+
+URL actions now store the URL in an escaped data attribute and a delegated
+click handler reads it as data. Open URL additionally accepts only HTTP and
+HTTPS URLs. Apostrophes and markup characters round-trip without becoming
+executable JavaScript.
 
 ## 10. Stale URL probes overwrite newer or cleared Download Options
 
