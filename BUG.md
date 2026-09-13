@@ -2,7 +2,8 @@
 
 Issues 1-8 were found during the container feature audit performed on
 2026-09-06 against commit `73214c1`. They were rechecked on 2026-09-07 against
-commit `957d4c9`; issues 1 and 2 are resolved and issues 3-8 remain open.
+commit `957d4c9`; issues 1, 2, and 6 are resolved and issues 3-5 and 7-8 remain
+open.
 Issues 9-13 were found during that recheck. The original audit and its limits
 are in [`feature-audit/REPORT.md`](feature-audit/REPORT.md).
 
@@ -124,9 +125,11 @@ that resumable Current entries will also be removed.
 
 Evidence: [supplemental results](feature-audit/evidence/supplement.json).
 
-## 6. Cancelled downloads can leave partial files behind
+## 6. [Resolved] Cancelled downloads can leave partial files behind
 
 **Severity:** Medium
+
+**Status:** Resolved and verified on 2026-09-13.
 
 Some cancelled downloads have no path saved in the history row. Removing the
 entry or clearing history therefore cannot locate their `.part`, fragment, and
@@ -136,6 +139,12 @@ entry or clearing history therefore cannot locate their `.part`, fragment, and
 owned by that download, without affecting unrelated files.
 
 Evidence: [deletion evidence](feature-audit/evidence/deletion-evidence.json).
+
+Each worker now records the directory it actually uses. Removal identifies
+all final, split-format, fragment, `.part`, and `.ytdl` files by the random
+download ID embedded in their output names, even when no filename reached the
+database before cancellation. Cleanup remains confined to that worker's
+directory and leaves files belonging to other download IDs untouched.
 
 ## 7. History insertion animation does not make room before revealing the row
 

@@ -146,6 +146,10 @@ def init_db():
             # the History tab can explain *why* a 'Requested format is not
             # available' error happened.
             ("requested_format", "ALTER TABLE downloads ADD COLUMN requested_format TEXT"),
+            # Snapshot the directory used by this worker. Preferences can
+            # change before a cancelled entry is removed, and early partials
+            # may exist before yt-dlp reports a filename.
+            ("output_dir", "ALTER TABLE downloads ADD COLUMN output_dir TEXT"),
         ]:
             if col not in existing_cols:
                 conn.execute(ddl)
@@ -185,7 +189,7 @@ def db_insert_download(download_id, url):
 def db_update_download(download_id, *, status=None, progress=None,
                        filename=None, resolution=None, filesize=None,
                        speed=None, eta=None, title=None, finished_at=None,
-                       formats=None, requested_format=None):
+                       formats=None, requested_format=None, output_dir=None):
     fields, values = [], []
     if status is not None:
         fields.append("status = ?"); values.append(status)
@@ -209,6 +213,8 @@ def db_update_download(download_id, *, status=None, progress=None,
         fields.append("formats = ?"); values.append(formats)
     if requested_format is not None:
         fields.append("requested_format = ?"); values.append(requested_format)
+    if output_dir is not None:
+        fields.append("output_dir = ?"); values.append(output_dir)
     if not fields:
         return
     values.append(download_id)
@@ -237,12 +243,51 @@ def db_delete_download(download_id):
     return rows
 
 
+def delete_download_artifacts(entry, fallback_dir=None):
+    """Delete final and temporary files owned by one download row."""
+    candidates = set()
+    filename = entry.get("filename")
+    if filename:
+        # Keep supporting renamed files, whose basename no longer carries the
+        # generated download ID used to identify yt-dlp's temporary files.
+        candidates.update((filename, filename + ".part", filename + ".ytdl"))
+
+    search_dirs = {entry.get("output_dir"), fallback_dir}
+    if filename:
+        search_dirs.add(os.path.dirname(os.path.abspath(filename)))
+
+    # Every output template includes this random row ID. It remains present in
+    # split-format, fragment, .part, and .ytdl names even when no filename was
+    # recorded before cancellation.
+    owned_name = re.compile(rf"^.*_{re.escape(str(entry['id']))}\..+$")
+    for directory in filter(None, search_dirs):
+        try:
+            with os.scandir(os.path.abspath(directory)) as items:
+                for item in items:
+                    if (owned_name.fullmatch(item.name)
+                            and (item.is_file(follow_symlinks=False)
+                                 or item.is_symlink())):
+                        candidates.add(item.path)
+        except OSError:
+            pass
+
+    removed = 0
+    for path in candidates:
+        try:
+            os.remove(path)
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
 def db_clear_terminal():
     placeholders = ",".join("?" * len(TERMINAL_STATUSES))
+    fallback_dir = db_get_preferences().get("download_dir", ".")
     with _db_lock, db() as conn:
-        filenames = [
-            r[0] for r in conn.execute(
-                f"SELECT filename FROM downloads WHERE status IN ({placeholders}) AND filename IS NOT NULL",
+        entries = [
+            dict(r) for r in conn.execute(
+                f"SELECT id, filename, output_dir FROM downloads WHERE status IN ({placeholders})",
                 TERMINAL_STATUSES,
             ).fetchall()
         ]
@@ -251,15 +296,12 @@ def db_clear_terminal():
             TERMINAL_STATUSES,
         )
         rows = cur.rowcount
-    for path in filenames:
-        for candidate in (path, path + '.part'):
-            try:
-                os.remove(candidate)
-            except OSError:
-                pass
+    files_deleted = sum(
+        delete_download_artifacts(entry, fallback_dir) for entry in entries
+    )
     if rows:
         event_bus.publish('change', {'reason': 'clear', 'count': rows})
-    return rows, len(filenames)
+    return rows, files_deleted
 
 
 def db_list_downloads():
@@ -575,6 +617,7 @@ def _is_format_unavailable_error(exc):
 def background_download(url, download_id):
     prefs = db_get_preferences()
     output_dir = prefs.get("download_dir", ".")
+    db_update_download(download_id, output_dir=os.path.abspath(output_dir))
     
     # Check if there's a format override from quality selection; otherwise use preference
     entry = db_get_download(download_id)
@@ -984,13 +1027,8 @@ def remove_download(download_id):
         return jsonify({"error": "Unknown download id"}), 404
     if entry['status'] in ('starting', 'downloading', 'paused'):
         return jsonify({"error": "Cannot remove an active download. Stop it first."}), 409
-    filename = entry.get('filename')
-    if filename:
-        for path in (filename, filename + '.part'):
-            try:
-                os.remove(path)
-            except OSError:
-                pass
+    fallback_dir = db_get_preferences().get("download_dir", ".")
+    delete_download_artifacts(entry, fallback_dir)
     db_delete_download(download_id)
     return jsonify({"message": "Removed", "id": download_id})
 
