@@ -5,10 +5,10 @@
 * [DONE] Fav icon for the site which looks like the download symbol added to the button
 * [DONE] Reload button for failed downloads
 * [DONE] more verbose error message for failed downloads in a section that can be fold with an arror 
-* [DONE] finished downloads should move to the next section, foldable with an arrow
+* [DONE] finished downloads move to the separate Download History tab (accepted replacement for the older foldable-section design)
 * [DONE] copy URL button for finished downloads
 * add tags to entries
-* [DONE] make the file name editable, with pencil button at the end of the name; for this the name should be abbreviated in the display, and the pencil at the end, or the name should be displayed in a kind of text field which cannot be edited, and changes to edit-mode, as soon as the pencil-button is clicked. The pencil-button will change to a tick symbol when editing and shows also an X to its left for aborting the edit.
+* [DONE] make the file name editable with a pencil action and explicit Save/Cancel controls; their relative ordering is not a product contract
 * search the history, filter by parts of the title, or the web site, and quality
 * [DONE] show the quality of the downloaded video, during download and also in the history
 * [DONE] add Escape key-binding to close the video overlay window
@@ -28,13 +28,15 @@
 * Error message missing, if the server is down and the app cannot communicate with the server any longer
 * Use keep-alive to check periodically if the server is still alive, otherwise dislay a dialogue
 * [DONE] The Download Options section has two triangles, the first (solid) triange should be removed.
-* If no URL was entered, the Options section should be empty, with a message stating that more options will appear once an URL has been provided
+* [DONE] If no URL was entered, the Options section shows disabled fields behind a message stating that more options appear once a URL is provided
 * ESC-key to close the overlay video also escapes the full-screen mode on MacOS. Can this be fixed? This works better if the video has been selected with the mouse before, and if not it excapes the full-screen mode of the app instead.
 * [DONE] Can Ctrl-V be captured and used to insert the contens of the clipboard, if its in an URL format?
 * Add Option: Audio Only
 * Add "Auto-Start" option to the Preferences, i.e. as soon as a URL is entered into the input field, the download should start with the preferred options set as parameters. The Options pane should not open in that case.
 * [DONE] Animation: when a video has been downloaded successfully and is added to the History, the new item should be added with an animation, that is, making room, and then making the new item visible.
 * [DONE] Allow the listening port to be configured at startup with the `--port` command-line parameter (for example, `python vdl.py --port 8080`).
+
+Permanent regression coverage and tier commands are documented in [`tests/README.md`](tests/README.md).
 
 
 ## Components to Install in Docker

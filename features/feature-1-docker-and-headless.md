@@ -213,7 +213,6 @@ __pycache__/
 *.py[cod]
 downloads.db
 media/
-feature-audit/
 tests/
 *.log
 ```

@@ -1,26 +1,18 @@
 import os
-import tempfile
 import unittest
 
 import vdl
+from tests.support.app_case import AppCase
 
 
-class CancelledDownloadCleanupTest(unittest.TestCase):
+class CancelledDownloadCleanupTest(AppCase):
     def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.other_dir = tempfile.TemporaryDirectory()
-        self.old_db_path = vdl.DB_PATH
-        vdl.DB_PATH = os.path.join(self.temp_dir.name, "downloads.db")
-        vdl.init_db()
-        vdl.db_set_preferences({"download_dir": self.temp_dir.name})
-
-    def tearDown(self):
-        vdl.DB_PATH = self.old_db_path
-        self.other_dir.cleanup()
-        self.temp_dir.cleanup()
+        super().setUp()
+        self.other_dir = os.path.join(self.temp_dir.name, "other")
+        os.mkdir(self.other_dir)
 
     def _write(self, filename):
-        path = os.path.join(self.temp_dir.name, filename)
+        path = os.path.join(self.download_dir, filename)
         with open(path, "wb") as output_file:
             output_file.write(b"partial")
         return path
@@ -50,10 +42,10 @@ class CancelledDownloadCleanupTest(unittest.TestCase):
         vdl.db_update_download(
             download_id,
             status="cancelled",
-            output_dir=self.temp_dir.name,
+            output_dir=self.download_dir,
         )
         partial_path = self._write(f"fixture_{download_id}.mp4.part")
-        vdl.db_set_preferences({"download_dir": self.other_dir.name})
+        vdl.db_set_preferences({"download_dir": self.other_dir})
 
         response = vdl.app.test_client().post(f"/api/remove/{download_id}")
 
@@ -69,7 +61,7 @@ class CancelledDownloadCleanupTest(unittest.TestCase):
 
         entry = vdl.db_get_download(download_id)
         self.assertEqual(entry["status"], "cancelled")
-        self.assertEqual(entry["output_dir"], os.path.abspath(self.temp_dir.name))
+        self.assertEqual(entry["output_dir"], os.path.abspath(self.download_dir))
 
 
 if __name__ == "__main__":

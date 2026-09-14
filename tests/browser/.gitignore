@@ -1,0 +1,4 @@
+node_modules/
+test-results/
+.fixture-downloads.db
+.fixture-media/

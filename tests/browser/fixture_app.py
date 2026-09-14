@@ -1,0 +1,72 @@
+"""Deterministic Flask fixture used only by the Playwright regression tier."""
+
+import os
+import sys
+import time
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+import vdl  # noqa: E402
+from flask import jsonify, request  # noqa: E402
+from tests.support.fake_ytdlp import FakeYoutubeDL  # noqa: E402
+
+
+vdl.yt_dlp.YoutubeDL = FakeYoutubeDL
+vdl.ffprobe_resolution = lambda _path: "360p"
+
+
+@vdl.app.post("/__test__/reset")
+def test_reset():
+    for row in vdl.db_list_downloads():
+        if row["status"] in ("starting", "downloading", "paused"):
+            vdl.request_cancel(row["id"])
+    with vdl._db_lock, vdl.db() as connection:
+        connection.execute("DELETE FROM downloads")
+        connection.execute("DELETE FROM preferences")
+    with vdl._cancel_lock:
+        vdl._cancel_flags.clear()
+        vdl._pause_flags.clear()
+    vdl.init_db()
+    FakeYoutubeDL.reset()
+    return jsonify({"ok": True})
+
+
+@vdl.app.post("/__test__/row")
+def test_row():
+    data = request.get_json() or {}
+    download_id = data.get("id", "browser1")
+    if vdl.db_get_download(download_id) is None:
+        vdl.db_insert_download(download_id, data.get("url", "https://fixture.invalid/video"))
+    filename = None
+    if data.get("file"):
+        os.makedirs(os.environ["DOWNLOADS_DIR"], exist_ok=True)
+        filename = os.path.join(os.environ["DOWNLOADS_DIR"], data.get("name", "fixture.mp4"))
+        with open(filename, "wb") as output:
+            output.write(bytes(range(100)))
+    updates = {
+        key: value for key, value in data.items()
+        if key in {
+            "status", "progress", "resolution", "filesize", "speed", "eta",
+            "title", "finished_at", "formats", "requested_format",
+        }
+    }
+    if filename:
+        updates["filename"] = filename
+    if data.get("status") in ("finished", "error", "cancelled", "interrupted"):
+        updates.setdefault("finished_at", time.time())
+    if updates:
+        vdl.db_update_download(download_id, **updates)
+    return jsonify(vdl.db_get_download(download_id))
+
+
+@vdl.app.post("/__test__/preferences")
+def test_preferences():
+    vdl.db_set_preferences(request.get_json() or {})
+    return jsonify(vdl.db_get_preferences())
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "5000"))
+    vdl.app.run(host="0.0.0.0", port=port, debug=False, threaded=True)

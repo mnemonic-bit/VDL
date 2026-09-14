@@ -1,0 +1,10 @@
+{
+  "name": "vdl-browser-tests",
+  "private": true,
+  "scripts": {
+    "test": "python3 run.py"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0"
+  }
+}

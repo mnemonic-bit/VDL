@@ -1,0 +1,132 @@
+#!/bin/sh
+set -eu
+
+root=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
+engine=${CONTAINER_ENGINE:-}
+if [ -z "$engine" ]; then
+    if command -v docker >/dev/null 2>&1; then
+        engine=docker
+    elif command -v podman >/dev/null 2>&1; then
+        engine=podman
+    else
+        echo "Container tier requires Docker or Podman" >&2
+        exit 1
+    fi
+fi
+
+image=${VDL_IMAGE:-vdl:local}
+suffix="$$-$(date +%s)"
+name="vdl-smoke-$suffix"
+data_volume="vdl-smoke-data-$suffix"
+media_volume="vdl-smoke-media-$suffix"
+
+cleanup() {
+    "$engine" rm -f "$name" >/dev/null 2>&1 || true
+    "$engine" volume rm "$data_volume" "$media_volume" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT INT TERM
+
+if [ "${1:-}" = "--build" ]; then
+    "$engine" build --pull -t "$image" "$root"
+elif [ "${1:-}" != "" ]; then
+    echo "Usage: $0 [--build]" >&2
+    exit 2
+fi
+
+test "$("$engine" run --rm --entrypoint id "$image" -u)" = "10001"
+test "$("$engine" run --rm --entrypoint id "$image" -g)" = "10001"
+test "$("$engine" run --rm "$image" yt-dlp --version)" = "2026.08.19"
+"$engine" run --rm "$image" deno --version >/dev/null
+"$engine" run --rm "$image" ffmpeg -version >/dev/null
+"$engine" run --rm "$image" ffprobe -version >/dev/null
+"$engine" run --rm "$image" python -c \
+    'import curl_cffi, yt_dlp_ejs; print("recommended Python extras: ok")'
+
+if "$engine" run --rm --entrypoint sh "$image" -c \
+    'command -v chromium || command -v chromium-browser || command -v google-chrome'; then
+    echo "Unexpected browser binary in the shipping image" >&2
+    exit 1
+fi
+
+"$engine" volume create "$data_volume" >/dev/null
+"$engine" volume create "$media_volume" >/dev/null
+"$engine" run -d --name "$name" \
+    -v "$data_volume:/data" -v "$media_volume:/downloads" "$image" >/dev/null
+
+for attempt in $(seq 1 40); do
+    if "$engine" exec "$name" python -c \
+        "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/api/health', timeout=1)" \
+        >/dev/null 2>&1; then
+        break
+    fi
+    if [ "$attempt" = "40" ]; then
+        "$engine" logs "$name" >&2
+        echo "Shipping container did not become healthy" >&2
+        exit 1
+    fi
+    sleep 0.25
+done
+
+"$engine" exec "$name" python - <<'PY'
+import urllib.request
+
+for path in ('/api/health', '/', '/static/app.js', '/static/styles.css'):
+    with urllib.request.urlopen('http://127.0.0.1:5000' + path, timeout=3) as response:
+        assert response.status == 200, (path, response.status)
+PY
+
+"$engine" exec "$name" python - <<'PY'
+import json
+import sqlite3
+import time
+import urllib.request
+
+request = urllib.request.Request(
+    'http://127.0.0.1:5000/api/preferences',
+    data=json.dumps({'theme': 'dark'}).encode(),
+    headers={'Content-Type': 'application/json'},
+)
+urllib.request.urlopen(request, timeout=3).close()
+with open('/downloads/persist.mp4', 'wb') as output:
+    output.write(b'persistent media')
+with sqlite3.connect('/data/downloads.db') as connection:
+    connection.execute(
+        "INSERT INTO downloads(id, url, status, progress, created_at, filename, finished_at) "
+        "VALUES (?, ?, 'finished', '100%', ?, ?, ?)",
+        ('persist1', 'https://fixture.invalid/persist', time.time(), '/downloads/persist.mp4', time.time()),
+    )
+PY
+
+"$engine" rm -f "$name" >/dev/null
+"$engine" run -d --name "$name" \
+    -v "$data_volume:/data" -v "$media_volume:/downloads" "$image" >/dev/null
+for attempt in $(seq 1 40); do
+    if "$engine" exec "$name" python -c \
+        "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/api/health', timeout=1)" \
+        >/dev/null 2>&1; then
+        break
+    fi
+    sleep 0.25
+done
+"$engine" exec "$name" python - <<'PY'
+import json
+import urllib.request
+
+with urllib.request.urlopen('http://127.0.0.1:5000/api/preferences') as response:
+    assert json.load(response)['theme'] == 'dark'
+with urllib.request.urlopen('http://127.0.0.1:5000/api/history') as response:
+    assert any(row['id'] == 'persist1' for row in json.load(response))
+with urllib.request.urlopen('http://127.0.0.1:5000/api/file/persist1') as response:
+    assert response.read() == b'persistent media'
+PY
+
+# Mount only test code; application code remains the immutable /app payload
+# from the shipping image while the generated media stays temporary.
+"$engine" run --rm \
+    -e VDL_RUN_MEDIA=1 -e VDL_REQUIRE_MEDIA_TOOLS=1 \
+    -e PYTHONPATH=/app:/workspace \
+    -v "$root/tests:/workspace/tests:ro" \
+    -w /app "$image" python -m unittest -v \
+    tests.integration.test_real_media.RealMediaIntegrationTest.test_dash_merge_stored_path_playback_rename_and_removal
+
+echo "VDL shipping-container smoke checks passed for $image"

@@ -97,6 +97,19 @@ policy; changing the bind address alone is not a safe public deployment.
 
 ## Verification
 
+The permanent regression suite is split into explicit tiers:
+
+```bash
+./tests/run-all.sh --unit
+./tests/run-all.sh --browser
+./tests/run-all.sh --media
+./tests/run-all.sh --container
+./tests/run-all.sh --all
+```
+
+`--all` is the release gate. See [`tests/README.md`](tests/README.md) for
+dependencies, expected-failure policy, and the macOS manual check.
+
 Build and inspect the local image with:
 
 ```bash

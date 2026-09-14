@@ -1,9 +1,9 @@
 import os
-import tempfile
 import unittest
 from unittest import mock
 
 import vdl
+from tests.support.app_case import AppCase
 
 
 class FakeYoutubeDL:
@@ -74,23 +74,13 @@ class FakeYoutubeDL:
             })
 
 
-class MergedDownloadPathTest(unittest.TestCase):
-    def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.old_db_path = vdl.DB_PATH
-        vdl.DB_PATH = os.path.join(self.temp_dir.name, "downloads.db")
-        vdl.init_db()
-        vdl.db_set_preferences({"download_dir": self.temp_dir.name})
-
-    def tearDown(self):
-        vdl.DB_PATH = self.old_db_path
-        self.temp_dir.cleanup()
+class MergedDownloadPathTest(AppCase):
 
     def test_stream_completion_does_not_finish_job_before_merge(self):
         download_id = "merge000"
         vdl.db_insert_download(download_id, "https://fixture.invalid/manifest.mpd")
         final_path = os.path.join(
-            self.temp_dir.name,
+            self.download_dir,
             f"fixture_{download_id}.mp4",
         )
 
@@ -126,7 +116,7 @@ class MergedDownloadPathTest(unittest.TestCase):
             )
 
         expected_path = os.path.join(
-            self.temp_dir.name,
+            self.download_dir,
             f"fixture_{download_id}.mp4",
         )
         row = vdl.db_get_download(download_id)
@@ -135,20 +125,19 @@ class MergedDownloadPathTest(unittest.TestCase):
         self.assertEqual(row["filesize"], os.path.getsize(expected_path))
         self.assertEqual(row["resolution"], "360p")
 
-        client = vdl.app.test_client()
-        playback_response = client.get(f"/api/file/{download_id}")
+        playback_response = self.client.get(f"/api/file/{download_id}")
         self.assertEqual(playback_response.status_code, 200)
         playback_response.close()
 
-        rename_response = client.post(
+        rename_response = self.client.post(
             f"/api/rename/{download_id}",
             json={"filename": "renamed-merge"},
         )
         self.assertEqual(rename_response.status_code, 200)
-        renamed_path = os.path.join(self.temp_dir.name, "renamed-merge.mp4")
+        renamed_path = os.path.join(self.download_dir, "renamed-merge.mp4")
         self.assertEqual(vdl.db_get_download(download_id)["filename"], renamed_path)
 
-        self.assertEqual(client.post(f"/api/remove/{download_id}").status_code, 200)
+        self.assertEqual(self.client.post(f"/api/remove/{download_id}").status_code, 200)
         self.assertFalse(os.path.exists(renamed_path))
 
 

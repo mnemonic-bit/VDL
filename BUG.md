@@ -1,11 +1,9 @@
 # Known Bugs
 
-Issues 1-8 were found during the container feature audit performed on
-2026-09-06 against commit `73214c1`. They were rechecked on 2026-09-07 against
-commit `957d4c9`; issues 1, 2, and 6 are resolved and issues 3-5 and 7-8 remain
-open.
-Issues 9-13 were found during that recheck. The original audit and its limits
-are in [`feature-audit/REPORT.md`](feature-audit/REPORT.md).
+Issues 1-8 were found during a container review on 2026-09-06 and rechecked on
+2026-09-07. Issues 9-13 were found during that recheck. Their valuable
+reproductions now live in the permanent deterministic suite under `tests/`;
+historical screenshots and logs were retired after that migration.
 
 ## 1. [Resolved] Merged downloads kept the deleted temporary audio filename
 
@@ -49,9 +47,8 @@ merged output path.
 such as the audit DASH fixture, and select a merged video format. Wait for the
 entry to report `finished`, then try Play or Rename.
 
-Evidence: [focused result](feature-audit/evidence/merge-evidence.json),
-[failing reproduction](feature-audit/evidence/merge-repro.log), and
-[orphaned-file result](feature-audit/evidence/deletion-evidence.json).
+Permanent coverage: `tests/test_merged_download.py` and
+`tests/integration/test_real_media.py`.
 
 The fix now waits for post-processing to finish and stores the path reported
 by the postprocessor. A current real DASH merge stored the resulting MP4 path;
@@ -71,7 +68,7 @@ value set to `1`, two test downloads simultaneously reached `downloading` at
 **Expected:** At most the configured number of downloads should run; excess
 downloads should remain queued until a worker slot is available.
 
-Evidence: [browser audit results](feature-audit/evidence/results.json).
+Permanent coverage: `tests/test_max_concurrent.py`.
 
 Workers now wait in FIFO order for a dynamically sized slot before entering
 the probe and download phases. Focused tests verify that the configured limit
@@ -89,7 +86,8 @@ backend does not use it when building yt-dlp's output template. Entering
 **Expected:** A valid custom filename entered in Download Options should be
 used for the downloaded file while preserving the real output extension.
 
-Evidence: [browser audit results](feature-audit/evidence/results.json).
+Expected-behavior coverage: `tests/test_download_requests.py` and
+`tests/browser/download-options.spec.cjs`.
 
 ## 4. Audio-only behavior is inconsistent
 
@@ -107,8 +105,9 @@ There are two related failures:
 **Expected:** Audio-only must produce an audio-only output for supported
 sources, and nonnumeric resolution labels must never generate height filters.
 
-Evidence: [browser audit results](feature-audit/evidence/results.json) and
-[DASH supplemental results](feature-audit/evidence/supplement.json).
+Expected-behavior coverage: `tests/test_formats.py`,
+`tests/integration/test_real_media.py`, and
+`tests/browser/download-options.spec.cjs`.
 
 ## 5. Clear History also removes cancelled and interrupted Current entries
 
@@ -123,7 +122,7 @@ entry disappeared from Current after Clear History was used.
 History (`finished` and `error`), or the UI should clearly disclose and confirm
 that resumable Current entries will also be removed.
 
-Evidence: [supplemental results](feature-audit/evidence/supplement.json).
+Expected-behavior coverage: `tests/test_history_api.py`.
 
 ## 6. [Resolved] Cancelled downloads can leave partial files behind
 
@@ -138,7 +137,7 @@ entry or clearing history therefore cannot locate their `.part`, fragment, and
 **Expected:** Removing a cancelled download should remove all partial files
 owned by that download, without affecting unrelated files.
 
-Evidence: [deletion evidence](feature-audit/evidence/deletion-evidence.json).
+Permanent coverage: `tests/test_cancelled_cleanup.py`.
 
 Each worker now records the directory it actually uses. Removal identifies
 all final, split-format, fragment, `.part`, and `.ytdl` files by the random
@@ -157,9 +156,9 @@ entry fades in.
 **Expected:** Animate the inserted row's occupied space and visibility, as
 described by the TODO marked complete.
 
-Evidence: [browser audit results](feature-audit/evidence/results.json).
+Expected-behavior coverage: `tests/browser/live-updates.spec.cjs`.
 
-## 8. Finished-download section is not foldable
+## 8. [Resolved by product decision] Finished-download section is not foldable
 
 **Severity:** Low
 
@@ -167,10 +166,12 @@ Finished downloads correctly move to the Download History tab, but that
 section has no disclosure control and cannot be folded despite the TODO being
 marked complete.
 
-**Expected:** Either make the finished section foldable or update the TODO to
-record the tab-based design as the accepted replacement.
+**Status:** Resolved on 2026-09-14. The separate Download History tab is the
+accepted replacement for the older foldable-section design. `TODOs.md` and
+`tests/README.md` record this contract.
 
-Evidence: [supplemental results](feature-audit/evidence/supplement.json).
+Permanent coverage: `tests/browser/live-updates.spec.cjs` verifies movement
+between Current and Download History.
 
 ## 9. [Resolved] Download URLs could inject JavaScript into row actions
 
@@ -202,6 +203,8 @@ click handler reads it as data. Open URL additionally accepts only HTTP and
 HTTPS URLs. Apostrophes and markup characters round-trip without becoming
 executable JavaScript.
 
+Permanent coverage: `tests/browser/history-actions.spec.cjs`.
+
 ## 10. Stale URL probes overwrite newer or cleared Download Options
 
 **Severity:** Medium
@@ -224,6 +227,8 @@ changing the URL must cancel or invalidate all earlier responses.
 clear the input before A completes. Arrange for A to respond last and inspect
 the title hint and quality selector.
 
+Expected-behavior coverage: `tests/browser/download-options.spec.cjs`.
+
 ## 11. An open row menu can leave live download state stale
 
 **Severity:** Medium
@@ -245,6 +250,8 @@ closes, or update the row without disrupting the open menu.
 until `/api/history` reports `finished`. Close the menu and observe that the
 row remains in Current until another refresh occurs.
 
+Expected-behavior coverage: `tests/browser/live-updates.spec.cjs`.
+
 ## 12. Failed download submissions silently clear the form
 
 **Severity:** Medium
@@ -263,6 +270,8 @@ show the server-provided error message.
 **Reproduction:** Make `/api/download` return HTTP 400 or 500 with a JSON error,
 then submit a valid-looking URL through the form.
 
+Expected-behavior coverage: `tests/browser/download-form.spec.cjs`.
+
 ## 13. Special characters are double-escaped in the filename hint
 
 **Severity:** Low
@@ -277,12 +286,14 @@ escaping, so characters such as `&` and `<` appear as literal `&amp;` and
 **Reproduction:** Probe a source whose title contains `&` or `<` and inspect
 the Title/Filename placeholder.
 
-## Minor UI differences
+Expected-behavior coverage: `tests/browser/download-options.spec.cjs`.
 
-- In inline rename mode, Cancel appears to the right of Save, while the TODO
-  specifies an X to the left of the tick.
-- With no URL entered, Download Options shows the explanatory message as an
-  overlay over visible disabled fields rather than showing an empty section.
+## Accepted UI decisions
+
+- Inline rename requires working Save and Cancel actions; their relative order
+  is not a product contract.
+- With no URL entered, Download Options intentionally shows its explanatory
+  message over visible disabled fields.
 
 The Debian package-server DNS failure seen while building the former
 `Dockerfile.vdl` seed is

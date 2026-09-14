@@ -1,10 +1,10 @@
 import os
-import tempfile
 import threading
 import unittest
 from unittest import mock
 
 import vdl
+from tests.support.app_case import AppCase
 
 
 class ControlledYoutubeDL:
@@ -68,14 +68,11 @@ class ControlledYoutubeDL:
             type(self).active -= 1
 
 
-class MaxConcurrentDownloadsTest(unittest.TestCase):
+class MaxConcurrentDownloadsTest(AppCase):
     def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.old_db_path = vdl.DB_PATH
-        vdl.DB_PATH = os.path.join(self.temp_dir.name, "downloads.db")
-        vdl.init_db()
+        super().setUp()
         vdl.db_set_preferences({
-            "download_dir": self.temp_dir.name,
+            "download_dir": self.download_dir,
             "max_concurrent": 1,
         })
 
@@ -85,10 +82,6 @@ class MaxConcurrentDownloadsTest(unittest.TestCase):
         ControlledYoutubeDL.active = 0
         ControlledYoutubeDL.max_active = 0
         ControlledYoutubeDL.entered = 0
-
-    def tearDown(self):
-        vdl.DB_PATH = self.old_db_path
-        self.temp_dir.cleanup()
 
     def test_second_download_waits_for_available_worker_slot(self):
         urls = ["https://fixture.invalid/one", "https://fixture.invalid/two"]
