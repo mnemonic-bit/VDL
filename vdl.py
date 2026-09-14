@@ -313,21 +313,26 @@ def db_update_download(download_id, *, status=None, progress=None,
     event_bus.publish('change', {'reason': 'update', 'id': download_id})
 
 
+def db_claim_download_for_resume(download_id):
+    """Move one resumable row to starting, returning whether we won."""
+    with _db_lock, db() as conn:
+        cur = conn.execute(
+            "UPDATE downloads SET status = 'starting', progress = '0%' "
+            "WHERE id = ? AND status IN ('cancelled', 'interrupted')",
+            (download_id,),
+        )
+        claimed = cur.rowcount == 1
+    if claimed:
+        event_bus.publish('change', {'reason': 'update', 'id': download_id})
+    return claimed
+
+
 def db_get_download(download_id):
     with db() as conn:
         row = conn.execute(
             "SELECT * FROM downloads WHERE id = ?", (download_id,)
         ).fetchone()
         return dict(row) if row else None
-
-
-def db_delete_download(download_id):
-    with _db_lock, db() as conn:
-        cur = conn.execute("DELETE FROM downloads WHERE id = ?", (download_id,))
-        rows = cur.rowcount
-    if rows:
-        event_bus.publish('change', {'reason': 'delete', 'id': download_id})
-    return rows
 
 
 def delete_download_artifacts(entry, fallback_dir=None):
@@ -366,6 +371,27 @@ def delete_download_artifacts(entry, fallback_dir=None):
         except OSError:
             pass
     return removed
+
+
+def db_remove_download_if_inactive(download_id, fallback_dir=None):
+    """Atomically remove a non-active row and return its prior contents."""
+    with _db_lock, db() as conn:
+        row = conn.execute(
+            "SELECT * FROM downloads WHERE id = ?", (download_id,)
+        ).fetchone()
+        entry = dict(row) if row else None
+        if entry is None or entry['status'] in ('starting', 'downloading', 'paused'):
+            return entry, False
+        cur = conn.execute(
+            "DELETE FROM downloads WHERE id = ? "
+            "AND status NOT IN ('starting', 'downloading', 'paused')",
+            (download_id,),
+        )
+        removed = cur.rowcount == 1
+    if removed:
+        delete_download_artifacts(entry, fallback_dir)
+        event_bus.publish('change', {'reason': 'delete', 'id': download_id})
+    return entry, removed
 
 
 def db_clear_terminal():
@@ -1012,9 +1038,19 @@ def resume_download(download_id):
     if entry['status'] not in ('cancelled', 'interrupted'):
         return jsonify({"error": f"Cannot resume from status '{entry['status']}'"}), 409
 
-    # Clear stale cancel flag, mark the row as starting, then spawn the worker.
-    clear_cancel(download_id)
-    db_update_download(download_id, status='starting', progress='0%')
+    # The conditional write is the ownership hand-off: only its winner may
+    # clear stale cancellation state and touch the shared partial files.
+    with _cancel_lock:
+        claimed = db_claim_download_for_resume(download_id)
+        if claimed:
+            _cancel_flags.pop(download_id, None)
+    if not claimed:
+        current = db_get_download(download_id)
+        if current is None:
+            return jsonify({"error": "Unknown download id"}), 404
+        return jsonify({
+            "error": f"Cannot resume from status '{current['status']}'"
+        }), 409
     thread = threading.Thread(
         target=background_download, args=(entry['url'], download_id)
     )
@@ -1123,11 +1159,12 @@ def remove_download(download_id):
     entry = db_get_download(download_id)
     if entry is None:
         return jsonify({"error": "Unknown download id"}), 404
-    if entry['status'] in ('starting', 'downloading', 'paused'):
-        return jsonify({"error": "Cannot remove an active download. Stop it first."}), 409
     fallback_dir = db_get_preferences().get("download_dir", ".")
-    delete_download_artifacts(entry, fallback_dir)
-    db_delete_download(download_id)
+    entry, removed = db_remove_download_if_inactive(download_id, fallback_dir)
+    if entry is None:
+        return jsonify({"error": "Unknown download id"}), 404
+    if not removed:
+        return jsonify({"error": "Cannot remove an active download. Stop it first."}), 409
     return jsonify({"message": "Removed", "id": download_id})
 
 

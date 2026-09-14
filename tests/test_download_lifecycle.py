@@ -132,7 +132,6 @@ class DownloadLifecycleTest(AppCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["status"], "cancelled")
 
-    @unittest.expectedFailure  # BUG 17
     def test_simultaneous_resume_requests_start_exactly_one_worker(self):
         download_id = self.insert("race0001")
         vdl.db_update_download(download_id, status="cancelled")
@@ -176,7 +175,6 @@ class DownloadLifecycleTest(AppCase):
         self.assertEqual(sorted(responses), [200, 409])
         self.assertEqual(starts, [("https://fixture.invalid/video", download_id)])
 
-    @unittest.expectedFailure  # BUG 17 / BUG 22
     def test_resume_remove_race_has_one_consistent_winner(self):
         download_id = self.insert("remove-race")
         vdl.db_update_download(download_id, status="cancelled")
