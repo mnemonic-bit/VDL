@@ -4,6 +4,9 @@ Issues 1-8 were found during a container review on 2026-09-06 and rechecked on
 2026-09-07. Issues 9-13 were found during that recheck. Their valuable
 reproductions now live in the permanent deterministic suite under `tests/`;
 historical screenshots and logs were retired after that migration.
+Issues 14-22 were found during a repository and test-coverage audit on
+2026-09-14. Unlike the earlier findings, they do not yet have permanent
+regression tests; Issue 22 records that coverage debt explicitly.
 
 ## 1. [Resolved] Merged downloads kept the deleted temporary audio filename
 
@@ -287,6 +290,200 @@ escaping, so characters such as `&` and `<` appear as literal `&amp;` and
 the Title/Filename placeholder.
 
 Expected-behavior coverage: `tests/browser/download-options.spec.cjs`.
+
+## 14. Renamed filenames can inject JavaScript into the Play action
+
+**Severity:** High
+
+The rename endpoint permits HTML entity text such as `&apos;`, and the History
+renderer interpolates the resulting filename into an inline `onclick`
+attribute. `escapeJs()` escapes literal apostrophes but does not HTML-escape
+ampersands. The browser decodes the entity before compiling the handler, so a
+filename can close the JavaScript string and append script that runs when Play
+is clicked.
+
+A deterministic Chromium reproduction renamed a finished file to an otherwise
+valid basename containing encoded apostrophes and a harmless marker assignment.
+Clicking Play set the marker on `window`.
+
+**Expected:** Filenames must remain data. Bind Play through a delegated event
+handler or another non-executable data channel; do not interpolate filenames
+into inline JavaScript.
+
+**Reproduction:** Rename a finished file to a basename containing an HTML-
+encoded apostrophe and JavaScript expression, then click Play. The expression
+runs in the VDL origin.
+
+**Coverage gap:** No permanent regression test currently exercises hostile
+renamed filenames in the Play action. Add browser coverage alongside the URL-
+action injection test in `tests/browser/history-actions.spec.cjs`.
+
+## 15. Cross-origin form posts can invoke destructive API actions
+
+**Severity:** High
+
+State-changing endpoints such as `/api/clear`, `/api/remove/<id>`,
+`/api/stop/<id>`, and `/api/resume/<id>` do not validate `Origin`, require a
+CSRF token, or require a non-simple request content type. In particular,
+`POST /api/clear` accepts an empty `application/x-www-form-urlencoded` request,
+so a web page or browser context able to reach the loopback service can submit
+a form without needing to read the cross-origin response.
+
+The deterministic Flask reproduction sent `/api/clear` with
+`Origin: https://attacker.invalid`; the endpoint returned HTTP 200 and deleted
+both the finished row and its media file.
+
+**Expected:** Destructive requests must be resistant to cross-origin form
+submission, for example by validating the request origin and/or requiring a
+CSRF-resistant request contract consistently across every mutating route.
+
+**Coverage gap:** No permanent test sends cross-origin or simple-content-type
+requests to mutating endpoints.
+
+## 16. An unusable download directory leaves workers stuck at Starting
+
+**Severity:** Medium
+
+`POST /api/preferences` accepts an empty, invalid, or unwritable
+`download_dir`. `background_download()` calls `os.makedirs()` before entering
+its exception-handling block. A directory preparation error therefore escapes
+the worker thread instead of updating the row to `error`, and the UI can show
+that row at `starting` / `0%` indefinitely.
+
+The deterministic reproduction saved an empty directory, which returned HTTP
+200, then started a worker. `os.makedirs('')` raised `FileNotFoundError` and the
+database row remained active.
+
+**Expected:** Validate the download directory when preferences are saved and
+also keep worker setup inside the failure boundary so filesystem errors become
+terminal rows with useful messages.
+
+**Coverage gap:** Preference tests cover persistence and theme behavior, but
+not invalid directories, backend validation, or worker setup failures.
+
+## 17. Concurrent Resume requests can start duplicate workers
+
+**Severity:** High
+
+`/api/resume/<id>` reads the row, checks that it is resumable, and updates it in
+separate database operations. Two requests can both observe `cancelled` or
+`interrupted` before either writes `starting`; both then return HTTP 200 and
+launch workers using the same download ID and output template. The workers can
+write the same `.part` and final paths concurrently.
+
+A barrier-synchronised reproduction sent two resume requests for one cancelled
+row. Both returned HTTP 200 and two worker starts were recorded.
+
+**Expected:** Claim the resumable row with one atomic conditional state
+transition, and start exactly one worker only when that claim succeeds.
+
+**Coverage gap:** The lifecycle suite checks sequential double-resume, but not
+simultaneous resume requests or resume/remove races.
+
+## 18. The playback allow-list authorizes a tampered row's own directory
+
+**Severity:** Medium
+
+`/api/file/<id>` builds its allowed directory set from every finished row,
+including the row currently being served. If a database row points directly to
+an existing file outside the configured or historically trusted download
+directories, that file's parent is added to the allow-list and the check always
+passes for that row. This contradicts the route's stated tampered-row defense.
+
+The deterministic reproduction stored a finished row pointing to an external
+fixture file. `/api/file/<id>` returned HTTP 200 and the external contents.
+
+**Expected:** Derive trusted roots independently of the candidate row, such as
+persisted worker output directories, and reject a filename outside those roots.
+
+**Coverage gap:** The playback tests cover a symlink escape from a valid
+download directory, but not a row whose stored filename directly names an
+outside path.
+
+## 19. Unknown-size downloads never leave Starting in the UI
+
+**Severity:** Medium
+
+The progress hook writes status and metadata only when `total_bytes` or
+`total_bytes_estimate` is positive. For streams where yt-dlp reports downloaded
+bytes but no total, every `downloading` event is ignored. The row stays at
+`starting` / `0%` and omits title, resolution, and speed until the final event.
+
+The deterministic reproduction called the real progress hook with a valid
+`downloading` payload, 4096 downloaded bytes, and no total. The database row
+remained `starting` with no captured metadata.
+
+**Expected:** Mark the row `downloading` and persist available metadata even
+when a percentage cannot be calculated; show an indeterminate progress state.
+
+**Coverage gap:** Current lifecycle and browser tests only use progress payloads
+with a known positive total.
+
+## 20. Format fallback triggers on noncanonical diagnostic errors
+
+**Severity:** Medium
+
+`_is_format_unavailable_error()` accepts any error containing
+`--list-formats`, in addition to yt-dlp's literal `Requested format is not
+available` message. A network, authorization, or extractor error that merely
+suggests that diagnostic command can therefore cause VDL to retry with a
+different format, masking the original request and doing unnecessary work.
+
+A deterministic fake raised `HTTP 403; run --list-formats for diagnostics` on
+the `best` attempt. VDL selected format `v1`, persisted that replacement, and
+made a second download attempt.
+
+**Expected:** Only the literal `Requested format is not available` condition
+may trigger automatic format fallback. Other failures must surface unchanged.
+
+**Coverage gap:** Format tests exercise format summarisation and selection, but
+not the error classifier or the retry/no-retry boundary.
+
+## 21. Failed Preferences saves are displayed as successful
+
+**Severity:** Medium
+
+`savePreferences()` does not check `response.ok`. Any HTTP response, including
+a 400 or 500, changes the button to Saved and temporarily disables it. The UI
+also applies player and theme choices before persistence succeeds, so the page
+can claim and display settings that the server did not store.
+
+A deterministic browser reproduction intercepted the Preferences POST with an
+HTTP 500 response. The button still changed to Saved.
+
+**Expected:** Show Saved only after a successful response. On rejection, retain
+the editable values, report the server error, and make clear that the changes
+were not persisted.
+
+**Coverage gap:** The browser suite verifies only the successful Preferences
+path.
+
+## 22. Important backend, UI, and container contracts lack regression coverage
+
+**Severity:** Medium
+
+The permanent suite is broad and all four tiers currently pass under the
+documented expected-failure policy, but the coverage ledger overstates several
+areas. In addition to Bugs 14-21 having no permanent red-capable tests, these
+important contracts are unprotected:
+
+- atomic and rejected backend transitions for pause, unpause, stop, resume, and
+  remove (the browser test only proves which URL is called);
+- upgrades from an older SQLite schema through every migration;
+- history pagination and page-boundary behavior;
+- UI rendering for matching, mismatched, missing, and malformed API versions;
+- failed Preferences, Clear, Reload, Continue, Pause, Stop, and Delete requests;
+- shipping-container parity for pause/unpause/cancel/resume and partial cleanup;
+  the container tier runs only the real DASH merge lifecycle test; and
+- cleanup failure behavior when a file cannot be removed.
+
+There is also no coverage report or minimum threshold in the release gate, so
+future code can silently introduce additional unexercised paths.
+
+**Expected:** Add focused unit/browser/container tests at the real seams above,
+give each open behavior bug an expected-failure regression until fixed, and
+enforce a reviewed coverage baseline without treating line coverage alone as
+proof of correctness.
 
 ## Accepted UI decisions
 
