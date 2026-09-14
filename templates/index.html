@@ -8,7 +8,7 @@
          primary submit button. Inlined as a data: URL so we don't need
          a dedicated route. -->
     <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7.5' fill='%231f8a3b'/><g fill='none' stroke='white' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M8 4v5.5'/><path d='M5 7l3 3 3-3'/><path d='M4.5 12.5h7'/></g></svg>">
-    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css', v=ui_version) }}">
     <script>
         (function () {
             try {
@@ -247,6 +247,12 @@
         </div>
     </div>
 
-    <script src="{{ url_for('static', filename='app.js') }}"></script>
+    <footer id="versionFooter" class="version-footer" data-ui-version="{{ ui_version }}">
+        <span>UI v{{ ui_version }}</span><span aria-hidden="true"> · </span><span id="apiVersion">API checking…</span>
+        <span id="versionWarning" class="version-warning" hidden> · version mismatch — refresh</span>
+        <span id="versionStatus" class="visually-hidden" role="status" aria-live="polite">API version is being checked.</span>
+    </footer>
+
+    <script src="{{ url_for('static', filename='app.js', v=ui_version) }}"></script>
 </body>
 </html>

@@ -28,9 +28,49 @@ function apiFetch(url, options) {
     });
 }
 
+function updateApiVersion(version, unavailable) {
+    const footer = document.getElementById('versionFooter');
+    const apiVersion = document.getElementById('apiVersion');
+    const warning = document.getElementById('versionWarning');
+    const status = document.getElementById('versionStatus');
+    const uiVersion = footer.dataset.uiVersion;
+
+    if (unavailable) {
+        apiVersion.textContent = 'API unavailable';
+        warning.hidden = true;
+        footer.classList.remove('version-mismatch');
+        status.textContent = 'API version is unavailable.';
+        return;
+    }
+
+    const usableVersion = typeof version === 'string' && version.trim()
+        ? version.trim()
+        : null;
+    const apiLabel = usableVersion ? `API v${usableVersion}` : 'API unknown';
+    const mismatched = usableVersion !== uiVersion;
+    apiVersion.textContent = apiLabel;
+    warning.hidden = !mismatched;
+    footer.classList.toggle('version-mismatch', mismatched);
+    status.textContent = mismatched
+        ? `Version mismatch: UI version ${uiVersion}; ${apiLabel}. Refresh the page.`
+        : `UI and API version ${uiVersion} match.`;
+}
+
+function checkHealth() {
+    return apiFetch('/api/health')
+        .then(res => {
+            if (!res.ok) throw new Error(`Health check failed with status ${res.status}`);
+            return res.json();
+        })
+        .then(data => updateApiVersion(data && data.version, false))
+        .catch(() => updateApiVersion(null, true));
+}
+
 setInterval(() => {
-    apiFetch('/api/health').catch(() => {});
+    checkHealth();
 }, 30000);
+
+checkHealth();
 
 function startDownload(event) {
     if (event) event.preventDefault();

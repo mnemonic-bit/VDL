@@ -14,7 +14,40 @@ import subprocess
 import mimetypes
 import copy
 from contextlib import contextmanager
+from pathlib import Path
 from urllib.parse import urlsplit
+
+
+SEMVER_PATTERN = re.compile(
+    r'^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+    r'(?:-((?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)'
+    r'(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?'
+    r'(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$'
+)
+
+
+def _load_app_version(version_path=None):
+    """Load and validate the release identifier before the app can start."""
+    path = Path(version_path) if version_path is not None else Path(__file__).resolve().with_name('VERSION')
+    try:
+        version = path.read_text(encoding='utf-8').rstrip()
+    except OSError as exc:
+        raise RuntimeError(
+            f'Unable to read VERSION file at {path}; expected a SemVer value '
+            f'in MAJOR.MINOR.PATCH form: {exc}'
+        ) from exc
+
+    if not version or not SEMVER_PATTERN.fullmatch(version):
+        raise RuntimeError(
+            f'Invalid VERSION file at {path}: expected a SemVer value in '
+            'MAJOR.MINOR.PATCH form, with optional prerelease or build metadata'
+        )
+    return version
+
+
+# Loading once keeps health checks cheap and makes a missing or malformed
+# release declaration a startup failure instead of an ambiguous runtime state.
+APP_VERSION = _load_app_version()
 
 
 def _validated_pot_provider_url(value):
@@ -866,12 +899,19 @@ def ffprobe_resolution(path):
 
 @app.route('/')
 def index():
-    return render_template('index.html')
+    response = app.make_response(render_template(
+        'index.html',
+        ui_version=APP_VERSION,
+    ))
+    response.headers['Cache-Control'] = 'no-store'
+    return response
 
 
 @app.route('/api/health', methods=['GET'])
 def health():
-    return jsonify({"ok": True})
+    response = jsonify({"ok": True, "version": APP_VERSION})
+    response.headers['Cache-Control'] = 'no-store'
+    return response
 
 
 @app.route('/api/download', methods=['POST'])

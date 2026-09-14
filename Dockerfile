@@ -35,7 +35,7 @@ COPY requirements-container.in requirements-container.constraints requirements-c
 RUN python -m pip install --no-cache-dir --require-hashes -r requirements-container.txt
 
 # Runtime source is deliberately allow-listed instead of copying the repository.
-COPY vdl.py docker-entrypoint.sh ./
+COPY vdl.py docker-entrypoint.sh VERSION ./
 COPY templates/ templates/
 COPY static/ static/
 RUN chmod 0555 /app/docker-entrypoint.sh \
