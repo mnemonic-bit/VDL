@@ -78,6 +78,25 @@ test('stored URL remains data for Open, Reload, Continue, and Copy actions', asy
     expect(await page.evaluate(() => window.__injected)).toBeUndefined();
 });
 
+test('renamed filename remains data when Play is clicked', async ({ page }) => {
+    test.fail(true, 'BUG 14: HTML entities in renamed filenames execute through Play onclick');
+    await seed(page, { id: 'safe-play', status: 'finished', file: true, name: 'original.mp4' });
+    await page.locator('[data-tab=history]').click();
+    await refresh(page);
+    const row = page.locator('[data-row-id="safe-play"]');
+    const hostileName = 'safe&apos;);self[&quot;__filenameInjected&quot;]=1;void(&apos;';
+    await row.getByRole('button', { name: 'Edit name', exact: true }).click();
+    await row.locator('.rename-input').fill(hostileName);
+    await row.getByRole('button', { name: 'Save', exact: true }).click();
+    await expect(row.locator('.rename-display')).toContainText(hostileName);
+
+    const play = row.getByRole('button', { name: 'Play', exact: true });
+    const inlineHandler = await play.getAttribute('onclick');
+    await play.click();
+    expect(await page.evaluate(() => window.__filenameInjected)).toBeUndefined();
+    expect(inlineHandler).toBeNull();
+});
+
 test('Clear History confirms and deletes stored files', async ({ page }) => {
     await seed(page, { id: 'clear001', status: 'finished', file: true });
     await page.locator('[data-tab=history]').click();

@@ -22,6 +22,22 @@ test('SSE reconciliation renders Current metadata and moves finished rows to His
     await expect(page.locator('#activeList [data-row-id="live0001"]')).toHaveCount(0);
 });
 
+test('unknown-size downloads render an indeterminate Current progress state', async ({ page }) => {
+    test.fail(true, 'BUG 19: unknown-size progress remains Starting instead of becoming indeterminate');
+    await seed(page, {
+        id: 'unknown1', status: 'downloading', progress: 'Downloading',
+        speed: 1024, resolution: '720p', title: 'Unknown length fixture',
+    });
+    await refresh(page);
+    const row = page.locator('[data-row-id="unknown1"]');
+    await expect(row.locator('.status-row')).toContainText('downloading');
+    await expect(row).toContainText('Unknown length fixture');
+    const animationName = await row.locator('.progress-bar-fill').evaluate(
+        element => getComputedStyle(element).animationName,
+    );
+    expect(animationName).not.toBe('none');
+});
+
 test('pause, unpause, stop, and continue buttons call their dedicated endpoints', async ({ page }) => {
     await seed(page, { id: 'actions1', status: 'downloading', progress: '10%' });
     await refresh(page);

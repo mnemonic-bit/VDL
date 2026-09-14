@@ -5,8 +5,9 @@ Issues 1-8 were found during a container review on 2026-09-06 and rechecked on
 reproductions now live in the permanent deterministic suite under `tests/`;
 historical screenshots and logs were retired after that migration.
 Issues 14-22 were found during a repository and test-coverage audit on
-2026-09-14. Unlike the earlier findings, they do not yet have permanent
-regression tests; Issue 22 records that coverage debt explicitly.
+2026-09-14. Their deterministic reproductions now live in the permanent
+suite, with open behavior guarded by expected-failure markers. Issue 22
+records both the expanded coverage and the remaining behavioral debt.
 
 ## 1. [Resolved] Merged downloads kept the deleted temporary audio filename
 
@@ -314,9 +315,8 @@ into inline JavaScript.
 encoded apostrophe and JavaScript expression, then click Play. The expression
 runs in the VDL origin.
 
-**Coverage gap:** No permanent regression test currently exercises hostile
-renamed filenames in the Play action. Add browser coverage alongside the URL-
-action injection test in `tests/browser/history-actions.spec.cjs`.
+Expected-behavior coverage:
+`tests/browser/history-actions.spec.cjs`.
 
 ## 15. Cross-origin form posts can invoke destructive API actions
 
@@ -337,8 +337,7 @@ both the finished row and its media file.
 submission, for example by validating the request origin and/or requiring a
 CSRF-resistant request contract consistently across every mutating route.
 
-**Coverage gap:** No permanent test sends cross-origin or simple-content-type
-requests to mutating endpoints.
+Expected-behavior coverage: `tests/test_request_security.py`.
 
 ## 16. An unusable download directory leaves workers stuck at Starting
 
@@ -358,8 +357,7 @@ database row remained active.
 also keep worker setup inside the failure boundary so filesystem errors become
 terminal rows with useful messages.
 
-**Coverage gap:** Preference tests cover persistence and theme behavior, but
-not invalid directories, backend validation, or worker setup failures.
+Expected-behavior coverage: `tests/test_preferences.py`.
 
 ## 17. Concurrent Resume requests can start duplicate workers
 
@@ -377,8 +375,7 @@ row. Both returned HTTP 200 and two worker starts were recorded.
 **Expected:** Claim the resumable row with one atomic conditional state
 transition, and start exactly one worker only when that claim succeeds.
 
-**Coverage gap:** The lifecycle suite checks sequential double-resume, but not
-simultaneous resume requests or resume/remove races.
+Expected-behavior coverage: `tests/test_download_lifecycle.py`.
 
 ## 18. The playback allow-list authorizes a tampered row's own directory
 
@@ -396,9 +393,7 @@ fixture file. `/api/file/<id>` returned HTTP 200 and the external contents.
 **Expected:** Derive trusted roots independently of the candidate row, such as
 persisted worker output directories, and reject a filename outside those roots.
 
-**Coverage gap:** The playback tests cover a symlink escape from a valid
-download directory, but not a row whose stored filename directly names an
-outside path.
+Expected-behavior coverage: `tests/test_playback.py`.
 
 ## 19. Unknown-size downloads never leave Starting in the UI
 
@@ -416,8 +411,8 @@ remained `starting` with no captured metadata.
 **Expected:** Mark the row `downloading` and persist available metadata even
 when a percentage cannot be calculated; show an indeterminate progress state.
 
-**Coverage gap:** Current lifecycle and browser tests only use progress payloads
-with a known positive total.
+Expected-behavior coverage: `tests/test_download_lifecycle.py` and
+`tests/browser/live-updates.spec.cjs`.
 
 ## 20. Format fallback triggers on noncanonical diagnostic errors
 
@@ -436,8 +431,7 @@ made a second download attempt.
 **Expected:** Only the literal `Requested format is not available` condition
 may trigger automatic format fallback. Other failures must surface unchanged.
 
-**Coverage gap:** Format tests exercise format summarisation and selection, but
-not the error classifier or the retry/no-retry boundary.
+Expected-behavior coverage: `tests/test_formats.py`.
 
 ## 21. Failed Preferences saves are displayed as successful
 
@@ -455,8 +449,7 @@ HTTP 500 response. The button still changed to Saved.
 the editable values, report the server error, and make clear that the changes
 were not persisted.
 
-**Coverage gap:** The browser suite verifies only the successful Preferences
-path.
+Expected-behavior coverage: `tests/browser/preferences.spec.cjs`.
 
 ## 22. Important backend, UI, and container contracts lack regression coverage
 
@@ -484,6 +477,24 @@ future code can silently introduce additional unexercised paths.
 give each open behavior bug an expected-failure regression until fixed, and
 enforce a reviewed coverage baseline without treating line coverage alone as
 proof of correctness.
+
+Permanent coverage now includes:
+
+- `tests/test_download_lifecycle.py` for accepted/rejected transitions,
+  simultaneous Resume, and Resume/Remove races;
+- `tests/test_migrations.py` for upgrades from the initial schema through every
+  current migration;
+- `tests/browser/history-pagination.spec.cjs` for ordering and page-boundary
+  clamping;
+- `tests/browser/version-status.spec.cjs` for matching, mismatched, missing,
+  malformed, and unavailable API versions;
+- `tests/browser/action-errors.spec.cjs` and
+  `tests/browser/preferences.spec.cjs` for rejected UI actions;
+- `tests/container/smoke.sh` for shipping-image lifecycle and partial cleanup
+  parity;
+- `tests/test_cancelled_cleanup.py` for cleanup failures; and
+- `tests/coverage_gate.py` for a dependency-free reviewed 90% `vdl.py` line
+  baseline in the unit/release gate.
 
 ## Accepted UI decisions
 

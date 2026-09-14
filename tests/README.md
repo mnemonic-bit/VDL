@@ -12,6 +12,11 @@ The existing fast command remains supported:
 python -m unittest discover -s tests -v
 ```
 
+The tier runner additionally measures executable lines in `vdl.py` with the
+Python standard library and enforces the reviewed 90% baseline. This keeps the
+gate dependency-free; behavior assertions remain the primary measure of test
+quality.
+
 Local-media cases intentionally skip in that command. The tier runner makes
 requirements explicit:
 
@@ -40,8 +45,11 @@ Developer media runs skip when tools are absent; `--media`, `--container`, and
 
 Open bugs assert desired behavior using `unittest.expectedFailure` or
 Playwright `test.fail()`. An unexpected pass fails its tier so the marker must
-be removed with the bug fix. Current markers name Bugs 3, 4, 5, 7, and 10–13
-from `BUG.md`. Pending roadmap features have no absence assertions.
+be removed with the bug fix. Current markers name Bugs 3–5, 7, and 10–22 from
+`BUG.md`. Bug 22 markers cover the individual failed-action and cleanup
+contracts that remain open; its passing tests protect migrations, pagination,
+version rendering, state-transition rejection, and container parity. Pending
+roadmap features have no absence assertions.
 
 ## Coverage decisions and limitations
 

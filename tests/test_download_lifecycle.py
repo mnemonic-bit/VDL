@@ -9,6 +9,26 @@ from tests.support.fake_ytdlp import FakeYoutubeDL
 
 
 class DownloadLifecycleTest(AppCase):
+    @unittest.expectedFailure  # BUG 19
+    def test_unknown_size_progress_exposes_live_metadata_and_indeterminate_state(self):
+        download_id = self.insert("unknown1")
+
+        vdl.progress_hook({
+            "status": "downloading",
+            "downloaded_bytes": 4096,
+            "speed": 1024,
+            "info_dict": {
+                "title": "Unknown length fixture",
+                "height": 720,
+            },
+        }, download_id)
+
+        row = self.client.get("/api/history").get_json()[0]
+        self.assertEqual(row["status"], "downloading")
+        self.assertEqual(row["title"], "Unknown length fixture")
+        self.assertEqual(row["resolution"], "720p")
+        self.assertEqual(row["speed"], 1024.0)
+
     def test_pause_is_recorded_once_and_progress_continues_after_unpause(self):
         download_id = self.insert()
         vdl.request_pause(download_id)
@@ -54,6 +74,170 @@ class DownloadLifecycleTest(AppCase):
         self.assertEqual(calls, [("https://fixture.invalid/video", download_id)])
         self.assertEqual(vdl.db_get_download(download_id)["status"], "starting")
         self.assertEqual(self.client.post(f"/api/resume/{download_id}").status_code, 409)
+
+    def test_transition_endpoints_reject_unknown_or_incompatible_states(self):
+        self.assertEqual(self.client.post("/api/pause/missing1").status_code, 404)
+        self.assertEqual(self.client.post("/api/unpause/missing1").status_code, 404)
+        self.assertEqual(self.client.post("/api/stop/missing1").status_code, 404)
+        self.assertEqual(self.client.post("/api/resume/missing1").status_code, 404)
+        self.assertEqual(self.client.post("/api/remove/missing1").status_code, 404)
+
+        self.insert("finished1")
+        vdl.db_update_download("finished1", status="finished")
+        self.assertEqual(self.client.post("/api/pause/finished1").status_code, 409)
+        self.assertEqual(self.client.post("/api/unpause/finished1").status_code, 409)
+        self.assertEqual(self.client.post("/api/resume/finished1").status_code, 409)
+
+        self.insert("active01")
+        vdl.db_update_download("active01", status="downloading")
+        self.assertEqual(self.client.post("/api/remove/active01").status_code, 409)
+
+    def test_pause_unpause_and_stop_apply_only_to_active_workers(self):
+        self.insert("pause001")
+        vdl.db_update_download("pause001", status="downloading")
+        self.assertEqual(self.client.post("/api/pause/pause001").status_code, 200)
+        progress = threading.Thread(
+            target=vdl.progress_hook,
+            args=({
+                "status": "downloading",
+                "downloaded_bytes": 5,
+                "total_bytes": 10,
+                "info_dict": {},
+            }, "pause001"),
+        )
+        progress.start()
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            row = self.client.get("/api/history").get_json()[0]
+            if row["status"] == "paused":
+                break
+            time.sleep(0.01)
+        self.assertEqual(row["status"], "paused")
+
+        self.assertEqual(self.client.post("/api/unpause/pause001").status_code, 200)
+        progress.join(1)
+        self.assertFalse(progress.is_alive())
+        self.assertEqual(
+            self.client.get("/api/history").get_json()[0]["status"],
+            "downloading",
+        )
+
+        self.assertEqual(self.client.post("/api/stop/pause001").status_code, 200)
+        with self.assertRaises(vdl.DownloadCancelled):
+            vdl.progress_hook({"status": "downloading"}, "pause001")
+
+        self.insert("terminal1")
+        vdl.db_update_download("terminal1", status="cancelled")
+        response = self.client.post("/api/stop/terminal1")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["status"], "cancelled")
+
+    @unittest.expectedFailure  # BUG 17
+    def test_simultaneous_resume_requests_start_exactly_one_worker(self):
+        download_id = self.insert("race0001")
+        vdl.db_update_download(download_id, status="cancelled")
+        read_barrier = threading.Barrier(2)
+        real_get = vdl.db_get_download
+        real_thread = threading.Thread
+        starts = []
+
+        def synchronized_get(candidate_id):
+            entry = real_get(candidate_id)
+            if candidate_id == download_id and entry and entry["status"] == "cancelled":
+                read_barrier.wait(timeout=2)
+            return entry
+
+        class RecordingWorker:
+            def __init__(self, target=None, args=(), **_kwargs):
+                self.target = target
+                self.args = args
+                self.daemon = False
+
+            def start(self):
+                starts.append(self.args)
+
+        responses = []
+
+        def resume():
+            with vdl.app.test_client() as client:
+                responses.append(client.post(f"/api/resume/{download_id}").status_code)
+
+        with (
+            mock.patch.object(vdl, "db_get_download", side_effect=synchronized_get),
+            mock.patch.object(vdl.threading, "Thread", RecordingWorker),
+        ):
+            requests = [real_thread(target=resume) for _ in range(2)]
+            for request_thread in requests:
+                request_thread.start()
+            for request_thread in requests:
+                request_thread.join(3)
+
+        self.assertFalse(any(request_thread.is_alive() for request_thread in requests))
+        self.assertEqual(sorted(responses), [200, 409])
+        self.assertEqual(starts, [("https://fixture.invalid/video", download_id)])
+
+    @unittest.expectedFailure  # BUG 17 / BUG 22
+    def test_resume_remove_race_has_one_consistent_winner(self):
+        download_id = self.insert("remove-race")
+        vdl.db_update_download(download_id, status="cancelled")
+        read_barrier = threading.Barrier(2)
+        real_get = vdl.db_get_download
+        real_thread = threading.Thread
+        starts = []
+
+        def synchronized_get(candidate_id):
+            entry = real_get(candidate_id)
+            if candidate_id == download_id and entry and entry["status"] == "cancelled":
+                read_barrier.wait(timeout=2)
+            return entry
+
+        class RecordingWorker:
+            def __init__(self, target=None, args=(), **_kwargs):
+                self.args = args
+                self.daemon = False
+
+            def start(self):
+                starts.append(self.args)
+
+        responses = {}
+
+        def post(name, path):
+            with vdl.app.test_client() as client:
+                responses[name] = client.post(path).status_code
+
+        with (
+            mock.patch.object(vdl, "db_get_download", side_effect=synchronized_get),
+            mock.patch.object(vdl.threading, "Thread", RecordingWorker),
+        ):
+            requests = [
+                real_thread(
+                    target=post,
+                    args=("resume", f"/api/resume/{download_id}"),
+                ),
+                real_thread(
+                    target=post,
+                    args=("remove", f"/api/remove/{download_id}"),
+                ),
+            ]
+            for request_thread in requests:
+                request_thread.start()
+            for request_thread in requests:
+                request_thread.join(3)
+
+        self.assertFalse(any(request_thread.is_alive() for request_thread in requests))
+        self.assertIn(
+            responses,
+            [
+                {"resume": 200, "remove": 409},
+                {"resume": 404, "remove": 200},
+            ],
+        )
+        if responses["resume"] == 200:
+            self.assertEqual(vdl.db_get_download(download_id)["status"], "starting")
+            self.assertEqual(len(starts), 1)
+        else:
+            self.assertIsNone(vdl.db_get_download(download_id))
+            self.assertEqual(starts, [])
 
     def test_init_db_recovers_all_abandoned_active_states(self):
         for index, status in enumerate(("starting", "downloading", "paused")):

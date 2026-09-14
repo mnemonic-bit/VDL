@@ -1,5 +1,6 @@
 import os
 import unittest
+from unittest import mock
 
 import vdl
 from tests.support.app_case import AppCase
@@ -62,6 +63,24 @@ class CancelledDownloadCleanupTest(AppCase):
         entry = vdl.db_get_download(download_id)
         self.assertEqual(entry["status"], "cancelled")
         self.assertEqual(entry["output_dir"], os.path.abspath(self.download_dir))
+
+    @unittest.expectedFailure  # BUG 22
+    def test_cleanup_failure_keeps_the_row_available_for_retry(self):
+        download_id = "cleanup1"
+        vdl.db_insert_download(download_id, "https://fixture.invalid/video.mp4")
+        partial_path = self._write(f"fixture_{download_id}.mp4.part")
+        vdl.db_update_download(
+            download_id,
+            status="cancelled",
+            output_dir=self.download_dir,
+        )
+
+        with mock.patch.object(vdl.os, "remove", side_effect=PermissionError("read only")):
+            response = self.client.post(f"/api/remove/{download_id}")
+
+        self.assertEqual(response.status_code, 500)
+        self.assertIsNotNone(vdl.db_get_download(download_id))
+        self.assertTrue(os.path.exists(partial_path))
 
 
 if __name__ == "__main__":

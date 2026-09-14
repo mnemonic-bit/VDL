@@ -30,11 +30,13 @@ python_runner() {
     "$engine" run --rm \
         -e "VDL_RUN_MEDIA=${VDL_RUN_MEDIA:-0}" \
         -e "VDL_REQUIRE_MEDIA_TOOLS=${VDL_REQUIRE_MEDIA_TOOLS:-0}" \
+        -e DOWNLOADS_DB=/tmp/vdl-tests.db \
+        -e DOWNLOADS_DIR=/tmp/vdl-media \
         -v "$root:/workspace:ro" -w /workspace "$image" python "$@"
 }
 
 run_unit() {
-    python_runner -m unittest discover -s tests -v
+    python_runner tests/coverage_gate.py
 }
 
 run_browser() {

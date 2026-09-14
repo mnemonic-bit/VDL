@@ -129,4 +129,17 @@ PY
     -w /app "$image" python -m unittest -v \
     tests.integration.test_real_media.RealMediaIntegrationTest.test_dash_merge_stored_path_playback_rename_and_removal
 
+# Exercise the shipping application's lifecycle and partial-file cleanup
+# through the same deterministic seams as the fast tier. Mounting only tests
+# ensures these checks cannot accidentally substitute workspace app code for
+# the immutable code installed in the image.
+"$engine" run --rm \
+    -e PYTHONPATH=/app:/workspace \
+    -v "$root/tests:/workspace/tests:ro" \
+    -w /app "$image" python -m unittest -v \
+    tests.test_download_lifecycle.DownloadLifecycleTest.test_pause_unpause_and_stop_apply_only_to_active_workers \
+    tests.test_download_lifecycle.DownloadLifecycleTest.test_resume_accepts_only_resumable_rows_and_keeps_the_id \
+    tests.test_cancelled_cleanup.CancelledDownloadCleanupTest.test_remove_cancelled_download_deletes_its_partial_files \
+    tests.test_cancelled_cleanup.CancelledDownloadCleanupTest.test_remove_uses_worker_directory_after_preference_changes
+
 echo "VDL shipping-container smoke checks passed for $image"

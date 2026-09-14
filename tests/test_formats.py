@@ -86,6 +86,34 @@ class FormatContractTest(AppCase):
         self.assertTrue(video)
         self.assertTrue(audio)
 
+    @unittest.expectedFailure  # BUG 20
+    def test_diagnostic_list_formats_text_does_not_trigger_format_fallback(self):
+        class DiagnosticFailure(FakeYoutubeDL):
+            attempts = []
+
+            def download(self, urls):
+                type(self).attempts.append(self.options["format"])
+                if len(type(self).attempts) == 1:
+                    raise vdl.yt_dlp.utils.DownloadError(
+                        "HTTP 403; run --list-formats for diagnostics"
+                    )
+                return super().download(urls)
+
+        FakeYoutubeDL.reset()
+        DiagnosticFailure.attempts = []
+        download_id = self.insert("format20")
+        with (
+            mock.patch.object(vdl.yt_dlp, "YoutubeDL", DiagnosticFailure),
+            mock.patch.object(vdl, "ffprobe_resolution", return_value="360p"),
+        ):
+            vdl.background_download("https://fixture.invalid/video", download_id)
+
+        row = self.client.get("/api/history").get_json()[0]
+        self.assertEqual(row["status"], "error")
+        self.assertIn("HTTP 403", row["progress"])
+        self.assertEqual(row["requested_format"], "best")
+        self.assertEqual(DiagnosticFailure.attempts, ["best"])
+
 
 if __name__ == "__main__":
     unittest.main()
