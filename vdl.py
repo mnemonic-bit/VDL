@@ -12,7 +12,61 @@ import re
 import time
 import subprocess
 import mimetypes
+import copy
 from contextlib import contextmanager
+from urllib.parse import urlsplit
+
+
+def _validated_pot_provider_url(value):
+    """Return a normalized HTTP provider URL, or None when it is disabled."""
+    value = (value or '').strip()
+    if not value:
+        return None
+
+    parsed = urlsplit(value)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise RuntimeError(
+            'VDL_POT_PROVIDER_URL contains an invalid port'
+        ) from exc
+    if (
+        parsed.scheme not in ('http', 'https')
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or (port is not None and not 1 <= port <= 65535)
+    ):
+        raise RuntimeError(
+            'VDL_POT_PROVIDER_URL must be an HTTP(S) base URL without '
+            'credentials, a query, or a fragment'
+        )
+    return value.rstrip('/')
+
+
+# The provider is deployment-wide, so validate it once before any worker can
+# start. The container bootstrap separately disables plugin discovery when the
+# variable is empty; native installs without the plugin keep working as before.
+POT_PROVIDER_URL = _validated_pot_provider_url(
+    os.environ.get('VDL_POT_PROVIDER_URL')
+)
+
+
+def yt_dlp_options(options):
+    """Merge deployment-wide yt-dlp settings into one invocation's options."""
+    merged = copy.deepcopy(options)
+    if not POT_PROVIDER_URL:
+        return merged
+
+    extractor_args = merged.setdefault('extractor_args', {})
+    provider_args = extractor_args.setdefault('youtubepot-bgutilhttp', {})
+    # yt-dlp's parsed extractor arguments are lists even for single values.
+    # Replacing only base_url leaves unrelated extractor/provider arguments
+    # intact while making the environment setting authoritative.
+    provider_args['base_url'] = [POT_PROVIDER_URL]
+    return merged
 
 app = Flask(__name__)
 
@@ -640,7 +694,7 @@ def background_download(url, download_id):
             postprocessed_paths.append(path)
 
     def build_opts(format_selector):
-        return {
+        return yt_dlp_options({
             'format': format_selector,
             'outtmpl': os.path.join(output_dir, f'%(title)s_{download_id}.%(ext)s'),
             'progress_hooks': [lambda d: progress_hook(d, download_id)],
@@ -651,7 +705,7 @@ def background_download(url, download_id):
             # resumed download picks up the existing .part file rather than
             # restarting from byte zero.
             'continuedl': True,
-        }
+        })
 
     # Persist the yt-dlp format selector that we're about to use, so the
     # History tab can show *what was asked for* whenever a download fails
@@ -684,12 +738,12 @@ def background_download(url, download_id):
         if is_cancel_requested(download_id):
             raise DownloadCancelled()
         try:
-            probe_opts = {
+            probe_opts = yt_dlp_options({
                 'quiet': True,
                 'noprogress': True,
                 'skip_download': True,
                 'progress_hooks': [lambda d: progress_hook(d, download_id)],
-            }
+            })
             with yt_dlp.YoutubeDL(probe_opts) as probe:
                 info = probe.extract_info(url, download=False)
             formats_summary = summarize_formats(info)
@@ -852,7 +906,11 @@ def probe_url():
         return jsonify({"error": "URL is required"}), 400
 
     try:
-        with yt_dlp.YoutubeDL({'quiet': True, 'noprogress': True, 'skip_download': True}) as probe:
+        with yt_dlp.YoutubeDL(yt_dlp_options({
+            'quiet': True,
+            'noprogress': True,
+            'skip_download': True,
+        })) as probe:
             info = probe.extract_info(url, download=False)
 
         # Extract title

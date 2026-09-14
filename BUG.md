@@ -284,7 +284,8 @@ the Title/Filename placeholder.
 - With no URL entered, Download Options shows the explanatory message as an
   overlay over visible disabled fields rather than showing an empty section.
 
-The Debian package-server DNS failure seen while building `Dockerfile.vdl` is
+The Debian package-server DNS failure seen while building the former
+`Dockerfile.vdl` seed is
 not listed as an application bug. The same hosts were unreachable from the
 test host, and the Dockerfile could not be assessed on a network with working
 Debian repositories.

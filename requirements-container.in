@@ -1,0 +1,3 @@
+Flask
+yt-dlp[default,curl-cffi]==2026.08.19
+bgutil-ytdlp-pot-provider==2.0.0

@@ -16,7 +16,7 @@ Flask + `yt-dlp` video-downloader UI. **Single-process, single-file backend** ([
 ├── media/                # gitignored — runtime download output
 ├── downloads.db          # gitignored — SQLite state, schema in init_db()
 ├── requirements.txt      # Flask>=2.0, yt-dlp>=2024.12.0
-├── Dockerfile            # NOT a VDL image — dev container for OpenCode tooling
+├── Dockerfile            # Hardened VDL image; Compose runtime in compose.yaml
 └── TODOs.md              # Roadmap; mostly checked off
 ```
 
@@ -70,10 +70,10 @@ Flask + `yt-dlp` video-downloader UI. **Single-process, single-file backend** ([
 - **DO NOT** invent new status strings without updating BOTH [`TERMINAL_STATUSES`](file:///workspace/vdl.py#L84) and the [JS status sets](file:///workspace/static/app.js#L1-L8).
 
 ## GOTCHAS
-- **`Dockerfile` is NOT for VDL.** It builds a `node:20-slim` dev container with OpenCode + oh-my-openagent. `docker build .` does NOT produce a runnable VDL image.
+- **Container dependencies are separately locked.** Native development uses `requirements.txt`; the image installs the hashed `requirements-container.txt` and keeps the optional BgUtils plugin dormant unless `VDL_POT_PROVIDER_URL` is set.
 - **`/api/resume` ≠ `/api/unpause`**: `resume` spawns a NEW worker thread for `cancelled`/`interrupted` rows (relies on yt-dlp's `continuedl=True` to find the `.part` file). `unpause` clears the flag for an ALIVE paused worker.
 - **Cancel beats pause**: [`request_cancel` drops the pause flag](file:///workspace/vdl.py#L290-L295) so a paused worker wakes up and aborts. Don't re-arm pause during cancel.
-- **No tests, no CI, no linter.** Verification is manual: `python vdl.py`, click around. There is no green-build signal — be deliberate.
+- **No CI or linter.** Run `python -m unittest discover -s tests -v`; UI lifecycle and external-site verification remain manual.
 - **`media/` and `downloads.db` are tracked-in-tree but gitignored.** A fresh clone has neither; both are created on first run.
 
 ## COMMANDS
@@ -90,6 +90,12 @@ HOST=0.0.0.0 FLASK_DEBUG=0 python vdl.py
 
 # Override DB / download dir (e.g. in a container)
 DOWNLOADS_DB=/data/downloads.db DOWNLOADS_DIR=/downloads python vdl.py
+
+# Container deployment (loopback-only port, persistent named volumes)
+docker compose up --build -d
+
+# Optional PO-token provider profile
+VDL_POT_PROVIDER_URL=http://bgutil-provider:4416 docker compose --profile pot up --build -d
 ```
 
 ## ENV VARS
@@ -100,6 +106,8 @@ DOWNLOADS_DB=/data/downloads.db DOWNLOADS_DIR=/downloads python vdl.py
 | `FLASK_DEBUG` | `1` | `"1"` enables; any other value disables |
 | `DOWNLOADS_DB` | `<repo>/downloads.db` | |
 | `DOWNLOADS_DIR` | `.` | preferences row in DB overrides at runtime |
+| `VDL_POT_PROVIDER_URL` | empty | HTTP(S) BgUtils base URL; empty disables plugin discovery in the image |
 
 ## EXTERNAL REQUIREMENTS
-- **`ffmpeg`** — used by yt-dlp for stream merging and by [`ffprobe_resolution`](file:///workspace/vdl.py#L638-L651) for final-container probing. Without it: merged downloads fail and the resolution column may stay at the per-stream value.
+- **Native:** `ffmpeg` supplies media merging and `ffprobe_resolution()` support.
+- **Container:** ffmpeg/ffprobe, Deno, EJS, curl-cffi, and tini are included; Chromium remains intentionally deferred.

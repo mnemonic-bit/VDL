@@ -1,0 +1,50 @@
+services:
+    vdl:
+        build:
+            context: .
+            dockerfile: Dockerfile
+        image: vdl:local
+        ports:
+            - "127.0.0.1:${VDL_PORT:-5000}:5000"
+        environment:
+            VDL_POT_PROVIDER_URL: ${VDL_POT_PROVIDER_URL:-}
+        volumes:
+            - vdl-downloads:/downloads
+            - vdl-data:/data
+        restart: unless-stopped
+        cap_drop:
+            - ALL
+        security_opt:
+            - no-new-privileges:true
+
+    bgutil-provider:
+        profiles:
+            - pot
+        # The digest identifies the 2.0.0 Deno linux/amd64 artifact.
+        image: docker.io/brainicism/bgutil-ytdlp-pot-provider:2.0.0-deno@sha256:6e4fcc7b5ae399faced222994864e37550eedc8679067a56f871281ff9ab4dfd
+        init: true
+        expose:
+            - "4416"
+        healthcheck:
+            test:
+                - CMD
+                - deno
+                - eval
+                - --allow-net=127.0.0.1:4416
+                - "const r = await fetch('http://127.0.0.1:4416/ping'); if (!r.ok) Deno.exit(1)"
+            interval: 30s
+            timeout: 5s
+            start_period: 10s
+            retries: 3
+        restart: unless-stopped
+        cap_drop:
+            - ALL
+        security_opt:
+            - no-new-privileges:true
+        mem_limit: 256m
+        cpus: 0.50
+        pids_limit: 128
+
+volumes:
+    vdl-downloads:
+    vdl-data:
