@@ -63,7 +63,7 @@ class VersionEndpointTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json(), {
             'ok': True,
-            'version': '0.1.0',
+            'version': vdl.APP_VERSION,
         })
         self.assertEqual(response.headers['Cache-Control'], 'no-store')
 
@@ -73,11 +73,11 @@ class VersionEndpointTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers['Cache-Control'], 'no-store')
-        self.assertIn('data-ui-version="0.1.0"', page)
-        self.assertIn('UI v0.1.0', page)
+        self.assertIn(f'data-ui-version="{vdl.APP_VERSION}"', page)
+        self.assertIn(f'UI v{vdl.APP_VERSION}', page)
         self.assertIn('API checking…', page)
-        self.assertIn('/static/styles.css?v=0.1.0', page)
-        self.assertIn('/static/app.js?v=0.1.0', page)
+        self.assertIn(f'/static/styles.css?v={vdl.APP_VERSION}', page)
+        self.assertIn(f'/static/app.js?v={vdl.APP_VERSION}', page)
 
 
 if __name__ == '__main__':

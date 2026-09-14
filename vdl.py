@@ -1316,6 +1316,10 @@ def main(argv=None):
     # /api/events doesn't block other requests.
     host  = os.environ.get("HOST", "127.0.0.1")
     debug = os.environ.get("FLASK_DEBUG", "1") == "1"
+    print(
+        f'VDL startup: UI v{APP_VERSION} | API v{APP_VERSION}',
+        flush=True,
+    )
     app.run(host=host, port=args.port, debug=debug, threaded=True)
 
 

@@ -13,10 +13,15 @@ class StartupArgumentsTest(unittest.TestCase):
                 "HOST": "127.0.0.2",
                 "FLASK_DEBUG": "0",
             }),
+            mock.patch("builtins.print") as print_output,
             mock.patch.object(vdl.app, "run") as run,
         ):
             vdl.main(["--port", "7000"])
 
+        print_output.assert_called_once_with(
+            f"VDL startup: UI v{vdl.APP_VERSION} | API v{vdl.APP_VERSION}",
+            flush=True,
+        )
         run.assert_called_once_with(
             host="127.0.0.2",
             port=7000,
@@ -27,6 +32,7 @@ class StartupArgumentsTest(unittest.TestCase):
     def test_environment_port_remains_the_fallback(self):
         with (
             mock.patch.dict(os.environ, {"PORT": "6100"}),
+            mock.patch("builtins.print"),
             mock.patch.object(vdl.app, "run") as run,
         ):
             vdl.main([])

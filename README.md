@@ -5,8 +5,9 @@ served locally and live progress arrives over Server-Sent Events.
 
 The footer shows the release observed in the loaded UI and the release reported
 by the active API. A mismatch asks you to refresh, which makes stale pages or
-mixed deployments visible. Maintainers update the root `VERSION` file when
-cutting a behavior-changing release according to the policy in `AGENTS.md`.
+mixed deployments visible. The server also prints both values to its console
+when it starts. Maintainers update the root `VERSION` file when cutting a
+behavior-changing release according to the policy in `AGENTS.md`.
 
 ## Run with Docker Compose
 
