@@ -233,9 +233,11 @@ the title hint and quality selector.
 
 Expected-behavior coverage: `tests/browser/download-options.spec.cjs`.
 
-## 11. An open row menu can leave live download state stale
+## 11. [Resolved] An open row menu can leave live download state stale
 
 **Severity:** Medium
+
+**Status:** Resolved and verified on 2026-09-15.
 
 `fetchHistory()` returns immediately whenever any row action menu is open.
 SSE change events received during that interval are discarded, and closing
@@ -254,7 +256,12 @@ closes, or update the row without disrupting the open menu.
 until `/api/history` reports `finished`. Close the menu and observe that the
 row remains in Current until another refresh occurs.
 
-Expected-behavior coverage: `tests/browser/live-updates.spec.cjs`.
+Blocked history refreshes are now coalesced while a row menu is open. Closing
+the menu schedules one reconciliation; switching directly to another menu
+keeps the new menu stable and carries the deferred refresh forward until it
+also closes.
+
+Permanent coverage: `tests/browser/live-updates.spec.cjs`.
 
 ## 12. [Resolved] Failed download submissions silently clear the form
 

@@ -519,6 +519,7 @@ function clearHistory() {
 }
 
 let openMenuId = null;
+let historyFetchDeferred = false;
 
 function renderFormatsTable(info) {
     let formats = info.formats;
@@ -571,8 +572,15 @@ function onErrorDetailsToggle(id, el) {
 }
 
 function closeAllMenus() {
+    const shouldRefresh = openMenuId !== null && historyFetchDeferred;
     document.querySelectorAll('.kebab-menu.open').forEach(m => m.classList.remove('open'));
     openMenuId = null;
+    if (shouldRefresh) {
+        historyFetchDeferred = false;
+        // Schedule after the click finishes so switching directly to another
+        // menu keeps its actions stable and defers the refresh again.
+        scheduleFetch();
+    }
 }
 
 function toggleMenu(id, ev) {
@@ -923,11 +931,18 @@ function goToPage(target) {
 }
 
 function fetchHistory() {
-    if (openMenuId !== null) return Promise.resolve();
+    if (openMenuId !== null) {
+        historyFetchDeferred = true;
+        return Promise.resolve();
+    }
 
     return apiFetch('/api/history')
     .then(res => res.json())
     .then(data => {
+        if (openMenuId !== null) {
+            historyFetchDeferred = true;
+            return;
+        }
         const reversed = data.slice().reverse();
         const active = reversed.filter(i => CURRENT_TAB_STATUSES.has(i.status));
         const done   = reversed.filter(i => HISTORY_TAB_STATUSES.has(i.status));

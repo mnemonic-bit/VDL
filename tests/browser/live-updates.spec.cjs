@@ -63,7 +63,6 @@ test('pause, unpause, stop, and continue buttons call their dedicated endpoints'
 });
 
 test('closing a row menu reconciles a deferred live update', async ({ page }) => {
-    test.fail(true, 'BUG 11: open row menu discards live reconciliation');
     await seed(page, { id: 'menu0001', status: 'downloading', progress: '90%' });
     await refresh(page);
     await page.locator('[data-row-id="menu0001"] .kebab-btn').click();
