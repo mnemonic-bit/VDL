@@ -76,6 +76,7 @@ class AppCase(unittest.TestCase):
             status="finished",
             progress="100%",
             filename=path,
+            output_dir=self.download_dir,
             filesize=len(data),
             finished_at=time.time(),
         )

@@ -56,7 +56,6 @@ class PlaybackTest(AppCase):
         )
         self.assertEqual(self.client.get("/api/file/escape01").status_code, 403)
 
-    @unittest.expectedFailure  # BUG 18
     def test_tampered_row_cannot_authorize_its_own_external_directory(self):
         external_dir = os.path.join(self.temp_dir.name, "external")
         os.mkdir(external_dir)

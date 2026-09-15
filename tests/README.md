@@ -45,8 +45,8 @@ Developer media runs skip when tools are absent; `--media`, `--container`, and
 
 Open bugs assert desired behavior using `unittest.expectedFailure` or
 Playwright `test.fail()`. An unexpected pass fails its tier so the marker must
-be removed with the bug fix. Current markers name Bugs 3–5, 7, 10–13, 15,
-and 18 from `BUG.md`. Bug 22's passing tests protect rejected actions,
+be removed with the bug fix. Current markers name Bugs 3–5, 7, 10–13, and 15
+from `BUG.md`. Bug 22's passing tests protect rejected actions,
 cleanup failures, migrations, pagination, version rendering, state-transition
 rejection, and container parity. Pending roadmap features have no absence
 assertions.

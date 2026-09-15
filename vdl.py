@@ -1282,9 +1282,8 @@ def stream_file(download_id):
     the user changes the download directory mid-history.
 
     Path-traversal protection: instead of confining to the current
-    `download_dir`, we confine to the union of every directory that has
-    ever been used by a finished row. A tampered DB row pointing outside
-    those directories is still rejected.
+    `download_dir`, we confine to the union of directories captured when
+    workers start. A tampered filename cannot make its own parent trusted.
     """
     entry = db_get_download(download_id)
     if entry is None or entry.get('status') != 'finished':
@@ -1294,18 +1293,20 @@ def stream_file(download_id):
         abort(404)
     real = os.path.realpath(path)
 
-    # Build the allow-list of base directories: the current preference plus
-    # every distinct parent directory of finished downloads on record.
+    # Worker snapshots are independent of the later filename reported by
+    # yt-dlp, so a corrupted filename cannot authorize its own directory.
+    # Retaining every snapshot keeps old downloads playable after preferences
+    # change, including rows whose worker did not reach a finished state.
     prefs = db_get_preferences()
     allowed_bases = {os.path.realpath(prefs.get('download_dir', '.'))}
     with _db_lock, sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
-            "SELECT DISTINCT filename FROM downloads "
-            "WHERE status = 'finished' AND filename IS NOT NULL"
+            "SELECT DISTINCT output_dir FROM downloads "
+            "WHERE output_dir IS NOT NULL"
         ).fetchall()
-    for (fn,) in rows:
+    for (output_dir,) in rows:
         try:
-            allowed_bases.add(os.path.realpath(os.path.dirname(fn)))
+            allowed_bases.add(os.path.realpath(output_dir))
         except (TypeError, ValueError):
             continue
 
