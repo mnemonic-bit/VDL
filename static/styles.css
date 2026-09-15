@@ -241,10 +241,15 @@ input[type="text"].rename-input {
 .history-summary::-webkit-details-marker { display: none; }
 .history-summary::before { content: '▶'; display: inline-block; margin-right: 8px; font-size: 0.8em; transition: transform 0.15s; }
 details[open] > .history-summary::before { transform: rotate(90deg); }
-.progress-bar-bg { width: 100%; background-color: var(--progress-bg); border-radius: 5px; margin-top: 10px;}
+.progress-bar-bg { width: 100%; overflow: hidden; background-color: var(--progress-bg); border-radius: 5px; margin-top: 10px;}
 .progress-bar-fill { height: 20px; background-color: #4caf50; border-radius: 5px; width: 0%; transition: width 0.4s ease; }
+.progress-bar-fill.indeterminate { width: 35%; transition: none; animation: progress-indeterminate 1.4s ease-in-out infinite; }
 .progress-bar-fill.interrupted { background-color: #e74c3c; }
 .progress-bar-fill.error { background-color: #c0392b; }
+@keyframes progress-indeterminate {
+    from { transform: translateX(-110%); }
+    to { transform: translateX(300%); }
+}
 .history-toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
 .clear-btn { padding: 8px 14px; background-color: var(--surface-2); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; }
 .clear-btn:hover { background-color: var(--surface-hover); }

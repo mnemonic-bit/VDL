@@ -787,8 +787,11 @@ function renderItem(info, inHistoryView = false) {
 
     let bottom = '';
     if (isRunning || isCurrentTabStopped) {
-        let width = String(info.progress).replace('%', '');
-        if (isNaN(width)) width = 0;
+        const progressText = String(info.progress);
+        const parsedProgress = Number.parseFloat(progressText);
+        const isIndeterminate = isRunning
+            && (!progressText.trim().endsWith('%') || !Number.isFinite(parsedProgress));
+        const width = Number.isFinite(parsedProgress) ? parsedProgress : 0;
         const etaStr = isRunning ? formatEta(info.eta) : '';
         const sizeStr = formatBytes(info.filesize);
         const resStr = info.resolution;
@@ -803,13 +806,15 @@ function renderItem(info, inHistoryView = false) {
             ? `<div class="meta">${sizeQualityParts.join(' &middot; ')}</div>`
             : '';
         let barClass = 'progress-bar-fill';
-        if (isCancelled) barClass += ' cancelled';
+        if (isIndeterminate) barClass += ' indeterminate';
+        else if (isCancelled) barClass += ' cancelled';
         else if (info.status === 'interrupted') barClass += ' interrupted';
+        const widthStyle = isIndeterminate ? '' : ` style="width: ${width}%;"`;
         bottom = `
                     ${statusRow}
                     ${sizeQualityRow}
                     <div class="progress-bar-bg progress-bar-bottom">
-                        <div class="${barClass}" style="width: ${width}%;"></div>
+                        <div class="${barClass}"${widthStyle}></div>
                     </div>`;
     } else {
         if (!isFinished && info.status !== 'error') {

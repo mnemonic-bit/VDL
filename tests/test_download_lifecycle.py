@@ -9,7 +9,6 @@ from tests.support.fake_ytdlp import FakeYoutubeDL
 
 
 class DownloadLifecycleTest(AppCase):
-    @unittest.expectedFailure  # BUG 19
     def test_unknown_size_progress_exposes_live_metadata_and_indeterminate_state(self):
         download_id = self.insert("unknown1")
 
@@ -25,9 +24,11 @@ class DownloadLifecycleTest(AppCase):
 
         row = self.client.get("/api/history").get_json()[0]
         self.assertEqual(row["status"], "downloading")
+        self.assertEqual(row["progress"], "Downloading")
         self.assertEqual(row["title"], "Unknown length fixture")
         self.assertEqual(row["resolution"], "720p")
         self.assertEqual(row["speed"], 1024.0)
+        self.assertIsNone(row["filesize"])
 
     def test_pause_is_recorded_once_and_progress_continues_after_unpause(self):
         download_id = self.insert()

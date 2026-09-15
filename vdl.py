@@ -584,18 +584,24 @@ def progress_hook(d, download_id):
         elif width and height:
             live_resolution = f"{width}x{height}"
         live_title = info.get('title') or info.get('fulltitle')
+        # Unknown-length streams still have useful live state. Keep percentage
+        # calculation conditional without withholding status and metadata.
+        progress = 'Downloading'
+        filesize = None
         if total_bytes > 0:
             percent = (downloaded / total_bytes) * 100
-            db_update_download(
-                download_id,
-                status='downloading',
-                progress=f"{percent:.1f}%",
-                speed=float(speed) if speed else None,
-                eta=int(eta) if eta else None,
-                filesize=int(total_bytes),
-                resolution=live_resolution,
-                title=live_title,
-            )
+            progress = f"{percent:.1f}%"
+            filesize = int(total_bytes)
+        db_update_download(
+            download_id,
+            status='downloading',
+            progress=progress,
+            speed=float(speed) if speed else None,
+            eta=int(eta) if eta else None,
+            filesize=filesize,
+            resolution=live_resolution,
+            title=live_title,
+        )
     elif d['status'] == 'finished':
         # 'finished' here applies to one downloaded format, not necessarily
         # the whole job: a separate audio stream and ffmpeg merge may still

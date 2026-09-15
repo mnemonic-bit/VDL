@@ -23,7 +23,6 @@ test('SSE reconciliation renders Current metadata and moves finished rows to His
 });
 
 test('unknown-size downloads render an indeterminate Current progress state', async ({ page }) => {
-    test.fail(true, 'BUG 19: unknown-size progress remains Starting instead of becoming indeterminate');
     await seed(page, {
         id: 'unknown1', status: 'downloading', progress: 'Downloading',
         speed: 1024, resolution: '720p', title: 'Unknown length fixture',
