@@ -285,7 +285,7 @@ function probeVideoUrl(url) {
         }
                 
         if (data.title) {
-            document.getElementById('optionsFilename').placeholder = `Will be auto-filled: ${escapeHtml(data.title)}`;
+            document.getElementById('optionsFilename').placeholder = `Will be auto-filled: ${data.title}`;
         }
                 
         if (data.resolutions && data.resolutions.length > 0) {

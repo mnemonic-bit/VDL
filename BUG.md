@@ -276,21 +276,25 @@ then submit a valid-looking URL through the form.
 
 Expected-behavior coverage: `tests/browser/download-form.spec.cjs`.
 
-## 13. Special characters are double-escaped in the filename hint
+## 13. [Resolved] Special characters were double-escaped in the filename hint
 
 **Severity:** Low
 
-The title returned by `/api/probe` is HTML-escaped before being assigned to the
-input's `placeholder` property. Property assignment does not need HTML
-escaping, so characters such as `&` and `<` appear as literal `&amp;` and
-`&lt;` text.
+**Status:** Resolved and verified on 2026-09-15.
+
+The title returned by `/api/probe` was HTML-escaped before being assigned to
+the input's `placeholder` property. Property assignment does not parse HTML,
+so characters such as `&` and `<` appeared as literal `&amp;` and `&lt;` text.
 
 **Expected:** The filename hint should display the title's original text.
 
 **Reproduction:** Probe a source whose title contains `&` or `<` and inspect
 the Title/Filename placeholder.
 
-Expected-behavior coverage: `tests/browser/download-options.spec.cjs`.
+Permanent coverage: `tests/browser/download-options.spec.cjs`.
+
+The filename hint now assigns the probe title directly to the DOM property,
+preserving the original text without introducing an HTML-injection sink.
 
 ## 14. [Resolved] Renamed filenames could inject JavaScript into the Play action
 

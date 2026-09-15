@@ -47,7 +47,6 @@ test('only the newest probe can update Options', async ({ page }) => {
 });
 
 test('probe title is assigned as raw text to the filename hint', async ({ page }) => {
-    test.fail(true, 'BUG 13: probe title is double-escaped');
     await page.locator('#urlInput').fill('https://fixture.invalid/raw-title');
     await expect(page.locator('#optionsFilename')).toHaveAttribute(
         'placeholder',
