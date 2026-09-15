@@ -74,7 +74,6 @@ test('closing a row menu reconciles a deferred live update', async ({ page }) =>
 });
 
 test('History insertion animates occupied space before visibility', async ({ page }) => {
-    test.fail(true, 'BUG 7: History insertion only animates opacity');
     await page.locator('[data-tab=history]').click();
     await page.evaluate(() => {
         window.__historyAnimations = [];
@@ -87,9 +86,11 @@ test('History insertion animates occupied space before visibility', async ({ pag
         });
     });
     await seed(page, { id: 'animate1', status: 'finished', progress: '100%', file: true });
-    await expect(page.locator('[data-row-id="animate1"]')).toBeVisible();
+    await expect.poll(() => page.evaluate(() => window.__historyAnimations.length)).toBeGreaterThan(0);
     const frames = await page.evaluate(() => window.__historyAnimations.flat());
     expect(frames.some(frame => 'height' in frame || 'maxHeight' in frame || 'transform' in frame)).toBeTruthy();
+    expect(frames.some(frame => frame.opacity === '0' && parseFloat(frame.maxHeight) > 0)).toBeTruthy();
+    await expect(page.locator('[data-row-id="animate1"]')).not.toHaveClass(/item-fade-in/);
 });
 
 test('health checks use the scheduled clock and recovery hides the banner', async ({ page }) => {

@@ -935,6 +935,36 @@ let historyTotal = 0;
 let _renderedActiveIds  = new Set();
 let _renderedHistoryIds = new Set();
 
+function animateInsertedItem(element) {
+    // Rows vary with their metadata, so animate toward the natural box size
+    // instead of leaving every completed row under a guessed height limit.
+    const style = getComputedStyle(element);
+    element.style.setProperty('--item-expanded-height', `${element.getBoundingClientRect().height}px`);
+    element.style.setProperty('--item-expanded-padding-top', style.paddingTop);
+    element.style.setProperty('--item-expanded-padding-bottom', style.paddingBottom);
+    element.style.setProperty('--item-expanded-margin-bottom', style.marginBottom);
+    element.style.setProperty('--item-expanded-border-top-width', style.borderTopWidth);
+    element.style.setProperty('--item-expanded-border-bottom-width', style.borderBottomWidth);
+    element.classList.add('item-fade-in');
+
+    const finish = event => {
+        if (event.target !== element || event.animationName !== 'item-fade-in') return;
+        element.removeEventListener('animationend', finish);
+        element.classList.remove('item-fade-in');
+        for (const property of [
+            '--item-expanded-height',
+            '--item-expanded-padding-top',
+            '--item-expanded-padding-bottom',
+            '--item-expanded-margin-bottom',
+            '--item-expanded-border-top-width',
+            '--item-expanded-border-bottom-width',
+        ]) {
+            element.style.removeProperty(property);
+        }
+    };
+    element.addEventListener('animationend', finish);
+}
+
 function changePage(delta) {
     const maxPage = Math.max(0, Math.ceil(historyTotal / HISTORY_PAGE_SIZE) - 1);
     const next = Math.min(maxPage, Math.max(0, historyPage + delta));
@@ -1003,7 +1033,7 @@ function fetchHistory() {
             newActiveIds.forEach(id => {
                 if (!_renderedActiveIds.has(id)) {
                     const el = document.querySelector(`#activeList [data-row-id="${id}"]`);
-                    if (el) el.classList.add('item-fade-in');
+                    if (el) animateInsertedItem(el);
                 }
             });
         }
@@ -1011,7 +1041,7 @@ function fetchHistory() {
             newHistoryIds.forEach(id => {
                 if (!_renderedHistoryIds.has(id)) {
                     const el = document.querySelector(`#historyList [data-row-id="${id}"]`);
-                    if (el) el.classList.add('item-fade-in');
+                    if (el) animateInsertedItem(el);
                 }
             });
         }

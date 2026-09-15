@@ -133,9 +133,37 @@ input[type="text"], input[type="number"], select, textarea {
 input[type="text"]:focus, input[type="number"]:focus, select:focus, textarea:focus { outline: none; border-color: var(--muted); }
 input[type="text"], input[type="number"] { padding: 10px; }
 button { padding: 10px 20px; cursor: pointer; }
-@keyframes item-fade-in  { from { opacity: 0; } to { opacity: 1; } }
+@keyframes item-fade-in {
+    0% {
+        opacity: 0;
+        max-height: 0;
+        padding-top: 0;
+        padding-bottom: 0;
+        margin-bottom: 0;
+        border-top-width: 0;
+        border-bottom-width: 0;
+    }
+    60% {
+        opacity: 0;
+        max-height: var(--item-expanded-height);
+        padding-top: var(--item-expanded-padding-top);
+        padding-bottom: var(--item-expanded-padding-bottom);
+        margin-bottom: var(--item-expanded-margin-bottom);
+        border-top-width: var(--item-expanded-border-top-width);
+        border-bottom-width: var(--item-expanded-border-bottom-width);
+    }
+    100% {
+        opacity: 1;
+        max-height: var(--item-expanded-height);
+        padding-top: var(--item-expanded-padding-top);
+        padding-bottom: var(--item-expanded-padding-bottom);
+        margin-bottom: var(--item-expanded-margin-bottom);
+        border-top-width: var(--item-expanded-border-top-width);
+        border-bottom-width: var(--item-expanded-border-bottom-width);
+    }
+}
 @keyframes item-fade-out { from { opacity: 1; } to { opacity: 0; } }
-.item-fade-in  { animation: item-fade-in  0.3s ease-out both; }
+.item-fade-in  { overflow: hidden; animation: item-fade-in 0.45s ease-out both; }
 .item-fade-out { animation: item-fade-out 0.25s ease-in  both; }
 .history-item { position: relative; border: 1px solid var(--border); background: var(--surface); padding: 15px; margin-bottom: 10px; border-radius: 5px; }
 .history-item > .row-actions { position: absolute; top: 12px; right: 12px; }

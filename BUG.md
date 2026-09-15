@@ -149,9 +149,11 @@ download ID embedded in their output names, even when no filename reached the
 database before cancellation. Cleanup remains confined to that worker's
 directory and leaves files belonging to other download IDs untouched.
 
-## 7. History insertion animation does not make room before revealing the row
+## 7. [Resolved] History insertion animation does not make room before revealing the row
 
 **Severity:** Low
+
+**Status:** Resolved and verified on 2026-09-15.
 
 The item animation changes opacity only. The list layout changes immediately,
 so existing rows jump rather than moving smoothly to make room before the new
@@ -160,7 +162,11 @@ entry fades in.
 **Expected:** Animate the inserted row's occupied space and visibility, as
 described by the TODO marked complete.
 
-Expected-behavior coverage: `tests/browser/live-updates.spec.cjs`.
+Permanent coverage: `tests/browser/live-updates.spec.cjs`.
+
+New rows now expand from zero to their measured height while hidden, then
+fade in after the surrounding list has made room. The temporary height limit
+is removed when the animation finishes so row content remains unconstrained.
 
 ## 8. [Resolved by product decision] Finished-download section is not foldable
 
