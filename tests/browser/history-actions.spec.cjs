@@ -79,7 +79,6 @@ test('stored URL remains data for Open, Reload, Continue, and Copy actions', asy
 });
 
 test('renamed filename remains data when Play is clicked', async ({ page }) => {
-    test.fail(true, 'BUG 14: HTML entities in renamed filenames execute through Play onclick');
     await seed(page, { id: 'safe-play', status: 'finished', file: true, name: 'original.mp4' });
     await page.locator('[data-tab=history]').click();
     await refresh(page);
@@ -92,6 +91,7 @@ test('renamed filename remains data when Play is clicked', async ({ page }) => {
 
     const play = row.getByRole('button', { name: 'Play', exact: true });
     const inlineHandler = await play.getAttribute('onclick');
+    expect(await play.getAttribute('data-play-label')).toBe(`${hostileName}.mp4`);
     await play.click();
     expect(await page.evaluate(() => window.__filenameInjected)).toBeUndefined();
     expect(inlineHandler).toBeNull();

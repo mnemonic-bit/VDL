@@ -292,16 +292,18 @@ the Title/Filename placeholder.
 
 Expected-behavior coverage: `tests/browser/download-options.spec.cjs`.
 
-## 14. Renamed filenames can inject JavaScript into the Play action
+## 14. [Resolved] Renamed filenames could inject JavaScript into the Play action
 
 **Severity:** High
 
-The rename endpoint permits HTML entity text such as `&apos;`, and the History
-renderer interpolates the resulting filename into an inline `onclick`
-attribute. `escapeJs()` escapes literal apostrophes but does not HTML-escape
-ampersands. The browser decodes the entity before compiling the handler, so a
-filename can close the JavaScript string and append script that runs when Play
-is clicked.
+**Status:** Resolved and verified on 2026-09-15.
+
+Before the fix, the rename endpoint permitted HTML entity text such as
+`&apos;`, and the History renderer interpolated the resulting filename into an
+inline `onclick` attribute. `escapeJs()` escaped literal apostrophes but did
+not HTML-escape ampersands. The browser decoded the entity before compiling
+the handler, so a filename could close the JavaScript string and append script
+that ran when Play was clicked.
 
 A deterministic Chromium reproduction renamed a finished file to an otherwise
 valid basename containing encoded apostrophes and a harmless marker assignment.
@@ -315,8 +317,11 @@ into inline JavaScript.
 encoded apostrophe and JavaScript expression, then click Play. The expression
 runs in the VDL origin.
 
-Expected-behavior coverage:
-`tests/browser/history-actions.spec.cjs`.
+Permanent coverage: `tests/browser/history-actions.spec.cjs`.
+
+The Play action now carries the filename in HTML-escaped data attributes and
+uses the delegated click handler to pass it to the player as data. No filename
+is compiled as inline JavaScript.
 
 ## 15. Cross-origin form posts can invoke destructive API actions
 

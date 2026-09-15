@@ -589,6 +589,14 @@ function toggleMenu(id, ev) {
 }
 
 document.addEventListener('click', (ev) => {
+    const playAction = ev.target.closest('[data-play-action]');
+    if (playAction) {
+        playVideo(
+            playAction.dataset.downloadId,
+            playAction.dataset.playLabel,
+            playAction.dataset.playExt,
+        );
+    }
     const urlAction = ev.target.closest('[data-url-action]');
     if (urlAction) {
         const url = urlAction.dataset.url;
@@ -654,14 +662,6 @@ function escapeAttr(s) {
         .replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;')
         .replace(/'/g, '&#39;');
-}
-
-// Escape a string for use as a single-quoted JS literal inside an HTML
-// attribute (e.g. onclick="fn('...')"). HTML-entity escaping alone is not
-// enough: the browser decodes entities before the JS engine sees the string,
-// so an apostrophe in a filename would break the surrounding JS string literal.
-function escapeJs(s) {
-    return String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 }
 
 function escapeHtml(s) {
@@ -765,9 +765,14 @@ function renderItem(info, inHistoryView = false) {
     }
 
     const hasPlay = isFinished && info.filename;
-    const playBtn = hasPlay
-        ? `<button onclick="playVideo('${id}', '${escapeJs(info.filename.split('/').pop().split('\\').pop())}', '${escapeJs(info.filename.split('.').pop().toLowerCase())}')" aria-label="Play" title="Play"><svg class="icon"><use href="#i-camera"/></svg></button>`
-        : '';
+    let playBtn = '';
+    if (hasPlay) {
+        const playLabel = info.filename.split('/').pop().split('\\').pop();
+        const playExt = info.filename.split('.').pop().toLowerCase();
+        // Filenames stay in data attributes so HTML entity decoding cannot
+        // turn stored text into executable inline JavaScript.
+        playBtn = `<button data-play-action data-download-id="${escapeAttr(id)}" data-play-label="${escapeAttr(playLabel)}" data-play-ext="${escapeAttr(playExt)}" aria-label="Play" title="Play"><svg class="icon"><use href="#i-camera"/></svg></button>`;
+    }
 
     const kebabInner = menuItems.length ? `
                 <div class="menu-wrap">
