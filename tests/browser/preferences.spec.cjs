@@ -1,5 +1,5 @@
 const { test, expect } = require('@playwright/test');
-const { reset } = require('./support.cjs');
+const { reset, seed, refresh } = require('./support.cjs');
 
 test.beforeEach(async ({ page }) => reset(page));
 
@@ -32,7 +32,6 @@ test('preferences persist and the temporary Saved icon restores to Save', async 
 });
 
 test('rejected preferences stay editable and are not displayed as saved', async ({ page }) => {
-    test.fail(true, 'BUG 21: failed Preferences saves are displayed as successful');
     await page.locator('[data-tab=preferences]').click();
     const original = await (await page.request.get('/api/preferences')).json();
     await page.route('**/api/preferences', async route => {
@@ -48,6 +47,7 @@ test('rejected preferences stay editable and are not displayed as saved', async 
     });
 
     await page.locator('#prefMax').fill('1');
+    await page.locator('#prefPlayer').selectOption('new_tab');
     await page.locator('#prefTheme').selectOption('dark');
     await page.locator('#saveBtn').click();
 
@@ -57,4 +57,10 @@ test('rejected preferences stay editable and are not displayed as saved', async 
     await expect(page.locator('#prefMax')).toHaveValue('1');
     const persisted = await (await page.request.get('/api/preferences')).json();
     expect(persisted).toEqual(original);
+
+    await seed(page, { id: 'failedpref1', status: 'finished', file: true, name: 'fixture.mp4' });
+    await page.locator('[data-tab=history]').click();
+    await refresh(page);
+    await page.locator('[data-row-id="failedpref1"]').getByRole('button', { name: 'Play', exact: true }).click();
+    await expect(page.locator('#playerBackdrop')).toHaveClass(/open/);
 });

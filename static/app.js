@@ -1174,13 +1174,13 @@ function savePreferences() {
         player_mode: document.getElementById('prefPlayer').value,
         theme: document.getElementById('prefTheme').value,
     };
-    playerMode = body.player_mode;
-    applyTheme(body.theme);
-    apiFetch('/api/preferences', {
+    apiAction('/api/preferences', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
     }).then(() => {
+        playerMode = body.player_mode;
+        applyTheme(body.theme);
         const btn = document.getElementById('saveBtn');
         btn.innerHTML = '<svg class="btn-icon"><use href="#i-check"/></svg><span>Saved</span>';
         btn.disabled = true;
@@ -1188,7 +1188,7 @@ function savePreferences() {
             btn.innerHTML = '<svg class="btn-icon"><use href="#i-save"/></svg><span>Save</span>';
             btn.disabled = false;
         }, 1500);
-    });
+    }).catch(() => {});
 }
 
 loadPreferences();
