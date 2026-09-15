@@ -434,14 +434,16 @@ when a percentage cannot be calculated; show an indeterminate progress state.
 Expected-behavior coverage: `tests/test_download_lifecycle.py` and
 `tests/browser/live-updates.spec.cjs`.
 
-## 20. Format fallback triggers on noncanonical diagnostic errors
+## 20. [Resolved] Format fallback triggers on noncanonical diagnostic errors
 
 **Severity:** Medium
 
-`_is_format_unavailable_error()` accepts any error containing
+**Status:** Resolved and verified on 2026-09-15.
+
+Before the fix, `_is_format_unavailable_error()` accepted any error containing
 `--list-formats`, in addition to yt-dlp's literal `Requested format is not
 available` message. A network, authorization, or extractor error that merely
-suggests that diagnostic command can therefore cause VDL to retry with a
+suggested that diagnostic command could therefore cause VDL to retry with a
 different format, masking the original request and doing unnecessary work.
 
 A deterministic fake raised `HTTP 403; run --list-formats for diagnostics` on
@@ -451,7 +453,11 @@ made a second download attempt.
 **Expected:** Only the literal `Requested format is not available` condition
 may trigger automatic format fallback. Other failures must surface unchanged.
 
-Expected-behavior coverage: `tests/test_formats.py`.
+Permanent coverage: `tests/test_formats.py`.
+
+Format fallback now recognizes only yt-dlp's canonical `Requested format is
+not available` message. Errors that merely mention `--list-formats` retain the
+original selector, make no second download attempt, and surface unchanged.
 
 ## 21. [Resolved] Failed Preferences saves are displayed as successful
 

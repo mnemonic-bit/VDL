@@ -729,8 +729,7 @@ def _is_format_unavailable_error(exc):
     errors because retrying with a different format wouldn't help those.
     """
     msg = str(exc) if exc else ''
-    return ('Requested format is not available' in msg
-            or '--list-formats' in msg)
+    return 'Requested format is not available' in msg
 
 
 def _prepare_download_directory(value):
@@ -861,11 +860,9 @@ def background_download(url, download_id):
             with yt_dlp.YoutubeDL(build_opts(fmt)) as ydl:
                 ydl.download([url])
         except yt_dlp.utils.DownloadError as e:
-            # Auto-fallback: if yt-dlp tells the user to consult
-            # --list-formats, we already have that table from the probe
-            # phase. Pick the best concrete format_id and retry once with
-            # an explicit selector. This mirrors what the user would
-            # otherwise have to do by hand.
+            # Auto-fallback only for yt-dlp's canonical unavailable-format
+            # condition. Diagnostic suggestions can accompany unrelated
+            # failures that must surface without changing the user's request.
             if (is_cancel_requested(download_id)
                     or not _is_format_unavailable_error(e)
                     or not formats_summary):

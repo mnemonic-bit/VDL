@@ -86,7 +86,32 @@ class FormatContractTest(AppCase):
         self.assertTrue(video)
         self.assertTrue(audio)
 
-    @unittest.expectedFailure  # BUG 20
+    def test_canonical_unavailable_format_triggers_format_fallback(self):
+        class UnavailableFormat(FakeYoutubeDL):
+            attempts = []
+
+            def download(self, urls):
+                type(self).attempts.append(self.options["format"])
+                if len(type(self).attempts) == 1:
+                    raise vdl.yt_dlp.utils.DownloadError(
+                        "Requested format is not available"
+                    )
+                return super().download(urls)
+
+        FakeYoutubeDL.reset()
+        UnavailableFormat.attempts = []
+        download_id = self.insert("format20-canonical")
+        with (
+            mock.patch.object(vdl.yt_dlp, "YoutubeDL", UnavailableFormat),
+            mock.patch.object(vdl, "ffprobe_resolution", return_value="360p"),
+        ):
+            vdl.background_download("https://fixture.invalid/video", download_id)
+
+        row = self.client.get("/api/history").get_json()[0]
+        self.assertEqual(row["status"], "finished")
+        self.assertEqual(row["requested_format"], "v360")
+        self.assertEqual(UnavailableFormat.attempts, ["best", "v360"])
+
     def test_diagnostic_list_formats_text_does_not_trigger_format_fallback(self):
         class DiagnosticFailure(FakeYoutubeDL):
             attempts = []
