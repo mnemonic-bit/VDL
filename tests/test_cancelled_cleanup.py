@@ -64,7 +64,6 @@ class CancelledDownloadCleanupTest(AppCase):
         self.assertEqual(entry["status"], "cancelled")
         self.assertEqual(entry["output_dir"], os.path.abspath(self.download_dir))
 
-    @unittest.expectedFailure  # BUG 22
     def test_cleanup_failure_keeps_the_row_available_for_retry(self):
         download_id = "cleanup1"
         vdl.db_insert_download(download_id, "https://fixture.invalid/video.mp4")

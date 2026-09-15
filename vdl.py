@@ -368,7 +368,8 @@ def delete_download_artifacts(entry, fallback_dir=None):
         try:
             os.remove(path)
             removed += 1
-        except OSError:
+        except FileNotFoundError:
+            # A postprocessor may already have consumed a temporary file.
             pass
     return removed
 
@@ -382,6 +383,10 @@ def db_remove_download_if_inactive(download_id, fallback_dir=None):
         entry = dict(row) if row else None
         if entry is None or entry['status'] in ('starting', 'downloading', 'paused'):
             return entry, False
+        # Keep the row as a retry handle if filesystem cleanup fails. Holding
+        # the state lock also prevents Resume from claiming the same partial
+        # files while they are being removed.
+        delete_download_artifacts(entry, fallback_dir)
         cur = conn.execute(
             "DELETE FROM downloads WHERE id = ? "
             "AND status NOT IN ('starting', 'downloading', 'paused')",
@@ -389,7 +394,6 @@ def db_remove_download_if_inactive(download_id, fallback_dir=None):
         )
         removed = cur.rowcount == 1
     if removed:
-        delete_download_artifacts(entry, fallback_dir)
         event_bus.publish('change', {'reason': 'delete', 'id': download_id})
     return entry, removed
 
@@ -404,14 +408,16 @@ def db_clear_terminal():
                 TERMINAL_STATUSES,
             ).fetchall()
         ]
+        # If any file cannot be removed, retain all rows so the user can retry
+        # instead of losing the only record of the remaining artifacts.
+        files_deleted = sum(
+            delete_download_artifacts(entry, fallback_dir) for entry in entries
+        )
         cur = conn.execute(
             f"DELETE FROM downloads WHERE status IN ({placeholders})",
             TERMINAL_STATUSES,
         )
         rows = cur.rowcount
-    files_deleted = sum(
-        delete_download_artifacts(entry, fallback_dir) for entry in entries
-    )
     if rows:
         event_bus.publish('change', {'reason': 'clear', 'count': rows})
     return rows, files_deleted
@@ -1160,7 +1166,10 @@ def remove_download(download_id):
     if entry is None:
         return jsonify({"error": "Unknown download id"}), 404
     fallback_dir = db_get_preferences().get("download_dir", ".")
-    entry, removed = db_remove_download_if_inactive(download_id, fallback_dir)
+    try:
+        entry, removed = db_remove_download_if_inactive(download_id, fallback_dir)
+    except OSError as exc:
+        return jsonify({"error": f"Cleanup failed: {exc}"}), 500
     if entry is None:
         return jsonify({"error": "Unknown download id"}), 404
     if not removed:
@@ -1181,7 +1190,10 @@ def clear_history_preview():
 
 @app.route('/api/clear', methods=['POST'])
 def clear_history():
-    removed, files_deleted = db_clear_terminal()
+    try:
+        removed, files_deleted = db_clear_terminal()
+    except OSError as exc:
+        return jsonify({"error": f"Cleanup failed: {exc}"}), 500
     return jsonify({"message": "Cleared", "removed": removed, "files_deleted": files_deleted})
 
 

@@ -12,7 +12,6 @@ async function reject(page, path, message) {
 }
 
 test('failed Pause request reports the error and preserves the row', async ({ page }) => {
-    test.fail(true, 'BUG 22: failed Pause requests are silent');
     await seed(page, { id: 'failpause', status: 'downloading', progress: '25%' });
     await refresh(page);
     await reject(page, '/api/pause/failpause', 'pause was rejected');
@@ -24,7 +23,6 @@ test('failed Pause request reports the error and preserves the row', async ({ pa
 });
 
 test('failed Stop request reports the error and preserves the row', async ({ page }) => {
-    test.fail(true, 'BUG 22: failed Stop requests are silent');
     await seed(page, { id: 'failstop', status: 'downloading', progress: '25%' });
     await refresh(page);
     await reject(page, '/api/stop/failstop', 'stop was rejected');
@@ -35,7 +33,6 @@ test('failed Stop request reports the error and preserves the row', async ({ pag
 });
 
 test('failed Continue request reports the error and preserves the row', async ({ page }) => {
-    test.fail(true, 'BUG 22: failed Continue requests are silent');
     await seed(page, { id: 'failcontinue', status: 'cancelled', progress: 'Stopped' });
     await refresh(page);
     await reject(page, '/api/resume/failcontinue', 'continue was rejected');
@@ -46,7 +43,6 @@ test('failed Continue request reports the error and preserves the row', async ({
 });
 
 test('failed Delete request restores the row and reports the error', async ({ page }) => {
-    test.fail(true, 'BUG 22: failed Delete requests are silent');
     await seed(page, { id: 'faildelete', status: 'finished', file: true });
     await page.locator('[data-tab=history]').click();
     await refresh(page);
@@ -59,7 +55,6 @@ test('failed Delete request restores the row and reports the error', async ({ pa
 });
 
 test('failed Reload does not resubmit and reports the error', async ({ page }) => {
-    test.fail(true, 'BUG 22: failed Reload requests continue and stay silent');
     await seed(page, { id: 'failreload', status: 'error', progress: 'fixture error' });
     await page.locator('[data-tab=history]').click();
     await refresh(page);
@@ -78,7 +73,6 @@ test('failed Reload does not resubmit and reports the error', async ({ page }) =
 });
 
 test('failed Clear reports the error and preserves History', async ({ page }) => {
-    test.fail(true, 'BUG 22: failed Clear requests are silent');
     await seed(page, { id: 'failclear', status: 'finished', file: true });
     await page.locator('[data-tab=history]').click();
     await refresh(page);

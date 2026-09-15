@@ -459,9 +459,11 @@ were not persisted.
 
 Expected-behavior coverage: `tests/browser/preferences.spec.cjs`.
 
-## 22. Important backend, UI, and container contracts lack regression coverage
+## 22. [Resolved] Important backend, UI, and container contracts lacked regression coverage
 
 **Severity:** Medium
+
+**Status:** Resolved and verified on 2026-09-15.
 
 The permanent suite is broad and all four tiers currently pass under the
 documented expected-failure policy, but the coverage ledger overstates several
@@ -503,6 +505,12 @@ Permanent coverage now includes:
 - `tests/test_cancelled_cleanup.py` for cleanup failures; and
 - `tests/coverage_gate.py` for a dependency-free reviewed 90% `vdl.py` line
   baseline in the unit/release gate.
+
+The remaining expected failures were retired after rejected Pause, Stop,
+Continue, Delete, Reload, and Clear actions began showing the server's error
+without losing their rows or continuing a failed action chain. Artifact cleanup
+now runs before its database row is removed; a filesystem failure returns an
+error and retains the row so cleanup can be retried.
 
 ## Accepted UI decisions
 

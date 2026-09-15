@@ -28,6 +28,29 @@ function apiFetch(url, options) {
     });
 }
 
+function hideActionError() {
+    document.getElementById('actionError').hidden = true;
+}
+
+function showActionError(message) {
+    document.getElementById('actionErrorMessage').textContent = message;
+    document.getElementById('actionError').hidden = false;
+}
+
+function apiAction(url, options) {
+    hideActionError();
+    return apiFetch(url, options)
+        .then(async res => {
+            if (res.ok) return res;
+            const data = await res.json().catch(() => ({}));
+            throw new Error(data.error || res.statusText || `Request failed (${res.status})`);
+        })
+        .catch(err => {
+            showActionError(err.message || 'Request failed');
+            throw err;
+        });
+}
+
 function updateApiVersion(version, unavailable) {
     const footer = document.getElementById('versionFooter');
     const apiVersion = document.getElementById('apiVersion');
@@ -324,8 +347,9 @@ function resetOptions() {
 
 function stopDownload(id) {
     closeAllMenus();
-    apiFetch('/api/stop/' + encodeURIComponent(id), { method: 'POST' })
-        .then(() => fetchHistory());
+    apiAction('/api/stop/' + encodeURIComponent(id), { method: 'POST' })
+        .then(() => fetchHistory())
+        .catch(() => fetchHistory());
 }
 
 const renameDrafts = new Map();
@@ -434,31 +458,35 @@ function renameCommit(id) {
 
 function pauseDownload(id) {
     closeAllMenus();
-    apiFetch('/api/pause/' + encodeURIComponent(id), { method: 'POST' })
-        .then(() => fetchHistory());
+    apiAction('/api/pause/' + encodeURIComponent(id), { method: 'POST' })
+        .then(() => fetchHistory())
+        .catch(() => fetchHistory());
 }
 
 function unpauseDownload(id) {
     closeAllMenus();
-    apiFetch('/api/unpause/' + encodeURIComponent(id), { method: 'POST' })
-        .then(() => fetchHistory());
+    apiAction('/api/unpause/' + encodeURIComponent(id), { method: 'POST' })
+        .then(() => fetchHistory())
+        .catch(() => fetchHistory());
 }
 
 function reloadDownload(id, url) {
     closeAllMenus();
-    apiFetch('/api/remove/' + encodeURIComponent(id), { method: 'POST' })
-        .then(() => apiFetch('/api/download', {
+    apiAction('/api/remove/' + encodeURIComponent(id), { method: 'POST' })
+        .then(() => apiAction('/api/download', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ url: url })
         }))
-        .then(() => fetchHistory());
+        .then(() => fetchHistory())
+        .catch(() => fetchHistory());
 }
 
 function continueDownload(id, url) {
     closeAllMenus();
-    apiFetch('/api/resume/' + encodeURIComponent(id), { method: 'POST' })
-        .then(() => fetchHistory());
+    apiAction('/api/resume/' + encodeURIComponent(id), { method: 'POST' })
+        .then(() => fetchHistory())
+        .catch(() => fetchHistory());
 }
 
 function deleteDownload(id) {
@@ -468,15 +496,13 @@ function deleteDownload(id) {
         row.classList.add('item-fade-out');
         row.addEventListener('animationend', () => row.remove(), { once: true });
     }
-    apiFetch('/api/remove/' + encodeURIComponent(id), { method: 'POST' })
-        .then(res => {
-            if (!res.ok) fetchHistory();
-        })
+    apiAction('/api/remove/' + encodeURIComponent(id), { method: 'POST' })
+        .then(() => fetchHistory())
         .catch(() => fetchHistory());
 }
 
 function clearHistory() {
-    apiFetch('/api/clear/preview')
+    apiAction('/api/clear/preview')
         .then(r => r.json())
         .then(data => {
             const entries = data.entries || 0;
@@ -487,9 +513,10 @@ function clearHistory() {
                 : '';
             const msg = `Remove ${entries} history entr${entries !== 1 ? 'ies' : 'y'}${fileLine}?`;
             if (!confirm(msg)) return;
-            apiFetch('/api/clear', { method: 'POST' })
+            return apiAction('/api/clear', { method: 'POST' })
                 .then(() => fetchHistory());
-        });
+        })
+        .catch(() => fetchHistory());
 }
 
 let openMenuId = null;
