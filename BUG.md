@@ -323,13 +323,16 @@ The Play action now carries the filename in HTML-escaped data attributes and
 uses the delegated click handler to pass it to the player as data. No filename
 is compiled as inline JavaScript.
 
-## 15. Cross-origin form posts can invoke destructive API actions
+## 15. [Resolved] Cross-origin form posts can invoke destructive API actions
 
 **Severity:** High
 
-State-changing endpoints such as `/api/clear`, `/api/remove/<id>`,
-`/api/stop/<id>`, and `/api/resume/<id>` do not validate `Origin`, require a
-CSRF token, or require a non-simple request content type. In particular,
+**Status:** Resolved and verified on 2026-09-15.
+
+Before the fix, state-changing endpoints such as `/api/clear`,
+`/api/remove/<id>`, `/api/stop/<id>`, and `/api/resume/<id>` did not validate
+`Origin`, require a CSRF token, or require a non-simple request content type.
+In particular,
 `POST /api/clear` accepts an empty `application/x-www-form-urlencoded` request,
 so a web page or browser context able to reach the loopback service can submit
 a form without needing to read the cross-origin response.
@@ -342,7 +345,12 @@ both the finished row and its media file.
 submission, for example by validating the request origin and/or requiring a
 CSRF-resistant request contract consistently across every mutating route.
 
-Expected-behavior coverage: `tests/test_request_security.py`.
+Permanent coverage: `tests/test_request_security.py`.
+
+All mutating API requests now pass through one request-boundary guard. It
+rejects a supplied origin unless it matches the service origin and also
+rejects cross-site Fetch Metadata, while retaining compatibility with direct
+API clients that do not send browser security headers.
 
 ## 16. [Resolved] An unusable download directory leaves workers stuck at Starting
 

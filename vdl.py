@@ -103,6 +103,54 @@ def yt_dlp_options(options):
 
 app = Flask(__name__)
 
+
+def _normalized_http_origin(value):
+    """Return a comparable HTTP origin tuple, or None for invalid input."""
+    if not value:
+        return None
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme.lower() not in ('http', 'https')
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in ('', '/')
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+    if port is None:
+        port = 443 if parsed.scheme.lower() == 'https' else 80
+    return parsed.scheme.lower(), parsed.hostname.lower(), port
+
+
+@app.before_request
+def reject_cross_origin_api_mutation():
+    """Keep browser form submissions from mutating the loopback service."""
+    if (
+        not request.path.startswith('/api/')
+        or request.method not in ('POST', 'PUT', 'PATCH', 'DELETE')
+    ):
+        return None
+
+    origin = request.headers.get('Origin')
+    if origin is not None:
+        supplied_origin = _normalized_http_origin(origin)
+        service_origin = _normalized_http_origin(request.host_url)
+        if supplied_origin is None or supplied_origin != service_origin:
+            return jsonify({"error": "Cross-origin request denied"}), 403
+
+    # Fetch Metadata covers clients that suppress Origin. Browsers control
+    # this header, so an attacking page cannot make a cross-site request look
+    # same-origin; non-browser API clients remain compatible without it.
+    if request.headers.get('Sec-Fetch-Site', '').lower() == 'cross-site':
+        return jsonify({"error": "Cross-origin request denied"}), 403
+    return None
+
 # ---------------------------------------------------------------------------
 # Event bus (server -> browser push)
 # ---------------------------------------------------------------------------
