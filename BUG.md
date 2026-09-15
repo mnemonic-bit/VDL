@@ -256,9 +256,11 @@ row remains in Current until another refresh occurs.
 
 Expected-behavior coverage: `tests/browser/live-updates.spec.cjs`.
 
-## 12. Failed download submissions silently clear the form
+## 12. [Resolved] Failed download submissions silently clear the form
 
 **Severity:** Medium
+
+**Status:** Resolved and verified on 2026-09-15.
 
 The submit handler parses every `/api/download` response and resets the URL and
 options without checking `response.ok`. An HTTP error response is therefore
@@ -274,7 +276,11 @@ show the server-provided error message.
 **Reproduction:** Make `/api/download` return HTTP 400 or 500 with a JSON error,
 then submit a valid-looking URL through the form.
 
-Expected-behavior coverage: `tests/browser/download-form.spec.cjs`.
+Permanent coverage: `tests/browser/download-form.spec.cjs`.
+
+Rejected download submissions now use the shared action-error boundary. HTTP
+errors retain the entered URL and Download Options while showing the server's
+JSON error message; only accepted submissions clear the form.
 
 ## 13. [Resolved] Special characters were double-escaped in the filename hint
 

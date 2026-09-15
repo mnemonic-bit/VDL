@@ -119,7 +119,7 @@ function startDownload(event) {
         }
     }
     
-    apiFetch('/api/download', {
+    apiAction('/api/download', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -127,9 +127,7 @@ function startDownload(event) {
             format: finalFormat || undefined,
             filename: customFilename || undefined
         })
-    })
-    .then(res => res.json())
-    .then(() => {
+    }).then(() => {
         document.getElementById('urlInput').value = '';
         updateUrlClear();
         document.getElementById('optionsFilename').value = '';
@@ -140,7 +138,8 @@ function startDownload(event) {
         resetOptions();
         if (optionsDetails && !optionsOpenedManually) setOptionsOpen(false);
         fetchHistory();
-    });
+    })
+    .catch(() => {});
 }
 
 let probeTimeout;

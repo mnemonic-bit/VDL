@@ -30,14 +30,20 @@ test('Ctrl-V outside editable controls focuses the URL input and pastes', async 
 });
 
 test('rejected submission retains the form and reports the server error', async ({ page }) => {
-    test.fail(true, 'BUG 12: rejected download submission clears the form');
     await page.route('**/api/download', route => route.fulfill({
         status: 500,
         contentType: 'application/json',
         body: '{"error":"fixture rejected the request"}',
     }));
     await page.locator('#urlInput').fill('https://fixture.invalid/rejected');
+    await expect(page.locator('#optionsQualitySelect')).toBeEnabled({ timeout: 3000 });
+    await page.locator('#optionsQualitySelect').selectOption('bestvideo[height<=360]+bestaudio/best');
+    await page.locator('#optionsContainerSelect').selectOption('mp4');
+    await page.locator('#optionsFilename').fill('keep-this-name');
     await page.locator('#downloadForm button[type=submit]').click();
     await expect(page.locator('#urlInput')).toHaveValue('https://fixture.invalid/rejected');
+    await expect(page.locator('#optionsQualitySelect')).toHaveValue('bestvideo[height<=360]+bestaudio/best');
+    await expect(page.locator('#optionsContainerSelect')).toHaveValue('mp4');
+    await expect(page.locator('#optionsFilename')).toHaveValue('keep-this-name');
     await expect(page.getByText('fixture rejected the request')).toBeVisible();
 });
