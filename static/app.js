@@ -129,6 +129,7 @@ function startDownload(event) {
         })
     }).then(() => {
         document.getElementById('urlInput').value = '';
+        invalidateProbe();
         updateUrlClear();
         document.getElementById('optionsFilename').value = '';
         const qualitySelect = document.getElementById('optionsQualitySelect');
@@ -143,6 +144,9 @@ function startDownload(event) {
 }
 
 let probeTimeout;
+// A request may finish after its URL has been replaced or cleared. Generation
+// checks keep those callbacks from restoring options for an obsolete input.
+let probeGeneration = 0;
 const urlInput = document.getElementById('urlInput');
 const urlClear = document.getElementById('urlClear');
 const optionsDetails = document.querySelector('#optionsContainer details');
@@ -151,9 +155,20 @@ function updateUrlClear() {
     urlClear.style.display = urlInput.value ? '' : 'none';
 }
 
+function invalidateProbe() {
+    clearTimeout(probeTimeout);
+    probeGeneration += 1;
+}
+
+function scheduleProbe(url) {
+    invalidateProbe();
+    const generation = probeGeneration;
+    probeTimeout = setTimeout(() => probeVideoUrl(url, generation), 500);
+}
+
 urlClear.addEventListener('click', () => {
     urlInput.value = '';
-    clearTimeout(probeTimeout);
+    invalidateProbe();
     resetOptions();
     if (optionsDetails && !optionsOpenedManually) setOptionsOpen(false);
     updateUrlClear();
@@ -219,10 +234,10 @@ if (optionsDetails) {
 }
 
 urlInput.addEventListener('input', () => {
-    clearTimeout(probeTimeout);
     updateUrlClear();
     const url = urlInput.value.trim();
     if (!url) {
+        invalidateProbe();
         resetOptions();
         return;
     }
@@ -231,11 +246,11 @@ urlInput.addEventListener('input', () => {
     }
     const overlay = document.getElementById('optionsOverlay');
     if (overlay) overlay.classList.add('hidden');
-    probeTimeout = setTimeout(() => probeVideoUrl(url), 500);
+    scheduleProbe(url);
 });
 
 urlInput.addEventListener('paste', () => {
-    clearTimeout(probeTimeout);
+    invalidateProbe();
     setTimeout(() => {
         updateUrlClear();
         const url = urlInput.value.trim();
@@ -248,11 +263,13 @@ urlInput.addEventListener('paste', () => {
         }
         const overlay = document.getElementById('optionsOverlay');
         if (overlay) overlay.classList.add('hidden');
-        probeTimeout = setTimeout(() => probeVideoUrl(url), 500);
+        scheduleProbe(url);
     }, 0);
 });
         
-function probeVideoUrl(url) {
+function probeVideoUrl(url, generation) {
+    if (generation !== probeGeneration) return;
+
     const overlay = document.getElementById('optionsOverlay');
     if (overlay) overlay.classList.add('hidden');
 
@@ -270,6 +287,8 @@ function probeVideoUrl(url) {
     })
     .then(res => res.json())
     .then(data => {
+        if (generation !== probeGeneration) return;
+
         if (data.error) {
             select.disabled = true;
             const errorOption = document.createElement('option');
@@ -320,6 +339,8 @@ function probeVideoUrl(url) {
         }
     })
     .catch(err => {
+        if (generation !== probeGeneration) return;
+
         select.disabled = true;
         select.innerHTML = '<option value="">Use default preference</option>';
                 

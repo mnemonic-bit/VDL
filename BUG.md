@@ -209,9 +209,11 @@ executable JavaScript.
 
 Permanent coverage: `tests/browser/history-actions.spec.cjs`.
 
-## 10. Stale URL probes overwrite newer or cleared Download Options
+## 10. [Resolved] Stale URL probes overwrite newer or cleared Download Options
 
 **Severity:** Medium
+
+**Status:** Resolved and verified on 2026-09-15.
 
 Each URL edit starts an asynchronous `/api/probe` request, but responses are
 not associated with the URL that initiated them. If probe A is slow and probe
@@ -231,7 +233,12 @@ changing the URL must cancel or invalidate all earlier responses.
 clear the input before A completes. Arrange for A to respond last and inspect
 the title hint and quality selector.
 
-Expected-behavior coverage: `tests/browser/download-options.spec.cjs`.
+Permanent coverage: `tests/browser/download-options.spec.cjs`.
+
+Each scheduled probe now captures a generation number. URL edits, clearing,
+pasting, and successful submissions invalidate the previous generation, and
+probe callbacks update Download Options only while their generation remains
+current.
 
 ## 11. [Resolved] An open row menu can leave live download state stale
 

@@ -37,13 +37,31 @@ test('probe quality controls never emit NaN selectors', async ({ page }) => {
 });
 
 test('only the newest probe can update Options', async ({ page }) => {
-    test.fail(true, 'BUG 10: stale URL probes overwrite current Options');
     await page.locator('#urlInput').fill('https://fixture.invalid/slow-probe-A');
     await page.waitForRequest(request => request.url().endsWith('/api/probe'));
+    const slowProbe = page.waitForResponse(response => (
+        response.url().endsWith('/api/probe')
+        && response.request().postDataJSON().url.endsWith('/slow-probe-A')
+    ));
     await page.locator('#urlInput').fill('https://fixture.invalid/fast-B');
     await expect(page.locator('#optionsFilename')).toHaveAttribute('placeholder', /fast-B/);
-    await page.waitForTimeout(700);
+    await slowProbe;
     await expect(page.locator('#optionsFilename')).toHaveAttribute('placeholder', /fast-B/);
+});
+
+test('clearing the URL invalidates an in-flight probe', async ({ page }) => {
+    await page.locator('#urlInput').fill('https://fixture.invalid/slow-probe-A');
+    await page.waitForRequest(request => request.url().endsWith('/api/probe'));
+    const slowProbe = page.waitForResponse(response => response.url().endsWith('/api/probe'));
+    await page.locator('#urlClear').click();
+    await slowProbe;
+    await expect(page.locator('#optionsFilename')).toHaveAttribute(
+        'placeholder',
+        'Will be auto-filled from video title',
+    );
+    await expect(page.locator('#optionsQualitySelect')).toBeDisabled();
+    await expect(page.locator('#optionsContainerSelect')).toBeDisabled();
+    await expect(page.locator('#optionsOverlay')).not.toHaveClass(/hidden/);
 });
 
 test('probe title is assigned as raw text to the filename hint', async ({ page }) => {
