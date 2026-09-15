@@ -344,9 +344,11 @@ CSRF-resistant request contract consistently across every mutating route.
 
 Expected-behavior coverage: `tests/test_request_security.py`.
 
-## 16. An unusable download directory leaves workers stuck at Starting
+## 16. [Resolved] An unusable download directory leaves workers stuck at Starting
 
 **Severity:** Medium
+
+**Status:** Resolved and verified on 2026-09-15.
 
 `POST /api/preferences` accepts an empty, invalid, or unwritable
 `download_dir`. `background_download()` calls `os.makedirs()` before entering
@@ -363,6 +365,11 @@ also keep worker setup inside the failure boundary so filesystem errors become
 terminal rows with useful messages.
 
 Expected-behavior coverage: `tests/test_preferences.py`.
+
+Preferences now prepare and validate a nonempty, writable download directory
+before saving it. Workers repeat that check at startup so a directory that
+becomes unusable after it was saved is recorded as a terminal `error` with a
+useful message; the failure occurs before a concurrency slot is acquired.
 
 ## 17. [Resolved] Concurrent Resume requests could start duplicate workers
 

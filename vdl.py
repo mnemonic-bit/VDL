@@ -733,16 +733,44 @@ def _is_format_unavailable_error(exc):
             or '--list-formats' in msg)
 
 
+def _prepare_download_directory(value):
+    """Create and validate a directory before it is persisted or used."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError('Download directory must not be empty')
+
+    directory = value.strip()
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            f'Download directory is not usable: {exc}'
+        ) from exc
+    if not os.path.isdir(directory) or not os.access(
+            directory, os.W_OK | os.X_OK):
+        raise ValueError('Download directory is not writable')
+    return directory
+
+
 def background_download(url, download_id):
     prefs = db_get_preferences()
     output_dir = prefs.get("download_dir", ".")
+    try:
+        output_dir = _prepare_download_directory(output_dir)
+    except ValueError as exc:
+        db_update_download(
+            download_id,
+            status='error',
+            progress=str(exc),
+            finished_at=time.time(),
+        )
+        clear_cancel(download_id)
+        clear_pause(download_id)
+        return
     db_update_download(download_id, output_dir=os.path.abspath(output_dir))
-    
+
     # Check if there's a format override from quality selection; otherwise use preference
     entry = db_get_download(download_id)
     fmt = (entry.get('requested_format') if entry else None) or prefs.get("format", "best")
-    
-    os.makedirs(output_dir, exist_ok=True)
 
     # Progress hooks report the paths of individual downloaded formats. The
     # post-processor hook is the first authoritative source for the merged or
@@ -1317,6 +1345,13 @@ def preferences():
     updates = {k: v for k, v in data.items() if k in allowed and v is not None}
     if not updates:
         return jsonify({"error": "No valid preference fields provided"}), 400
+    if "download_dir" in updates:
+        try:
+            updates["download_dir"] = _prepare_download_directory(
+                updates["download_dir"]
+            )
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
     db_set_preferences(updates)
     return jsonify(db_get_preferences())
 
