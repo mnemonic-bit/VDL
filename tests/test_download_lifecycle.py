@@ -30,29 +30,42 @@ class DownloadLifecycleTest(AppCase):
         self.assertEqual(row["speed"], 1024.0)
         self.assertIsNone(row["filesize"])
 
-    def test_changing_size_estimates_remain_indeterminate(self):
+    def test_changing_size_estimates_are_smoothed(self):
         download_id = self.insert("estimate1")
+        mib = 1024 * 1024
+        observed_sizes = []
+        observed_progress = []
 
-        for estimate in (800, 725):
+        for estimate in (800, 806, 794, 805, 796):
             vdl.progress_hook({
                 "status": "downloading",
-                "downloaded_bytes": 400,
-                "total_bytes_estimate": estimate,
+                "downloaded_bytes": 400 * mib,
+                "total_bytes_estimate": estimate * mib,
                 "info_dict": {},
             }, download_id)
 
             row = self.client.get("/api/history").get_json()[0]
-            self.assertEqual(row["progress"], "Downloading")
-            self.assertIsNone(row["filesize"])
+            observed_sizes.append(row["filesize"])
+            observed_progress.append(float(row["progress"].rstrip("%")))
 
-        vdl.progress_hook({
-            "status": "finished",
-            "total_bytes_estimate": 700,
-            "info_dict": {"filesize_approx": 700},
-        }, download_id)
-        row = self.client.get("/api/history").get_json()[0]
-        self.assertEqual(row["progress"], "100%")
-        self.assertIsNone(row["filesize"])
+        self.assertEqual(observed_sizes, [800 * mib] * 5)
+        self.assertEqual(observed_progress, [50.0] * 5)
+
+        for _ in range(30):
+            vdl.progress_hook({
+                "status": "downloading",
+                "downloaded_bytes": 400 * mib,
+                "total_bytes_estimate": 820 * mib,
+                "info_dict": {},
+            }, download_id)
+            row = self.client.get("/api/history").get_json()[0]
+            observed_sizes.append(row["filesize"])
+            observed_progress.append(float(row["progress"].rstrip("%")))
+
+        self.assertGreater(observed_sizes[-1], 815 * mib)
+        self.assertLessEqual(observed_sizes[-1], 820 * mib)
+        self.assertLess(len(set(observed_sizes)), 10)
+        self.assertEqual(observed_progress, sorted(observed_progress))
 
     def test_exact_size_drives_determinate_progress(self):
         download_id = self.insert("exact001")

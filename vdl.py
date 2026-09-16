@@ -526,6 +526,15 @@ _cancel_flags = {}
 _pause_flags  = {}
 _cancel_lock  = threading.Lock()  # guards both maps
 
+# HLS totals are extrapolated from the fragments received so far. Preserve a
+# responsive internal average, but only publish it after a material movement;
+# otherwise the one-decimal UI still changes on nearly every fragment.
+_ESTIMATE_ALPHA = 0.10
+_ESTIMATE_RELATIVE_DEADBAND = 0.005
+_ESTIMATE_MIN_DEADBAND = 1024 * 1024
+_progress_estimates = {}
+_progress_estimate_lock = threading.Lock()
+
 
 def request_cancel(download_id):
     with _cancel_lock:
@@ -562,6 +571,50 @@ def is_pause_requested(download_id):
 def clear_pause(download_id):
     with _cancel_lock:
         _pause_flags.pop(download_id, None)
+
+
+def _clear_progress_estimate(download_id):
+    with _progress_estimate_lock:
+        _progress_estimates.pop(download_id, None)
+
+
+def _smoothed_estimated_progress(download_id, raw_total, downloaded):
+    raw_total = float(raw_total)
+    downloaded = float(downloaded or 0)
+
+    with _progress_estimate_lock:
+        state = _progress_estimates.get(download_id)
+        # A lower byte count identifies a restarted transfer. Its estimate and
+        # percentage should not inherit momentum from the previous stream.
+        if state is None or downloaded < state['downloaded']:
+            smoothed_total = raw_total
+            displayed_total = int(round(raw_total))
+            percent = (downloaded / displayed_total) * 100
+        else:
+            smoothed_total = (
+                state['smoothed_total']
+                + _ESTIMATE_ALPHA * (raw_total - state['smoothed_total'])
+            )
+            displayed_total = state['displayed_total']
+            deadband = max(
+                _ESTIMATE_MIN_DEADBAND,
+                displayed_total * _ESTIMATE_RELATIVE_DEADBAND,
+            )
+            if abs(smoothed_total - displayed_total) >= deadband:
+                displayed_total = int(round(smoothed_total))
+
+            candidate = (downloaded / displayed_total) * 100
+            # Revised estimates must not make completed work appear to undo
+            # itself. Falling byte counts reset the state in the branch above.
+            percent = max(state['percent'], candidate)
+
+        _progress_estimates[download_id] = {
+            'smoothed_total': smoothed_total,
+            'displayed_total': displayed_total,
+            'downloaded': downloaded,
+            'percent': percent,
+        }
+        return displayed_total, percent
 
 
 def _configured_worker_limit():
@@ -625,6 +678,7 @@ def progress_hook(d, download_id):
 
     if d['status'] == 'downloading':
         total_bytes = d.get('total_bytes') or 0
+        estimated_total = d.get('total_bytes_estimate') or 0
         downloaded = d.get('downloaded_bytes', 0)
         speed = d.get('speed')  # bytes/sec, may be None at the very start
         eta = d.get('eta')      # seconds remaining, may be None
@@ -644,9 +698,17 @@ def progress_hook(d, download_id):
         progress = 'Downloading'
         filesize = None
         if total_bytes > 0:
+            _clear_progress_estimate(download_id)
             percent = (downloaded / total_bytes) * 100
             progress = f"{percent:.1f}%"
             filesize = int(total_bytes)
+        elif estimated_total > 0:
+            filesize, percent = _smoothed_estimated_progress(
+                download_id,
+                estimated_total,
+                downloaded,
+            )
+            progress = f"{percent:.1f}%"
         db_update_download(
             download_id,
             status='downloading',
@@ -680,10 +742,16 @@ def progress_hook(d, download_id):
                 if cand and re.fullmatch(r'\d{3,5}p|\d+x\d+', str(cand)):
                     resolution = str(cand)
                     break
-        # Approximate sizes fluctuate as fragmented streams arrive. Keep them
-        # out of the authoritative size column; background_download stats the
-        # completed output after all merging and post-processing has finished.
         filesize = info.get('filesize') or d.get('total_bytes')
+        estimated_filesize = (
+            info.get('filesize_approx') or d.get('total_bytes_estimate')
+        )
+        if not filesize and estimated_filesize:
+            filesize, _percent = _smoothed_estimated_progress(
+                download_id,
+                estimated_filesize,
+                d.get('downloaded_bytes', 0),
+            )
         title = info.get('title') or info.get('fulltitle')
         db_update_download(
             download_id,
@@ -696,6 +764,7 @@ def progress_hook(d, download_id):
             eta=0,
             title=title,
         )
+        _clear_progress_estimate(download_id)
 
 
 def summarize_formats(info_dict):
@@ -1039,6 +1108,7 @@ def background_download(url, download_id):
     finally:
         clear_cancel(download_id)
         clear_pause(download_id)
+        _clear_progress_estimate(download_id)
         _release_worker_slot()
 
 
