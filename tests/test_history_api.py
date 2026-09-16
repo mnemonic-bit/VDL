@@ -22,16 +22,25 @@ class HistoryApiTest(AppCase):
         self.assertEqual((result["removed"], result["files_deleted"]), (2, 2))
         self.assertTrue(all(not os.path.exists(path) for path in paths))
 
-    @unittest.expectedFailure  # BUG 5
     def test_clear_history_preserves_cancelled_and_interrupted_current_rows(self):
+        paths = {}
         for index, status in enumerate(("finished", "error", "cancelled", "interrupted")):
             download_id = self.insert(f"clear{index}")
-            vdl.db_update_download(download_id, status=status)
+            path = os.path.join(self.download_dir, f"clear{index}.mp4")
+            with open(path, "wb") as output:
+                output.write(b"fixture")
+            paths[status] = path
+            vdl.db_update_download(download_id, status=status, filename=path)
         preview = self.client.get("/api/clear/preview").get_json()
-        self.assertEqual(preview["entries"], 2)
-        self.client.post("/api/clear")
+        self.assertEqual(preview, {"entries": 2, "with_files": 2})
+        result = self.client.post("/api/clear").get_json()
+        self.assertEqual((result["removed"], result["files_deleted"]), (2, 2))
         remaining = {row["status"] for row in vdl.db_list_downloads()}
         self.assertEqual(remaining, {"cancelled", "interrupted"})
+        self.assertFalse(os.path.exists(paths["finished"]))
+        self.assertFalse(os.path.exists(paths["error"]))
+        self.assertTrue(os.path.exists(paths["cancelled"]))
+        self.assertTrue(os.path.exists(paths["interrupted"]))
 
     def test_rows_and_preferences_survive_database_reopening(self):
         self.insert("persist1")

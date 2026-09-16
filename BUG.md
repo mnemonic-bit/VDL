@@ -113,9 +113,11 @@ Expected-behavior coverage: `tests/test_formats.py`,
 `tests/integration/test_real_media.py`, and
 `tests/browser/download-options.spec.cjs`.
 
-## 5. Clear History also removes cancelled and interrupted Current entries
+## 5. [Resolved] Clear History also removes cancelled and interrupted Current entries
 
 **Severity:** Medium
+
+**Status:** Resolved and verified on 2026-09-16.
 
 The UI presents Clear History inside the Download History tab, but the backend
 clears every terminal status. This includes `cancelled` and `interrupted`,
@@ -126,7 +128,11 @@ entry disappeared from Current after Clear History was used.
 History (`finished` and `error`), or the UI should clearly disclose and confirm
 that resumable Current entries will also be removed.
 
-Expected-behavior coverage: `tests/test_history_api.py`.
+Permanent coverage: `tests/test_history_api.py`.
+
+Clear History now uses the same `finished` and `error` status boundary as the
+Download History tab. Its preview, artifact cleanup, and row deletion all
+preserve resumable `cancelled` and `interrupted` Current entries.
 
 ## 6. [Resolved] Cancelled downloads can leave partial files behind
 

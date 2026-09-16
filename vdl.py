@@ -218,7 +218,8 @@ DB_PATH = os.environ.get(
 # Configurable so the Docker image can ship a sensible writable default
 # (/downloads) without forcing the user to set it on first run.
 DEFAULT_DOWNLOAD_DIR = os.environ.get("DOWNLOADS_DIR", ".")
-TERMINAL_STATUSES = ('finished', 'error', 'cancelled', 'interrupted')
+HISTORY_STATUSES = ('finished', 'error')
+TERMINAL_STATUSES = HISTORY_STATUSES + ('cancelled', 'interrupted')
 
 # A single lock serialises writes from background threads. SQLite itself is
 # safe for concurrent reads, but multiple writers across threads on the same
@@ -446,14 +447,14 @@ def db_remove_download_if_inactive(download_id, fallback_dir=None):
     return entry, removed
 
 
-def db_clear_terminal():
-    placeholders = ",".join("?" * len(TERMINAL_STATUSES))
+def db_clear_history():
+    placeholders = ",".join("?" * len(HISTORY_STATUSES))
     fallback_dir = db_get_preferences().get("download_dir", ".")
     with _db_lock, db() as conn:
         entries = [
             dict(r) for r in conn.execute(
                 f"SELECT id, filename, output_dir FROM downloads WHERE status IN ({placeholders})",
-                TERMINAL_STATUSES,
+                HISTORY_STATUSES,
             ).fetchall()
         ]
         # If any file cannot be removed, retain all rows so the user can retry
@@ -463,7 +464,7 @@ def db_clear_terminal():
         )
         cur = conn.execute(
             f"DELETE FROM downloads WHERE status IN ({placeholders})",
-            TERMINAL_STATUSES,
+            HISTORY_STATUSES,
         )
         rows = cur.rowcount
     if rows:
@@ -1258,11 +1259,11 @@ def remove_download(download_id):
 
 @app.route('/api/clear/preview', methods=['GET'])
 def clear_history_preview():
-    placeholders = ",".join("?" * len(TERMINAL_STATUSES))
+    placeholders = ",".join("?" * len(HISTORY_STATUSES))
     with db() as conn:
         rows = conn.execute(
             f"SELECT COUNT(*), COUNT(filename) FROM downloads WHERE status IN ({placeholders})",
-            TERMINAL_STATUSES,
+            HISTORY_STATUSES,
         ).fetchone()
     return jsonify({"entries": rows[0], "with_files": rows[1]})
 
@@ -1270,7 +1271,7 @@ def clear_history_preview():
 @app.route('/api/clear', methods=['POST'])
 def clear_history():
     try:
-        removed, files_deleted = db_clear_terminal()
+        removed, files_deleted = db_clear_history()
     except OSError as exc:
         return jsonify({"error": f"Cleanup failed: {exc}"}), 500
     return jsonify({"message": "Cleared", "removed": removed, "files_deleted": files_deleted})
