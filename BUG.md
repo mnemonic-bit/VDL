@@ -79,9 +79,11 @@ the probe and download phases. Focused tests verify that the configured limit
 is enforced, queued downloads can be cancelled, and raising the limit wakes a
 waiting download.
 
-## 3. Download Options ignores the custom Title/Filename
+## 3. [Resolved] Download Options ignores the custom Title/Filename
 
 **Severity:** Medium
+
+**Status:** Resolved and verified on 2026-09-16.
 
 The frontend sends the `filename` field in `POST /api/download`, but the
 backend does not use it when building yt-dlp's output template. Entering
@@ -92,6 +94,11 @@ used for the downloaded file while preserving the real output extension.
 
 Expected-behavior coverage: `tests/test_download_requests.py` and
 `tests/browser/download-options.spec.cjs`.
+
+Custom basenames are now validated and persisted with the download so resumed
+workers retain them. yt-dlp downloads to an ID-bearing staging name, preserving
+safe partial-file cleanup, then the completed output is renamed to the requested
+basename with the media's actual extension.
 
 ## 4. [Resolved] Audio-only behavior is inconsistent
 

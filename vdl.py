@@ -286,6 +286,9 @@ def init_db():
             # change before a cancelled entry is removed, and early partials
             # may exist before yt-dlp reports a filename.
             ("output_dir", "ALTER TABLE downloads ADD COLUMN output_dir TEXT"),
+            # Keep the user's basename separate from yt-dlp's reported path.
+            # Resumed workers need the same template to find existing parts.
+            ("requested_filename", "ALTER TABLE downloads ADD COLUMN requested_filename TEXT"),
         ]:
             if col not in existing_cols:
                 conn.execute(ddl)
@@ -325,7 +328,8 @@ def db_insert_download(download_id, url):
 def db_update_download(download_id, *, status=None, progress=None,
                        filename=None, resolution=None, filesize=None,
                        speed=None, eta=None, title=None, finished_at=None,
-                       formats=None, requested_format=None, output_dir=None):
+                       formats=None, requested_format=None, output_dir=None,
+                       requested_filename=None):
     fields, values = [], []
     if status is not None:
         fields.append("status = ?"); values.append(status)
@@ -351,6 +355,8 @@ def db_update_download(download_id, *, status=None, progress=None,
         fields.append("requested_format = ?"); values.append(requested_format)
     if output_dir is not None:
         fields.append("output_dir = ?"); values.append(output_dir)
+    if requested_filename is not None:
+        fields.append("requested_filename = ?"); values.append(requested_filename)
     if not fields:
         return
     values.append(download_id)
@@ -805,6 +811,25 @@ def _prepare_download_directory(value):
     return directory
 
 
+def _validated_custom_filename(value):
+    """Return an extension-free bare basename suitable for an output path."""
+    if not isinstance(value, str):
+        raise ValueError('Filename must be text')
+    name = value.strip()
+    if not name:
+        raise ValueError('Filename must not be empty')
+    if ('/' in name or '\\' in name or '\x00' in name
+            or name in ('.', '..')):
+        raise ValueError('Filename must not contain path separators')
+
+    # The downloaded media decides its extension. Mirroring inline rename
+    # avoids names such as video.webm.mp4 when a user supplies a suffix.
+    stem, _typed_ext = os.path.splitext(name)
+    if not stem:
+        raise ValueError('Filename must not be empty')
+    return stem
+
+
 def background_download(url, download_id):
     prefs = db_get_preferences()
     output_dir = prefs.get("download_dir", ".")
@@ -825,6 +850,7 @@ def background_download(url, download_id):
     # Check if there's a format override from quality selection; otherwise use preference
     entry = db_get_download(download_id)
     fmt = (entry.get('requested_format') if entry else None) or prefs.get("format", "best")
+    requested_filename = entry.get('requested_filename') if entry else None
     audio_only = fmt == 'bestaudio/best'
 
     # Progress hooks report the paths of individual downloaded formats. The
@@ -842,9 +868,18 @@ def background_download(url, download_id):
             postprocessed_paths.append(path)
 
     def build_opts(format_selector):
+        if requested_filename:
+            # Retain the random row ID until the download is complete so
+            # cancellation cleanup can identify every partial owned by it.
+            # Percent signs are literals here, not yt-dlp placeholders.
+            template_stem = requested_filename.replace('%', '%%')
+        else:
+            template_stem = '%(title)s'
         options = {
             'format': format_selector,
-            'outtmpl': os.path.join(output_dir, f'%(title)s_{download_id}.%(ext)s'),
+            'outtmpl': os.path.join(
+                output_dir, f'{template_stem}_{download_id}.%(ext)s'
+            ),
             'progress_hooks': [lambda d: progress_hook(d, download_id)],
             'postprocessor_hooks': [capture_postprocessed_path],
             'quiet': True,
@@ -956,6 +991,19 @@ def background_download(url, download_id):
                         final_path = cand
                         break
             if final_path and os.path.exists(final_path):
+                if requested_filename:
+                    _, final_ext = os.path.splitext(final_path)
+                    requested_path = os.path.join(
+                        output_dir, requested_filename + final_ext
+                    )
+                    if os.path.realpath(requested_path) != os.path.realpath(final_path):
+                        if os.path.lexists(requested_path):
+                            raise FileExistsError(
+                                f'A file named {os.path.basename(requested_path)} '
+                                'already exists'
+                            )
+                        os.rename(final_path, requested_path)
+                        final_path = requested_path
                 # Probe the merged file with ffprobe for the authoritative
                 # resolution. yt-dlp's progress hook reports the per-stream
                 # resolution, which is None for the audio half of a merged
@@ -1042,6 +1090,13 @@ def add_download():
     if not url:
         return jsonify({"error": "URL is required"}), 400
 
+    requested_filename = data.get('filename')
+    if requested_filename is not None:
+        try:
+            requested_filename = _validated_custom_filename(requested_filename)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
     download_id = str(uuid.uuid4())[:8]
     db_insert_download(download_id, url)
 
@@ -1049,6 +1104,8 @@ def add_download():
     format_override = data.get('format')
     if format_override:
         db_update_download(download_id, requested_format=format_override)
+    if requested_filename:
+        db_update_download(download_id, requested_filename=requested_filename)
 
     thread = threading.Thread(target=background_download, args=(url, download_id))
     thread.daemon = True

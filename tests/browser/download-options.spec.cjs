@@ -73,7 +73,6 @@ test('probe title is assigned as raw text to the filename hint', async ({ page }
 });
 
 test('custom filename controls the resulting downloaded basename', async ({ page }) => {
-    test.fail(true, 'BUG 3: backend ignores the custom filename');
     await page.locator('#urlInput').fill('https://fixture.invalid/custom');
     await page.locator('#optionsFilename').fill('chosen-browser-name');
     await page.locator('#downloadForm button[type=submit]').click();

@@ -47,7 +47,7 @@ class SchemaMigrationTest(unittest.TestCase):
                     "id", "url", "status", "progress", "created_at",
                     "filename", "resolution", "filesize", "speed", "eta",
                     "title", "finished_at", "formats", "requested_format",
-                    "output_dir",
+                    "output_dir", "requested_filename",
                 })
                 self.assertEqual(
                     vdl.db_get_download("legacy1")["status"],

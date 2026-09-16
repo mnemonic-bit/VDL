@@ -29,7 +29,6 @@ class DownloadRequestTest(AppCase):
         row = vdl.db_get_download(response.get_json()["id"])
         self.assertEqual(row["requested_format"], "v360+a1")
 
-    @unittest.expectedFailure  # BUG 3
     def test_custom_filename_reaches_output_template_and_preserves_extension(self):
         with (
             mock.patch.object(vdl.yt_dlp, "YoutubeDL", FakeYoutubeDL),
@@ -40,21 +39,28 @@ class DownloadRequestTest(AppCase):
                 "/api/download",
                 json={
                     "url": "https://fixture.invalid/video",
-                    "filename": "chosen-name",
+                    "filename": "chosen-name.webm",
                 },
             )
         row = vdl.db_get_download(response.get_json()["id"])
         self.assertEqual(os.path.basename(row["filename"]), "chosen-name.mp4")
 
-    @unittest.expectedFailure  # BUG 3
     def test_custom_filename_accepts_only_safe_bare_names(self):
-        for filename in ("../escape", "a/b", "a\\b", "\x00", ".", ".."):
-            with self.subTest(filename=filename):
-                response = self.client.post(
-                    "/api/download",
-                    json={"url": "https://fixture.invalid/video", "filename": filename},
-                )
-                self.assertEqual(response.status_code, 400)
+        with (
+            mock.patch.object(vdl, "background_download"),
+            self.start_immediately(),
+        ):
+            for filename in ("../escape", "a/b", "a\\b", "\x00", ".", ".."):
+                with self.subTest(filename=filename):
+                    response = self.client.post(
+                        "/api/download",
+                        json={
+                            "url": "https://fixture.invalid/video",
+                            "filename": filename,
+                        },
+                    )
+                    self.assertEqual(response.status_code, 400)
+        self.assertEqual(vdl.db_list_downloads(), [])
 
 
 if __name__ == "__main__":
