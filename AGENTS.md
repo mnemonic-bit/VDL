@@ -23,7 +23,7 @@ Flask + `yt-dlp` video-downloader UI. **Single-process, single-file backend** ([
 ## WHERE TO LOOK
 | Task | Location |
 |---|---|
-| Complete bug ledger (open and resolved) | [`BUG.md`](BUG.md) |
+| Complete bug ledger (open and resolved) | [`BUGS/BUG-INDEX.md`](BUGS/BUG-INDEX.md) |
 | HTTP routes | [`vdl.py` Routes section](file:///workspace/vdl.py#L660-L989) |
 | Download lifecycle | [`background_download`](file:///workspace/vdl.py#L511-L636) + [`progress_hook`](file:///workspace/vdl.py#L323-L411) |
 | Pause / cancel flags | [in-memory dicts + lock](file:///workspace/vdl.py#L280-L321) |
