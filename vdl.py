@@ -535,6 +535,15 @@ _ESTIMATE_MIN_DEADBAND = 1024 * 1024
 _progress_estimates = {}
 _progress_estimate_lock = threading.Lock()
 
+# ETA is more stable when treated as a predicted completion timestamp. The
+# timestamp can be filtered while its remaining duration still counts down
+# naturally between meaningful revisions.
+_ETA_ALPHA = 0.10
+_ETA_RELATIVE_DEADBAND = 0.05
+_ETA_MIN_DEADBAND = 5.0
+_eta_estimates = {}
+_eta_estimate_lock = threading.Lock()
+
 
 def request_cancel(download_id):
     with _cancel_lock:
@@ -617,6 +626,43 @@ def _smoothed_estimated_progress(download_id, raw_total, downloaded):
         return displayed_total, percent
 
 
+def _clear_eta_estimate(download_id):
+    with _eta_estimate_lock:
+        _eta_estimates.pop(download_id, None)
+
+
+def _smoothed_eta(download_id, raw_eta, downloaded):
+    now = time.monotonic()
+    raw_deadline = now + float(raw_eta)
+    downloaded = float(downloaded or 0)
+
+    with _eta_estimate_lock:
+        state = _eta_estimates.get(download_id)
+        if state is None or downloaded < state['downloaded']:
+            smoothed_deadline = raw_deadline
+            displayed_deadline = raw_deadline
+        else:
+            smoothed_deadline = (
+                state['smoothed_deadline']
+                + _ETA_ALPHA * (raw_deadline - state['smoothed_deadline'])
+            )
+            displayed_deadline = state['displayed_deadline']
+            displayed_eta = max(0.0, displayed_deadline - now)
+            deadband = max(
+                _ETA_MIN_DEADBAND,
+                displayed_eta * _ETA_RELATIVE_DEADBAND,
+            )
+            if abs(smoothed_deadline - displayed_deadline) >= deadband:
+                displayed_deadline = smoothed_deadline
+
+        _eta_estimates[download_id] = {
+            'smoothed_deadline': smoothed_deadline,
+            'displayed_deadline': displayed_deadline,
+            'downloaded': downloaded,
+        }
+        return max(0, int(round(displayed_deadline - now)))
+
+
 def _configured_worker_limit():
     value = db_get_preferences().get("max_concurrent", "3")
     try:
@@ -675,13 +721,20 @@ def progress_hook(d, download_id):
             if is_cancel_requested(download_id):
                 raise DownloadCancelled()
             time.sleep(0.25)
+        # The payload predates the pause. Restart ETA filtering from it so the
+        # paused wall time is not mistaken for a sudden network slowdown.
+        _clear_eta_estimate(download_id)
 
     if d['status'] == 'downloading':
         total_bytes = d.get('total_bytes') or 0
         estimated_total = d.get('total_bytes_estimate') or 0
         downloaded = d.get('downloaded_bytes', 0)
         speed = d.get('speed')  # bytes/sec, may be None at the very start
-        eta = d.get('eta')      # seconds remaining, may be None
+        raw_eta = d.get('eta')  # seconds remaining, may be None
+        eta = (
+            _smoothed_eta(download_id, raw_eta, downloaded)
+            if raw_eta is not None and raw_eta >= 0 else None
+        )
         # Capture resolution + title as soon as they're known so the Current
         # tab can show them during the download, not only after completion.
         info = d.get('info_dict') or {}
@@ -714,7 +767,7 @@ def progress_hook(d, download_id):
             status='downloading',
             progress=progress,
             speed=float(speed) if speed else None,
-            eta=int(eta) if eta else None,
+            eta=eta,
             filesize=filesize,
             resolution=live_resolution,
             title=live_title,
@@ -765,6 +818,7 @@ def progress_hook(d, download_id):
             title=title,
         )
         _clear_progress_estimate(download_id)
+        _clear_eta_estimate(download_id)
 
 
 def summarize_formats(info_dict):
@@ -1109,6 +1163,7 @@ def background_download(url, download_id):
         clear_cancel(download_id)
         clear_pause(download_id)
         _clear_progress_estimate(download_id)
+        _clear_eta_estimate(download_id)
         _release_worker_slot()
 
 

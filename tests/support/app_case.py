@@ -28,6 +28,8 @@ class AppCase(unittest.TestCase):
             vdl._pause_flags.clear()
         with vdl._progress_estimate_lock:
             vdl._progress_estimates.clear()
+        with vdl._eta_estimate_lock:
+            vdl._eta_estimates.clear()
         with vdl._worker_condition:
             vdl._worker_queue.clear()
             vdl._active_worker_count = 0
@@ -57,6 +59,8 @@ class AppCase(unittest.TestCase):
             vdl._pause_flags.clear()
         with vdl._progress_estimate_lock:
             vdl._progress_estimates.clear()
+        with vdl._eta_estimate_lock:
+            vdl._eta_estimates.clear()
         with vdl._worker_condition:
             vdl._worker_queue.clear()
             vdl._active_worker_count = 0

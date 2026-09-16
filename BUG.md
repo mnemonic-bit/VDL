@@ -9,8 +9,9 @@ Issues 14-22 were found during a repository and test-coverage audit on
 suite, with open behavior guarded by expected-failure markers. Issue 22
 records both the expanded coverage and the remaining behavioral debt.
 Issue 23 was reproduced in the running container on 2026-09-16 and reduced
-to a deterministic progress-hook reproduction. Issue 24 records the UI
-regression introduced by its first fix and the subsequent smoothing behavior.
+to a deterministic progress-hook reproduction. Issues 24-25 record the UI
+regression introduced by its first fix and the subsequent size and ETA
+smoothing behavior.
 
 ## 1. [Resolved] Merged downloads kept the deleted temporary audio filename
 
@@ -687,6 +688,35 @@ new stream or completed worker; exact totals bypass it, and final completion
 still records the filesystem size. The regression test holds the displayed
 total steady across small 794-806 MiB revisions, verifies convergence toward a
 sustained 820 MiB estimate, and checks monotonic percentage progress.
+
+## 25. [Resolved] Estimated time remaining jumped between updates
+
+**Severity:** Medium
+
+**Status:** Resolved in version `0.2.20` on 2026-09-16.
+
+The Current tab persisted and displayed every yt-dlp `eta` sample verbatim.
+Short-lived transfer-rate changes therefore made the estimated time remaining
+jump both forward and backward even after total-size smoothing stabilized the
+neighboring progress display.
+
+A deterministic reproduction submits five progress payloads one second apart
+with ETA values of 120, 128, 116, 125, and 114 seconds. Before the fix, those
+five values appeared unchanged in the API. A stable presentation should count
+down from 120 to 116 seconds because their predicted completion times remain
+within the normal noise band.
+
+**Expected:** Keep ETA visible and naturally counting down, suppress small
+completion-time revisions, and follow a sustained change in the prediction
+without one large jump.
+
+**Resolution:** ETA smoothing now operates on predicted completion timestamps
+rather than directly averaging remaining seconds. A 10% exponentially weighted
+moving average follows the prediction, while a 5-second or 5% deadband,
+whichever is larger, suppresses noise. The filter resets across pauses, new
+streams, and completed workers. Regression coverage verifies a steady countdown,
+bounded adjustments, and convergence toward a sustained revised completion
+time.
 
 ## Accepted UI decisions
 

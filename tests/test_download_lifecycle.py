@@ -82,6 +82,31 @@ class DownloadLifecycleTest(AppCase):
         self.assertEqual(row["progress"], "50.0%")
         self.assertEqual(row["filesize"], 800)
 
+    def test_changing_eta_estimates_are_smoothed_around_completion_time(self):
+        download_id = self.insert("eta00001")
+        sample_times = list(range(1000, 1035))
+        raw_etas = [120, 128, 116, 125, 114]
+        raw_etas.extend(1160 - now for now in sample_times[5:])
+        observed = []
+
+        with mock.patch.object(vdl.time, "monotonic", side_effect=sample_times):
+            for index, eta in enumerate(raw_etas):
+                vdl.progress_hook({
+                    "status": "downloading",
+                    "downloaded_bytes": 400 + index,
+                    "total_bytes": 800,
+                    "eta": eta,
+                    "info_dict": {},
+                }, download_id)
+                observed.append(vdl.db_get_download(download_id)["eta"])
+
+        self.assertEqual(observed[:5], [120, 119, 118, 117, 116])
+        self.assertLessEqual(
+            max(current - previous for previous, current in zip(observed, observed[1:])),
+            10,
+        )
+        self.assertLessEqual(abs(observed[-1] - raw_etas[-1]), 10)
+
     def test_pause_is_recorded_once_and_progress_continues_after_unpause(self):
         download_id = self.insert()
         vdl.request_pause(download_id)
