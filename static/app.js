@@ -306,13 +306,20 @@ function probeVideoUrl(url, generation) {
             document.getElementById('optionsFilename').placeholder = `Will be auto-filled: ${data.title}`;
         }
                 
-        if (data.resolutions && data.resolutions.length > 0) {
-            data.resolutions.forEach(res => {
-                const height = parseInt(res);
+        const numericResolutions = Array.isArray(data.resolutions)
+            ? data.resolutions.flatMap(res => {
+                const match = String(res).match(/^(\d+)p$/);
+                if (!match) return [];
+                const height = Number(match[1]);
+                return Number.isSafeInteger(height) && height > 0 ? [height] : [];
+            })
+            : [];
+        if (numericResolutions.length > 0) {
+            numericResolutions.forEach(height => {
                 const formatSelector = `bestvideo[height<=${height}]+bestaudio/best`;
                 const option = document.createElement('option');
                 option.value = formatSelector;
-                option.textContent = res;
+                option.textContent = `${height}p`;
                 select.appendChild(option);
             });
             select.disabled = false;

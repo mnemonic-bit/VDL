@@ -51,7 +51,6 @@ class RealMediaIntegrationTest(AppCase):
         self.assertTrue(streams(row["filename"]))
         self.assertTrue(all(item["codec_type"] == "audio" for item in streams(row["filename"])))
 
-    @unittest.expectedFailure  # BUG 4
     def test_combined_source_audio_selection_extracts_audio(self):
         with fixture_server(self.temp_dir.name) as server:
             row = self.download(server.base_url + "/combined.mp4", "bestaudio/best", "mp4audio")

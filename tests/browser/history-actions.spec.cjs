@@ -107,7 +107,6 @@ test('Clear History confirms and deletes stored files', async ({ page }) => {
 });
 
 test('Clear History leaves resumable Current rows intact', async ({ page }) => {
-    test.fail(true, 'BUG 5: Clear History also removes cancelled and interrupted rows');
     await seed(page, { id: 'finished1', status: 'finished', file: true });
     await seed(page, { id: 'cancelled1', status: 'cancelled', progress: 'Stopped' });
     await page.locator('[data-tab=history]').click();

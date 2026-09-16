@@ -29,7 +29,6 @@ test('MP4 option builds a compatible MP4-video plus M4A-audio selector', async (
 });
 
 test('probe quality controls never emit NaN selectors', async ({ page }) => {
-    test.fail(true, 'BUG 4: audio-only labels are treated as numeric qualities');
     await page.locator('#urlInput').fill('https://fixture.invalid/options');
     await expect(page.locator('#optionsQualitySelect')).toBeEnabled({ timeout: 3000 });
     const values = await page.locator('#optionsQualitySelect option').evaluateAll(options => options.map(option => option.value));

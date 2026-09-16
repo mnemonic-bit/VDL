@@ -44,7 +44,6 @@ class FormatContractTest(AppCase):
         summary = vdl.summarize_formats({"formats": FORMATS[2:]})
         self.assertEqual(vdl.pick_best_format_id(summary), "a1")
 
-    @unittest.expectedFailure  # BUG 4
     def test_probe_exposes_only_numeric_video_qualities(self):
         class Probe:
             def __init__(self, _options):
@@ -63,7 +62,6 @@ class FormatContractTest(AppCase):
             response = self.client.post("/api/probe", json={"url": "https://fixture.invalid"})
         self.assertEqual(response.get_json()["resolutions"], ["720p", "360p"])
 
-    @unittest.expectedFailure  # BUG 4
     def test_combined_source_audio_selection_configures_audio_extraction(self):
         FakeYoutubeDL.reset()
         download_id = self.insert()

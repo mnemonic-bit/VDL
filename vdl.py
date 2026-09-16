@@ -825,6 +825,7 @@ def background_download(url, download_id):
     # Check if there's a format override from quality selection; otherwise use preference
     entry = db_get_download(download_id)
     fmt = (entry.get('requested_format') if entry else None) or prefs.get("format", "best")
+    audio_only = fmt == 'bestaudio/best'
 
     # Progress hooks report the paths of individual downloaded formats. The
     # post-processor hook is the first authoritative source for the merged or
@@ -841,7 +842,7 @@ def background_download(url, download_id):
             postprocessed_paths.append(path)
 
     def build_opts(format_selector):
-        return yt_dlp_options({
+        options = {
             'format': format_selector,
             'outtmpl': os.path.join(output_dir, f'%(title)s_{download_id}.%(ext)s'),
             'progress_hooks': [lambda d: progress_hook(d, download_id)],
@@ -852,7 +853,15 @@ def background_download(url, download_id):
             # resumed download picks up the existing .part file rather than
             # restarting from byte zero.
             'continuedl': True,
-        })
+        }
+        if audio_only:
+            # `best` may be a combined video when no separate audio format is
+            # available. Preserve the user's output intent across that yt-dlp
+            # fallback, including any later retry with a concrete format ID.
+            options['postprocessors'] = [
+                {'key': 'FFmpegExtractAudio', 'preferredcodec': 'm4a'},
+            ]
+        return yt_dlp_options(options)
 
     # Persist the yt-dlp format selector that we're about to use, so the
     # History tab can show *what was asked for* whenever a download fails
@@ -1071,18 +1080,20 @@ def probe_url():
         # Build list of formats with resolution info
         formats_summary = summarize_formats(info)
         
-        # Collect resolutions in order (highest first)
+        # Collect numeric video heights in order (highest first). Extractors
+        # also use `resolution` for labels such as "audio only"; those are
+        # display metadata, not values suitable for a height selector.
         resolutions_list = []
         seen_res = set()
         container_exts = set()
         if formats_summary:
             for fmt in formats_summary:
-                res_str = None
-                if fmt.get('height'):
-                    res_str = f"{fmt['height']}p"
-                elif fmt.get('resolution'):
-                    res_str = fmt['resolution']
-                
+                try:
+                    height = int(fmt.get('height'))
+                except (TypeError, ValueError):
+                    height = 0
+                res_str = f"{height}p" if height > 0 else None
+
                 if res_str and res_str not in seen_res:
                     seen_res.add(res_str)
                     resolutions_list.append(res_str)
@@ -1092,13 +1103,10 @@ def probe_url():
                     container_exts.add(fmt['ext'])
         
         # Sort by height (descending)
-        def get_height(res_str):
-            try:
-                return int(res_str.rstrip('p'))
-            except:
-                return 0
-        
-        resolutions_list.sort(key=get_height, reverse=True)
+        resolutions_list.sort(
+            key=lambda resolution: int(resolution.removesuffix('p')),
+            reverse=True,
+        )
         
         # Sort containers: mp4 first (if available), then others alphabetically
         containers_list = sorted(container_exts, key=lambda x: (x != 'mp4', x))

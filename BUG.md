@@ -93,9 +93,11 @@ used for the downloaded file while preserving the real output extension.
 Expected-behavior coverage: `tests/test_download_requests.py` and
 `tests/browser/download-options.spec.cjs`.
 
-## 4. Audio-only behavior is inconsistent
+## 4. [Resolved] Audio-only behavior is inconsistent
 
 **Severity:** Medium
+
+**Status:** Resolved and verified on 2026-09-16.
 
 There are two related failures:
 
@@ -112,6 +114,11 @@ sources, and nonnumeric resolution labels must never generate height filters.
 Expected-behavior coverage: `tests/test_formats.py`,
 `tests/integration/test_real_media.py`, and
 `tests/browser/download-options.spec.cjs`.
+
+Audio-only requests now attach yt-dlp's audio extraction postprocessor, so a
+combined video fallback is converted to an M4A audio output. Probe responses
+derive qualities only from positive numeric heights, and the browser also
+rejects malformed quality labels before constructing a format selector.
 
 ## 5. [Resolved] Clear History also removes cancelled and interrupted Current entries
 
