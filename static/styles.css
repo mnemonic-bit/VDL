@@ -169,6 +169,8 @@ button { padding: 10px 20px; cursor: pointer; }
 .history-item > .row-actions { position: absolute; top: 12px; right: 12px; }
 .history-item > .item-title,
 .history-item > .meta { padding-right: 110px; }
+.history-item > .tag-row,
+.history-item > .tag-editor-shell { max-width: calc(100% - 110px); }
 .history-item .meta { overflow-wrap: anywhere; word-break: break-word; }
 .row-actions { display: flex; gap: 6px; }
 .stop-btn, .continue-btn { padding: 0 12px; height: 32px; color: white; border: none; border-radius: 4px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; line-height: 1; font-size: 1em; }
@@ -259,6 +261,61 @@ input[type="text"].rename-input {
 .formats-table th { position: sticky; top: 0; background: var(--surface-2); font-weight: 600; color: var(--muted); }
 .formats-table tbody tr:hover { background: var(--surface-hover); }
 .fmt-code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.9em; padding: 1px 6px; border-radius: 3px; background: var(--surface-2); border: 1px solid var(--border-soft); color: var(--fg); }
+.tag-filter { display: flex; align-items: flex-start; gap: 8px; margin: -10px 0 16px; }
+.tag-match-mode { height: 36px; padding: 0 26px 0 10px; flex: 0 0 auto; font-weight: 600; }
+.tag-filter-picker { position: relative; flex: 1; min-width: 0; }
+.tag-filter-tokens,
+.tag-token-input {
+    display: flex; align-items: center; flex-wrap: wrap; gap: 5px;
+    min-height: 36px; padding: 4px 7px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 4px;
+    cursor: text;
+}
+.tag-filter-tokens:focus-within,
+.tag-token-input:focus-within { border-color: var(--muted); }
+input[type="text"]#tagFilterInput,
+input[type="text"].tag-entry-input {
+    flex: 1 1 110px; min-width: 90px; height: 26px; padding: 0 3px;
+    border: 0; outline: 0; background: transparent; color: var(--fg);
+}
+.tag-filter-clear { height: 36px; padding: 0 11px; background: transparent; color: var(--muted); border: 1px solid transparent; border-radius: 4px; }
+.tag-filter-clear:hover { color: var(--fg); background: var(--surface-3); }
+.tag-chip {
+    display: inline-flex; align-items: center; gap: 3px;
+    max-width: 100%; padding: 2px 8px;
+    color: var(--fg); background: var(--surface-2);
+    border: 1px solid var(--border); border-radius: 999px;
+    font-size: 0.82em; line-height: 1.45; overflow-wrap: anywhere;
+}
+.tag-chip-editing { padding-right: 3px; }
+.tag-chip button {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 18px; height: 18px; padding: 0; border: 0; border-radius: 50%;
+    background: transparent; color: var(--muted-2); font-size: 16px; line-height: 1;
+}
+.tag-chip:focus-within button,
+.tag-chip:hover button,
+.tag-chip button:hover,
+.tag-chip button:focus { color: var(--error-fg); background: var(--error-bg); outline: none; }
+.tag-row { display: flex; flex-wrap: wrap; gap: 5px; width: fit-content; max-width: 100%; min-height: 28px; margin: 4px 0 2px; padding-top: 3px; padding-bottom: 3px; border: 1px solid transparent; border-radius: 4px; cursor: text; }
+.tag-display-row:hover,
+.tag-display-row:focus { border-color: var(--border); outline: none; }
+.add-tag-affordance { color: var(--muted-2); font-size: 0.86em; line-height: 20px; }
+.tag-editor-shell { position: relative; max-width: 520px; margin: 4px 0 2px; }
+.tag-suggestions {
+    position: absolute; left: 0; right: 0; top: calc(100% + 3px); z-index: 20;
+    max-height: 180px; overflow-y: auto;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 4px;
+    box-shadow: 0 2px 8px var(--menu-shadow);
+}
+.tag-suggestions[hidden] { display: none; }
+.tag-suggestion {
+    display: block; width: 100%; padding: 7px 10px; text-align: left;
+    background: transparent; color: var(--fg); border: 0;
+}
+.tag-suggestion:hover,
+.tag-suggestion:focus { background: var(--surface-3); outline: none; }
+.tag-filter-suggestions { top: calc(100% + 3px); }
 .player-backdrop { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 100; align-items: center; justify-content: center; }
 .player-backdrop.open { display: flex; }
 .player-box { position: relative; max-width: 90vw; max-height: 90vh; }

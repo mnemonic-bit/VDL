@@ -13,6 +13,7 @@ import time
 import subprocess
 import mimetypes
 import copy
+import unicodedata
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -240,6 +241,7 @@ def db():
     """Yield a sqlite3 connection with row factory; commits on clean exit."""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
     try:
         yield conn
         conn.commit()
@@ -261,6 +263,29 @@ def init_db():
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS tags (
+                id              INTEGER PRIMARY KEY,
+                name            TEXT NOT NULL,
+                normalized_name TEXT NOT NULL UNIQUE,
+                created_at      REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS download_tags (
+                download_id TEXT NOT NULL REFERENCES downloads(id) ON DELETE CASCADE,
+                tag_id      INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+                created_at  REAL NOT NULL,
+                PRIMARY KEY (download_id, tag_id)
+            );
+            CREATE INDEX IF NOT EXISTS download_tags_tag_id
+                ON download_tags(tag_id);
+            CREATE TRIGGER IF NOT EXISTS delete_unused_tag
+            AFTER DELETE ON download_tags
+            BEGIN
+                DELETE FROM tags
+                WHERE id = OLD.tag_id
+                  AND NOT EXISTS (
+                      SELECT 1 FROM download_tags WHERE tag_id = OLD.tag_id
+                  );
+            END;
         """)
         # --- lightweight migrations: add new columns if missing ---
         existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(downloads)")}
@@ -305,6 +330,13 @@ def init_db():
                 "INSERT OR IGNORE INTO preferences(key, value) VALUES (?, ?)",
                 (k, v),
             )
+
+        # Tags have no independent lifecycle. This also repairs orphan rows
+        # left by an interrupted migration or a manually edited database.
+        conn.execute(
+            "DELETE FROM tags WHERE NOT EXISTS ("
+            "SELECT 1 FROM download_tags WHERE tag_id = tags.id)"
+        )
 
         # Any download that was active when the app died is now orphaned.
         # 'paused' counts as active for this purpose -- the worker thread
@@ -382,12 +414,114 @@ def db_claim_download_for_resume(download_id):
     return claimed
 
 
+def _db_download_tags(conn, download_id):
+    return [
+        tag["name"] for tag in conn.execute(
+            "SELECT tags.name FROM tags "
+            "JOIN download_tags ON download_tags.tag_id = tags.id "
+            "WHERE download_tags.download_id = ? "
+            "ORDER BY tags.name COLLATE NOCASE, tags.name",
+            (download_id,),
+        )
+    ]
+
+
 def db_get_download(download_id):
     with db() as conn:
         row = conn.execute(
             "SELECT * FROM downloads WHERE id = ?", (download_id,)
         ).fetchone()
-        return dict(row) if row else None
+        if row is None:
+            return None
+        result = dict(row)
+        result["tags"] = _db_download_tags(conn, download_id)
+        return result
+
+
+TAG_MAX_LENGTH = 64
+
+
+def _validated_tag_name(value):
+    """Return display and identity forms for one user-entered tag."""
+    if not isinstance(value, str):
+        raise ValueError("Tag must be text")
+    if any(unicodedata.category(char).startswith("C") for char in value):
+        raise ValueError("Tag must not contain control characters")
+
+    # A token editor uses comma as its commit key, so accepting it inside a
+    # name would make the same tag impossible to enter consistently. Collapse
+    # whitespace to keep visually identical free-form names reusable.
+    display_name = re.sub(r"\s+", " ", value).strip()
+    if not display_name:
+        raise ValueError("Tag must not be empty")
+    if "," in display_name:
+        raise ValueError("Tag must not contain commas")
+    if len(display_name) > TAG_MAX_LENGTH:
+        raise ValueError(
+            f"Tag must be {TAG_MAX_LENGTH} characters or fewer"
+        )
+    return display_name, display_name.casefold()
+
+
+def db_list_tags():
+    """Return every tag still attached to at least one download entry."""
+    with db() as conn:
+        return [
+            row["name"] for row in conn.execute(
+                "SELECT name FROM tags ORDER BY name COLLATE NOCASE, name"
+            )
+        ]
+
+
+def db_add_download_tag(download_id, value):
+    """Attach a normalized tag, preserving its first-created display name."""
+    display_name, normalized_name = _validated_tag_name(value)
+    with _db_lock, db() as conn:
+        if conn.execute(
+            "SELECT 1 FROM downloads WHERE id = ?", (download_id,)
+        ).fetchone() is None:
+            return None, False
+        now = time.time()
+        conn.execute(
+            "INSERT OR IGNORE INTO tags(name, normalized_name, created_at) "
+            "VALUES (?, ?, ?)",
+            (display_name, normalized_name, now),
+        )
+        tag = conn.execute(
+            "SELECT id FROM tags WHERE normalized_name = ?",
+            (normalized_name,),
+        ).fetchone()
+        cursor = conn.execute(
+            "INSERT OR IGNORE INTO download_tags(download_id, tag_id, created_at) "
+            "VALUES (?, ?, ?)",
+            (download_id, tag["id"], now),
+        )
+        changed = cursor.rowcount == 1
+        tags = _db_download_tags(conn, download_id)
+    if changed:
+        event_bus.publish("change", {"reason": "tag", "id": download_id})
+    return tags, changed
+
+
+def db_remove_download_tag(download_id, value):
+    """Detach one case-insensitive tag and discard it when no longer used."""
+    _display_name, normalized_name = _validated_tag_name(value)
+    with _db_lock, db() as conn:
+        if conn.execute(
+            "SELECT 1 FROM downloads WHERE id = ?", (download_id,)
+        ).fetchone() is None:
+            return None, False
+        cursor = conn.execute(
+            "DELETE FROM download_tags "
+            "WHERE download_id = ? AND tag_id = ("
+            "SELECT id FROM tags WHERE normalized_name = ?)",
+            (download_id, normalized_name),
+        )
+        changed = cursor.rowcount == 1
+        tags = _db_download_tags(conn, download_id)
+    if changed:
+        event_bus.publish("change", {"reason": "tag", "id": download_id})
+    return tags, changed
 
 
 def delete_download_artifacts(entry, fallback_dir=None):
@@ -486,7 +620,20 @@ def db_list_downloads():
             "formats, requested_format "
             "FROM downloads ORDER BY created_at ASC"
         ).fetchall()
-        return [dict(r) for r in rows]
+        downloads = [dict(r) for r in rows]
+        tags_by_download = {}
+        for row in conn.execute(
+            "SELECT download_tags.download_id, tags.name "
+            "FROM download_tags "
+            "JOIN tags ON tags.id = download_tags.tag_id "
+            "ORDER BY tags.name COLLATE NOCASE, tags.name"
+        ):
+            tags_by_download.setdefault(row["download_id"], []).append(
+                row["name"]
+            )
+        for download in downloads:
+            download["tags"] = tags_by_download.get(download["id"], [])
+        return downloads
 
 
 def db_get_preferences():
@@ -1523,6 +1670,27 @@ def clear_history():
 @app.route('/api/history', methods=['GET'])
 def get_history():
     return jsonify(db_list_downloads())
+
+
+@app.route('/api/tags/<download_id>', methods=['POST', 'DELETE'])
+def download_tags(download_id):
+    payload = request.get_json(silent=True) or {}
+    try:
+        if request.method == 'POST':
+            tags, changed = db_add_download_tag(download_id, payload.get('tag'))
+        else:
+            tags, changed = db_remove_download_tag(download_id, payload.get('tag'))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    if tags is None:
+        return jsonify({"error": "Unknown download id"}), 404
+    return jsonify({
+        "id": download_id,
+        "tags": tags,
+        "available_tags": db_list_tags(),
+        "changed": changed,
+    })
 
 
 @app.route('/api/events')

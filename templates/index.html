@@ -175,6 +175,20 @@
         <button class="tab" data-tab="preferences" onclick="switchTab('preferences')">Preferences</button>
     </div>
 
+    <div id="tagFilter" class="tag-filter" aria-label="Filter downloads by tag">
+        <select id="tagMatchMode" class="tag-match-mode" aria-label="Tag match mode">
+            <option value="all">ALL</option>
+            <option value="any">ANY</option>
+        </select>
+        <div id="tagFilterPicker" class="tag-filter-picker">
+            <div id="tagFilterTokens" class="tag-filter-tokens">
+                <input id="tagFilterInput" type="text" maxlength="64" placeholder="Filter by tag" autocomplete="off" aria-label="Filter by tag" aria-expanded="false" aria-controls="tagFilterSuggestions">
+            </div>
+            <div id="tagFilterSuggestions" class="tag-suggestions tag-filter-suggestions" role="listbox" hidden></div>
+        </div>
+        <button id="clearTagFilter" class="tag-filter-clear" type="button" hidden>Clear</button>
+    </div>
+
     <div id="tab-current" class="tab-panel active">
         <div id="activeList"></div>
         <p id="currentEmpty" class="empty">No active downloads. Paste a URL above to start.</p>

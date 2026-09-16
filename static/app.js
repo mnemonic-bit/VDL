@@ -372,6 +372,305 @@ function resetOptions() {
     if (overlay) overlay.classList.remove('hidden');
 }
 
+let availableTags = [];
+let selectedTagFilters = [];
+let tagMatchMode = 'all';
+const editingTagIds = new Set();
+const tagDrafts = new Map();
+
+function tagSearchKey(value) {
+    return String(value || '').toLocaleLowerCase();
+}
+
+function sortTags(tags) {
+    return tags.slice().sort((left, right) => left.localeCompare(
+        right, undefined, { sensitivity: 'base' }));
+}
+
+function refreshAvailableTags(rows) {
+    const names = new Set();
+    rows.forEach(row => {
+        (Array.isArray(row.tags) ? row.tags : []).forEach(tag => names.add(tag));
+    });
+    availableTags = sortTags(Array.from(names));
+    const available = new Set(availableTags);
+    selectedTagFilters = selectedTagFilters.filter(tag => available.has(tag));
+    renderTagFilter();
+}
+
+function renderTagFilterSuggestions(open) {
+    const input = document.getElementById('tagFilterInput');
+    const suggestions = document.getElementById('tagFilterSuggestions');
+    if (!input || !suggestions) return;
+    const query = tagSearchKey(input.value.trim());
+    const selected = new Set(selectedTagFilters);
+    const matches = availableTags.filter(tag => (
+        !selected.has(tag) && (!query || tagSearchKey(tag).includes(query))
+    ));
+    suggestions.innerHTML = '';
+    matches.forEach(tag => {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'tag-suggestion';
+        button.setAttribute('role', 'option');
+        button.textContent = tag;
+        button.addEventListener('mousedown', event => event.preventDefault());
+        button.addEventListener('click', () => {
+            selectedTagFilters.push(tag);
+            input.value = '';
+            historyPage = 0;
+            renderTagFilter();
+            fetchHistory();
+            input.focus();
+        });
+        suggestions.appendChild(button);
+    });
+    suggestions.hidden = !open || matches.length === 0;
+    input.setAttribute('aria-expanded', String(!suggestions.hidden));
+}
+
+function renderTagFilter() {
+    const tokens = document.getElementById('tagFilterTokens');
+    const input = document.getElementById('tagFilterInput');
+    const clear = document.getElementById('clearTagFilter');
+    if (!tokens || !input || !clear) return;
+    tokens.querySelectorAll('.tag-filter-chip').forEach(chip => chip.remove());
+    selectedTagFilters.forEach(tag => {
+        const chip = document.createElement('span');
+        chip.className = 'tag-chip tag-filter-chip';
+        chip.append(document.createTextNode(tag));
+        const remove = document.createElement('button');
+        remove.type = 'button';
+        remove.setAttribute('aria-label', `Remove ${tag} filter`);
+        remove.textContent = '×';
+        remove.addEventListener('mousedown', event => event.preventDefault());
+        remove.addEventListener('click', () => {
+            selectedTagFilters = selectedTagFilters.filter(name => name !== tag);
+            historyPage = 0;
+            renderTagFilter();
+            fetchHistory();
+        });
+        chip.appendChild(remove);
+        tokens.insertBefore(chip, input);
+    });
+    clear.hidden = selectedTagFilters.length === 0;
+    renderTagFilterSuggestions(document.activeElement === input);
+}
+
+function matchesTagFilter(info) {
+    if (selectedTagFilters.length === 0) return true;
+    const tags = new Set(Array.isArray(info.tags) ? info.tags : []);
+    if (tagMatchMode === 'any') {
+        return selectedTagFilters.some(tag => tags.has(tag));
+    }
+    return selectedTagFilters.every(tag => tags.has(tag));
+}
+
+function tagFilterCommitDraft() {
+    const input = document.getElementById('tagFilterInput');
+    if (!input) return;
+    const query = tagSearchKey(input.value.trim());
+    if (!query) return;
+    const match = availableTags.find(tag => (
+        !selectedTagFilters.includes(tag) && tagSearchKey(tag) === query
+    ));
+    if (!match) return;
+    selectedTagFilters.push(match);
+    input.value = '';
+    historyPage = 0;
+    renderTagFilter();
+    fetchHistory();
+}
+
+const tagFilterInput = document.getElementById('tagFilterInput');
+tagFilterInput.addEventListener('focus', () => renderTagFilterSuggestions(true));
+tagFilterInput.addEventListener('input', () => renderTagFilterSuggestions(true));
+tagFilterInput.addEventListener('keydown', event => {
+    if (event.key === 'Enter' || event.key === ',') {
+        event.preventDefault();
+        tagFilterCommitDraft();
+    } else if (event.key === 'Backspace' && !tagFilterInput.value && selectedTagFilters.length) {
+        selectedTagFilters.pop();
+        historyPage = 0;
+        renderTagFilter();
+        fetchHistory();
+    } else if (event.key === 'Escape') {
+        tagFilterInput.value = '';
+        renderTagFilterSuggestions(false);
+        tagFilterInput.blur();
+    }
+});
+tagFilterInput.addEventListener('blur', () => {
+    setTimeout(() => renderTagFilterSuggestions(false), 0);
+});
+document.getElementById('tagFilterPicker').addEventListener('click', () => {
+    tagFilterInput.focus();
+});
+document.getElementById('tagMatchMode').addEventListener('change', event => {
+    tagMatchMode = event.target.value === 'any' ? 'any' : 'all';
+    historyPage = 0;
+    fetchHistory();
+});
+document.getElementById('clearTagFilter').addEventListener('click', () => {
+    selectedTagFilters = [];
+    tagFilterInput.value = '';
+    historyPage = 0;
+    renderTagFilter();
+    fetchHistory();
+});
+
+function tagChipHtml(tag, removable) {
+    if (!removable) return `<span class="tag-chip">${escapeHtml(tag)}</span>`;
+    return `<span class="tag-chip tag-chip-editing">${escapeHtml(tag)}<button type="button" class="tag-remove" data-remove-tag="${escapeAttr(tag)}" aria-label="Remove ${escapeAttr(tag)}">×</button></span>`;
+}
+
+function tagSuggestionsHtml(info, draft) {
+    const attached = new Set(Array.isArray(info.tags) ? info.tags : []);
+    const query = tagSearchKey(draft.trim());
+    return availableTags
+        .filter(tag => !attached.has(tag) && (!query || tagSearchKey(tag).includes(query)))
+        .map(tag => `<button type="button" class="tag-suggestion" data-suggest-tag="${escapeAttr(tag)}" role="option">${escapeHtml(tag)}</button>`)
+        .join('');
+}
+
+function renderTagControl(info) {
+    const id = String(info.id);
+    const tags = Array.isArray(info.tags) ? info.tags : [];
+    if (!editingTagIds.has(id)) {
+        const contents = tags.length
+            ? tags.map(tag => tagChipHtml(tag, false)).join('')
+            : '<span class="add-tag-affordance">Add tag</span>';
+        return `<div class="tag-row tag-display-row" data-tag-id="${escapeAttr(id)}" data-mode="display" role="button" tabindex="0" aria-label="Edit tags">${contents}</div>`;
+    }
+
+    const draft = tagDrafts.get(id) || '';
+    const suggestions = tagSuggestionsHtml(info, draft);
+    return `<div class="tag-editor-shell" data-tag-id="${escapeAttr(id)}">
+                <div class="tag-token-input">
+                    ${tags.map(tag => tagChipHtml(tag, true)).join('')}
+                    <input class="tag-entry-input" type="text" maxlength="64" value="${escapeAttr(draft)}" autocomplete="off" aria-label="Add tag" aria-expanded="${suggestions ? 'true' : 'false'}">
+                </div>
+                <div class="tag-suggestions tag-entry-suggestions" role="listbox"${suggestions ? '' : ' hidden'}>${suggestions}</div>
+            </div>`;
+}
+
+function tagEditStart(id) {
+    editingTagIds.add(String(id));
+    tagDrafts.set(String(id), '');
+    fetchHistory().then(() => {
+        const input = document.querySelector(`.tag-editor-shell[data-tag-id="${CSS.escape(String(id))}"] .tag-entry-input`);
+        if (input) input.focus();
+    });
+}
+
+function tagEditStop(id) {
+    editingTagIds.delete(String(id));
+    tagDrafts.delete(String(id));
+    fetchHistory();
+}
+
+function mutateDownloadTag(id, tag, method) {
+    return apiAction('/api/tags/' + encodeURIComponent(id), {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tag }),
+    }).then(() => {
+        tagDrafts.set(String(id), '');
+        return fetchHistory();
+    }).catch(() => fetchHistory());
+}
+
+function tagCommit(id, explicitTag) {
+    const input = document.querySelector(`.tag-editor-shell[data-tag-id="${CSS.escape(String(id))}"] .tag-entry-input`);
+    const tag = explicitTag === undefined ? ((input && input.value) || '') : explicitTag;
+    if (!tag.trim()) return;
+    if (input && input.dataset.saving === '1') return;
+    // Keep focus while the request is in flight. Disabling the input emits a
+    // real blur before reconciliation and would incorrectly close the editor.
+    if (input) input.dataset.saving = '1';
+    mutateDownloadTag(id, tag, 'POST').then(() => {
+        const nextInput = document.querySelector(`.tag-editor-shell[data-tag-id="${CSS.escape(String(id))}"] .tag-entry-input`);
+        if (nextInput) nextInput.focus();
+    });
+}
+
+function tagRemove(id, tag) {
+    mutateDownloadTag(id, tag, 'DELETE').then(() => {
+        const input = document.querySelector(`.tag-editor-shell[data-tag-id="${CSS.escape(String(id))}"] .tag-entry-input`);
+        if (input) input.focus();
+    });
+}
+
+function bindTagEditors() {
+    document.querySelectorAll('.tag-display-row').forEach(row => {
+        row.addEventListener('click', () => tagEditStart(row.dataset.tagId));
+        row.addEventListener('keydown', event => {
+            if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault();
+                tagEditStart(row.dataset.tagId);
+            }
+        });
+    });
+    document.querySelectorAll('.tag-editor-shell').forEach(shell => {
+        const id = shell.dataset.tagId;
+        const input = shell.querySelector('.tag-entry-input');
+        input.addEventListener('input', () => {
+            tagDrafts.set(id, input.value);
+            const suggestions = shell.querySelector('.tag-entry-suggestions');
+            const info = { tags: Array.from(shell.querySelectorAll('[data-remove-tag]')).map(button => button.dataset.removeTag) };
+            const html = tagSuggestionsHtml(info, input.value);
+            suggestions.innerHTML = html;
+            suggestions.hidden = !html;
+            input.setAttribute('aria-expanded', String(Boolean(html)));
+            bindTagSuggestionButtons(shell);
+        });
+        input.addEventListener('keydown', event => {
+            if (event.key === 'Enter' || event.key === ',') {
+                event.preventDefault();
+                tagCommit(id);
+            } else if (event.key === 'Backspace' && !input.value) {
+                const buttons = shell.querySelectorAll('[data-remove-tag]');
+                const last = buttons[buttons.length - 1];
+                if (last) {
+                    event.preventDefault();
+                    tagRemove(id, last.dataset.removeTag);
+                }
+            } else if (event.key === 'Escape') {
+                event.preventDefault();
+                tagEditStop(id);
+            }
+        });
+        input.addEventListener('blur', () => {
+            setTimeout(() => {
+                // SSE/API reconciliation can replace the whole row while the
+                // editor remains logically open. Ignore blur from that stale
+                // node; the newly rendered input owns the current session.
+                if (!document.body.contains(shell)) return;
+                if (!shell.contains(document.activeElement)) tagEditStop(id);
+            }, 0);
+        });
+        shell.querySelectorAll('[data-remove-tag]').forEach(button => {
+            button.addEventListener('mousedown', event => event.preventDefault());
+            button.addEventListener('click', event => {
+                event.stopPropagation();
+                tagRemove(id, button.dataset.removeTag);
+            });
+        });
+        bindTagSuggestionButtons(shell);
+        shell.querySelector('.tag-token-input').addEventListener('click', event => {
+            if (!event.target.closest('button')) input.focus();
+        });
+    });
+}
+
+function bindTagSuggestionButtons(shell) {
+    const id = shell.dataset.tagId;
+    shell.querySelectorAll('[data-suggest-tag]').forEach(button => {
+        button.addEventListener('mousedown', event => event.preventDefault());
+        button.addEventListener('click', () => tagCommit(id, button.dataset.suggestTag));
+    });
+}
+
 function stopDownload(id) {
     closeAllMenus();
     apiAction('/api/stop/' + encodeURIComponent(id), { method: 'POST' })
@@ -914,6 +1213,7 @@ function renderItem(info, inHistoryView = false) {
     const titleRow = displayTitle
         ? `<div class="item-title" title="${escapeAttr(displayTitle)}">${escapeHtml(displayTitle)}</div>`
         : '';
+    const tagRow = renderTagControl(info);
 
     const urlLine = inHistoryView
         ? (warn ? `<div>${warn}<strong>Status:</strong> ${info.status} (${statusLabel})</div>` : '')
@@ -929,6 +1229,7 @@ function renderItem(info, inHistoryView = false) {
                 <div class="history-item" data-row-id="${id}">
                     <div class="row-actions">${actions}</div>
                     ${titleRow}
+                    ${tagRow}
                     ${headMeta}
                     ${bottom}
                     ${errorBlock}
@@ -1002,8 +1303,13 @@ function fetchHistory() {
             return;
         }
         const reversed = data.slice().reverse();
-        const active = reversed.filter(i => CURRENT_TAB_STATUSES.has(i.status));
-        const done   = reversed.filter(i => HISTORY_TAB_STATUSES.has(i.status));
+        refreshAvailableTags(reversed);
+        const active = reversed.filter(i => (
+            CURRENT_TAB_STATUSES.has(i.status) && matchesTagFilter(i)
+        ));
+        const done = reversed.filter(i => (
+            HISTORY_TAB_STATUSES.has(i.status) && matchesTagFilter(i)
+        ));
 
         historyTotal = done.length;
         const maxPage = Math.max(0, Math.ceil(historyTotal / HISTORY_PAGE_SIZE) - 1);
@@ -1024,6 +1330,16 @@ function fetchHistory() {
                 };
                 const cur = renameDrafts.get(focusRestore.id);
                 if (cur) cur.value = ae.value;
+            }
+        } else if (ae && ae.classList && ae.classList.contains('tag-entry-input')) {
+            const shell = ae.closest('.tag-editor-shell');
+            if (shell && shell.dataset.tagId) {
+                focusRestore = {
+                    tagId: shell.dataset.tagId,
+                    selStart: ae.selectionStart,
+                    selEnd: ae.selectionEnd,
+                };
+                tagDrafts.set(focusRestore.tagId, ae.value);
             }
         }
 
@@ -1057,10 +1373,14 @@ function fetchHistory() {
         _renderedHistoryIds = newHistoryIds;
 
         bindRenameInputs();
+        bindTagEditors();
 
         if (focusRestore) {
-            const newInput = document.querySelector(
-                `.rename-wrap[data-rename-id="${focusRestore.id}"] .rename-input`);
+            const newInput = focusRestore.tagId
+                ? document.querySelector(
+                    `.tag-editor-shell[data-tag-id="${CSS.escape(focusRestore.tagId)}"] .tag-entry-input`)
+                : document.querySelector(
+                    `.rename-wrap[data-rename-id="${focusRestore.id}"] .rename-input`);
             if (newInput) {
                 newInput.focus();
                 try {
@@ -1070,6 +1390,13 @@ function fetchHistory() {
             }
         }
 
+        const hasFilter = selectedTagFilters.length > 0;
+        document.getElementById('currentEmpty').textContent = hasFilter
+            ? 'No current downloads match this tag filter.'
+            : 'No active downloads. Paste a URL above to start.';
+        document.getElementById('historyEmpty').textContent = hasFilter
+            ? 'No download history matches this tag filter.'
+            : 'No completed downloads yet.';
         document.getElementById('currentEmpty').style.display = active.length ? 'none' : '';
         document.getElementById('historyEmpty').style.display = done.length ? 'none' : '';
 
@@ -1174,6 +1501,9 @@ function switchTab(name) {
     document.querySelectorAll('.tab-panel').forEach(p => {
         p.classList.toggle('active', p.id === 'tab-' + name);
     });
+    document.getElementById('tagFilter').style.display = name === 'preferences'
+        ? 'none'
+        : '';
     closeAllMenus();
 }
 

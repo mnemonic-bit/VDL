@@ -43,12 +43,18 @@ class SchemaMigrationTest(unittest.TestCase):
                             "PRAGMA table_info(downloads)"
                         )
                     }
+                    tables = {
+                        row[0] for row in connection.execute(
+                            "SELECT name FROM sqlite_master WHERE type = 'table'"
+                        )
+                    }
                 self.assertEqual(columns, {
                     "id", "url", "status", "progress", "created_at",
                     "filename", "resolution", "filesize", "speed", "eta",
                     "title", "finished_at", "formats", "requested_format",
                     "output_dir", "requested_filename",
                 })
+                self.assertTrue({"tags", "download_tags"}.issubset(tables))
                 self.assertEqual(
                     vdl.db_get_download("legacy1")["status"],
                     "interrupted",

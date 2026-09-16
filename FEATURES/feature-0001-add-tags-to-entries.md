@@ -1,7 +1,7 @@
 # Add tags to download entries
 
 **Source section:** Further things to add to the download helper
-**Status:** Refining
+**Status:** Implemented
 **Last refined:** 2026-09-16
 
 ## Decision summary
@@ -73,9 +73,13 @@ free-text and metadata filters such as title, website, and quality. The two
 features should eventually share a coherent filter area, but Feature 0001 must
 be independently useful before Feature 0002 is implemented.
 
-## Open decisions
+## Implementation decisions
 
-- Remaining tag naming rules, including maximum length and treatment of
-  leading, trailing, or repeated whitespace.
-- Exact editor placement and keyboard interaction.
-- Exact placement of the shared filter controls relative to the tabs.
+- Tag names are limited to 64 characters. Leading and trailing whitespace is
+  removed, repeated whitespace is collapsed to one space, and commas and
+  control characters are rejected.
+- The inline editor appears directly below the entry title. Enter and comma
+  commit, an empty Backspace removes the preceding chip, and Escape discards
+  only the current draft.
+- The shared filter sits directly below the tabs and is hidden while
+  Preferences is open.
