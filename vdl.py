@@ -541,6 +541,8 @@ _progress_estimate_lock = threading.Lock()
 _ETA_ALPHA = 0.10
 _ETA_RELATIVE_DEADBAND = 0.05
 _ETA_MIN_DEADBAND = 5.0
+_ETA_RAW_DEVIATION_RELATIVE = 0.25
+_ETA_RAW_DEVIATION_MIN = 30.0
 _eta_estimates = {}
 _eta_estimate_lock = threading.Lock()
 
@@ -631,6 +633,29 @@ def _clear_eta_estimate(download_id):
         _eta_estimates.pop(download_id, None)
 
 
+def _seed_eta_estimate(download_id, eta):
+    if eta is None or eta <= 0:
+        return
+    now = time.monotonic()
+    deadline = now + float(eta)
+    with _eta_estimate_lock:
+        _eta_estimates[download_id] = {
+            'smoothed_deadline': deadline,
+            'displayed_deadline': deadline,
+            'downloaded': 0.0,
+        }
+
+
+def _shift_eta_estimate(download_id, seconds):
+    if seconds <= 0:
+        return
+    with _eta_estimate_lock:
+        state = _eta_estimates.get(download_id)
+        if state is not None:
+            state['smoothed_deadline'] += seconds
+            state['displayed_deadline'] += seconds
+
+
 def _smoothed_eta(download_id, raw_eta, downloaded):
     now = time.monotonic()
     raw_deadline = now + float(raw_eta)
@@ -642,12 +667,28 @@ def _smoothed_eta(download_id, raw_eta, downloaded):
             smoothed_deadline = raw_deadline
             displayed_deadline = raw_deadline
         else:
-            smoothed_deadline = (
-                state['smoothed_deadline']
-                + _ETA_ALPHA * (raw_deadline - state['smoothed_deadline'])
-            )
             displayed_deadline = state['displayed_deadline']
             displayed_eta = max(0.0, displayed_deadline - now)
+            # Startup throughput after Continue can briefly imply days of
+            # remaining work. Bound one sample's influence while allowing a
+            # sustained slowdown to move the estimate over subsequent hooks.
+            raw_deviation = max(
+                _ETA_RAW_DEVIATION_MIN,
+                displayed_eta * _ETA_RAW_DEVIATION_RELATIVE,
+            )
+            bounded_deadline = min(
+                state['smoothed_deadline'] + raw_deviation,
+                max(
+                    state['smoothed_deadline'] - raw_deviation,
+                    raw_deadline,
+                ),
+            )
+            smoothed_deadline = (
+                state['smoothed_deadline']
+                + _ETA_ALPHA * (
+                    bounded_deadline - state['smoothed_deadline']
+                )
+            )
             deadband = max(
                 _ETA_MIN_DEADBAND,
                 displayed_eta * _ETA_RELATIVE_DEADBAND,
@@ -714,6 +755,7 @@ def progress_hook(d, download_id):
     # at 'paused' for the duration; it flips back to 'downloading' on the
     # very next hook call after the flag clears.
     if is_pause_requested(download_id):
+        pause_started = time.monotonic()
         # Mark the row paused once on entry; avoid hammering the DB on
         # every iteration of the wait loop.
         db_update_download(download_id, status='paused', speed=None, eta=None)
@@ -721,9 +763,12 @@ def progress_hook(d, download_id):
             if is_cancel_requested(download_id):
                 raise DownloadCancelled()
             time.sleep(0.25)
-        # The payload predates the pause. Restart ETA filtering from it so the
-        # paused wall time is not mistaken for a sudden network slowdown.
-        _clear_eta_estimate(download_id)
+        # Paused wall time does not represent remaining download work. Move
+        # both completion-time baselines forward before using the parked hook.
+        _shift_eta_estimate(
+            download_id,
+            time.monotonic() - pause_started,
+        )
 
     if d['status'] == 'downloading':
         total_bytes = d.get('total_bytes') or 0
@@ -1037,6 +1082,12 @@ def background_download(url, download_id):
         clear_cancel(download_id)
         clear_pause(download_id)
         return
+
+    # A Continue action starts a new worker, so its in-memory filter is gone.
+    # The last persisted ETA is a much safer baseline than yt-dlp's first
+    # throughput sample while the resumed connection is still warming up.
+    if entry:
+        _seed_eta_estimate(download_id, entry.get('eta'))
 
     try:
         # ---- Probe phase --------------------------------------------------

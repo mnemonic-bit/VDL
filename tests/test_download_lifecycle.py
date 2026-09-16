@@ -107,6 +107,54 @@ class DownloadLifecycleTest(AppCase):
         )
         self.assertLessEqual(abs(observed[-1] - raw_etas[-1]), 10)
 
+    def test_post_pause_eta_ignores_a_multi_day_startup_outlier(self):
+        download_id = self.insert("eta-pause")
+        clock = [1000.0]
+
+        def send_progress(eta, downloaded):
+            vdl.progress_hook({
+                "status": "downloading",
+                "downloaded_bytes": downloaded,
+                "total_bytes": 800,
+                "eta": eta,
+                "info_dict": {},
+            }, download_id)
+
+        with mock.patch.object(vdl.time, "monotonic", side_effect=lambda: clock[0]):
+            send_progress(300, 400)
+            vdl.request_pause(download_id)
+            clock[0] += 1
+            with mock.patch.object(
+                vdl.time,
+                "sleep",
+                side_effect=lambda _seconds: vdl.clear_pause(download_id),
+            ):
+                send_progress(299, 401)
+
+            clock[0] += 1
+            send_progress(7 * 24 * 60 * 60, 402)
+            self.assertLess(vdl.db_get_download(download_id)["eta"], 3600)
+
+            for downloaded in range(403, 413):
+                clock[0] += 1
+                send_progress(1300 - clock[0], downloaded)
+
+        self.assertLessEqual(vdl.db_get_download(download_id)["eta"], 300)
+
+    def test_continued_worker_seeds_eta_from_persisted_value(self):
+        download_id = self.insert("eta-seed")
+        vdl.db_update_download(download_id, eta=300)
+
+        with (
+            mock.patch.object(vdl.yt_dlp, "YoutubeDL", FakeYoutubeDL),
+            mock.patch.object(vdl, "ffprobe_resolution", return_value="360p"),
+            mock.patch.object(vdl, "_seed_eta_estimate") as seed_eta,
+        ):
+            vdl.background_download("https://fixture.invalid/video", download_id)
+
+        seed_eta.assert_called_once_with(download_id, 300)
+        self.assertEqual(vdl.db_get_download(download_id)["status"], "finished")
+
     def test_pause_is_recorded_once_and_progress_continues_after_unpause(self):
         download_id = self.insert()
         vdl.request_pause(download_id)

@@ -44,3 +44,17 @@ Permanent regression coverage and tier commands are documented in [`tests/README
 * ffmpeg
 * Python yt-dlp, flask
 * vlc (this might be important due to codecs that ship with VLC, but its unclear at the moment if this only seemed to have helped on my MacOS)
+
+
+## Sandbox
+
+* add 
+
+
+## VLD Repo
+
+* docker-alias which points to podman
+* remove reference in AGENTS.md for use of podman
+* split BUG.md into single bug.md files in a BUGS folder
+* transform the TODOs.md into single FEATURE.md files, maybe in a FEATURES folder
+* 
