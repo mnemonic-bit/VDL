@@ -624,7 +624,7 @@ def progress_hook(d, download_id):
             time.sleep(0.25)
 
     if d['status'] == 'downloading':
-        total_bytes = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
+        total_bytes = d.get('total_bytes') or 0
         downloaded = d.get('downloaded_bytes', 0)
         speed = d.get('speed')  # bytes/sec, may be None at the very start
         eta = d.get('eta')      # seconds remaining, may be None
@@ -680,8 +680,10 @@ def progress_hook(d, download_id):
                 if cand and re.fullmatch(r'\d{3,5}p|\d+x\d+', str(cand)):
                     resolution = str(cand)
                     break
-        filesize = (info.get('filesize') or info.get('filesize_approx')
-                    or d.get('total_bytes') or d.get('total_bytes_estimate'))
+        # Approximate sizes fluctuate as fragmented streams arrive. Keep them
+        # out of the authoritative size column; background_download stats the
+        # completed output after all merging and post-processing has finished.
+        filesize = info.get('filesize') or d.get('total_bytes')
         title = info.get('title') or info.get('fulltitle')
         db_update_download(
             download_id,

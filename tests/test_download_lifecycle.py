@@ -30,6 +30,45 @@ class DownloadLifecycleTest(AppCase):
         self.assertEqual(row["speed"], 1024.0)
         self.assertIsNone(row["filesize"])
 
+    def test_changing_size_estimates_remain_indeterminate(self):
+        download_id = self.insert("estimate1")
+
+        for estimate in (800, 725):
+            vdl.progress_hook({
+                "status": "downloading",
+                "downloaded_bytes": 400,
+                "total_bytes_estimate": estimate,
+                "info_dict": {},
+            }, download_id)
+
+            row = self.client.get("/api/history").get_json()[0]
+            self.assertEqual(row["progress"], "Downloading")
+            self.assertIsNone(row["filesize"])
+
+        vdl.progress_hook({
+            "status": "finished",
+            "total_bytes_estimate": 700,
+            "info_dict": {"filesize_approx": 700},
+        }, download_id)
+        row = self.client.get("/api/history").get_json()[0]
+        self.assertEqual(row["progress"], "100%")
+        self.assertIsNone(row["filesize"])
+
+    def test_exact_size_drives_determinate_progress(self):
+        download_id = self.insert("exact001")
+
+        vdl.progress_hook({
+            "status": "downloading",
+            "downloaded_bytes": 400,
+            "total_bytes": 800,
+            "total_bytes_estimate": 725,
+            "info_dict": {},
+        }, download_id)
+
+        row = self.client.get("/api/history").get_json()[0]
+        self.assertEqual(row["progress"], "50.0%")
+        self.assertEqual(row["filesize"], 800)
+
     def test_pause_is_recorded_once_and_progress_continues_after_unpause(self):
         download_id = self.insert()
         vdl.request_pause(download_id)

@@ -8,6 +8,8 @@ Issues 14-22 were found during a repository and test-coverage audit on
 2026-09-14. Their deterministic reproductions now live in the permanent
 suite, with open behavior guarded by expected-failure markers. Issue 22
 records both the expanded coverage and the remaining behavioral debt.
+Issue 23 was reproduced in the running container on 2026-09-16 and reduced
+to a deterministic progress-hook reproduction.
 
 ## 1. [Resolved] Merged downloads kept the deleted temporary audio filename
 
@@ -608,6 +610,49 @@ Continue, Delete, Reload, and Clear actions began showing the server's error
 without losing their rows or continuing a failed action chain. Artifact cleanup
 now runs before its database row is removed; a filesystem failure returns an
 error and retains the row so cleanup can be retried.
+
+## 23. [Resolved] Estimated HLS size and progress jump during download
+
+**Severity:** Medium
+
+**Status:** Resolved on 2026-09-16.
+
+While downloading `https://www.youtube.com/watch?v=G3jvn7n-68Y` as format
+`625` (2160p), the Current tab's Total size changed on nearly every update and
+the progress percentage sometimes moved backward. Sixteen API samples over
+eight seconds produced sixteen different totals between 835.2 MB and 858.4 MB;
+for example, progress changed from 66.7% to 66.2% while the reported total
+increased from 836,352,172 to 846,237,715 bytes.
+
+Format `625` is a single `m3u8_native` video stream with no declared filesize.
+For fragmented downloads, yt-dlp supplies `total_bytes_estimate` and
+recalculates it from the average size of the fragments received so far. The
+progress hook treats that changing estimate like an exact `total_bytes` value,
+uses it as the percentage denominator, and persists it in `filesize`. The
+frontend then presents the value as **Total size** without indicating that it
+is an estimate.
+
+A deterministic minimal reproduction sends the real progress hook two
+`downloading` payloads for the same row and downloaded-byte count, first with
+`total_bytes_estimate=800` and then with `total_bytes_estimate=725`. The stored
+`filesize` changes from 800 to 725 and the displayed progress changes from
+50.0% to 55.2%.
+
+The affected live download completed successfully. Its final database size
+and actual file size both became the authoritative 818,715,111 bytes, so this
+does not indicate media corruption.
+
+**Expected:** Do not present `total_bytes_estimate` as an authoritative Total
+size. Exact totals should remain stable; estimated totals should either be
+identified as approximate or withheld until completion. Progress should not
+visibly move backward solely because yt-dlp revised its size estimate. Add a
+permanent regression test covering consecutive changing estimates.
+
+**Resolution:** Active downloads now use only exact `total_bytes` values for
+percentage and total-size display. Changing HLS estimates remain indeterminate,
+and the completed output's filesystem size becomes authoritative after all
+post-processing finishes. Consecutive estimate and exact-total controls are
+covered by the download-lifecycle suite.
 
 ## Accepted UI decisions
 
