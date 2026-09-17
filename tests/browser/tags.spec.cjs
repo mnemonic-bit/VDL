@@ -13,7 +13,7 @@ test('inline tag editor commits, discards drafts, and removes with Backspace', a
     await refresh(page);
     const row = page.locator('[data-row-id="tag-edit"]');
 
-    await row.getByText('Add tag', { exact: true }).click();
+    await row.getByText('Add tags', { exact: true }).click();
     const input = row.locator('.tag-entry-input');
     await input.fill('Music Videos');
     await input.press('Enter');
@@ -41,12 +41,36 @@ test('failed tag commits restore the draft for correction', async ({ page }) => 
     }));
     const row = page.locator('[data-row-id="tag-fail"]');
 
-    await row.getByText('Add tag', { exact: true }).click();
+    await row.getByText('Add tags', { exact: true }).click();
     await row.locator('.tag-entry-input').fill('Keep this draft');
     await row.locator('.tag-entry-input').press('Enter');
 
     await expect(page.locator('#actionError')).toContainText('Tag save failed');
     await expect(row.locator('.tag-entry-input')).toHaveValue('Keep this draft');
+});
+
+test('tag affordance fills its row and disappears when editing starts', async ({ page }) => {
+    await seed(page, { id: 'tag-layout', status: 'cancelled', progress: 'Stopped' });
+    await refresh(page);
+    const row = page.locator('[data-row-id="tag-layout"]');
+    const tagLine = row.locator('.tag-display-row');
+    const hint = tagLine.getByText('Add tags', { exact: true });
+
+    await expect(hint).toBeVisible();
+    const rowBox = await row.boundingBox();
+    const tagBox = await tagLine.boundingBox();
+    expect(tagBox.width).toBeGreaterThan(rowBox.width * 0.7);
+    await expect(tagLine).toHaveCSS('border-top-color', 'rgba(0, 0, 0, 0)');
+    await tagLine.hover();
+    await expect(tagLine).not.toHaveCSS('border-top-color', 'rgba(0, 0, 0, 0)');
+    const hintColor = await hint.evaluate(element => getComputedStyle(element).color);
+
+    await tagLine.click();
+    const input = row.locator('.tag-entry-input');
+    await expect(input).toBeFocused();
+    await expect(row.getByText('Add tags', { exact: true })).toHaveCount(0);
+    const inputColor = await input.evaluate(element => getComputedStyle(element).color);
+    expect(hintColor).not.toBe(inputColor);
 });
 
 test('shared tag filter supports ALL and ANY across Current and History', async ({ page }) => {

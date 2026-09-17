@@ -540,7 +540,7 @@ function renderTagControl(info) {
     if (!editingTagIds.has(id)) {
         const contents = tags.length
             ? tags.map(tag => tagChipHtml(tag, false)).join('')
-            : '<span class="add-tag-affordance">Add tag</span>';
+            : '<span class="add-tag-affordance">Add tags</span>';
         return `<div class="tag-row tag-display-row" data-tag-id="${escapeAttr(id)}" data-mode="display" role="button" tabindex="0" aria-label="Edit tags">${contents}</div>`;
     }
 
@@ -549,7 +549,7 @@ function renderTagControl(info) {
     return `<div class="tag-editor-shell" data-tag-id="${escapeAttr(id)}">
                 <div class="tag-token-input">
                     ${tags.map(tag => tagChipHtml(tag, true)).join('')}
-                    <input class="tag-entry-input" type="text" maxlength="64" value="${escapeAttr(draft)}" autocomplete="off" aria-label="Add tag" aria-expanded="${suggestions ? 'true' : 'false'}">
+                    <input class="tag-entry-input" type="text" maxlength="64" value="${escapeAttr(draft)}" autocomplete="off" aria-label="Add tags" aria-expanded="${suggestions ? 'true' : 'false'}">
                 </div>
                 <div class="tag-suggestions tag-entry-suggestions" role="listbox"${suggestions ? '' : ' hidden'}>${suggestions}</div>
             </div>`;

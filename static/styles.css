@@ -297,7 +297,7 @@ input[type="text"].tag-entry-input {
 .tag-chip:hover button,
 .tag-chip button:hover,
 .tag-chip button:focus { color: var(--error-fg); background: var(--error-bg); outline: none; }
-.tag-row { display: flex; flex-wrap: wrap; gap: 5px; width: fit-content; max-width: 100%; min-height: 28px; margin: 4px 0 2px; padding-top: 3px; padding-bottom: 3px; border: 1px solid transparent; border-radius: 4px; cursor: text; }
+.tag-row { display: flex; flex-wrap: wrap; gap: 5px; width: 100%; max-width: 100%; min-height: 28px; margin: 4px 0 2px; padding: 3px 6px; border: 1px solid transparent; border-radius: 4px; cursor: text; }
 .tag-display-row:hover,
 .tag-display-row:focus { border-color: var(--border); outline: none; }
 .add-tag-affordance { color: var(--muted-2); font-size: 0.86em; line-height: 20px; }
