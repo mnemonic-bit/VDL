@@ -377,6 +377,7 @@ let selectedTagFilters = [];
 let tagMatchMode = 'all';
 const editingTagIds = new Set();
 const tagDrafts = new Map();
+const pendingTagCommits = new Set();
 
 function tagSearchKey(value) {
     return String(value || '').toLocaleLowerCase();
@@ -574,31 +575,50 @@ function mutateDownloadTag(id, tag, method) {
         method,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ tag }),
-    }).then(() => {
-        tagDrafts.set(String(id), '');
-        return fetchHistory();
-    }).catch(() => fetchHistory());
+    }).then(() => true).catch(() => false);
 }
 
 function tagCommit(id, explicitTag) {
-    const input = document.querySelector(`.tag-editor-shell[data-tag-id="${CSS.escape(String(id))}"] .tag-entry-input`);
+    const tagId = String(id);
+    const input = document.querySelector(`.tag-editor-shell[data-tag-id="${CSS.escape(tagId)}"] .tag-entry-input`);
     const tag = explicitTag === undefined ? ((input && input.value) || '') : explicitTag;
     if (!tag.trim()) return;
-    if (input && input.dataset.saving === '1') return;
-    // Keep focus while the request is in flight. Disabling the input emits a
-    // real blur before reconciliation and would incorrectly close the editor.
-    if (input) input.dataset.saving = '1';
-    mutateDownloadTag(id, tag, 'POST').then(() => {
-        const nextInput = document.querySelector(`.tag-editor-shell[data-tag-id="${CSS.escape(String(id))}"] .tag-entry-input`);
-        if (nextInput) nextInput.focus();
-    });
+    if (pendingTagCommits.has(tagId)) return;
+
+    const draftBeforeCommit = (input && input.value) || '';
+    pendingTagCommits.add(tagId);
+    tagDrafts.set(tagId, '');
+    if (input) {
+        // Clear the live field before the API can publish an SSE change. Any
+        // reconciliation that wins the race now captures the intended empty
+        // draft instead of resurrecting the text that became a chip.
+        input.value = '';
+        input.dispatchEvent(new Event('input'));
+    }
+
+    mutateDownloadTag(id, tag, 'POST')
+        .then(succeeded => {
+            if (!succeeded) {
+                tagDrafts.set(tagId, draftBeforeCommit);
+                const currentInput = document.querySelector(`.tag-editor-shell[data-tag-id="${CSS.escape(tagId)}"] .tag-entry-input`);
+                if (currentInput) currentInput.value = draftBeforeCommit;
+            }
+            return fetchHistory();
+        })
+        .then(() => {
+            const nextInput = document.querySelector(`.tag-editor-shell[data-tag-id="${CSS.escape(tagId)}"] .tag-entry-input`);
+            if (nextInput) nextInput.focus();
+        })
+        .finally(() => pendingTagCommits.delete(tagId));
 }
 
 function tagRemove(id, tag) {
-    mutateDownloadTag(id, tag, 'DELETE').then(() => {
-        const input = document.querySelector(`.tag-editor-shell[data-tag-id="${CSS.escape(String(id))}"] .tag-entry-input`);
-        if (input) input.focus();
-    });
+    mutateDownloadTag(id, tag, 'DELETE')
+        .then(() => fetchHistory())
+        .then(() => {
+            const input = document.querySelector(`.tag-editor-shell[data-tag-id="${CSS.escape(String(id))}"] .tag-entry-input`);
+            if (input) input.focus();
+        });
 }
 
 function bindTagEditors() {

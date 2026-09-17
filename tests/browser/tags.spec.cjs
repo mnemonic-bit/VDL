@@ -18,6 +18,7 @@ test('inline tag editor commits, discards drafts, and removes with Backspace', a
     await input.fill('Music Videos');
     await input.press('Enter');
     await expect(row.locator('.tag-chip')).toContainText('Music Videos');
+    await expect(row.locator('.tag-entry-input')).toHaveValue('');
 
     await row.locator('.tag-entry-input').fill('not committed');
     await row.locator('.tag-entry-input').press('Escape');
@@ -28,6 +29,24 @@ test('inline tag editor commits, discards drafts, and removes with Backspace', a
     await row.locator('.tag-entry-input').press('Backspace');
     await expect(row.locator('.tag-chip')).toHaveCount(0);
     await expect(row.locator('.tag-entry-input')).toBeFocused();
+});
+
+test('failed tag commits restore the draft for correction', async ({ page }) => {
+    await seed(page, { id: 'tag-fail', status: 'cancelled', progress: 'Stopped' });
+    await refresh(page);
+    await page.route('**/api/tags/tag-fail', route => route.fulfill({
+        status: 500,
+        contentType: 'application/json',
+        body: JSON.stringify({ error: 'Tag save failed' }),
+    }));
+    const row = page.locator('[data-row-id="tag-fail"]');
+
+    await row.getByText('Add tag', { exact: true }).click();
+    await row.locator('.tag-entry-input').fill('Keep this draft');
+    await row.locator('.tag-entry-input').press('Enter');
+
+    await expect(page.locator('#actionError')).toContainText('Tag save failed');
+    await expect(row.locator('.tag-entry-input')).toHaveValue('Keep this draft');
 });
 
 test('shared tag filter supports ALL and ANY across Current and History', async ({ page }) => {
