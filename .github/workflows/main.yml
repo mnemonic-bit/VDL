@@ -1,0 +1,271 @@
+name: Main
+
+on:
+    push:
+        branches:
+            - main
+
+permissions: {}
+
+concurrency:
+    group: main-publication
+    cancel-in-progress: false
+
+jobs:
+    validation:
+        name: Validation
+        uses: ./.github/workflows/validation.yml
+        permissions:
+            contents: read
+
+    publish:
+        name: Publish tested image
+        needs:
+            - validation
+        runs-on: ubuntu-24.04
+        timeout-minutes: 120
+        permissions:
+            attestations: write
+            contents: write
+            id-token: write
+            packages: write
+        steps:
+            - name: Check out tested commit
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  persist-credentials: false
+
+            - name: Set up Docker with the containerd image store
+              uses: docker/setup-docker-action@77e84dbf09b47d1e29270283c22f16145aa85ca1 # v5.4.0
+              with:
+                  version: v28.5.2
+                  daemon-config: |
+                      {
+                        "features": {
+                          "containerd-snapshotter": true
+                        }
+                      }
+
+            - name: Set up QEMU
+              uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+              with:
+                  platforms: arm64
+
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+            - name: Log in to GHCR
+              uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+              with:
+                  registry: ghcr.io
+                  username: ${{ github.actor }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Resolve image and release policy
+              id: release
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  set -euo pipefail
+                  image="ghcr.io/${GITHUB_REPOSITORY,,}"
+                  version=$(tr -d '[:space:]' < VERSION)
+                  if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                      echo "VERSION must contain a SemVer core such as 0.4.0" >&2
+                      exit 1
+                  fi
+                  release="v$version"
+                  echo "IMAGE=$image" >> "$GITHUB_ENV"
+                  echo "RELEASE=$release" >> "$GITHUB_ENV"
+
+                  api_status() {
+                      curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+                          --header "Accept: application/vnd.github+json" \
+                          --header "Authorization: Bearer $GH_TOKEN" \
+                          --header "X-GitHub-Api-Version: 2022-11-28" \
+                          "https://api.github.com/repos/$GITHUB_REPOSITORY/$1"
+                  }
+                  presence() {
+                      case "$1" in
+                          200) echo true ;;
+                          404) echo false ;;
+                          *) echo "GitHub API returned unexpected status $1" >&2; exit 1 ;;
+                      esac
+                  }
+
+                  tag_exists=$(presence "$(api_status "git/ref/tags/$release")")
+                  release_exists=$(presence "$(api_status "releases/tags/$release")")
+                  inspect_error="$RUNNER_TEMP/version-image-inspect.log"
+                  if docker buildx imagetools inspect "$image:$release" >/dev/null 2>"$inspect_error"; then
+                      image_exists=true
+                  elif grep -Eqi 'manifest unknown|name unknown|not found' "$inspect_error"; then
+                      image_exists=false
+                  else
+                      cat "$inspect_error" >&2
+                      exit 1
+                  fi
+
+                  if [[ "$tag_exists" == true && "$release_exists" == true && "$image_exists" == true ]]; then
+                      new_release=false
+                  elif [[ "$tag_exists" == false && "$release_exists" == false && "$image_exists" == false ]]; then
+                      new_release=true
+                  else
+                      echo "Partial release state for $release: tag=$tag_exists release=$release_exists image=$image_exists" >&2
+                      echo "Refusing to overwrite or guess how to complete a partial release." >&2
+                      exit 1
+                  fi
+                  echo "new_release=$new_release" >> "$GITHUB_OUTPUT"
+
+            - name: Build the multi-platform image locally
+              env:
+                  NEW_RELEASE: ${{ steps.release.outputs.new_release }}
+              run: |
+                  set -euo pipefail
+                  tags=(--tag "$IMAGE:main" --tag "$IMAGE:$GITHUB_SHA")
+                  if [[ "$NEW_RELEASE" == true ]]; then
+                      tags+=(--tag "$IMAGE:$RELEASE" --tag "$IMAGE:latest")
+                  fi
+                  docker buildx build \
+                      --pull \
+                      --platform linux/amd64,linux/arm64 \
+                      --load \
+                      --provenance=false \
+                      --sbom=false \
+                      --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+                      --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+                      --label "org.opencontainers.image.version=${RELEASE#v}" \
+                      --label "org.opencontainers.image.licenses=MIT" \
+                      "${tags[@]}" \
+                      .
+
+            - name: Validate linux/amd64 image
+              env:
+                  CONTAINER_ENGINE: docker
+                  DOCKER_DEFAULT_PLATFORM: linux/amd64
+                  VDL_IMAGE: ${{ env.IMAGE }}:${{ github.sha }}
+              run: ./tests/container/smoke.sh
+
+            - name: Validate linux/arm64 image under QEMU
+              env:
+                  CONTAINER_ENGINE: docker
+                  DOCKER_DEFAULT_PLATFORM: linux/arm64
+                  VDL_IMAGE: ${{ env.IMAGE }}:${{ github.sha }}
+              run: ./tests/container/smoke.sh
+
+            - name: Publish main and immutable commit tags
+              run: |
+                  set -euo pipefail
+                  docker push "$IMAGE:main"
+                  docker push "$IMAGE:$GITHUB_SHA"
+
+            - name: Verify anonymous image access
+              run: |
+                  set -euo pipefail
+                  docker logout ghcr.io
+                  for _ in $(seq 1 12); do
+                      if docker buildx imagetools inspect "$IMAGE:$GITHUB_SHA" >/dev/null 2>&1; then
+                          exit 0
+                      fi
+                      sleep 5
+                  done
+                  echo "$IMAGE is not anonymously pullable. Make the GHCR package public, then rerun this workflow." >&2
+                  exit 1
+
+            - name: Log back in to GHCR for attestations
+              uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+              with:
+                  registry: ghcr.io
+                  username: ${{ github.actor }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Resolve published image digests
+              id: digests
+              run: |
+                  set -euo pipefail
+                  raw_manifest="$RUNNER_TEMP/manifest.json"
+                  docker buildx imagetools inspect "$IMAGE:$GITHUB_SHA" --raw > "$raw_manifest"
+                  index=$(docker buildx imagetools inspect "$IMAGE:$GITHUB_SHA" | awk '$1 == "Digest:" { print $2; exit }')
+                  amd64=$(jq -r '.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64") | .digest' "$raw_manifest")
+                  arm64=$(jq -r '.manifests[] | select(.platform.os == "linux" and .platform.architecture == "arm64") | .digest' "$raw_manifest")
+                  if [[ ! "$index" =~ ^sha256:[0-9a-f]{64}$ || ! "$amd64" =~ ^sha256:[0-9a-f]{64}$ || ! "$arm64" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                      echo "Could not resolve the index and both platform digests" >&2
+                      exit 1
+                  fi
+                  {
+                      echo "index=$index"
+                      echo "amd64=$amd64"
+                      echo "arm64=$arm64"
+                  } >> "$GITHUB_OUTPUT"
+
+            - name: Generate linux/amd64 SBOM
+              uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+              with:
+                  image: ${{ env.IMAGE }}@${{ steps.digests.outputs.amd64 }}
+                  format: spdx-json
+                  output-file: ${{ runner.temp }}/sbom-amd64.spdx.json
+                  upload-artifact: false
+                  upload-release-assets: false
+
+            - name: Generate linux/arm64 SBOM
+              uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+              with:
+                  image: ${{ env.IMAGE }}@${{ steps.digests.outputs.arm64 }}
+                  format: spdx-json
+                  output-file: ${{ runner.temp }}/sbom-arm64.spdx.json
+                  upload-artifact: false
+                  upload-release-assets: false
+
+            - name: Attest multi-platform manifest provenance
+              uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+              with:
+                  subject-name: ${{ env.IMAGE }}
+                  subject-digest: ${{ steps.digests.outputs.index }}
+                  push-to-registry: true
+
+            - name: Attest linux/amd64 provenance
+              uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+              with:
+                  subject-name: ${{ env.IMAGE }}
+                  subject-digest: ${{ steps.digests.outputs.amd64 }}
+                  push-to-registry: true
+
+            - name: Attest linux/amd64 SBOM
+              uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+              with:
+                  subject-name: ${{ env.IMAGE }}
+                  subject-digest: ${{ steps.digests.outputs.amd64 }}
+                  sbom-path: ${{ runner.temp }}/sbom-amd64.spdx.json
+                  push-to-registry: true
+
+            - name: Attest linux/arm64 provenance
+              uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+              with:
+                  subject-name: ${{ env.IMAGE }}
+                  subject-digest: ${{ steps.digests.outputs.arm64 }}
+                  push-to-registry: true
+
+            - name: Attest linux/arm64 SBOM
+              uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+              with:
+                  subject-name: ${{ env.IMAGE }}
+                  subject-digest: ${{ steps.digests.outputs.arm64 }}
+                  sbom-path: ${{ runner.temp }}/sbom-arm64.spdx.json
+                  push-to-registry: true
+
+            - name: Publish new version tags
+              if: steps.release.outputs.new_release == 'true'
+              run: |
+                  set -euo pipefail
+                  docker push "$IMAGE:$RELEASE"
+                  docker push "$IMAGE:latest"
+
+            - name: Create GitHub Release
+              if: steps.release.outputs.new_release == 'true'
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  gh release create "$RELEASE" \
+                      --repo "$GITHUB_REPOSITORY" \
+                      --target "$GITHUB_SHA" \
+                      --title "$RELEASE" \
+                      --generate-notes \
+                      --latest

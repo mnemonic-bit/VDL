@@ -1,0 +1,72 @@
+name: Bug report
+description: Report reproducible incorrect behavior in VDL.
+title: "[Bug]: "
+body:
+    - type: markdown
+      attributes:
+          value: |
+              Thanks for taking the time to report a problem. Issue handling is best effort; a response or resolution time is not guaranteed. Duplicate, unsupported, or insufficiently actionable reports may be closed.
+
+              Do not disclose vulnerabilities here. Use the private reporting link in the issue chooser instead.
+    - type: input
+      id: version
+      attributes:
+          label: VDL version
+          description: Use the version shown in the page footer or the GitHub Release tag.
+          placeholder: v0.4.0
+      validations:
+          required: true
+    - type: dropdown
+      id: deployment
+      attributes:
+          label: Deployment method
+          options:
+              - Docker Compose
+              - Docker or Podman directly
+              - Native Python
+              - Other supported local setup
+      validations:
+          required: true
+    - type: textarea
+      id: environment
+      attributes:
+          label: Host and browser
+          description: Include host OS and architecture, container engine/version if applicable, and browser/version.
+          placeholder: Ubuntu 24.04 amd64, Docker 28.x, Firefox 142
+      validations:
+          required: true
+    - type: textarea
+      id: reproduction
+      attributes:
+          label: Reproduction steps
+          description: Give the smallest deterministic sequence that reproduces the problem.
+          placeholder: |
+              1. Start VDL with ...
+              2. Open ...
+              3. Select ...
+      validations:
+          required: true
+    - type: textarea
+      id: expected
+      attributes:
+          label: Expected behavior
+      validations:
+          required: true
+    - type: textarea
+      id: actual
+      attributes:
+          label: Actual behavior
+      validations:
+          required: true
+    - type: textarea
+      id: logs
+      attributes:
+          label: Sanitised logs or screenshots
+          description: Remove tokens, cookies, private URLs, downloaded media, file paths that identify people, and other sensitive data.
+    - type: checkboxes
+      id: safety
+      attributes:
+          label: Sensitive-data check
+          options:
+              - label: I have removed credentials, private media URLs, cookies, tokens, and other sensitive data.
+                required: true

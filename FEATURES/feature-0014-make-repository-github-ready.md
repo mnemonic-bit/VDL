@@ -1,7 +1,7 @@
 # Make the repository GitHub-ready
 
 **Source:** User-requested feature
-**Status:** Refined and ready for implementation
+**Status:** Implemented in repository; maintainer settings pending
 **Last refined:** 2026-09-17
 
 ## Decision summary

@@ -1,7 +1,29 @@
 # VDL
 
-A lightweight Flask video-downloader UI powered by yt-dlp. The browser UI is
-served locally and live progress arrives over Server-Sent Events.
+A lightweight local video-downloader UI powered by yt-dlp. VDL provides a
+browser interface for choosing formats, tracking concurrent downloads, pausing
+or resuming work, organising entries with tags, and playing completed media.
+Live progress arrives over Server-Sent Events without browser polling.
+
+[![Latest release](https://img.shields.io/github/v/release/mnemonic-bit/VDL?display_name=tag&sort=semver)](https://github.com/mnemonic-bit/VDL/releases/latest)
+[![Main pipeline](https://github.com/mnemonic-bit/VDL/actions/workflows/main.yml/badge.svg?branch=main&event=push)](https://github.com/mnemonic-bit/VDL/actions/workflows/main.yml?query=branch%3Amain+event%3Apush)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Container: GHCR](https://img.shields.io/badge/container-GHCR-blue?logo=github)](https://github.com/mnemonic-bit/VDL/pkgs/container/vdl)
+
+![VDL download form and navigation](overlay-initial.png)
+
+VDL is intended for a trusted local operator. It stores history and preferences
+in SQLite, writes media to a configurable directory, supports light and dark
+themes, and ships as a hardened non-root container for `linux/amd64` and
+`linux/arm64`.
+
+## Prerequisites
+
+The recommended deployment needs Docker Engine with Compose. Podman works with
+a Compose provider. Native use needs Python 3, the packages in
+`requirements.txt`, and ffmpeg/ffprobe. A current Chromium, Firefox, or WebKit-
+based browser is sufficient for the UI; browser playback still depends on codec
+support in that browser.
 
 The footer shows the release observed in the loaded UI and the release reported
 by the active API. A mismatch asks you to refresh, which makes stale pages or
@@ -44,6 +66,32 @@ docker run --rm -p 127.0.0.1:5000:5000 \
 The image contains yt-dlp `2026.08.19`, Deno `2.9.5`, EJS, curl-cffi,
 ffmpeg, and ffprobe. It runs through tini as fixed UID/GID `10001:10001` and
 does not contain Chromium or a browser automation package.
+
+Published multi-platform images are available from GHCR:
+
+```bash
+docker pull ghcr.io/mnemonic-bit/vdl:latest
+docker run --rm -p 127.0.0.1:5000:5000 \
+  -v vdl-downloads:/downloads -v vdl-data:/data \
+  ghcr.io/mnemonic-bit/vdl:latest
+```
+
+`latest` and `main` move. For reproducible deployment and rollback, use an
+immutable `v<VERSION>` or full Git commit SHA tag from the
+[package](https://github.com/mnemonic-bit/VDL/pkgs/container/vdl). Each
+published platform image has GitHub-native provenance and an SPDX SBOM
+attestation. Verify them with GitHub CLI:
+
+```bash
+gh attestation verify oci://ghcr.io/mnemonic-bit/vdl:v0.4.0 \
+  --repo mnemonic-bit/VDL
+amd64_digest=$(docker buildx imagetools inspect \
+  ghcr.io/mnemonic-bit/vdl:v0.4.0 --raw | \
+  jq -r '.manifests[] | select(.platform.architecture == "amd64") | .digest')
+gh attestation verify "oci://ghcr.io/mnemonic-bit/vdl@$amd64_digest" \
+  --repo mnemonic-bit/VDL \
+  --predicate-type https://spdx.dev/Document/v2.3
+```
 
 ## Optional PO-token provider
 
@@ -95,6 +143,10 @@ Compose port therefore binds to `127.0.0.1`. LAN or Internet exposure requires
 a separately reviewed authenticated reverse proxy, request limits, and an SSRF
 policy; changing the bind address alone is not a safe public deployment.
 
+Only download media you are authorised to access and use. VDL does not bypass
+DRM or access controls, and operators remain responsible for applicable site
+terms and copyright law.
+
 ## Verification
 
 The permanent regression suite is split into explicit tiers:
@@ -145,6 +197,19 @@ python vdl.py
 
 Native development defaults to <http://127.0.0.1:5000>. ffmpeg remains an
 external system dependency.
+
+## Project status and support
+
+VDL is a sole-maintainer project, released under the [MIT License](LICENSE).
+Public issues are available through structured forms for reproducible bugs and
+feature requests. Triage and maintenance are best effort, with no guaranteed
+response or resolution time; duplicate, unsupported, or insufficiently
+actionable reports may be closed. External pull requests and shared governance
+are not part of the current maintenance model.
+
+Report vulnerabilities privately according to [SECURITY.md](SECURITY.md), not
+through a public issue. Maintainer-only GitHub setup and release safeguards are
+recorded in [.github/REPOSITORY_SETTINGS.md](.github/REPOSITORY_SETTINGS.md).
 
 ## Future browser provider
 
