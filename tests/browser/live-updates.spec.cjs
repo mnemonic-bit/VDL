@@ -37,6 +37,45 @@ test('unknown-size downloads render an indeterminate Current progress state', as
     expect(animationName).not.toBe('none');
 });
 
+test('favicon shows aggregate progress across running downloads', async ({ page }) => {
+    const favicon = page.locator('#appFavicon');
+    const idleHref = await favicon.getAttribute('href');
+
+    await seed(page, {
+        id: 'favicon1', status: 'downloading', progress: '25%', filesize: 100,
+    });
+    await seed(page, {
+        id: 'favicon2', status: 'downloading', progress: '75%', filesize: 300,
+    });
+    await refresh(page);
+    await expect(favicon).toHaveAttribute('data-progress', '62.5');
+    await expect(favicon).toHaveAttribute('data-running-count', '2');
+    expect(await favicon.getAttribute('href')).not.toBe(idleHref);
+
+    await seed(page, { id: 'favicon2', status: 'paused' });
+    await refresh(page);
+    await expect(favicon).toHaveAttribute('data-progress', '25');
+    await expect(favicon).toHaveAttribute('data-running-count', '1');
+
+    await seed(page, { id: 'favicon1', status: 'finished', progress: '100%' });
+    await refresh(page);
+    await expect(favicon).not.toHaveAttribute('data-progress');
+    await expect(favicon).not.toHaveAttribute('data-running-count');
+    await expect(favicon).toHaveAttribute('href', idleHref);
+});
+
+test('favicon falls back to per-download progress for unknown sizes', async ({ page }) => {
+    await seed(page, {
+        id: 'favicon3', status: 'downloading', progress: '20%', filesize: 100,
+    });
+    await seed(page, {
+        id: 'favicon4', status: 'downloading', progress: 'Downloading',
+    });
+    await refresh(page);
+
+    await expect(page.locator('#appFavicon')).toHaveAttribute('data-progress', '10');
+});
+
 test('pause, unpause, stop, and continue buttons call their dedicated endpoints', async ({ page }) => {
     await seed(page, { id: 'actions1', status: 'downloading', progress: '10%' });
     await refresh(page);

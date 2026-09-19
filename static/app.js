@@ -9,6 +9,75 @@ const TERMINAL_STATUSES = new Set(['finished', 'error', 'cancelled', 'interrupte
 
 let _bannerDismissed = false;
 
+const favicon = document.getElementById('appFavicon');
+const idleFaviconHref = favicon ? favicon.getAttribute('href') : '';
+
+function downloadProgressPercent(info) {
+    const value = String(info.progress || '').trim();
+    if (!value.endsWith('%')) return null;
+    const parsed = Number.parseFloat(value);
+    return Number.isFinite(parsed) ? Math.min(100, Math.max(0, parsed)) : null;
+}
+
+function aggregateRunningProgress(downloads) {
+    const running = downloads.filter(info => RUNNING_STATUSES.has(info.status));
+    if (!running.length) return null;
+
+    const samples = running.map(info => ({
+        percent: downloadProgressPercent(info),
+        size: Number(info.filesize),
+    }));
+    const canWeightBySize = samples.every(sample => (
+        sample.percent !== null && Number.isFinite(sample.size) && sample.size > 0
+    ));
+    if (canWeightBySize) {
+        const totalSize = samples.reduce((sum, sample) => sum + sample.size, 0);
+        return {
+            count: running.length,
+            percent: samples.reduce(
+                (sum, sample) => sum + (sample.percent * sample.size), 0,
+            ) / totalSize,
+        };
+    }
+
+    // An unknown-length stream cannot contribute byte weight. Give every job
+    // equal influence instead, counting an indeterminate/starting job as 0%
+    // until yt-dlp provides a measurable percentage.
+    return {
+        count: running.length,
+        percent: samples.reduce((sum, sample) => sum + (sample.percent || 0), 0)
+            / running.length,
+    };
+}
+
+function updateFavicon(downloads) {
+    if (!favicon) return;
+    const aggregate = aggregateRunningProgress(downloads);
+    if (!aggregate) {
+        favicon.setAttribute('href', idleFaviconHref);
+        delete favicon.dataset.progress;
+        delete favicon.dataset.runningCount;
+        return;
+    }
+
+    const percent = Math.round(aggregate.percent * 10) / 10;
+    const radius = 7.5;
+    const angle = (percent / 100) * Math.PI * 2;
+    const endX = 8 + radius * Math.sin(angle);
+    const endY = 8 - radius * Math.cos(angle);
+    let progressShape = '';
+    if (percent >= 100) {
+        progressShape = `<circle cx="8" cy="8" r="${radius}" fill="#1f8a3b"/>`;
+    } else if (percent > 0) {
+        const largeArc = percent > 50 ? 1 : 0;
+        progressShape = `<path d="M8 8 L8 .5 A${radius} ${radius} 0 ${largeArc} 1 ${endX.toFixed(3)} ${endY.toFixed(3)} Z" fill="#1f8a3b"/>`;
+    }
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><circle cx="8" cy="8" r="${radius}" fill="#888"/>${progressShape}<g fill="none" stroke="white" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 4v5.5"/><path d="M5 7l3 3 3-3"/><path d="M4.5 12.5h7"/></g></svg>`;
+    favicon.setAttribute('href', `data:image/svg+xml,${encodeURIComponent(svg)}`);
+    favicon.dataset.progress = String(percent);
+    favicon.dataset.runningCount = String(aggregate.count);
+}
+
 function showServerBanner() {
     _bannerDismissed = false;
     document.getElementById('serverBanner').style.display = '';
@@ -1323,6 +1392,7 @@ function fetchHistory() {
             return;
         }
         const reversed = data.slice().reverse();
+        updateFavicon(reversed);
         refreshAvailableTags(reversed);
         const active = reversed.filter(i => (
             CURRENT_TAB_STATUSES.has(i.status) && matchesTagFilter(i)
