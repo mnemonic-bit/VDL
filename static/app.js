@@ -936,6 +936,38 @@ function clearHistory() {
 
 let openMenuId = null;
 let historyFetchDeferred = false;
+const heldRowActionPointers = new Set();
+
+function historyRefreshBlocked() {
+    return openMenuId !== null || heldRowActionPointers.size > 0;
+}
+
+function resumeDeferredHistoryFetch() {
+    if (historyRefreshBlocked() || !historyFetchDeferred) return;
+    historyFetchDeferred = false;
+    // requestAnimationFrame runs after the click synthesized for pointerup, so
+    // the pressed action can finish before reconciliation replaces its row.
+    scheduleFetch();
+}
+
+document.addEventListener('pointerdown', (ev) => {
+    const target = ev.target.closest && ev.target.closest(
+        '#activeList .row-actions button, #historyList .row-actions button');
+    if (target) heldRowActionPointers.add(ev.pointerId);
+}, true);
+
+function releaseRowActionPointer(ev) {
+    if (!heldRowActionPointers.delete(ev.pointerId)) return;
+    resumeDeferredHistoryFetch();
+}
+
+document.addEventListener('pointerup', releaseRowActionPointer, true);
+document.addEventListener('pointercancel', releaseRowActionPointer, true);
+window.addEventListener('blur', () => {
+    if (heldRowActionPointers.size === 0) return;
+    heldRowActionPointers.clear();
+    resumeDeferredHistoryFetch();
+});
 
 function renderFormatsTable(info) {
     let formats = info.formats;
@@ -988,14 +1020,13 @@ function onErrorDetailsToggle(id, el) {
 }
 
 function closeAllMenus() {
-    const shouldRefresh = openMenuId !== null && historyFetchDeferred;
+    const hadOpenMenu = openMenuId !== null;
     document.querySelectorAll('.kebab-menu.open').forEach(m => m.classList.remove('open'));
     openMenuId = null;
-    if (shouldRefresh) {
-        historyFetchDeferred = false;
+    if (hadOpenMenu) {
         // Schedule after the click finishes so switching directly to another
         // menu keeps its actions stable and defers the refresh again.
-        scheduleFetch();
+        resumeDeferredHistoryFetch();
     }
 }
 
@@ -1379,7 +1410,7 @@ function goToPage(target) {
 }
 
 function fetchHistory() {
-    if (openMenuId !== null) {
+    if (historyRefreshBlocked()) {
         historyFetchDeferred = true;
         return Promise.resolve();
     }
@@ -1387,7 +1418,7 @@ function fetchHistory() {
     return apiFetch('/api/history')
     .then(res => res.json())
     .then(data => {
-        if (openMenuId !== null) {
+        if (historyRefreshBlocked()) {
             historyFetchDeferred = true;
             return;
         }

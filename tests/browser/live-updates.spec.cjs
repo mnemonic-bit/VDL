@@ -101,6 +101,26 @@ test('pause, unpause, stop, and continue buttons call their dedicated endpoints'
     expect(calls).toEqual(['pause', 'unpause', 'stop', 'resume']);
 });
 
+test('Stop pressed during live reconciliation still requests cancellation', async ({ page }) => {
+    await seed(page, { id: 'stop0001', status: 'downloading', progress: '10%' });
+    await refresh(page);
+    let stopRequests = 0;
+    await page.route('**/api/stop/stop0001', async route => {
+        stopRequests += 1;
+        await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' });
+    });
+
+    const stop = page.locator('[data-row-id="stop0001"] .stop-btn');
+    const box = await stop.boundingBox();
+    expect(box).not.toBeNull();
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    await page.mouse.down();
+    await refresh(page);
+    await page.mouse.up();
+
+    await expect.poll(() => stopRequests).toBe(1);
+});
+
 test('closing a row menu reconciles a deferred live update', async ({ page }) => {
     await seed(page, { id: 'menu0001', status: 'downloading', progress: '90%' });
     await refresh(page);

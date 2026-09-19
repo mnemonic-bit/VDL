@@ -16,6 +16,11 @@ Issue 27 was found by the first GitHub Actions publication run on 2026-09-19
 and reproduced with pip's ARM64 platform resolver. The combined lock now
 admits only the reviewed wheels for both published architectures, and the
 validation workflow resolves both platforms before publication.
+Issue 28 was reported as an intermittent Stop-button failure on 2026-09-19.
+A deterministic browser reproduction showed that an SSE reconciliation can
+replace the pressed button between pointer down and pointer up, preventing the
+browser from emitting a click or sending the stop request. Row reconciliation
+now waits for pressed actions to finish before replacing their controls.
 
 ## Bug reports
 
@@ -46,6 +51,7 @@ validation workflow resolves both platforms before publication.
 - [Bug 0025 — Estimated time remaining jumped between updates](bug-0025-estimated-time-remaining-jumped.md)
 - [Bug 0026 — Continued downloads began with a multi-day ETA](bug-0026-continued-downloads-began-with-multi-day-eta.md)
 - [Bug 0027 — ARM64 container builds reject x86-only dependency hashes](bug-0027-arm64-container-builds-reject-x86-only-dependency-hashes.md)
+- [Bug 0028 — Live reconciliation can swallow Stop clicks](bug-0028-live-reconciliation-could-swallow-stop-clicks.md)
 
 ## Accepted UI decisions
 
