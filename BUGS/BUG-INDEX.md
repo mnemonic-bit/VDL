@@ -12,6 +12,10 @@ Issue 23 was reproduced in the running container on 2026-09-16 and reduced
 to a deterministic progress-hook reproduction. Issues 24-26 record the UI
 regression introduced by its first fix and the subsequent size and ETA
 smoothing behavior.
+Issue 27 was found by the first GitHub Actions publication run on 2026-09-19
+and reproduced with pip's ARM64 platform resolver. The combined lock now
+admits only the reviewed wheels for both published architectures, and the
+validation workflow resolves both platforms before publication.
 
 ## Bug reports
 
@@ -41,6 +45,7 @@ smoothing behavior.
 - [Bug 0024 — First HLS stabilization fix hid size and progress](bug-0024-first-hls-fix-hid-size-and-progress.md)
 - [Bug 0025 — Estimated time remaining jumped between updates](bug-0025-estimated-time-remaining-jumped.md)
 - [Bug 0026 — Continued downloads began with a multi-day ETA](bug-0026-continued-downloads-began-with-multi-day-eta.md)
+- [Bug 0027 — ARM64 container builds reject x86-only dependency hashes](bug-0027-arm64-container-builds-reject-x86-only-dependency-hashes.md)
 
 ## Accepted UI decisions
 

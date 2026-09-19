@@ -83,10 +83,10 @@ published platform image has GitHub-native provenance and an SPDX SBOM
 attestation. Verify them with GitHub CLI:
 
 ```bash
-gh attestation verify oci://ghcr.io/mnemonic-bit/vdl:v0.4.0 \
+gh attestation verify oci://ghcr.io/mnemonic-bit/vdl:v0.4.1 \
   --repo mnemonic-bit/VDL
 amd64_digest=$(docker buildx imagetools inspect \
-  ghcr.io/mnemonic-bit/vdl:v0.4.0 --raw | \
+  ghcr.io/mnemonic-bit/vdl:v0.4.1 --raw | \
   jq -r '.manifests[] | select(.platform.architecture == "amd64") | .digest')
 gh attestation verify "oci://ghcr.io/mnemonic-bit/vdl@$amd64_digest" \
   --repo mnemonic-bit/VDL \
@@ -119,10 +119,12 @@ preferences, while `/downloads` contains completed media and resumable partials.
 
 Upgrades are immutable and reviewed: update image digests and dependency pins,
 update `requirements-container.constraints`, regenerate
-`requirements-container.txt`, rebuild with `--pull`, run the smoke
-checks, then recreate the service. Do not run `yt-dlp -U`, `pip install -U`, or
-a Deno updater inside a running container. Rollback starts the previous image
-against the same two volumes; this feature adds no database migration.
+`requirements-container.txt` for both `manylinux_2_17_x86_64` and
+`manylinux_2_17_aarch64`, run `./tests/container/check-lock.sh`, rebuild with
+`--pull`, run the smoke checks, then recreate the service. Do not run
+`yt-dlp -U`, `pip install -U`, or a Deno updater inside a running container.
+Rollback starts the previous image against the same two volumes; this feature
+adds no database migration.
 
 Bind mounts are supported in place of the named volumes, but both host paths
 must already be writable by UID/GID 10001:

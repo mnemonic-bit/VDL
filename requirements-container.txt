@@ -1,26 +1,27 @@
-# Generated for CPython 3.12 on glibc Linux with:
-#   uv pip compile requirements-container.in --python-version 3.12 \
-#       --python-platform x86_64-manylinux_2_17 \
-#       --constraint requirements-container.constraints \
-#       --only-binary :all: --generate-hashes \
-#       --output-file requirements-container.txt
-# Regenerate and review this file rather than updating packages at runtime.
+# Locked for CPython 3.12 wheels on glibc linux/amd64 and linux/arm64.
+# Resolve requirements-container.in against requirements-container.constraints
+# for both manylinux_2_17 platforms, retain only the selected wheel hashes, and
+# run tests/container/check-lock.sh after every regeneration.
 bgutil-ytdlp-pot-provider==2.0.0 \
     --hash=sha256:22884c399802771ddfd9275bb05b178d67c89db67a1d5d1e17ed7f681956628e
 blinker==1.9.0 \
     --hash=sha256:ba0efaa9080b619ff2f3459d1d500c57bddea4a6b424b60a91141db6fd2f08bc
 brotli==1.2.0 \
-    --hash=sha256:072e7624b1fc4d601036ab3f4f27942ef772887e876beff0301d261210bca97f
+    --hash=sha256:072e7624b1fc4d601036ab3f4f27942ef772887e876beff0301d261210bca97f \
+    --hash=sha256:acec55bb7c90f1dfc476126f9711a8e81c9af7fb617409a9ee2953115343f08d
 certifi==2026.7.22 \
     --hash=sha256:62f22742b58a1a33014a2b6b706588a8d7e2a88ae7bd1a6ebe8c992928483775
 cffi==2.1.1 \
+    --hash=sha256:68e62fe11f30d5ca8289242866f0a5291402d8529ca2178ab8afc5c9694ae890 \
     --hash=sha256:c1453022f490d2459a11819d83ad1d586e9ff65a12ac3e705ffebd46d3685dcf
 charset-normalizer==3.5.0 \
-    --hash=sha256:14f6904a3cf870abf044df3a8c4924ac6c8ef77e9896586fd37e73ae96cff2af
+    --hash=sha256:14f6904a3cf870abf044df3a8c4924ac6c8ef77e9896586fd37e73ae96cff2af \
+    --hash=sha256:608553f476fca509537e804c4a71f5eb166ce63b75141f89c2c686ce1aa36956
 click==8.5.0 \
     --hash=sha256:255bc9599cf7748b4b1a446ccc735421bd08a2ae529a8b88597d3de5664ee360
 curl-cffi==0.16.0 \
-    --hash=sha256:182416f07d71a342240554fa62c22e591999b78c225b21d3fe27d9f807420dd6
+    --hash=sha256:182416f07d71a342240554fa62c22e591999b78c225b21d3fe27d9f807420dd6 \
+    --hash=sha256:93615d44f23e56c1256700c2e78de4b879310f39a5621828ea7e2a5ecc04bdda
 flask==3.1.3 \
     --hash=sha256:f4bcbefc124291925f1a26446da31a5178f9483862233b23c0c96a20701f670c
 idna==3.18 \
@@ -30,18 +31,22 @@ itsdangerous==2.2.0 \
 jinja2==3.1.6 \
     --hash=sha256:85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67
 markupsafe==3.0.3 \
+    --hash=sha256:3a7e8ae81ae39e62a41ec302f972ba6ae23a5c5396c8e60113e9066ef893da0d \
     --hash=sha256:d6dd0be5b5b189d31db7cda48b91d7e0a9795f31430b7f271219ab30f1d3ac9d
 mutagen==1.48.1 \
     --hash=sha256:4f077fe87d3fc7fba259aa63d8c026b18382ca6a42ef37c61e16f1b1b5b82fe7
 pycparser==3.0 \
     --hash=sha256:b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992
 pycryptodomex==3.23.0 \
+    --hash=sha256:43c446e2ba8df8889e0e16f02211c25b4934898384c1ec1ec04d7889c0333587 \
     --hash=sha256:f489c4765093fb60e2edafdf223397bc716491b2b69fe74367b70d6999257a5c
 requests==2.34.2 \
     --hash=sha256:2a0d60c172f83ac6ab31e4554906c0f3b3588d37b5cb939b1c061f4907e278e0
 urllib3==2.7.0 \
     --hash=sha256:9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897
 websockets==17.0.1 \
+    --hash=sha256:8848c207049ad49d318e5f64a3d4d7bb189f8328d0d98e65647788f2a085785c \
+    --hash=sha256:c6be9cba65c65cc76dfa3d4619e359ff02a4476c74e179b215236c11a0b32345 \
     --hash=sha256:f47b0815af3948ec6a440b3afa02f05b18cc0939549e91b5c677b5d9c2c8472a
 werkzeug==3.1.8 \
     --hash=sha256:63a77fb8892bf28ebc3178683445222aa500e48ebad5ec77b0ad80f8726b1f50

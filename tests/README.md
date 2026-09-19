@@ -28,6 +28,17 @@ requirements explicit:
 ./tests/run-all.sh --all        # required retirement/release gate
 ```
 
+Before changing or publishing the container dependency lock, verify that its
+hashed wheels cover both shipping architectures:
+
+```bash
+./tests/container/check-lock.sh
+```
+
+This check contacts the Python package index but never installs the downloaded
+wheels. The validation workflow runs it before the multi-platform publication
+job can start.
+
 Install native dependencies with `requirements.txt`. Browser setup is:
 
 ```bash
