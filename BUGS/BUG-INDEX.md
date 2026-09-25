@@ -21,6 +21,10 @@ A deterministic browser reproduction showed that an SSE reconciliation can
 replace the pressed button between pointer down and pointer up, preventing the
 browser from emitting a click or sending the stop request. Row reconciliation
 now waits for pressed actions to finish before replacing their controls.
+Issue 29 was reported and observed in the running container on 2026-09-19.
+Initial progress and ETA values can be implausible until the same download is
+stopped and continued. The latest post-Continue state is credible, but the
+original samples still need to be captured for a deterministic reproduction.
 
 ## Bug reports
 
@@ -52,6 +56,7 @@ now waits for pressed actions to finish before replacing their controls.
 - [Bug 0026 — Continued downloads began with a multi-day ETA](bug-0026-continued-downloads-began-with-multi-day-eta.md)
 - [Bug 0027 — ARM64 container builds reject x86-only dependency hashes](bug-0027-arm64-container-builds-reject-x86-only-dependency-hashes.md)
 - [Bug 0028 — Live reconciliation can swallow Stop clicks](bug-0028-live-reconciliation-could-swallow-stop-clicks.md)
+- [Bug 0029 — Initial progress and ETA are implausible until Stop and Continue](bug-0029-initial-progress-and-eta-were-implausible-until-continue.md)
 
 ## Accepted UI decisions
 
