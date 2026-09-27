@@ -53,6 +53,7 @@ class SchemaMigrationTest(unittest.TestCase):
                     "filename", "resolution", "filesize", "speed", "eta",
                     "title", "finished_at", "formats", "requested_format",
                     "output_dir", "requested_filename",
+                    "downloaded_bytes", "total_bytes",
                 })
                 self.assertTrue({"tags", "download_tags"}.issubset(tables))
                 self.assertEqual(

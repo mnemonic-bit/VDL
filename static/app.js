@@ -1,5 +1,6 @@
 // Statuses that count as "in flight" (the worker thread is alive).
 const RUNNING_STATUSES = new Set(['starting', 'downloading']);
+const ACTIVE_PROGRESS_STATUSES = new Set(['starting', 'downloading', 'paused']);
 // Statuses shown under the Current tab. Cancelled and interrupted
 // stay here so the user can resume them; everything else terminal
 // goes to History.
@@ -11,52 +12,66 @@ let _bannerDismissed = false;
 
 const favicon = document.getElementById('appFavicon');
 const idleFaviconHref = favicon ? favicon.getAttribute('href') : '';
+const appTitleIcon = document.getElementById('appTitleIcon');
+const appTitleProgressRing = document.getElementById('appTitleProgressRing');
 
-function downloadProgressPercent(info) {
-    const value = String(info.progress || '').trim();
-    if (!value.endsWith('%')) return null;
-    const parsed = Number.parseFloat(value);
-    return Number.isFinite(parsed) ? Math.min(100, Math.max(0, parsed)) : null;
-}
+function aggregateActiveProgress(downloads) {
+    const active = downloads.filter(info => ACTIVE_PROGRESS_STATUSES.has(info.status));
+    if (!active.length) return null;
 
-function aggregateRunningProgress(downloads) {
-    const running = downloads.filter(info => RUNNING_STATUSES.has(info.status));
-    if (!running.length) return null;
-
-    const samples = running.map(info => ({
-        percent: downloadProgressPercent(info),
-        size: Number(info.filesize),
-    }));
-    const canWeightBySize = samples.every(sample => (
-        sample.percent !== null && Number.isFinite(sample.size) && sample.size > 0
-    ));
-    if (canWeightBySize) {
-        const totalSize = samples.reduce((sum, sample) => sum + sample.size, 0);
-        return {
-            count: running.length,
-            percent: samples.reduce(
-                (sum, sample) => sum + (sample.percent * sample.size), 0,
-            ) / totalSize,
-        };
+    let downloadedBytes = 0;
+    let totalBytes = 0;
+    for (const info of active) {
+        const total = Number(info.total_bytes);
+        if (!Number.isFinite(total) || total <= 0) {
+            return { count: active.length, percent: null };
+        }
+        const reportedDownloaded = Number(info.downloaded_bytes);
+        const downloaded = Number.isFinite(reportedDownloaded)
+            ? Math.min(total, Math.max(0, reportedDownloaded))
+            : 0;
+        downloadedBytes += downloaded;
+        totalBytes += total;
     }
 
-    // An unknown-length stream cannot contribute byte weight. Give every job
-    // equal influence instead, counting an indeterminate/starting job as 0%
-    // until yt-dlp provides a measurable percentage.
     return {
-        count: running.length,
-        percent: samples.reduce((sum, sample) => sum + (sample.percent || 0), 0)
-            / running.length,
+        count: active.length,
+        percent: (downloadedBytes / totalBytes) * 100,
     };
 }
 
-function updateFavicon(downloads) {
-    if (!favicon) return;
-    const aggregate = aggregateRunningProgress(downloads);
+function updateHeaderProgress(aggregate) {
+    if (!appTitleIcon || !appTitleProgressRing) return;
     if (!aggregate) {
+        appTitleProgressRing.setAttribute('hidden', '');
+        delete appTitleIcon.dataset.progress;
+        delete appTitleIcon.dataset.runningCount;
+        return;
+    }
+
+    appTitleIcon.dataset.runningCount = String(aggregate.count);
+    if (aggregate.percent === null || aggregate.percent <= 0) {
+        appTitleProgressRing.setAttribute('hidden', '');
+        delete appTitleIcon.dataset.progress;
+        return;
+    }
+
+    const percent = Math.round(aggregate.percent * 10) / 10;
+    appTitleProgressRing.style.strokeDashoffset = String(100 - percent);
+    appTitleProgressRing.removeAttribute('hidden');
+    appTitleIcon.dataset.progress = String(percent);
+}
+
+function updateFavicon(aggregate) {
+    if (!favicon) return;
+    if (!aggregate || aggregate.percent === null) {
         favicon.setAttribute('href', idleFaviconHref);
         delete favicon.dataset.progress;
-        delete favicon.dataset.runningCount;
+        if (aggregate) {
+            favicon.dataset.runningCount = String(aggregate.count);
+        } else {
+            delete favicon.dataset.runningCount;
+        }
         return;
     }
 
@@ -76,6 +91,12 @@ function updateFavicon(downloads) {
     favicon.setAttribute('href', `data:image/svg+xml,${encodeURIComponent(svg)}`);
     favicon.dataset.progress = String(percent);
     favicon.dataset.runningCount = String(aggregate.count);
+}
+
+function updateProgressIndicators(downloads) {
+    const aggregate = aggregateActiveProgress(downloads);
+    updateHeaderProgress(aggregate);
+    updateFavicon(aggregate);
 }
 
 function showServerBanner() {
@@ -1423,7 +1444,7 @@ function fetchHistory() {
             return;
         }
         const reversed = data.slice().reverse();
-        updateFavicon(reversed);
+        updateProgressIndicators(reversed);
         refreshAvailableTags(reversed);
         const active = reversed.filter(i => (
             CURRENT_TAB_STATUSES.has(i.status) && matchesTagFilter(i)

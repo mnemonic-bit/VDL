@@ -133,7 +133,14 @@
         </defs>
     </svg>
 
-    <h2 class="app-title"><svg class="app-title-icon" aria-hidden="true"><use href="#i-app-download"/></svg><span>Video Download Helper</span></h2>
+    <h2 class="app-title">
+        <svg id="appTitleIcon" class="app-title-icon" viewBox="-1 -1 18 18" aria-hidden="true">
+            <use href="#i-app-download" x="0" y="0" width="16" height="16"/>
+            <circle id="appTitleProgressRing" class="app-title-progress-ring" cx="8" cy="8" r="8.1"
+                    pathLength="100" transform="rotate(-90 8 8)" hidden/>
+        </svg>
+        <span>Video Download Helper</span>
+    </h2>
     <form id="downloadForm" class="form-group" onsubmit="startDownload(event)">
         <div class="url-wrap">
             <input type="url" id="urlInput" placeholder="Enter video URL here..." required autocomplete="off">

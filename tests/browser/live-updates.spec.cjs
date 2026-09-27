@@ -37,15 +37,17 @@ test('unknown-size downloads render an indeterminate Current progress state', as
     expect(animationName).not.toBe('none');
 });
 
-test('favicon shows aggregate progress across running downloads', async ({ page }) => {
+test('favicon shows aggregate progress across active downloads', async ({ page }) => {
     const favicon = page.locator('#appFavicon');
     const idleHref = await favicon.getAttribute('href');
 
     await seed(page, {
         id: 'favicon1', status: 'downloading', progress: '25%', filesize: 100,
+        downloaded_bytes: 25, total_bytes: 100,
     });
     await seed(page, {
         id: 'favicon2', status: 'downloading', progress: '75%', filesize: 300,
+        downloaded_bytes: 225, total_bytes: 300,
     });
     await refresh(page);
     await expect(favicon).toHaveAttribute('data-progress', '62.5');
@@ -54,26 +56,99 @@ test('favicon shows aggregate progress across running downloads', async ({ page 
 
     await seed(page, { id: 'favicon2', status: 'paused' });
     await refresh(page);
-    await expect(favicon).toHaveAttribute('data-progress', '25');
-    await expect(favicon).toHaveAttribute('data-running-count', '1');
+    await expect(favicon).toHaveAttribute('data-progress', '62.5');
+    await expect(favicon).toHaveAttribute('data-running-count', '2');
 
     await seed(page, { id: 'favicon1', status: 'finished', progress: '100%' });
+    await refresh(page);
+    await expect(favicon).toHaveAttribute('data-progress', '75');
+    await expect(favicon).toHaveAttribute('data-running-count', '1');
+
+    await seed(page, { id: 'favicon2', status: 'finished', progress: '100%' });
     await refresh(page);
     await expect(favicon).not.toHaveAttribute('data-progress');
     await expect(favicon).not.toHaveAttribute('data-running-count');
     await expect(favicon).toHaveAttribute('href', idleHref);
 });
 
-test('favicon falls back to per-download progress for unknown sizes', async ({ page }) => {
+test('progress indicators remain indeterminate when any active size is unknown', async ({ page }) => {
+    const favicon = page.locator('#appFavicon');
+    const idleHref = await favicon.getAttribute('href');
     await seed(page, {
         id: 'favicon3', status: 'downloading', progress: '20%', filesize: 100,
+        downloaded_bytes: 20, total_bytes: 100,
     });
     await seed(page, {
         id: 'favicon4', status: 'downloading', progress: 'Downloading',
     });
     await refresh(page);
 
-    await expect(page.locator('#appFavicon')).toHaveAttribute('data-progress', '10');
+    await expect(favicon).not.toHaveAttribute('data-progress');
+    await expect(favicon).toHaveAttribute('data-running-count', '2');
+    await expect(favicon).toHaveAttribute('href', idleHref);
+    await expect(page.locator('#appTitleProgressRing')).toBeHidden();
+    await expect(page.locator('#appTitleIcon')).not.toHaveAttribute('data-progress');
+});
+
+test('header ring shows byte-weighted progress clockwise from twelve o’clock', async ({ page }) => {
+    const icon = page.locator('#appTitleIcon');
+    const ring = page.locator('#appTitleProgressRing');
+    await expect(ring).toBeHidden();
+    await expect(icon).toHaveAttribute('aria-hidden', 'true');
+    await expect(ring).toHaveAttribute('transform', 'rotate(-90 8 8)');
+    await expect(ring).toHaveAttribute('pathLength', '100');
+
+    await seed(page, {
+        id: 'ring0001', status: 'downloading', progress: '0%',
+        downloaded_bytes: 0, total_bytes: 200,
+    });
+    await refresh(page);
+    await expect(ring).toBeHidden();
+    await expect(icon).not.toHaveAttribute('data-progress');
+    await expect(icon).toHaveAttribute('data-running-count', '1');
+
+    await seed(page, {
+        id: 'ring0001', status: 'downloading', progress: '50%',
+        downloaded_bytes: 100, total_bytes: 200,
+    });
+    await refresh(page);
+    await expect(icon).toHaveAttribute('data-progress', '50');
+    await expect(ring).toBeVisible();
+    await expect(ring).toHaveCSS('stroke-dashoffset', '50px');
+
+    await seed(page, {
+        id: 'ring0002', status: 'downloading', progress: '12.5%',
+        downloaded_bytes: 100, total_bytes: 800,
+    });
+    await refresh(page);
+    await expect(icon).toHaveAttribute('data-progress', '20');
+    await expect(icon).toHaveAttribute('data-running-count', '2');
+    await expect(ring).toBeVisible();
+    await expect(ring).toHaveCSS('stroke-dashoffset', '80px');
+
+    await seed(page, { id: 'ring0002', status: 'paused' });
+    await refresh(page);
+    await expect(icon).toHaveAttribute('data-progress', '20');
+    await expect(icon).toHaveAttribute('data-running-count', '2');
+
+    await seed(page, {
+        id: 'ring0001', status: 'downloading', progress: '100%',
+        downloaded_bytes: 500, total_bytes: 200,
+    });
+    await seed(page, {
+        id: 'ring0002', status: 'paused', progress: '100%',
+        downloaded_bytes: 800, total_bytes: 800,
+    });
+    await refresh(page);
+    await expect(icon).toHaveAttribute('data-progress', '100');
+    await expect(ring).toHaveCSS('stroke-dashoffset', '0px');
+
+    await seed(page, { id: 'ring0001', status: 'finished', progress: '100%' });
+    await seed(page, { id: 'ring0002', status: 'finished', progress: '100%' });
+    await refresh(page);
+    await expect(ring).toBeHidden();
+    await expect(icon).not.toHaveAttribute('data-progress');
+    await expect(icon).not.toHaveAttribute('data-running-count');
 });
 
 test('pause, unpause, stop, and continue buttons call their dedicated endpoints', async ({ page }) => {

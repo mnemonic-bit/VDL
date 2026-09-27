@@ -29,6 +29,8 @@ class DownloadLifecycleTest(AppCase):
         self.assertEqual(row["resolution"], "720p")
         self.assertEqual(row["speed"], 1024.0)
         self.assertIsNone(row["filesize"])
+        self.assertEqual(row["downloaded_bytes"], 4096)
+        self.assertIsNone(row["total_bytes"])
 
     def test_changing_size_estimates_are_smoothed(self):
         download_id = self.insert("estimate1")
@@ -47,6 +49,8 @@ class DownloadLifecycleTest(AppCase):
             row = self.client.get("/api/history").get_json()[0]
             observed_sizes.append(row["filesize"])
             observed_progress.append(float(row["progress"].rstrip("%")))
+            self.assertEqual(row["downloaded_bytes"], 400 * mib)
+            self.assertEqual(row["total_bytes"], row["filesize"])
 
         self.assertEqual(observed_sizes, [800 * mib] * 5)
         self.assertEqual(observed_progress, [50.0] * 5)
@@ -81,6 +85,61 @@ class DownloadLifecycleTest(AppCase):
         row = self.client.get("/api/history").get_json()[0]
         self.assertEqual(row["progress"], "50.0%")
         self.assertEqual(row["filesize"], 800)
+        self.assertEqual(row["downloaded_bytes"], 400)
+        self.assertEqual(row["total_bytes"], 800)
+
+    def test_unknown_size_clears_a_stale_persisted_total(self):
+        download_id = self.insert("stale-total")
+        vdl.progress_hook({
+            "status": "downloading",
+            "downloaded_bytes": 400,
+            "total_bytes": 800,
+            "info_dict": {},
+        }, download_id)
+        vdl.progress_hook({
+            "status": "downloading",
+            "downloaded_bytes": 450,
+            "info_dict": {},
+        }, download_id)
+
+        row = self.client.get("/api/history").get_json()[0]
+        self.assertEqual(row["downloaded_bytes"], 450)
+        self.assertIsNone(row["total_bytes"])
+
+    def test_pause_preserves_the_latest_persisted_byte_counts(self):
+        download_id = self.insert("pause-bytes")
+        vdl.progress_hook({
+            "status": "downloading",
+            "downloaded_bytes": 4,
+            "total_bytes": 10,
+            "info_dict": {},
+        }, download_id)
+        vdl.request_pause(download_id)
+        progress = threading.Thread(
+            target=vdl.progress_hook,
+            args=({
+                "status": "downloading",
+                "downloaded_bytes": 5,
+                "total_bytes": 10,
+                "info_dict": {},
+            }, download_id),
+        )
+        progress.start()
+
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            row = vdl.db_get_download(download_id)
+            if row["status"] == "paused":
+                break
+            time.sleep(0.01)
+        self.assertEqual(row["status"], "paused")
+        self.assertEqual((row["downloaded_bytes"], row["total_bytes"]), (4, 10))
+
+        vdl.clear_pause(download_id)
+        progress.join(1)
+        self.assertFalse(progress.is_alive())
+        row = vdl.db_get_download(download_id)
+        self.assertEqual((row["downloaded_bytes"], row["total_bytes"]), (5, 10))
 
     def test_changing_eta_estimates_are_smoothed_around_completion_time(self):
         download_id = self.insert("eta00001")

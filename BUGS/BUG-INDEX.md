@@ -25,6 +25,10 @@ Issue 29 was reported and observed in the running container on 2026-09-19.
 Initial progress and ETA values can be implausible until the same download is
 stopped and continued. The latest post-Continue state is credible, but the
 original samples still need to be captured for a deterministic reproduction.
+Issue 30 was reproduced in the running Podman container on 2026-09-27. Removing
+a stopped download unlinked its partial and deleted its database row while the
+worker still held the file descriptor, retaining approximately 555 MiB until
+the worker exits or the container restarts.
 
 ## Bug reports
 
@@ -57,6 +61,7 @@ original samples still need to be captured for a deterministic reproduction.
 - [Bug 0027 — ARM64 container builds reject x86-only dependency hashes](bug-0027-arm64-container-builds-reject-x86-only-dependency-hashes.md)
 - [Bug 0028 — Live reconciliation can swallow Stop clicks](bug-0028-live-reconciliation-could-swallow-stop-clicks.md)
 - [Bug 0029 — Initial progress and ETA are implausible until Stop and Continue](bug-0029-initial-progress-and-eta-were-implausible-until-continue.md)
+- [Bug 0030 — Removing a stopped download retains an unlinked partial file](bug-0030-removing-stopped-download-retains-unlinked-partial.md)
 
 ## Accepted UI decisions
 

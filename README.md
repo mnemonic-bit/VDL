@@ -33,8 +33,8 @@ behavior-changing release according to the policy in `AGENTS.md`.
 
 ## Run with Docker Compose
 
-The default deployment binds only to host loopback and stores media and SQLite
-state in independent named volumes:
+The default deployment publishes port 5000 on all host interfaces and stores
+media and SQLite state in independent named volumes:
 
 ```bash
 docker compose up --build -d
@@ -141,9 +141,9 @@ that cannot create its database or media files.
 ## Network exposure
 
 The UI accepts arbitrary operator-supplied URLs and has no authentication. The
-Compose port therefore binds to `127.0.0.1`. LAN or Internet exposure requires
-a separately reviewed authenticated reverse proxy, request limits, and an SSRF
-policy; changing the bind address alone is not a safe public deployment.
+Compose port binds to `0.0.0.0`, so anyone who can reach the host port can use
+the app. Restrict access to a trusted network or place it behind an authenticated
+reverse proxy with request limits and an SSRF policy before exposing it publicly.
 
 Only download media you are authorised to access and use. VDL does not bypass
 DRM or access controls, and operators remain responsible for applicable site

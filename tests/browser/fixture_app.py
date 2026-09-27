@@ -50,6 +50,7 @@ def test_row():
         if key in {
             "status", "progress", "resolution", "filesize", "speed", "eta",
             "title", "finished_at", "formats", "requested_format",
+            "downloaded_bytes", "total_bytes",
         }
     }
     if filename:

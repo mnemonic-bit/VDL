@@ -20,6 +20,7 @@
     --warn-text:    #000000;
     --accent:       #4caf50;
     --brand:        #1f8a3b;
+    --app-progress: #3498db;
     --danger:       #e74c3c;
     --danger-2:     #c0392b;
     --orange:       #f39c12;
@@ -48,6 +49,7 @@ html[data-theme="dark"] {
     --warn-text:    #000000;
     --accent:       #4caf50;
     --brand:        #1f8a3b;
+    --app-progress: #5dade2;
     --danger:       #e74c3c;
     --danger-2:     #c0392b;
     --orange:       #f39c12;
@@ -58,6 +60,8 @@ html, body { background: var(--bg); color: var(--fg); }
 body { font-family: Arial, sans-serif; max-width: 800px; margin: 40px auto; padding: 20px; box-sizing: border-box; }
 .app-title { display: flex; align-items: center; gap: 0.4em; }
 .app-title-icon { width: 1em; height: 1em; flex: none; color: var(--brand); }
+.app-title-progress-ring { fill: none; stroke: var(--app-progress); stroke-width: 1.2; stroke-linecap: round; stroke-dasharray: 100; stroke-dashoffset: 100; }
+.app-title-progress-ring[hidden] { display: none; }
 .server-banner { position: fixed; top: 0; left: 0; right: 0; z-index: 1000; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 16px; background: #f39c12; color: #000; font-size: 0.95em; font-weight: 500; box-shadow: 0 2px 6px rgba(0,0,0,0.2); }
 .server-banner-close { background: none; border: none; padding: 4px; cursor: pointer; color: inherit; line-height: 0; border-radius: 3px; flex-shrink: 0; }
 .server-banner-close:hover { opacity: 0.7; }

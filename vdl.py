@@ -227,6 +227,7 @@ TERMINAL_STATUSES = HISTORY_STATUSES + ('cancelled', 'interrupted')
 # connection cause "database is locked" errors. We open a fresh connection
 # per operation and guard writes with this lock.
 _db_lock = threading.Lock()
+_NO_UPDATE = object()
 
 # Workers wait here before entering yt-dlp. A FIFO queue keeps a burst in
 # worker-arrival order while the counter lets preference changes take
@@ -314,6 +315,11 @@ def init_db():
             # Keep the user's basename separate from yt-dlp's reported path.
             # Resumed workers need the same template to find existing parts.
             ("requested_filename", "ALTER TABLE downloads ADD COLUMN requested_filename TEXT"),
+            # Progress percentages are presentation data. Keep the underlying
+            # byte counts so every client can aggregate jobs without losing
+            # precision or giving small and large downloads equal weight.
+            ("downloaded_bytes", "ALTER TABLE downloads ADD COLUMN downloaded_bytes INTEGER"),
+            ("total_bytes", "ALTER TABLE downloads ADD COLUMN total_bytes INTEGER"),
         ]:
             if col not in existing_cols:
                 conn.execute(ddl)
@@ -361,7 +367,8 @@ def db_update_download(download_id, *, status=None, progress=None,
                        filename=None, resolution=None, filesize=None,
                        speed=None, eta=None, title=None, finished_at=None,
                        formats=None, requested_format=None, output_dir=None,
-                       requested_filename=None):
+                       requested_filename=None, downloaded_bytes=None,
+                       total_bytes=_NO_UPDATE):
     fields, values = [], []
     if status is not None:
         fields.append("status = ?"); values.append(status)
@@ -389,6 +396,10 @@ def db_update_download(download_id, *, status=None, progress=None,
         fields.append("output_dir = ?"); values.append(output_dir)
     if requested_filename is not None:
         fields.append("requested_filename = ?"); values.append(requested_filename)
+    if downloaded_bytes is not None:
+        fields.append("downloaded_bytes = ?"); values.append(downloaded_bytes)
+    if total_bytes is not _NO_UPDATE:
+        fields.append("total_bytes = ?"); values.append(total_bytes)
     if not fields:
         return
     values.append(download_id)
@@ -617,7 +628,7 @@ def db_list_downloads():
         rows = conn.execute(
             "SELECT id, url, status, progress, created_at, "
             "filename, resolution, filesize, speed, eta, title, finished_at, "
-            "formats, requested_format "
+            "formats, requested_format, downloaded_bytes, total_bytes "
             "FROM downloads ORDER BY created_at ASC"
         ).fetchall()
         downloads = [dict(r) for r in rows]
@@ -958,6 +969,8 @@ def progress_hook(d, download_id):
             download_id,
             status='downloading',
             progress=progress,
+            downloaded_bytes=max(0, int(downloaded or 0)),
+            total_bytes=int(filesize) if filesize and filesize > 0 else None,
             speed=float(speed) if speed else None,
             eta=eta,
             filesize=filesize,
@@ -998,10 +1011,19 @@ def progress_hook(d, download_id):
                 d.get('downloaded_bytes', 0),
             )
         title = info.get('title') or info.get('fulltitle')
+        finished_total = (
+            int(filesize) if filesize and filesize > 0 else None
+        )
         db_update_download(
             download_id,
             status='downloading',
             progress='100%',
+            downloaded_bytes=(
+                finished_total
+                if finished_total is not None
+                else max(0, int(d.get('downloaded_bytes') or 0))
+            ),
+            total_bytes=finished_total,
             filename=filename,
             resolution=resolution,
             filesize=int(filesize) if filesize else None,

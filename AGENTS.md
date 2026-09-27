@@ -94,7 +94,7 @@ HOST=0.0.0.0 FLASK_DEBUG=0 python vdl.py
 # Override DB / download dir (e.g. in a container)
 DOWNLOADS_DB=/data/downloads.db DOWNLOADS_DIR=/downloads python vdl.py
 
-# Container deployment (loopback-only port, persistent named volumes)
+# Container deployment (all interfaces, persistent named volumes)
 docker compose up --build -d
 
 # Optional PO-token provider profile

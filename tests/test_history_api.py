@@ -6,6 +6,19 @@ from tests.support.app_case import AppCase
 
 
 class HistoryApiTest(AppCase):
+    def test_history_exposes_persisted_progress_bytes(self):
+        download_id = self.insert("bytes001")
+        vdl.db_update_download(
+            download_id,
+            status="downloading",
+            downloaded_bytes=125,
+            total_bytes=1000,
+        )
+
+        row = self.client.get("/api/history").get_json()[0]
+        self.assertEqual(row["downloaded_bytes"], 125)
+        self.assertEqual(row["total_bytes"], 1000)
+
     def test_clear_preview_and_clear_target_finished_and_error_rows(self):
         paths = []
         for index, status in enumerate(("finished", "error")):
