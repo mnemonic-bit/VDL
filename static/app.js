@@ -169,19 +169,70 @@ function updateApiVersion(version, unavailable) {
         : `UI and API version ${uiVersion} match.`;
 }
 
+let uptimeBaseline = null;
+
+function formatUptime(seconds) {
+    const totalSeconds = Math.max(0, Math.floor(Number(seconds)));
+    const units = [
+        { seconds: 365 * 24 * 60 * 60, label: 'Year' },
+        { seconds: 30 * 24 * 60 * 60, label: 'Month' },
+        { seconds: 24 * 60 * 60, label: 'Day' },
+        { seconds: 60 * 60, label: 'Hour' },
+        { seconds: 60, label: 'Minute' },
+        { seconds: 1, label: 'Second' },
+    ];
+    const unit = units.find(candidate => totalSeconds >= candidate.seconds)
+        || units[units.length - 1];
+    const value = Math.floor(totalSeconds / unit.seconds);
+    return `${value} ${unit.label}${value === 1 ? '' : 's'}`;
+}
+
+function renderUptime() {
+    if (!uptimeBaseline) return;
+    const elapsedSeconds = Math.max(0, (Date.now() - uptimeBaseline.receivedAt) / 1000);
+    document.getElementById('uptime').textContent =
+        `Uptime ${formatUptime(uptimeBaseline.seconds + elapsedSeconds)}`;
+}
+
+function updateUptime(seconds, unavailable) {
+    const uptime = document.getElementById('uptime');
+    if (unavailable) {
+        uptimeBaseline = null;
+        uptime.textContent = 'Uptime unavailable';
+        return;
+    }
+
+    const usableSeconds = Number(seconds);
+    if (typeof seconds !== 'number' || !Number.isFinite(usableSeconds) || usableSeconds < 0) {
+        uptimeBaseline = null;
+        uptime.textContent = 'Uptime unknown';
+        return;
+    }
+
+    uptimeBaseline = { seconds: usableSeconds, receivedAt: Date.now() };
+    renderUptime();
+}
+
 function checkHealth() {
     return apiFetch('/api/health')
         .then(res => {
             if (!res.ok) throw new Error(`Health check failed with status ${res.status}`);
             return res.json();
         })
-        .then(data => updateApiVersion(data && data.version, false))
-        .catch(() => updateApiVersion(null, true));
+        .then(data => {
+            updateApiVersion(data && data.version, false);
+            updateUptime(data && data.uptime_seconds, false);
+        })
+        .catch(() => {
+            updateApiVersion(null, true);
+            updateUptime(null, true);
+        });
 }
 
 setInterval(() => {
     checkHealth();
 }, 30000);
+setInterval(renderUptime, 1000);
 
 checkHealth();
 

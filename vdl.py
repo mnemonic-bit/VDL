@@ -50,6 +50,14 @@ def _load_app_version(version_path=None):
 # Loading once keeps health checks cheap and makes a missing or malformed
 # release declaration a startup failure instead of an ambiguous runtime state.
 APP_VERSION = _load_app_version()
+# A monotonic clock measures process lifetime without wall-clock corrections
+# making the displayed uptime jump backwards or forwards.
+APP_STARTED_AT = time.monotonic()
+
+
+def _get_uptime_seconds():
+    """Return the number of complete seconds this application has been running."""
+    return max(0, int(time.monotonic() - APP_STARTED_AT))
 
 
 def _validated_pot_provider_url(value):
@@ -1449,7 +1457,11 @@ def index():
 
 @app.route('/api/health', methods=['GET'])
 def health():
-    response = jsonify({"ok": True, "version": APP_VERSION})
+    response = jsonify({
+        "ok": True,
+        "uptime_seconds": _get_uptime_seconds(),
+        "version": APP_VERSION,
+    })
     response.headers['Cache-Control'] = 'no-store'
     return response
 

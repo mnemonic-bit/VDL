@@ -56,13 +56,21 @@ class VersionEndpointTest(unittest.TestCase):
     def setUp(self):
         self.client = vdl.app.test_client()
 
+    def test_uptime_is_elapsed_time_since_application_start(self):
+        with mock.patch.object(vdl.time, 'monotonic', return_value=vdl.APP_STARTED_AT + 13.9):
+            self.assertEqual(vdl._get_uptime_seconds(), 13)
+
     def test_health_exposes_cached_application_version(self):
-        with mock.patch.object(Path, 'read_text', side_effect=AssertionError('unexpected read')):
+        with (
+            mock.patch.object(Path, 'read_text', side_effect=AssertionError('unexpected read')),
+            mock.patch.object(vdl, '_get_uptime_seconds', return_value=13),
+        ):
             response = self.client.get('/api/health')
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json(), {
             'ok': True,
+            'uptime_seconds': 13,
             'version': vdl.APP_VERSION,
         })
         self.assertEqual(response.headers['Cache-Control'], 'no-store')
@@ -76,6 +84,7 @@ class VersionEndpointTest(unittest.TestCase):
         self.assertIn(f'data-ui-version="{vdl.APP_VERSION}"', page)
         self.assertIn(f'UI v{vdl.APP_VERSION}', page)
         self.assertIn('API checking…', page)
+        self.assertIn('Uptime checking…', page)
         self.assertIn(f'/static/styles.css?v={vdl.APP_VERSION}', page)
         self.assertIn(f'/static/app.js?v={vdl.APP_VERSION}', page)
 
