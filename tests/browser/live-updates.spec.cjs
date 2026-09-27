@@ -6,15 +6,33 @@ test.beforeEach(async ({ page }) => reset(page));
 test('SSE reconciliation renders Current metadata and moves finished rows to History', async ({ page }) => {
     await seed(page, {
         id: 'live0001', status: 'downloading', progress: '25.0%',
-        filesize: 2048, resolution: '720p', eta: 12, title: 'Live fixture',
+        filesize: 2048, downloaded_bytes: 512, total_bytes: 2048,
+        resolution: '720p', eta: 12, title: 'Live fixture',
     });
     const current = page.locator('#activeList [data-row-id="live0001"]');
     await expect(current).toBeVisible();
-    await expect(current.locator('.status-row')).toContainText('downloading (25.0%)');
-    await expect(current.locator('.eta-right')).toContainText('12s');
+    await expect(current.locator('.status-row')).toHaveCount(0);
+    await expect(current).not.toContainText('Status:');
+    await expect(current).not.toContainText('URL:');
+    await expect(current).not.toContainText('https://fixture.invalid/video');
+    await current.locator('.kebab-btn').click();
+    await expect(current.getByRole('button', { name: 'Open URL', exact: true })).toBeVisible();
+    await current.locator('.kebab-btn').click();
     await expect(current).toContainText('Total size:');
     await expect(current).toContainText('Quality: 720p');
-    expect(await current.locator('.progress-bar-bottom').evaluate(el => el === el.parentElement.lastElementChild)).toBeTruthy();
+    const summaryRow = current.locator('.download-summary-row');
+    await expect(summaryRow).toContainText('Total size: 2.0 KB');
+    await expect(summaryRow).toContainText('Quality: 720p');
+    await expect(summaryRow).toContainText('Downloaded: 25%');
+    await expect(summaryRow.locator('.eta-right')).toContainText('12s');
+    await expect(current.locator(':scope > :last-child')).toHaveClass(/download-summary-row/);
+    const etaRightDelta = await summaryRow.evaluate(element => {
+        const eta = element.querySelector('.eta-right');
+        return Math.abs(element.getBoundingClientRect().right - eta.getBoundingClientRect().right);
+    });
+    expect(etaRightDelta).toBeLessThanOrEqual(1);
+    await expect(current.locator('.progress-bar-bg')).toHaveCount(0);
+    await expect(current.locator('.action-progress-track')).toBeVisible();
 
     await seed(page, { id: 'live0001', status: 'finished', progress: '100%', file: true, resolution: '720p' });
     await page.locator('[data-tab=history]').click();
@@ -22,19 +40,122 @@ test('SSE reconciliation renders Current metadata and moves finished rows to His
     await expect(page.locator('#activeList [data-row-id="live0001"]')).toHaveCount(0);
 });
 
-test('unknown-size downloads render an indeterminate Current progress state', async ({ page }) => {
+test('active download shows progress around the Stop action', async ({ page }) => {
+    await seed(page, {
+        id: 'itemring1', status: 'downloading', progress: '25%',
+        downloaded_bytes: 25, total_bytes: 100,
+    });
+    await refresh(page);
+
+    const row = page.locator('[data-row-id="itemring1"]');
+    const stop = row.getByRole('button', { name: 'Stop', exact: true });
+    const icon = stop.locator('.action-progress-icon');
+    const ring = stop.locator('.action-progress-ring');
+    await expect(row.locator('.progress-bar-bg')).toHaveCount(0);
+    await expect(stop).toHaveAttribute('aria-label', 'Stop');
+    await expect(stop).toHaveAttribute('title', 'Stop');
+    expect(await stop.evaluate(element => element.textContent.trim())).toBe('');
+    await expect(stop.locator('use')).toHaveAttribute('href', '#i-pause');
+    await expect(icon).toHaveAttribute('aria-hidden', 'true');
+    await expect(icon).toHaveAttribute('data-progress', '25');
+    await expect(row.locator('.action-progress-track')).toBeVisible();
+    await expect(ring).toBeVisible();
+    await expect(ring).toHaveAttribute('pathLength', '100');
+    await expect(ring).toHaveAttribute('transform', 'rotate(-90 8 8)');
+    await expect(ring).toHaveCSS('stroke-dashoffset', '75px');
+    await expect(stop).toHaveCSS('height', '32px');
+    await expect(stop).toHaveCSS('width', '32px');
+    const appearance = await icon.evaluate(element => {
+        const ringElement = element.querySelector('.action-progress-ring');
+        const useBox = element.querySelector('use').getBBox();
+        const viewBox = element.viewBox.baseVal;
+        const strokeRadius = parseFloat(getComputedStyle(ringElement).strokeWidth) / 2;
+        const outerRadius = ringElement.r.baseVal.value + strokeRadius;
+        return {
+            color: getComputedStyle(element).color,
+            ringStroke: getComputedStyle(ringElement).stroke,
+            renderedWidth: element.getBoundingClientRect().width,
+            iconCenterDeltaX: Math.abs(
+                useBox.x + useBox.width / 2 - ringElement.cx.baseVal.value),
+            iconCenterDeltaY: Math.abs(
+                useBox.y + useBox.height / 2 - ringElement.cy.baseVal.value),
+            fits: ringElement.cx.baseVal.value - outerRadius >= viewBox.x
+                && ringElement.cy.baseVal.value - outerRadius >= viewBox.y
+                && ringElement.cx.baseVal.value + outerRadius <= viewBox.x + viewBox.width
+                && ringElement.cy.baseVal.value + outerRadius <= viewBox.y + viewBox.height,
+        };
+    });
+    expect(appearance.ringStroke).toBe(appearance.color);
+    expect(appearance.iconCenterDeltaX).toBeLessThanOrEqual(0.01);
+    expect(appearance.iconCenterDeltaY).toBeLessThanOrEqual(0.01);
+    expect(appearance.renderedWidth).toBe(22);
+    expect(appearance.fits).toBeTruthy();
+
+    await seed(page, {
+        id: 'itemring1', status: 'downloading', progress: '150%',
+        downloaded_bytes: 150, total_bytes: 100,
+    });
+    await refresh(page);
+    await expect(row.locator('.action-progress-icon')).toHaveAttribute('data-progress', '100');
+    await expect(row.locator('.action-progress-ring')).toHaveCSS('stroke-dashoffset', '0px');
+});
+
+test('paused download keeps progress around the Resume action', async ({ page }) => {
+    await seed(page, {
+        id: 'itemring2', status: 'downloading', progress: '40%',
+        filesize: 100, downloaded_bytes: 40, total_bytes: 100,
+        resolution: '720p',
+    });
+    await refresh(page);
+    await seed(page, { id: 'itemring2', status: 'paused' });
+    await refresh(page);
+
+    let row = page.locator('[data-row-id="itemring2"]');
+    const resume = row.getByRole('button', { name: 'Resume', exact: true });
+    await expect(row.locator('.progress-bar-bg')).toHaveCount(0);
+    await expect(resume.locator('use')).toHaveAttribute('href', '#i-play');
+    await expect(resume.locator('.action-progress-icon')).toHaveAttribute('data-progress', '40');
+    await expect(resume.locator('.action-progress-ring')).toHaveCSS('stroke-dashoffset', '60px');
+    const summaryRow = row.locator('.download-summary-row');
+    await expect(summaryRow).toContainText('Total size: 100 B');
+    await expect(summaryRow).toContainText('Quality: 720p');
+    await expect(summaryRow).toContainText('Downloaded: 40%');
+    await expect(summaryRow.locator('.warn-icon')).toHaveCount(0);
+    await expect(row).not.toContainText('Status:');
+
+    await row.locator('.kebab-btn').click();
+    await expect(row.getByRole('button', { name: 'Stop', exact: true }).locator('.action-progress-ring')).toHaveCount(0);
+    await row.locator('.kebab-btn').click();
+
+    await seed(page, { id: 'itemring2', status: 'downloading' });
+    await refresh(page);
+    row = page.locator('[data-row-id="itemring2"]');
+    const stop = row.getByRole('button', { name: 'Stop', exact: true });
+    await expect(stop.locator('use')).toHaveAttribute('href', '#i-pause');
+    await expect(stop.locator('.action-progress-ring')).toHaveCSS('stroke-dashoffset', '60px');
+});
+
+test('unknown-size download shows only the action progress track', async ({ page }) => {
     await seed(page, {
         id: 'unknown1', status: 'downloading', progress: 'Downloading',
         speed: 1024, resolution: '720p', title: 'Unknown length fixture',
     });
     await refresh(page);
     const row = page.locator('[data-row-id="unknown1"]');
-    await expect(row.locator('.status-row')).toContainText('downloading');
+    await expect(row.locator('.status-row')).toHaveCount(0);
+    await expect(row).not.toContainText('Status:');
+    await expect(row.locator('.download-summary-row')).toContainText('Quality: 720p · Downloaded: —');
     await expect(row).toContainText('Unknown length fixture');
-    const animationName = await row.locator('.progress-bar-fill').evaluate(
+    const icon = row.locator('.action-progress-icon');
+    const ring = row.locator('.action-progress-ring');
+    await expect(row.locator('.progress-bar-bg')).toHaveCount(0);
+    await expect(icon).not.toHaveAttribute('data-progress');
+    await expect(row.locator('.action-progress-track')).toBeVisible();
+    await expect(ring).toBeHidden();
+    const animationName = await ring.evaluate(
         element => getComputedStyle(element).animationName,
     );
-    expect(animationName).not.toBe('none');
+    expect(animationName).toBe('none');
 });
 
 test('favicon shows aggregate progress across active downloads', async ({ page }) => {
@@ -196,7 +317,10 @@ test('header ring shows byte-weighted progress clockwise from twelve o’clock',
 });
 
 test('pause, unpause, stop, and continue buttons call their dedicated endpoints', async ({ page }) => {
-    await seed(page, { id: 'actions1', status: 'downloading', progress: '10%' });
+    await seed(page, {
+        id: 'actions1', status: 'downloading', progress: '10%',
+        downloaded_bytes: 10, total_bytes: 100,
+    });
     await refresh(page);
     const calls = [];
     for (const action of ['pause', 'unpause', 'stop', 'resume']) {
@@ -216,7 +340,21 @@ test('pause, unpause, stop, and continue buttons call their dedicated endpoints'
     await row.getByRole('button', { name: 'Stop', exact: true }).click();
     await seed(page, { id: 'actions1', status: 'cancelled' });
     await refresh(page);
-    await page.locator('[data-row-id="actions1"]').getByRole('button', { name: 'Continue', exact: true }).click();
+    row = page.locator('[data-row-id="actions1"]');
+    const continueButton = row.getByRole('button', { name: 'Continue', exact: true });
+    await expect(continueButton).toHaveAttribute('aria-label', 'Continue');
+    await expect(continueButton).toHaveAttribute('title', 'Continue');
+    expect(await continueButton.evaluate(element => element.textContent.trim())).toBe('');
+    await expect(continueButton).toHaveCSS('width', '32px');
+    await expect(continueButton.locator('use')).toHaveAttribute('href', '#i-play');
+    await expect(continueButton.locator('.action-progress-icon')).toHaveAttribute('data-progress', '10');
+    await expect(continueButton.locator('.action-progress-ring')).toHaveCSS('stroke-dashoffset', '90px');
+    await expect(row.locator('.progress-bar-bg')).toHaveCount(0);
+    await expect(row.locator('.download-summary-row')).toContainText('Downloaded: 10%');
+    await expect(row.locator('.download-summary-row .warn-icon')).toHaveCount(0);
+    await expect(row).not.toContainText('URL:');
+    await expect(row).not.toContainText('Status:');
+    await continueButton.click();
     expect(calls).toEqual(['pause', 'unpause', 'stop', 'resume']);
 });
 

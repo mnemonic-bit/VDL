@@ -15,6 +15,17 @@ const idleFaviconHref = favicon ? favicon.getAttribute('href') : '';
 const appTitleIcon = document.getElementById('appTitleIcon');
 const appTitleProgressRing = document.getElementById('appTitleProgressRing');
 
+function progressBytes(info) {
+    const total = Number(info.total_bytes);
+    if (!Number.isFinite(total) || total <= 0) return null;
+
+    const reportedDownloaded = Number(info.downloaded_bytes);
+    const downloaded = Number.isFinite(reportedDownloaded)
+        ? Math.min(total, Math.max(0, reportedDownloaded))
+        : 0;
+    return { downloaded, total };
+}
+
 function aggregateActiveProgress(downloads) {
     const active = downloads.filter(info => ACTIVE_PROGRESS_STATUSES.has(info.status));
     if (!active.length) return null;
@@ -22,22 +33,35 @@ function aggregateActiveProgress(downloads) {
     let downloadedBytes = 0;
     let totalBytes = 0;
     for (const info of active) {
-        const total = Number(info.total_bytes);
-        if (!Number.isFinite(total) || total <= 0) {
-            return { count: active.length, percent: null };
-        }
-        const reportedDownloaded = Number(info.downloaded_bytes);
-        const downloaded = Number.isFinite(reportedDownloaded)
-            ? Math.min(total, Math.max(0, reportedDownloaded))
-            : 0;
-        downloadedBytes += downloaded;
-        totalBytes += total;
+        const progress = progressBytes(info);
+        if (!progress) return { count: active.length, percent: null };
+        downloadedBytes += progress.downloaded;
+        totalBytes += progress.total;
     }
 
     return {
         count: active.length,
         percent: (downloadedBytes / totalBytes) * 100,
     };
+}
+
+function itemProgressPercent(info) {
+    const progress = progressBytes(info);
+    if (!progress) return null;
+    return Math.round((progress.downloaded / progress.total) * 1000) / 10;
+}
+
+function renderActionProgressIcon(symbolId, info) {
+    const percent = itemProgressPercent(info);
+    const progressAttr = percent === null ? '' : ` data-progress="${percent}"`;
+    const ringAttr = percent === null || percent <= 0
+        ? ' hidden'
+        : ` style="stroke-dashoffset: ${100 - percent};"`;
+    return `<svg class="icon action-progress-icon" viewBox="-2 -2 20 20" aria-hidden="true"${progressAttr}>
+                    <use href="#${symbolId}" x="0" y="0" width="16" height="16"/>
+                    <circle class="action-progress-track" cx="8" cy="8" r="8.1"/>
+                    <circle class="action-progress-ring" cx="8" cy="8" r="8.1" pathLength="100" transform="rotate(-90 8 8)"${ringAttr}/>
+                </svg>`;
 }
 
 function updateHeaderProgress(aggregate) {
@@ -1041,13 +1065,73 @@ window.addEventListener('blur', () => {
     resumeDeferredHistoryFetch();
 });
 
-function renderFormatsTable(info) {
+function parseFormats(info) {
     let formats = info.formats;
-    if (!formats) return '';
+    if (!formats) return [];
     if (typeof formats === 'string') {
-        try { formats = JSON.parse(formats); } catch (e) { return ''; }
+        try { formats = JSON.parse(formats); } catch (e) { return []; }
     }
-    if (!Array.isArray(formats) || formats.length === 0) return '';
+    return Array.isArray(formats) ? formats : [];
+}
+
+function describeFormat(format) {
+    const parts = [];
+    const height = Number(format.height);
+    const resolution = Number.isFinite(height) && height > 0
+        ? `${height}p`
+        : String(format.resolution || '').toLowerCase() === 'audio only'
+            ? ''
+            : format.resolution;
+    if (resolution) parts.push(String(resolution));
+
+    const fps = Number(format.fps);
+    if (Number.isFinite(fps) && fps > 0) parts.push(`${fps}fps`);
+    if (format.ext) parts.push(String(format.ext).toUpperCase());
+
+    const hasVideo = Boolean(format.vcodec && format.vcodec !== 'none');
+    const hasAudio = Boolean(format.acodec && format.acodec !== 'none');
+    if (hasVideo && hasAudio) parts.push('video + audio');
+    else if (hasVideo) parts.push('video');
+    else if (hasAudio) parts.push('audio');
+
+    if (parts.length) return parts.join(' ');
+    if (!format.format) return null;
+    const raw = String(format.format);
+    const prefix = format.format_id ? `${format.format_id} - ` : '';
+    return prefix && raw.startsWith(prefix) ? raw.slice(prefix.length) : raw;
+}
+
+function formatRequestedFormat(info) {
+    if (!info.requested_format) return null;
+    const requested = String(info.requested_format).trim();
+    if (!requested) return null;
+
+    const friendlySelectors = {
+        best: 'Best available',
+        'bestaudio/best': 'Best available audio',
+        'bestvideo+bestaudio/best': 'Best available video + audio',
+    };
+    if (friendlySelectors[requested]) return friendlySelectors[requested];
+
+    const heightSelector = requested.match(/^bestvideo\[height<=(\d+)\]\+bestaudio\/best$/);
+    if (heightSelector) return `Up to ${heightSelector[1]}p video + audio`;
+
+    const formats = parseFormats(info);
+    const requestedIds = requested.split('+');
+    const matches = requestedIds.map(formatId =>
+        formats.find(format => format && String(format.format_id) === formatId)
+    );
+    if (matches.length && matches.every(Boolean)) {
+        const descriptions = matches.map(describeFormat);
+        if (descriptions.every(Boolean)) return descriptions.join(' + ');
+    }
+
+    return /^\d+$/.test(requested) ? `Format ${requested}` : requested;
+}
+
+function renderFormatsTable(info) {
+    const formats = parseFormats(info);
+    if (formats.length === 0) return '';
 
     const fmtSize = (n) => {
         if (!n || isNaN(n)) return '';
@@ -1156,6 +1240,29 @@ function formatDateTime(epochSeconds) {
     });
 }
 
+function formatDuration(startEpochSeconds, endEpochSeconds) {
+    const start = Number(startEpochSeconds);
+    const end = Number(endEpochSeconds);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return null;
+
+    let remaining = Math.round(end - start);
+    const units = [
+        ['Day', 86400],
+        ['Hour', 3600],
+        ['Minute', 60],
+        ['Second', 1],
+    ];
+    const parts = [];
+    for (const [label, seconds] of units) {
+        const value = Math.floor(remaining / seconds);
+        if (value <= 0) continue;
+        parts.push(`${value} ${label}${value === 1 ? '' : 's'}`);
+        remaining %= seconds;
+        if (parts.length === 2) break;
+    }
+    return parts.length ? parts.join(' and ') : '0 Seconds';
+}
+
 function formatBytes(n) {
     if (n == null || isNaN(n)) return null;
     const units = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -1245,14 +1352,6 @@ function renderItem(info, inHistoryView = false) {
     const isFinished = info.status === 'finished';
     const isCurrentTabStopped = !inHistoryView && (isCancelled || info.status === 'interrupted');
 
-    let statusLabel;
-    if (isFinished) statusLabel = 'Complete';
-    else if (info.status === 'error') statusLabel = 'Error';
-    else if (info.status === 'cancelled') statusLabel = 'Cancelled';
-    else if (info.status === 'interrupted') statusLabel = 'Interrupted';
-    else if (isPaused) statusLabel = 'Paused';
-    else statusLabel = info.progress;
-
     // URLs stay in data attributes and are read through dataset by the
     // delegated click handler. Putting them inside inline JavaScript would
     // let HTML entity decoding turn an apostrophe back into executable code.
@@ -1263,11 +1362,11 @@ function renderItem(info, inHistoryView = false) {
     const menuItems = [];
 
     if (isRunning) {
-        primary = `<button class="stop-btn" onclick="stopDownload('${id}')"><svg class="icon"><use href="#i-stop"/></svg>Stop</button>`;
+        primary = `<button class="stop-btn icon-only" onclick="stopDownload('${id}')" aria-label="Stop" title="Stop">${renderActionProgressIcon('i-pause', info)}</button>`;
     } else if (isPaused) {
-        primary = `<button class="continue-btn" onclick="unpauseDownload('${id}')"><svg class="icon"><use href="#i-play"/></svg>Resume</button>`;
+        primary = `<button class="continue-btn" onclick="unpauseDownload('${id}')">${renderActionProgressIcon('i-play', info)}Resume</button>`;
     } else if (isCancelled || info.status === 'interrupted') {
-        primary = `<button class="continue-btn" data-url-action="continue" data-download-id="${id}" ${urlData}><svg class="icon"><use href="#i-play"/></svg>Continue</button>`;
+        primary = `<button class="continue-btn icon-only" data-url-action="continue" data-download-id="${id}" ${urlData} aria-label="Continue" title="Continue">${renderActionProgressIcon('i-play', info)}</button>`;
     }
 
     menuItems.push(`<button data-url-action="open" ${urlData}><svg class="menu-icon"><use href="#i-external"/></svg>Open URL</button>`);
@@ -1311,39 +1410,24 @@ function renderItem(info, inHistoryView = false) {
         ? `<div class="action-group">${leading}${kebabInner}</div>`
         : '';
 
-    let bottom = '';
-    if (isRunning || isCurrentTabStopped) {
-        const progressText = String(info.progress);
-        const parsedProgress = Number.parseFloat(progressText);
-        const isIndeterminate = isRunning
-            && (!progressText.trim().endsWith('%') || !Number.isFinite(parsedProgress));
-        const width = Number.isFinite(parsedProgress) ? parsedProgress : 0;
-        const etaStr = isRunning ? formatEta(info.eta) : '';
-        const sizeStr = formatBytes(info.filesize);
-        const resStr = info.resolution;
-        const statusRow = `<div class="status-row">
-                        <span><strong>Status:</strong> ${info.status} (${statusLabel})</span>
+    const isCurrentRow = !inHistoryView && CURRENT_TAB_STATUSES.has(info.status);
+    const etaStr = isRunning ? formatEta(info.eta) : '';
+    const downloadedPercent = itemProgressPercent(info);
+    const downloadSummaryParts = [];
+    const summarySize = formatBytes(info.filesize);
+    if (summarySize) downloadSummaryParts.push(`<strong>Total size:</strong> ${summarySize}`);
+    if (info.resolution) downloadSummaryParts.push(`<strong>Quality:</strong> ${info.resolution}`);
+    downloadSummaryParts.push(`<strong>Downloaded:</strong> ${downloadedPercent === null ? '&mdash;' : `${downloadedPercent}%`}`);
+    const downloadSummaryRow = isCurrentRow
+        ? `<div class="meta download-summary-row">
+                        <span>${downloadSummaryParts.join(' &middot; ')}</span>
                         ${etaStr ? `<span class="eta-right">${etaStr}</span>` : ''}
-                    </div>`;
-        const sizeQualityParts = [];
-        if (sizeStr) sizeQualityParts.push(`<strong>Total size:</strong> ${sizeStr}`);
-        if (resStr)  sizeQualityParts.push(`<strong>Quality:</strong> ${resStr}`);
-        const sizeQualityRow = sizeQualityParts.length
-            ? `<div class="meta">${sizeQualityParts.join(' &middot; ')}</div>`
-            : '';
-        let barClass = 'progress-bar-fill';
-        if (isIndeterminate) barClass += ' indeterminate';
-        else if (isCancelled) barClass += ' cancelled';
-        else if (info.status === 'interrupted') barClass += ' interrupted';
-        const widthStyle = isIndeterminate ? '' : ` style="width: ${width}%;"`;
-        bottom = `
-                    ${statusRow}
-                    ${sizeQualityRow}
-                    <div class="progress-bar-bg progress-bar-bottom">
-                        <div class="${barClass}"${widthStyle}></div>
-                    </div>`;
-    } else {
-        if (!isFinished && info.status !== 'error') {
+                    </div>`
+        : '';
+
+    let bottom = '';
+    if (!isRunning && !isCurrentTabStopped) {
+        if (!isFinished && info.status !== 'error' && !isPaused) {
             let barClass = 'progress-bar-fill';
             if (info.status === 'cancelled') barClass += ' cancelled';
             else if (info.status === 'interrupted') barClass += ' interrupted';
@@ -1363,26 +1447,33 @@ function renderItem(info, inHistoryView = false) {
                 meta.push(`<div><strong>File:</strong> <span class="filename">${escapeHtml(base)}</span></div>`);
             }
         }
-        if (info.resolution) meta.push(`<div><strong>Quality:</strong> ${info.resolution}</div>`);
         const sizeStr = formatBytes(info.filesize);
-        if (sizeStr) meta.push(`<div><strong>Size:</strong> ${sizeStr}</div>`);
         const startedStr = formatDateTime(info.created_at);
-        if (startedStr) meta.push(`<div><strong>Started:</strong> ${startedStr}</div>`);
-        const finishedStr = formatDateTime(info.finished_at);
-        if (finishedStr) {
-            const finLabel = info.status === 'finished' ? 'Finished'
-                           : info.status === 'error' ? 'Failed'
-                           : info.status === 'cancelled' ? 'Cancelled'
-                           : 'Ended';
-            meta.push(`<div><strong>${finLabel}:</strong> ${finishedStr}</div>`);
+        const requestedFormat = formatRequestedFormat(info);
+        if (inHistoryView) {
+            const mediaParts = [];
+            if (info.resolution) mediaParts.push(`<strong>Quality:</strong> ${info.resolution}`);
+            if (sizeStr) mediaParts.push(`<strong>Size:</strong> ${sizeStr}`);
+            if (requestedFormat) mediaParts.push(`<strong>Requested format:</strong> ${escapeHtml(requestedFormat)}`);
+            if (mediaParts.length) {
+                meta.push(`<div class="history-media-row">${mediaParts.join(' &middot; ')}</div>`);
+            }
+
+            const timingParts = [];
+            if (startedStr) timingParts.push(`<strong>Started:</strong> ${startedStr}`);
+            const durationStr = formatDuration(info.created_at, info.finished_at);
+            if (durationStr) timingParts.push(`<strong>Duration:</strong> ${durationStr}`);
+            if (timingParts.length) {
+                meta.push(`<div class="history-timing-row">${timingParts.join(' &middot; ')}</div>`);
+            }
+        } else if (startedStr) {
+            meta.push(`<div><strong>Started:</strong> ${startedStr}</div>`);
         }
-        if (info.requested_format) {
-            meta.push(`<div><strong>Requested format:</strong> <code class="fmt-code">${escapeHtml(info.requested_format)}</code></div>`);
+        if (!inHistoryView && requestedFormat) {
+            meta.push(`<div><strong>Requested format:</strong> ${escapeHtml(requestedFormat)}</div>`);
         }
         if (meta.length) bottom += `<div class="meta">${meta.join('')}</div>`;
     }
-
-    const warn = (isCancelled || info.status === 'interrupted') ? '<span class="warn-icon" title="Action required"></span>' : '';
 
     let errorBlock = '';
     if (info.status === 'error' && info.progress) {
@@ -1407,23 +1498,13 @@ function renderItem(info, inHistoryView = false) {
         : '';
     const tagRow = renderTagControl(info);
 
-    const urlLine = inHistoryView
-        ? (warn ? `<div>${warn}<strong>Status:</strong> ${info.status} (${statusLabel})</div>` : '')
-        : (isRunning || isCurrentTabStopped)
-            ? `<div>${warn}<strong>URL:</strong> ${escapeHtml(info.url)}</div>`
-            : `<div>${warn}<strong>URL:</strong> ${escapeHtml(info.url)}</div>
-                   <div><strong>Status:</strong> ${info.status} (${statusLabel})</div>`;
-    const headMeta = inHistoryView
-        ? (warn ? `<div class="meta">${urlLine}</div>` : '')
-        : `<div class="meta">${urlLine}</div>`;
-
     return `
                 <div class="history-item" data-row-id="${id}">
                     <div class="row-actions">${actions}</div>
                     ${titleRow}
                     ${tagRow}
-                    ${headMeta}
                     ${bottom}
+                    ${downloadSummaryRow}
                     ${errorBlock}
                 </div>
             `;

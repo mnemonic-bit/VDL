@@ -3,6 +3,72 @@ const { reset, seed, refresh } = require('./support.cjs');
 
 test.beforeEach(async ({ page }) => reset(page));
 
+test('History groups media details and shows a human-readable duration', async ({ page }) => {
+    const fixtures = [
+        ['history-day', 86400 + 5 * 3600 + 17 * 60, '1 Day and 5 Hours'],
+        ['history-hours', 11 * 3600 + 35 * 60, '11 Hours and 35 Minutes'],
+        ['history-minutes', 3 * 60 + 45, '3 Minutes and 45 Seconds'],
+        ['history-singular', 60 + 1, '1 Minute and 1 Second'],
+    ];
+
+    for (const [id, durationSeconds] of fixtures) {
+        const row = await seed(page, {
+            id, status: 'finished', resolution: '720p', filesize: 2048,
+        });
+        await seed(page, {
+            id, status: 'finished', finished_at: row.created_at + durationSeconds,
+        });
+    }
+
+    await page.locator('[data-tab=history]').click();
+    await refresh(page);
+
+    for (const [id, , durationLabel] of fixtures) {
+        const row = page.locator(`[data-row-id="${id}"]`);
+        await expect(row.locator('.history-media-row')).toHaveText('Quality: 720p · Size: 2.0 KB');
+        await expect(row.locator('.history-timing-row')).toContainText('Started:');
+        await expect(row.locator('.history-timing-row')).toContainText(`Duration: ${durationLabel}`);
+        await expect(row).not.toContainText('Finished:');
+    }
+});
+
+test('History places a readable requested format on the media line', async ({ page }) => {
+    await seed(page, {
+        id: 'history-format-id',
+        status: 'finished',
+        resolution: '2160p',
+        filesize: 2048,
+        requested_format: '625',
+        formats: JSON.stringify([{
+            format_id: '625',
+            ext: 'mp4',
+            height: 2160,
+            fps: 60,
+            vcodec: 'av01',
+            acodec: 'none',
+        }]),
+    });
+    await seed(page, {
+        id: 'history-format-selector',
+        status: 'finished',
+        requested_format: 'bestvideo[height<=720]+bestaudio/best',
+    });
+
+    await page.locator('[data-tab=history]').click();
+    await refresh(page);
+
+    const idRow = page.locator('[data-row-id="history-format-id"]');
+    await expect(idRow.locator('.history-media-row')).toHaveText(
+        'Quality: 2160p · Size: 2.0 KB · Requested format: 2160p 60fps MP4 video'
+    );
+    await expect(idRow.locator('.fmt-code')).toHaveCount(0);
+
+    const selectorRow = page.locator('[data-row-id="history-format-selector"]');
+    await expect(selectorRow.locator('.history-media-row')).toHaveText(
+        'Requested format: Up to 720p video + audio'
+    );
+});
+
 test('inline rename supports cancel, save, and extension preservation', async ({ page }) => {
     await seed(page, { id: 'rename01', status: 'finished', file: true, name: 'original.mp4' });
     await page.locator('[data-tab=history]').click();
