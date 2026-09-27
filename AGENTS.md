@@ -59,7 +59,7 @@ Flask + `yt-dlp` video-downloader UI. **Single-process, single-file backend** ([
 - **Indentation**: 4 spaces (Python and JS).
 - **Commit style**: `fix:`, `feature:`, `refactor:` prefixes; lowercase imperative.
 - **Podman port binding**: when starting containers with Podman, publish host ports on all interfaces (for example, `--publish 0.0.0.0:5000:5000`).
-- **Version bump is a completion criterion**: update root `VERSION` in the same change as shipped behavior. Features increment `MINOR` and reset `PATCH`; bug fixes increment `PATCH`; breaking or incompatible API changes increment `MAJOR` and reset `MINOR` and `PATCH` (including while major is zero). For mixed changes, apply only the highest-impact bump: `MAJOR` before `MINOR`, then `PATCH`. Documentation, tests, formatting, and behavior-neutral refactors do not independently require a bump.
+- **Every change requires its own version bump**: increment root `VERSION` before completing each distinct requested change, including documentation, tests, formatting, behavior-neutral refactors, and agent-instruction updates. An existing uncommitted version change belongs to earlier work and must not be reused; increment `VERSION` again for the new change. Features increment `MINOR` and reset `PATCH`; bug fixes and all changes without greater SemVer impact increment `PATCH`; breaking or incompatible API changes increment `MAJOR` and reset `MINOR` and `PATCH` (including while major is zero). For a mixed change, apply one bump at the highest impact: `MAJOR` before `MINOR`, then `PATCH`.
 
 ## ANTI-PATTERNS (THIS PROJECT)
 - **DO NOT** add a bundler / transpiler / framework to the frontend. It's intentionally vanilla.
