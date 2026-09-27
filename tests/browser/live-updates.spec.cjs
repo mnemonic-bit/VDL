@@ -87,16 +87,56 @@ test('progress indicators remain indeterminate when any active size is unknown',
     await expect(favicon).toHaveAttribute('data-running-count', '2');
     await expect(favicon).toHaveAttribute('href', idleHref);
     await expect(page.locator('#appTitleProgressRing')).toBeHidden();
+    await expect(page.locator('#appTitleProgressTrack')).toHaveCSS('stroke', 'rgb(57, 151, 72)');
     await expect(page.locator('#appTitleIcon')).not.toHaveAttribute('data-progress');
 });
 
 test('header ring shows byte-weighted progress clockwise from twelve o’clock', async ({ page }) => {
+    const title = page.locator('.app-title');
     const icon = page.locator('#appTitleIcon');
+    const track = page.locator('#appTitleProgressTrack');
     const ring = page.locator('#appTitleProgressRing');
+    const geometry = await icon.evaluate(element => {
+        const titleElement = element.closest('.app-title');
+        const titleStyle = getComputedStyle(titleElement);
+        const iconRect = element.getBoundingClientRect();
+        const titleRect = titleElement.getBoundingClientRect();
+        return {
+            widthEm: iconRect.width / parseFloat(titleStyle.fontSize),
+            heightEm: iconRect.height / parseFloat(titleStyle.fontSize),
+            centerDelta: Math.abs(
+                iconRect.top + iconRect.height / 2
+                - (titleRect.top + titleRect.height / 2),
+            ),
+        };
+    });
+    expect(geometry.widthEm).toBeCloseTo(1.3, 2);
+    expect(geometry.heightEm).toBeCloseTo(1.3, 2);
+    expect(geometry.centerDelta).toBeLessThanOrEqual(1);
+    await expect(title).toHaveCSS('align-items', 'center');
+    await expect(track).toBeVisible();
+    await expect(track).toHaveCSS('stroke', 'rgb(31, 138, 59)');
+    expect(await track.evaluate(element => element.nextElementSibling?.id))
+        .toBe('appTitleProgressRing');
+    await expect(ring).toHaveCSS('stroke-width', '2.2px');
     await expect(ring).toBeHidden();
     await expect(icon).toHaveAttribute('aria-hidden', 'true');
     await expect(ring).toHaveAttribute('transform', 'rotate(-90 8 8)');
     await expect(ring).toHaveAttribute('pathLength', '100');
+
+    const ringFitsViewport = await ring.evaluate(element => {
+        const svg = element.ownerSVGElement;
+        const viewBox = svg.viewBox.baseVal;
+        const strokeRadius = parseFloat(getComputedStyle(element).strokeWidth) / 2;
+        const outerRadius = element.r.baseVal.value + strokeRadius;
+        const cx = element.cx.baseVal.value;
+        const cy = element.cy.baseVal.value;
+        return cx - outerRadius >= viewBox.x
+            && cy - outerRadius >= viewBox.y
+            && cx + outerRadius <= viewBox.x + viewBox.width
+            && cy + outerRadius <= viewBox.y + viewBox.height;
+    });
+    expect(ringFitsViewport).toBeTruthy();
 
     await seed(page, {
         id: 'ring0001', status: 'downloading', progress: '0%',
@@ -104,6 +144,7 @@ test('header ring shows byte-weighted progress clockwise from twelve o’clock',
     });
     await refresh(page);
     await expect(ring).toBeHidden();
+    await expect(track).toHaveCSS('stroke', 'rgb(57, 151, 72)');
     await expect(icon).not.toHaveAttribute('data-progress');
     await expect(icon).toHaveAttribute('data-running-count', '1');
 
@@ -113,7 +154,9 @@ test('header ring shows byte-weighted progress clockwise from twelve o’clock',
     });
     await refresh(page);
     await expect(icon).toHaveAttribute('data-progress', '50');
+    await expect(track).toHaveCSS('stroke', 'rgb(57, 151, 72)');
     await expect(ring).toBeVisible();
+    await expect(ring).toHaveCSS('stroke', 'rgb(19, 77, 119)');
     await expect(ring).toHaveCSS('stroke-dashoffset', '50px');
 
     await seed(page, {
@@ -147,6 +190,7 @@ test('header ring shows byte-weighted progress clockwise from twelve o’clock',
     await seed(page, { id: 'ring0002', status: 'finished', progress: '100%' });
     await refresh(page);
     await expect(ring).toBeHidden();
+    await expect(track).toHaveCSS('stroke', 'rgb(31, 138, 59)');
     await expect(icon).not.toHaveAttribute('data-progress');
     await expect(icon).not.toHaveAttribute('data-running-count');
 });

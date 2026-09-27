@@ -36,6 +36,16 @@ cancelled fragmented download could finish its worker and become removable
 while an unreachable yt-dlp progress-hook cycle still retained the locked
 partial-file descriptor. Worker completion now forces cyclic finalization
 before removal is allowed.
+Issue 32 was reported, resolved, and visually refined on 2026-09-27. The
+download icon beside the page title was visually undersized, and its
+aggregate-progress ring was too thin. The icon is now larger while remaining
+vertically centered. A persistent green track becomes lighter during active
+downloads while blue determinate progress covers it, without clipping the
+broader stroke against the SVG viewport. A follow-up contrast refinement
+darkened both active colors while keeping the track lighter than the icon, and
+a second pass moved the progress stroke toward navy for stronger separation
+before a small lightening adjustment settled its final shade. The active green
+track was then slightly darkened while remaining lighter than the icon.
 
 ## Bug reports
 
@@ -70,6 +80,7 @@ before removal is allowed.
 - [Bug 0029 — Initial progress and ETA are implausible until Stop and Continue](bug-0029-initial-progress-and-eta-were-implausible-until-continue.md)
 - [Bug 0030 — Removing a stopped download retains an unlinked partial file](bug-0030-removing-stopped-download-retains-unlinked-partial.md)
 - [Bug 0031 — Cancelled fragment downloads retain their partial descriptor after worker completion](bug-0031-cancelled-fragment-download-retains-descriptor.md)
+- [Bug 0032 — Header download icon is undersized and its progress ring is too thin](bug-0032-header-download-icon-is-undersized.md)
 
 ## Accepted UI decisions
 
