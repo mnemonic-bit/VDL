@@ -28,7 +28,9 @@ original samples still need to be captured for a deterministic reproduction.
 Issue 30 was reproduced in the running Podman container on 2026-09-27. Removing
 a stopped download unlinked its partial and deleted its database row while the
 worker still held the file descriptor, retaining approximately 555 MiB until
-the worker exits or the container restarts.
+the worker exits or the container restarts. Worker lifetime is now tracked
+separately from terminal row status, and removal is rejected until the worker
+has released its resources.
 
 ## Bug reports
 

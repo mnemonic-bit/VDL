@@ -235,6 +235,10 @@ _NO_UPDATE = object()
 _worker_condition = threading.Condition()
 _worker_queue = []
 _active_worker_count = 0
+# Terminal status is visible before a worker has necessarily unwound its
+# yt-dlp stack. Keep that resource-ownership lifetime separate from the slot
+# counter so removal cannot unlink a file the worker still has open.
+_live_worker_ids = set()
 
 
 @contextmanager
@@ -575,13 +579,17 @@ def delete_download_artifacts(entry, fallback_dir=None):
 
 
 def db_remove_download_if_inactive(download_id, fallback_dir=None):
-    """Atomically remove a non-active row and return its prior contents."""
+    """Atomically remove a non-active, fully stopped download row."""
     with _db_lock, db() as conn:
         row = conn.execute(
             "SELECT * FROM downloads WHERE id = ?", (download_id,)
         ).fetchone()
         entry = dict(row) if row else None
-        if entry is None or entry['status'] in ('starting', 'downloading', 'paused'):
+        with _worker_condition:
+            worker_is_live = download_id in _live_worker_ids
+        if (entry is None
+                or entry['status'] in ('starting', 'downloading', 'paused')
+                or worker_is_live):
             return entry, False
         # Keep the row as a retry handle if filesystem cleanup fails. Holding
         # the state lock also prevents Resume from claiming the same partial
@@ -1170,6 +1178,19 @@ def _validated_custom_filename(value):
 
 
 def background_download(url, download_id):
+    with _worker_condition:
+        _live_worker_ids.add(download_id)
+    try:
+        return _background_download(url, download_id)
+    finally:
+        # The wrapped function's locals (including yt-dlp objects) have been
+        # released before ownership is handed back to Remove.
+        with _worker_condition:
+            _live_worker_ids.discard(download_id)
+            _worker_condition.notify_all()
+
+
+def _background_download(url, download_id):
     prefs = db_get_preferences()
     output_dir = prefs.get("download_dir", ".")
     try:
@@ -1665,7 +1686,9 @@ def remove_download(download_id):
     if entry is None:
         return jsonify({"error": "Unknown download id"}), 404
     if not removed:
-        return jsonify({"error": "Cannot remove an active download. Stop it first."}), 409
+        return jsonify({
+            "error": "Cannot remove a download until its worker has fully stopped."
+        }), 409
     return jsonify({"message": "Removed", "id": download_id})
 
 

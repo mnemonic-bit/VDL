@@ -1,9 +1,61 @@
 import os
+import threading
+import time
 import unittest
 from unittest import mock
 
 import vdl
 from tests.support.app_case import AppCase
+from tests.support.fake_ytdlp import FakeYoutubeDL
+
+
+class DescriptorHoldingYoutubeDL(FakeYoutubeDL):
+    """Keep the partial open until the worker function has fully returned."""
+
+    opened = threading.Event()
+    descriptor = None
+    path = None
+
+    @classmethod
+    def reset(cls):
+        super().reset()
+        cls.opened = threading.Event()
+        cls.descriptor = None
+        cls.path = None
+
+    def download(self, urls):
+        template = self.options["outtmpl"]
+        path = template.replace("%(title)s", "fixture").replace("%(ext)s", "mp4")
+        path += ".part"
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.output_file = open(path, "wb")
+        self.output_file.write(b"partial")
+        self.output_file.flush()
+        type(self).descriptor = self.output_file.fileno()
+        type(self).path = path
+        type(self).opened.set()
+
+        info = {"title": "fixture", "_filename": path, "filepath": path}
+        payload = {
+            "status": "downloading",
+            "downloaded_bytes": 7,
+            "total_bytes": 10,
+            "speed": 1,
+            "eta": 3,
+            "info_dict": info,
+        }
+        for hook in self.options.get("progress_hooks", []):
+            hook(payload)
+        while not vdl.is_cancel_requested(
+                os.path.basename(path).split("_")[-1].split(".")[0]):
+            time.sleep(0.01)
+        for hook in self.options.get("progress_hooks", []):
+            hook(payload)
+
+    def __del__(self):
+        output_file = getattr(self, "output_file", None)
+        if output_file is not None:
+            output_file.close()
 
 
 class CancelledDownloadCleanupTest(AppCase):
@@ -80,6 +132,51 @@ class CancelledDownloadCleanupTest(AppCase):
         self.assertEqual(response.status_code, 500)
         self.assertIsNotNone(vdl.db_get_download(download_id))
         self.assertTrue(os.path.exists(partial_path))
+
+    def test_remove_waits_for_cancelled_worker_to_release_open_partial(self):
+        download_id = "cancel05"
+        url = "https://fixture.invalid/video.mp4"
+        vdl.db_insert_download(download_id, url)
+        DescriptorHoldingYoutubeDL.reset()
+        release_entered = threading.Event()
+        finish_release = threading.Event()
+        original_release = vdl._release_worker_slot
+
+        def delayed_release():
+            release_entered.set()
+            finish_release.wait(2)
+            original_release()
+
+        with (
+            mock.patch.object(vdl.yt_dlp, "YoutubeDL", DescriptorHoldingYoutubeDL),
+            mock.patch.object(vdl, "_release_worker_slot", side_effect=delayed_release),
+        ):
+            worker = threading.Thread(
+                target=vdl.background_download,
+                args=(url, download_id),
+            )
+            worker.start()
+            self.assertTrue(DescriptorHoldingYoutubeDL.opened.wait(1))
+            self.assertEqual(self.client.post(f"/api/stop/{download_id}").status_code, 200)
+            self.assertTrue(release_entered.wait(1))
+            self.assertEqual(vdl.db_get_download(download_id)["status"], "cancelled")
+
+            try:
+                response = self.client.post(f"/api/remove/{download_id}")
+
+                self.assertEqual(response.status_code, 409)
+                self.assertTrue(os.path.exists(DescriptorHoldingYoutubeDL.path))
+                self.assertEqual(os.fstat(DescriptorHoldingYoutubeDL.descriptor).st_nlink, 1)
+            finally:
+                finish_release.set()
+                worker.join(1)
+
+        self.assertFalse(worker.is_alive())
+        with self.assertRaises(OSError):
+            os.fstat(DescriptorHoldingYoutubeDL.descriptor)
+        response = self.client.post(f"/api/remove/{download_id}")
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(os.path.exists(DescriptorHoldingYoutubeDL.path))
 
 
 if __name__ == "__main__":

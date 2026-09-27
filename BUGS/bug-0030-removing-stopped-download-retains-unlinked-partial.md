@@ -1,9 +1,8 @@
-## 30. [Open] Removing a stopped download retains an unlinked partial file
+## 30. [Resolved] Removing a stopped download retains an unlinked partial file
 
 **Severity:** Medium
 
-**Status:** Open; reproduced in the running Podman container on version
-`0.7.0` on 2026-09-27.
+**Status:** Resolved in version `0.7.0` on 2026-09-27.
 
 Removing a stopped download can report success and leave `/downloads` empty
 while the worker process still holds the deleted `.part` file open. The file
@@ -87,3 +86,16 @@ space should be released without restarting the app or container.
 - Add a regression test which keeps a partial descriptor open while the row
   becomes cancelled, attempts removal, and verifies both endpoint semantics
   and descriptor/block release after cleanup succeeds.
+
+### Resolution
+
+Worker resource ownership is now tracked independently from the persisted
+download status. Remove returns HTTP 409 while the worker is still unwinding,
+even when the row already says `cancelled`, so cleanup cannot unlink a partial
+which that worker may still hold open. Once the worker has returned and
+released its yt-dlp objects, a retry removes the partial and database row.
+
+A deterministic regression test holds a real descriptor open across the
+`cancelled` transition. It verifies that the first removal is rejected without
+changing the file's link count, that worker completion closes the descriptor,
+and that the following removal deletes the linked partial successfully.
