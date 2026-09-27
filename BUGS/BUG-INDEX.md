@@ -31,6 +31,11 @@ worker still held the file descriptor, retaining approximately 555 MiB until
 the worker exits or the container restarts. Worker lifetime is now tracked
 separately from terminal row status, and removal is rejected until the worker
 has released its resources.
+Issue 31 was reproduced after that worker-lifetime fix on 2026-09-27. A
+cancelled fragmented download could finish its worker and become removable
+while an unreachable yt-dlp progress-hook cycle still retained the locked
+partial-file descriptor. Worker completion now forces cyclic finalization
+before removal is allowed.
 
 ## Bug reports
 
@@ -64,6 +69,7 @@ has released its resources.
 - [Bug 0028 — Live reconciliation can swallow Stop clicks](bug-0028-live-reconciliation-could-swallow-stop-clicks.md)
 - [Bug 0029 — Initial progress and ETA are implausible until Stop and Continue](bug-0029-initial-progress-and-eta-were-implausible-until-continue.md)
 - [Bug 0030 — Removing a stopped download retains an unlinked partial file](bug-0030-removing-stopped-download-retains-unlinked-partial.md)
+- [Bug 0031 — Cancelled fragment downloads retain their partial descriptor after worker completion](bug-0031-cancelled-fragment-download-retains-descriptor.md)
 
 ## Accepted UI decisions
 

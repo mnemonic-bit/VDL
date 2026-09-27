@@ -99,3 +99,7 @@ A deterministic regression test holds a real descriptor open across the
 `cancelled` transition. It verifies that the first removal is rejected without
 changing the file's link count, that worker completion closes the descriptor,
 and that the following removal deletes the linked partial successfully.
+
+Bug 0031 records a separate follow-up found after this fix: yt-dlp's fragmented
+downloader could retain the descriptor in an unreachable reference cycle even
+after the worker had returned.

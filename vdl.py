@@ -1,4 +1,5 @@
 import argparse
+import gc
 
 from flask import Flask, render_template, request, jsonify, send_file, abort, Response, stream_with_context
 import yt_dlp
@@ -1183,8 +1184,10 @@ def background_download(url, download_id):
     try:
         return _background_download(url, download_id)
     finally:
-        # The wrapped function's locals (including yt-dlp objects) have been
-        # released before ownership is handed back to Remove.
+        # Fragment downloaders can retain their locked destination stream in a
+        # progress-hook reference cycle when cancellation skips normal cleanup.
+        # Finalize those unreachable objects before Remove may unlink the file.
+        gc.collect()
         with _worker_condition:
             _live_worker_ids.discard(download_id)
             _worker_condition.notify_all()

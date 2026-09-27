@@ -1,3 +1,4 @@
+import gc
 import os
 import threading
 import time
@@ -31,6 +32,9 @@ class DescriptorHoldingYoutubeDL(FakeYoutubeDL):
         self.output_file = open(path, "wb")
         self.output_file.write(b"partial")
         self.output_file.flush()
+        # FragmentFD retains its destination stream through a progress-hook
+        # reference cycle when cancellation skips its normal close path.
+        self.fragment_context = {"dl": self, "dest_stream": self.output_file}
         type(self).descriptor = self.output_file.fileno()
         type(self).path = path
         type(self).opened.set()
@@ -147,36 +151,43 @@ class CancelledDownloadCleanupTest(AppCase):
             finish_release.wait(2)
             original_release()
 
-        with (
-            mock.patch.object(vdl.yt_dlp, "YoutubeDL", DescriptorHoldingYoutubeDL),
-            mock.patch.object(vdl, "_release_worker_slot", side_effect=delayed_release),
-        ):
-            worker = threading.Thread(
-                target=vdl.background_download,
-                args=(url, download_id),
-            )
-            worker.start()
-            self.assertTrue(DescriptorHoldingYoutubeDL.opened.wait(1))
-            self.assertEqual(self.client.post(f"/api/stop/{download_id}").status_code, 200)
-            self.assertTrue(release_entered.wait(1))
-            self.assertEqual(vdl.db_get_download(download_id)["status"], "cancelled")
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            with (
+                mock.patch.object(vdl.yt_dlp, "YoutubeDL", DescriptorHoldingYoutubeDL),
+                mock.patch.object(vdl, "_release_worker_slot", side_effect=delayed_release),
+            ):
+                worker = threading.Thread(
+                    target=vdl.background_download,
+                    args=(url, download_id),
+                )
+                worker.start()
+                self.assertTrue(DescriptorHoldingYoutubeDL.opened.wait(1))
+                self.assertEqual(self.client.post(f"/api/stop/{download_id}").status_code, 200)
+                self.assertTrue(release_entered.wait(1))
+                self.assertEqual(vdl.db_get_download(download_id)["status"], "cancelled")
 
-            try:
-                response = self.client.post(f"/api/remove/{download_id}")
+                try:
+                    response = self.client.post(f"/api/remove/{download_id}")
 
-                self.assertEqual(response.status_code, 409)
-                self.assertTrue(os.path.exists(DescriptorHoldingYoutubeDL.path))
-                self.assertEqual(os.fstat(DescriptorHoldingYoutubeDL.descriptor).st_nlink, 1)
-            finally:
-                finish_release.set()
-                worker.join(1)
+                    self.assertEqual(response.status_code, 409)
+                    self.assertTrue(os.path.exists(DescriptorHoldingYoutubeDL.path))
+                    self.assertEqual(os.fstat(DescriptorHoldingYoutubeDL.descriptor).st_nlink, 1)
+                finally:
+                    finish_release.set()
+                    worker.join(1)
 
-        self.assertFalse(worker.is_alive())
-        with self.assertRaises(OSError):
-            os.fstat(DescriptorHoldingYoutubeDL.descriptor)
-        response = self.client.post(f"/api/remove/{download_id}")
-        self.assertEqual(response.status_code, 200)
-        self.assertFalse(os.path.exists(DescriptorHoldingYoutubeDL.path))
+            self.assertFalse(worker.is_alive())
+            with self.assertRaises(OSError):
+                os.fstat(DescriptorHoldingYoutubeDL.descriptor)
+            response = self.client.post(f"/api/remove/{download_id}")
+            self.assertEqual(response.status_code, 200)
+            self.assertFalse(os.path.exists(DescriptorHoldingYoutubeDL.path))
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+            gc.collect()
 
 
 if __name__ == "__main__":
