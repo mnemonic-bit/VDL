@@ -429,7 +429,15 @@ details[open] > .history-summary::before { transform: rotate(90deg); }
     text-align: center;
 }
 .version-footer.version-mismatch { color: var(--error-fg); }
-.version-warning { font-weight: 600; }
+.version-warning {
+    display: flex;
+    flex: 0 0 100%;
+    flex-direction: column;
+    align-items: center;
+    font-weight: 600;
+}
+.version-warning[hidden] { display: none; }
+.version-refresh-link { color: currentColor; text-underline-offset: 0.15em; }
 .visually-hidden {
     position: absolute;
     width: 1px;

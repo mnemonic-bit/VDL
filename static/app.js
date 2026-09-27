@@ -165,7 +165,7 @@ function updateApiVersion(version, unavailable) {
     warning.hidden = !mismatched;
     footer.classList.toggle('version-mismatch', mismatched);
     status.textContent = mismatched
-        ? `Version mismatch: UI version ${uiVersion}; ${apiLabel}. Refresh the page.`
+        ? `Version mismatch: UI version ${uiVersion}; ${apiLabel}. Use the Refresh page link to load the current UI.`
         : `UI and API version ${uiVersion} match.`;
 }
 
