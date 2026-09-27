@@ -12,7 +12,7 @@ test('Download control has rounded trailing corners, leading icon, and SVG favic
     await expect(page.locator('link[rel=icon]')).toHaveAttribute('href', /svg/);
 });
 
-test('Enter submits and clears the accepted URL', async ({ page }) => {
+test('Enter submits and clears the accepted URL without opening Current downloads', async ({ page }) => {
     let submitted;
     await page.route('**/api/download', async route => {
         submitted = route.request().postDataJSON();
@@ -21,7 +21,7 @@ test('Enter submits and clears the accepted URL', async ({ page }) => {
     await page.locator('#urlInput').fill('https://fixture.invalid/enter');
     await page.locator('#urlInput').press('Enter');
     await expect(page.locator('#urlInput')).toHaveValue('');
-    await expect(page.locator('#currentDownloadsDrawer')).toBeVisible();
+    await expect(page.locator('#currentDownloadsDrawer')).toBeHidden();
     expect(submitted.url).toBe('https://fixture.invalid/enter');
 });
 

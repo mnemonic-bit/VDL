@@ -315,7 +315,6 @@ function startDownload(event) {
         containerSelect.selectedIndex = 0;
         resetOptions();
         if (optionsDetails && !optionsOpenedManually) setOptionsOpen(false);
-        openCurrentDownloads();
         fetchHistory();
     })
     .catch(() => {});

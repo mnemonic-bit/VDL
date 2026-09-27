@@ -698,14 +698,14 @@ details[open] > .history-summary::before { transform: rotate(90deg); }
 .settings-error { margin: 4px 0 14px; }
 .current-drawer {
     position: fixed;
-    top: 64px;
+    top: 0;
     right: 0;
     bottom: auto;
     left: auto;
     width: min(480px, 100vw);
     max-width: none;
-    height: calc(100vh - 64px);
-    height: calc(100dvh - 64px);
+    height: 100vh;
+    height: 100dvh;
     max-height: none;
     margin: 0;
     padding: 0;
@@ -767,10 +767,7 @@ details[open] > .history-summary::before { transform: rotate(90deg); }
         margin: 0;
     }
     .current-drawer {
-        top: 56px;
         width: 100vw;
-        height: calc(100vh - 56px);
-        height: calc(100dvh - 56px);
         border-left: 0;
     }
     .new-download-section { padding: 14px; }
@@ -792,6 +789,7 @@ details[open] > .history-summary::before { transform: rotate(90deg); }
 .download-summary-row .eta-right { color: var(--muted); flex-shrink: 0; margin-left: auto; }
 .progress-bar-bottom { margin-top: 12px; }
 .badge { display: inline-block; margin-left: 6px; padding: 1px 7px; font-size: 0.75em; font-weight: 700; line-height: 1.6; border-radius: 999px; background-color: var(--accent); color: #fff; vertical-align: middle; }
+.badge[hidden] { display: none; }
 .pager { display: flex; justify-content: center; align-items: center; gap: 10px; margin-top: 12px; color: var(--muted); font-size: 0.95em; }
 .pager button { padding: 4px 12px; font-size: 1.1em; line-height: 1; background: var(--surface); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; min-width: 36px; }
 .pager button:disabled { opacity: 0.4; cursor: default; }

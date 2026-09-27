@@ -46,6 +46,12 @@ darkened both active colors while keeping the track lighter than the icon, and
 a second pass moved the progress stroke toward navy for stronger separation
 before a small lightening adjustment settled its final shade. The active green
 track was then slightly darkened while remaining lighter than the icon.
+Issue 33 was reported and resolved on 2026-09-27. Starting a download opened
+the Current Downloads drawer without user intent, the drawer stopped below the
+fixed header instead of covering the full viewport, and the count badge stayed
+visible after the final active download moved to History. Submission now leaves
+the drawer closed, the drawer spans the viewport at desktop and mobile widths,
+and the empty badge honors its hidden state.
 
 ## Bug reports
 
@@ -81,6 +87,7 @@ track was then slightly darkened while remaining lighter than the icon.
 - [Bug 0030 — Removing a stopped download retains an unlinked partial file](bug-0030-removing-stopped-download-retains-unlinked-partial.md)
 - [Bug 0031 — Cancelled fragment downloads retain their partial descriptor after worker completion](bug-0031-cancelled-fragment-download-retains-descriptor.md)
 - [Bug 0032 — Header download icon is undersized and its progress ring is too thin](bug-0032-header-download-icon-is-undersized.md)
+- [Bug 0033 — Current Downloads opens unexpectedly and retains a stale count](bug-0033-current-downloads-opens-and-retains-stale-count.md)
 
 ## Accepted UI decisions
 

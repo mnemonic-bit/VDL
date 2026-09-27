@@ -9,7 +9,7 @@ async function openInfo(row) {
 
 test.beforeEach(async ({ page }) => reset(page));
 
-test('fixed header opens the top-aligned Current drawer and Settings dialog', async ({ page }) => {
+test('fixed header opens the full-height Current drawer and Settings dialog', async ({ page }) => {
     await seed(page, { id: 'drawer001', status: 'downloading', progress: '25%' });
     await refresh(page);
 
@@ -45,14 +45,13 @@ test('fixed header opens the top-aligned Current drawer and Settings dialog', as
     expect(await drawer.evaluate(element => element.matches(':modal'))).toBe(true);
     const drawerPosition = await drawer.evaluate(element => {
         const box = element.getBoundingClientRect();
-        const header = document.getElementById('appHeader').getBoundingClientRect();
         return {
             top: Math.round(box.top),
-            headerBottom: Math.round(header.bottom),
+            bottom: Math.round(window.innerHeight - box.bottom),
             right: Math.round(window.innerWidth - box.right),
         };
     });
-    expect(drawerPosition).toEqual({ top: drawerPosition.headerBottom, headerBottom: drawerPosition.headerBottom, right: 0 });
+    expect(drawerPosition).toEqual({ top: 0, bottom: 0, right: 0 });
     await expect(drawer.locator('[data-row-id="drawer001"]')).toBeVisible();
     await drawer.getByRole('button', { name: 'Close current downloads' }).click();
     await expect(drawer).toBeHidden();
@@ -75,7 +74,7 @@ test('fixed header opens the top-aligned Current drawer and Settings dialog', as
     await expect(dialog).toBeHidden();
 });
 
-test('Current drawer becomes a top-aligned full-width sheet on small screens', async ({ page }) => {
+test('Current drawer becomes a full-height full-width sheet on small screens', async ({ page }) => {
     await page.setViewportSize({ width: 390, height: 800 });
     await seed(page, { id: 'mobile-current', status: 'paused', progress: 'Paused' });
     await refresh(page);
@@ -88,15 +87,14 @@ test('Current drawer becomes a top-aligned full-width sheet on small screens', a
     const drawer = page.locator('#currentDownloadsDrawer');
     const position = await drawer.evaluate(element => {
         const box = element.getBoundingClientRect();
-        const header = document.getElementById('appHeader').getBoundingClientRect();
         return {
             left: Math.round(box.left),
             top: Math.round(box.top),
+            bottom: Math.round(window.innerHeight - box.bottom),
             width: Math.round(box.width),
-            headerBottom: Math.round(header.bottom),
         };
     });
-    expect(position).toEqual({ left: 0, top: position.headerBottom, width: 390, headerBottom: position.headerBottom });
+    expect(position).toEqual({ left: 0, top: 0, bottom: 0, width: 390 });
     await page.keyboard.press('Escape');
     await expect(drawer).toBeHidden();
     await expect(button).toBeFocused();

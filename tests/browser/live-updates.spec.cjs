@@ -9,6 +9,7 @@ test('SSE reconciliation renders Current metadata and moves finished rows to His
         filesize: 2048, downloaded_bytes: 512, total_bytes: 2048,
         resolution: '720p', eta: 12, title: 'Live fixture',
     });
+    await expect(page.locator('#currentBadge')).toHaveText('1');
     await openCurrent(page);
     const current = page.locator('#activeList [data-row-id="live0001"]');
     await expect(current).toBeVisible();
@@ -39,6 +40,7 @@ test('SSE reconciliation renders Current metadata and moves finished rows to His
     await closeCurrent(page);
     await expect(page.locator('#historyList [data-row-id="live0001"]')).toBeVisible();
     await expect(page.locator('#activeList [data-row-id="live0001"]')).toHaveCount(0);
+    await expect(page.locator('#currentBadge')).toBeHidden();
 });
 
 test('active download shows progress around the Stop action', async ({ page }) => {
