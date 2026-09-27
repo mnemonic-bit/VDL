@@ -144,6 +144,7 @@ function apiFetch(url, options) {
 
 function hideActionError() {
     document.getElementById('actionError').hidden = true;
+    document.getElementById('newDownloadError').hidden = true;
     document.getElementById('settingsError').hidden = true;
     document.getElementById('currentDrawerError').hidden = true;
 }
@@ -151,7 +152,10 @@ function hideActionError() {
 function showActionError(message) {
     let errorId = 'actionError';
     let messageId = 'actionErrorMessage';
-    if (document.getElementById('settingsDialog').open) {
+    if (document.getElementById('newDownloadDialog').open) {
+        errorId = 'newDownloadError';
+        messageId = 'newDownloadErrorMessage';
+    } else if (document.getElementById('settingsDialog').open) {
         errorId = 'settingsError';
         messageId = 'settingsErrorMessage';
     } else if (document.getElementById('currentDownloadsDrawer').open) {
@@ -315,6 +319,7 @@ function startDownload(event) {
         containerSelect.selectedIndex = 0;
         resetOptions();
         if (optionsDetails && !optionsOpenedManually) setOptionsOpen(false);
+        closeNewDownload();
         fetchHistory();
     })
     .catch(() => {});
@@ -1854,7 +1859,7 @@ function fetchHistory() {
             : 'No downloads yet';
         document.getElementById('historyEmptyMessage').textContent = hasFilter
             ? 'No download history matches this tag filter.'
-            : 'Paste a video URL above to get started.';
+            : 'Add a video URL to get started.';
         document.getElementById('historyEmptyAction').hidden = hasFilter;
         document.getElementById('currentEmpty').style.display = active.length ? 'none' : '';
         document.getElementById('historyEmpty').style.display = done.length ? 'none' : '';
@@ -1948,6 +1953,9 @@ document.addEventListener('keydown', (ev) => {
     if (ev.defaultPrevented) return;
     if (ev.key === 'Escape' && document.getElementById('playerBackdrop').classList.contains('open')) {
         closePlayer();
+    } else if (ev.key === 'Escape' && document.getElementById('newDownloadDialog').open) {
+        ev.preventDefault();
+        closeNewDownload();
     } else if (ev.key === 'Escape' && document.getElementById('settingsDialog').open) {
         ev.preventDefault();
         closeSettings();
@@ -1967,15 +1975,55 @@ document.addEventListener('keydown', (ev) => {
         || (active && active.isContentEditable);
     if (isEditable) return;
 
-    urlInput.focus();
-    urlInput.select();
+    openNewDownload();
 });
 
 function focusNewDownload() {
-    const input = document.getElementById('urlInput');
-    input.focus();
-    input.select();
+    openNewDownload();
 }
+
+let newDownloadReturnFocus = null;
+
+function openNewDownload() {
+    const dialog = document.getElementById('newDownloadDialog');
+    if (!dialog.open) {
+        // Avoid stacking modal workflows if a paste shortcut is pressed while
+        // another dialog has focus; paste within its editable controls remains
+        // available through the guard in the keydown handler above.
+        if (document.getElementById('settingsDialog').open
+                || document.getElementById('currentDownloadsDrawer').open
+                || document.getElementById('playerBackdrop').classList.contains('open')) return;
+        newDownloadReturnFocus = document.activeElement;
+        closeHistoryInfo();
+        closeAllMenus();
+        hideActionError();
+        dialog.showModal();
+        document.getElementById('newDownloadButton').setAttribute('aria-expanded', 'true');
+    }
+    urlInput.focus();
+    urlInput.select();
+}
+
+function closeNewDownload() {
+    const dialog = document.getElementById('newDownloadDialog');
+    if (dialog.open) dialog.close();
+}
+
+const newDownloadDialog = document.getElementById('newDownloadDialog');
+newDownloadDialog.addEventListener('close', () => {
+    hideActionError();
+    document.getElementById('newDownloadButton').setAttribute('aria-expanded', 'false');
+    if (newDownloadReturnFocus && newDownloadReturnFocus.isConnected) {
+        newDownloadReturnFocus.focus();
+    }
+    newDownloadReturnFocus = null;
+});
+newDownloadDialog.addEventListener('click', ev => {
+    // Native select popups can bubble clicks with synthetic viewport
+    // coordinates. Only the dialog itself can represent its backdrop; child
+    // controls must never be classified as outside clicks by coordinates.
+    if (ev.target === newDownloadDialog) closeNewDownload();
+});
 
 let currentDrawerReturnFocus = null;
 

@@ -32,4 +32,12 @@ async function closeCurrent(page) {
     await expect(drawer).toBeHidden();
 }
 
-module.exports = { reset, seed, refresh, openCurrent, closeCurrent };
+async function openNewDownload(page) {
+    const dialog = page.locator('#newDownloadDialog');
+    if (!(await dialog.isVisible())) {
+        await page.locator('#newDownloadButton').click();
+    }
+    await expect(dialog).toBeVisible();
+}
+
+module.exports = { reset, seed, refresh, openCurrent, closeCurrent, openNewDownload };

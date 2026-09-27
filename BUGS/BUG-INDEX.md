@@ -52,6 +52,13 @@ fixed header instead of covering the full viewport, and the count badge stayed
 visible after the final active download moved to History. Submission now leaves
 the drawer closed, the drawer spans the viewport at desktop and mobile widths,
 and the empty badge honors its hidden state.
+Issue 34 was reported and resolved during the same redesign follow-up on
+2026-09-27. Native quality-selector clicks could dismiss New download, the URL
+draft lifecycle was not explicit, Current Downloads appeared without entrance
+motion, and a redundant History heading weakened the content-first hierarchy.
+Dialog hit testing and draft behavior are now covered, the drawer slides in
+with reduced-motion support, and the main content keeps only an accessible
+History label.
 
 ## Bug reports
 
@@ -88,6 +95,7 @@ and the empty badge honors its hidden state.
 - [Bug 0031 — Cancelled fragment downloads retain their partial descriptor after worker completion](bug-0031-cancelled-fragment-download-retains-descriptor.md)
 - [Bug 0032 — Header download icon is undersized and its progress ring is too thin](bug-0032-header-download-icon-is-undersized.md)
 - [Bug 0033 — Current Downloads opens unexpectedly and retains a stale count](bug-0033-current-downloads-opens-and-retains-stale-count.md)
+- [Bug 0034 — Download workflow redesign left modal and visual-hierarchy regressions](bug-0034-download-workflow-redesign-left-ui-regressions.md)
 
 ## Accepted UI decisions
 

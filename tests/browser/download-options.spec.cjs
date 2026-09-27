@@ -1,7 +1,10 @@
 const { test, expect } = require('@playwright/test');
-const { reset, closeCurrent } = require('./support.cjs');
+const { reset, closeCurrent, openNewDownload } = require('./support.cjs');
 
-test.beforeEach(async ({ page }) => reset(page));
+test.beforeEach(async ({ page }) => {
+    await reset(page);
+    await openNewDownload(page);
+});
 
 test('empty Options accepts the disabled-fields-behind-message contract', async ({ page }) => {
     await page.locator('.options-summary').click();
@@ -26,6 +29,20 @@ test('MP4 option builds a compatible MP4-video plus M4A-audio selector', async (
     await page.locator('#downloadForm button[type=submit]').click();
     await expect(page.locator('#urlInput')).toHaveValue('');
     expect(payload.format).toBe('bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]');
+});
+
+test('select interaction does not dismiss New download', async ({ page }) => {
+    const url = 'https://fixture.invalid/select';
+    await page.locator('#urlInput').fill(url);
+    const quality = page.locator('#optionsQualitySelect');
+    await expect(quality).toBeEnabled({ timeout: 3000 });
+
+    // Native select popups can report the option click without useful viewport
+    // coordinates. It is still an interaction with a control inside the dialog.
+    await quality.dispatchEvent('click', { clientX: 0, clientY: 0 });
+
+    await expect(page.locator('#newDownloadDialog')).toBeVisible();
+    await expect(page.locator('#urlInput')).toHaveValue(url);
 });
 
 test('probe quality controls never emit NaN selectors', async ({ page }) => {

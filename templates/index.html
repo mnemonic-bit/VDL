@@ -39,6 +39,11 @@
                     <path d="M8 2.5v7.2"/><path d="M4.3 6.2L8 9.9l3.7-3.7"/><path d="M2.8 13.2h10.4"/>
                 </g>
             </symbol>
+            <symbol id="i-plus" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+                    <path d="M8 3v10"/><path d="M3 8h10"/>
+                </g>
+            </symbol>
             <symbol id="i-app-download" viewBox="0 0 16 16">
                 <circle cx="8" cy="8" r="7.5" fill="currentColor"/>
                 <g fill="none" stroke="white" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
@@ -158,6 +163,12 @@
             <span>Video Download Helper</span>
         </h2>
         <div class="header-actions">
+            <button id="newDownloadButton" class="new-download-button" type="button"
+                    onclick="openNewDownload()" aria-label="New download"
+                    aria-haspopup="dialog" aria-controls="newDownloadDialog" aria-expanded="false">
+                <svg aria-hidden="true"><use href="#i-plus"/></svg>
+                <span class="new-download-label">New download</span>
+            </button>
             <button id="currentDownloadsButton" class="current-downloads-button" type="button"
                     onclick="openCurrentDownloads()" aria-label="Current downloads"
                     aria-haspopup="dialog" aria-controls="currentDownloadsDrawer" aria-expanded="false">
@@ -171,52 +182,8 @@
             </button>
         </div>
     </header>
-    <section class="new-download-section" aria-labelledby="newDownloadTitle">
-        <h2 id="newDownloadTitle">New download</h2>
-        <form id="downloadForm" class="form-group" onsubmit="startDownload(event)">
-            <label for="urlInput" class="visually-hidden">Download URL</label>
-            <div class="url-wrap">
-                <input type="url" id="urlInput" placeholder="Enter video URL here..." required autocomplete="off">
-                <button type="button" id="urlClear" class="url-clear" aria-label="Clear URL" style="display:none;"><svg width="14" height="14"><use href="#i-x"/></svg></button>
-            </div>
-            <button type="submit"><svg class="btn-icon"><use href="#i-download"/></svg><span>Download</span></button>
-        </form>
 
-        <div id="optionsContainer">
-            <details class="options-panel">
-                <summary class="options-summary">
-                    <svg class="chev" viewBox="0 0 16 16" width="16" height="16">
-                        <path fill="currentColor" d="M8 12.3L1 5.5l1.4-1.4L8 9.5l5.6-5.4L15 5.5z"/>
-                    </svg>
-                    Download Options
-                </summary>
-                <div class="options-content">
-                    <div id="optionsOverlay" class="options-overlay">
-                        <span class="options-overlay-msg">Select a URL to see available options</span>
-                    </div>
-                    <div class="options-row">
-                        <label for="optionsQualitySelect">Quality</label>
-                        <select id="optionsQualitySelect" class="options-select" style="flex: 1;" disabled>
-                            <option value="">Use default preference</option>
-                        </select>
-                    </div>
-                    <div class="options-row">
-                        <label for="optionsContainerSelect">Container Format</label>
-                        <select id="optionsContainerSelect" class="options-select" style="flex: 1;" disabled>
-                            <option value="">Automatic</option>
-                        </select>
-                    </div>
-                    <div class="options-row">
-                        <label for="optionsFilename">Title/Filename</label>
-                        <input type="text" id="optionsFilename" placeholder="Will be auto-filled from video title" style="flex: 1;">
-                    </div>
-                </div>
-            </details>
-        </div>
-    </section>
-
-    <section id="tab-history" class="history-panel" aria-labelledby="historyTitle">
-        <h2 id="historyTitle">Download History</h2>
+    <section id="tab-history" class="history-panel" aria-label="Download history">
         <div id="tagFilter" class="tag-filter" aria-label="Filter download history by tag">
             <select id="tagMatchMode" class="tag-match-mode" aria-label="Tag match mode">
                 <option value="all">ALL</option>
@@ -240,10 +207,65 @@
         </div>
         <div id="historyEmpty" class="history-empty">
             <strong id="historyEmptyTitle">No downloads yet</strong>
-            <span id="historyEmptyMessage">Paste a video URL above to get started.</span>
+            <span id="historyEmptyMessage">Add a video URL to get started.</span>
             <button id="historyEmptyAction" type="button" onclick="focusNewDownload()">Start a download</button>
         </div>
     </section>
+
+    <dialog id="newDownloadDialog" class="new-download-dialog" aria-labelledby="newDownloadTitle" aria-modal="true">
+        <div class="new-download-dialog-header">
+            <h2 id="newDownloadTitle">New download</h2>
+            <button class="new-download-close" type="button" onclick="closeNewDownload()" aria-label="Close new download">
+                <svg aria-hidden="true"><use href="#i-x"/></svg>
+            </button>
+        </div>
+        <div class="new-download-dialog-body">
+            <div id="newDownloadError" class="action-error" role="alert" aria-live="assertive" hidden>
+                <span id="newDownloadErrorMessage"></span>
+                <button type="button" class="action-error-close" onclick="hideActionError()" aria-label="Dismiss error"><svg width="14" height="14"><use href="#i-x"/></svg></button>
+            </div>
+            <form id="downloadForm" class="form-group" onsubmit="startDownload(event)">
+                <label for="urlInput" class="visually-hidden">Download URL</label>
+                <div class="url-wrap">
+                    <input type="url" id="urlInput" placeholder="Enter video URL here..." required autocomplete="off">
+                    <button type="button" id="urlClear" class="url-clear" aria-label="Clear URL" style="display:none;"><svg width="14" height="14"><use href="#i-x"/></svg></button>
+                </div>
+                <button type="submit"><svg class="btn-icon"><use href="#i-download"/></svg><span>Download</span></button>
+            </form>
+
+            <div id="optionsContainer">
+                <details class="options-panel">
+                    <summary class="options-summary">
+                        <svg class="chev" viewBox="0 0 16 16" width="16" height="16">
+                            <path fill="currentColor" d="M8 12.3L1 5.5l1.4-1.4L8 9.5l5.6-5.4L15 5.5z"/>
+                        </svg>
+                        Download Options
+                    </summary>
+                    <div class="options-content">
+                        <div id="optionsOverlay" class="options-overlay">
+                            <span class="options-overlay-msg">Select a URL to see available options</span>
+                        </div>
+                        <div class="options-row">
+                            <label for="optionsQualitySelect">Quality</label>
+                            <select id="optionsQualitySelect" class="options-select" style="flex: 1;" disabled>
+                                <option value="">Use default preference</option>
+                            </select>
+                        </div>
+                        <div class="options-row">
+                            <label for="optionsContainerSelect">Container Format</label>
+                            <select id="optionsContainerSelect" class="options-select" style="flex: 1;" disabled>
+                                <option value="">Automatic</option>
+                            </select>
+                        </div>
+                        <div class="options-row">
+                            <label for="optionsFilename">Title/Filename</label>
+                            <input type="text" id="optionsFilename" placeholder="Will be auto-filled from video title" style="flex: 1;">
+                        </div>
+                    </div>
+                </details>
+            </div>
+        </div>
+    </dialog>
 
     <dialog id="currentDownloadsDrawer" class="current-drawer" aria-labelledby="currentDownloadsTitle" aria-modal="true">
         <div class="current-drawer-shell">

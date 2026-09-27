@@ -16,8 +16,8 @@ test('fixed header opens the full-height Current drawer and Settings dialog', as
     await expect(page.locator('[data-tab]')).toHaveCount(0);
     await expect(page.locator('#tab-history')).toBeVisible();
     await expect(page.locator('#tab-history').getByRole('button', { name: 'Clear History' })).toHaveCount(0);
-    await expect(page.getByRole('heading', { name: 'New download' })).toBeVisible();
-    await expect(page.getByRole('heading', { name: 'Download History' })).toBeVisible();
+    await expect(page.locator('#tab-history')).toHaveAttribute('aria-label', 'Download history');
+    await expect(page.getByRole('heading', { name: 'Download History' })).toHaveCount(0);
 
     const header = page.locator('#appHeader');
     const headerPosition = await header.evaluate(element => {
@@ -31,18 +31,36 @@ test('fixed header opens the full-height Current drawer and Settings dialog', as
     });
     expect(headerPosition).toEqual({ position: 'fixed', top: 0, left: 0, right: 0 });
 
+    const newDownloadButton = page.locator('#newDownloadButton');
     const currentButton = page.locator('#currentDownloadsButton');
     const settingsButton = page.locator('#settingsButton');
+    await expect(newDownloadButton).toContainText('New download');
     await expect(currentButton).toContainText('Current downloads');
     await expect(currentButton.locator('#currentBadge')).toHaveText('1');
     expect(await currentButton.evaluate((button, settings) => (
         button.getBoundingClientRect().right <= document.querySelector(settings).getBoundingClientRect().left
     ), '#settingsButton')).toBeTruthy();
 
+    await newDownloadButton.click();
+    const newDownloadDialog = page.locator('#newDownloadDialog');
+    await expect(newDownloadDialog).toBeVisible();
+    await expect(newDownloadDialog.getByRole('heading', { name: 'New download' })).toBeVisible();
+    expect(await newDownloadDialog.evaluate(element => element.matches(':modal'))).toBe(true);
+    await newDownloadDialog.getByRole('button', { name: 'Close new download' }).click();
+    await expect(newDownloadDialog).toBeHidden();
+    await expect(newDownloadButton).toBeFocused();
+
     await currentButton.click();
     const drawer = page.locator('#currentDownloadsDrawer');
     await expect(drawer).toBeVisible();
     expect(await drawer.evaluate(element => element.matches(':modal'))).toBe(true);
+    expect(await drawer.evaluate(element => {
+        const style = getComputedStyle(element);
+        return { name: style.animationName, duration: style.animationDuration };
+    })).toEqual({ name: 'current-drawer-slide-in', duration: '0.28s' });
+    await drawer.evaluate(element => Promise.all(
+        element.getAnimations().map(animation => animation.finished),
+    ));
     const drawerPosition = await drawer.evaluate(element => {
         const box = element.getBoundingClientRect();
         return {
@@ -74,6 +92,16 @@ test('fixed header opens the full-height Current drawer and Settings dialog', as
     await expect(dialog).toBeHidden();
 });
 
+test('Current drawer respects reduced-motion preferences', async ({ page }) => {
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    await page.locator('#currentDownloadsButton').click();
+
+    const drawer = page.locator('#currentDownloadsDrawer');
+    await expect(drawer).toBeVisible();
+    expect(await drawer.evaluate(element => getComputedStyle(element).animationName)).toBe('none');
+    expect(await drawer.evaluate(element => getComputedStyle(element, '::backdrop').animationName)).toBe('none');
+});
+
 test('Current drawer becomes a full-height full-width sheet on small screens', async ({ page }) => {
     await page.setViewportSize({ width: 390, height: 800 });
     await seed(page, { id: 'mobile-current', status: 'paused', progress: 'Paused' });
@@ -85,6 +113,9 @@ test('Current drawer becomes a full-height full-width sheet on small screens', a
     await button.click();
 
     const drawer = page.locator('#currentDownloadsDrawer');
+    await drawer.evaluate(element => Promise.all(
+        element.getAnimations().map(animation => animation.finished),
+    ));
     const position = await drawer.evaluate(element => {
         const box = element.getBoundingClientRect();
         return {
