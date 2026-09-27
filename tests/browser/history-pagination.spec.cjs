@@ -12,7 +12,6 @@ test('History pagination preserves ordering and clamps after a page becomes empt
             name: `page-${index}.mp4`,
         });
     }
-    await page.locator('[data-tab=history]').click();
     await refresh(page);
 
     await expect(page.locator('#historyList [data-row-id]')).toHaveCount(10);

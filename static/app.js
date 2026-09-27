@@ -144,11 +144,23 @@ function apiFetch(url, options) {
 
 function hideActionError() {
     document.getElementById('actionError').hidden = true;
+    document.getElementById('settingsError').hidden = true;
+    document.getElementById('currentDrawerError').hidden = true;
 }
 
 function showActionError(message) {
-    document.getElementById('actionErrorMessage').textContent = message;
-    document.getElementById('actionError').hidden = false;
+    let errorId = 'actionError';
+    let messageId = 'actionErrorMessage';
+    if (document.getElementById('settingsDialog').open) {
+        errorId = 'settingsError';
+        messageId = 'settingsErrorMessage';
+    } else if (document.getElementById('currentDownloadsDrawer').open) {
+        errorId = 'currentDrawerError';
+        messageId = 'currentDrawerErrorMessage';
+    }
+    const error = document.getElementById(errorId);
+    document.getElementById(messageId).textContent = message;
+    error.hidden = false;
 }
 
 function apiAction(url, options) {
@@ -303,6 +315,7 @@ function startDownload(event) {
         containerSelect.selectedIndex = 0;
         resetOptions();
         if (optionsDetails && !optionsOpenedManually) setOptionsOpen(false);
+        openCurrentDownloads();
         fetchHistory();
     })
     .catch(() => {});
@@ -1001,6 +1014,7 @@ function continueDownload(id, url) {
 }
 
 function deleteDownload(id) {
+    closeHistoryInfo();
     closeAllMenus();
     const row = document.querySelector(`[data-row-id="${id}"]`);
     if (row) {
@@ -1031,6 +1045,7 @@ function clearHistory() {
 }
 
 let openMenuId = null;
+let openInfoId = null;
 let historyFetchDeferred = false;
 const heldRowActionPointers = new Set();
 
@@ -1186,11 +1201,75 @@ function closeAllMenus() {
     }
 }
 
+function closeHistoryInfo() {
+    if (openInfoId === null) return;
+    document.querySelectorAll('.history-info-popover.open').forEach(popover => {
+        popover.classList.remove('open');
+    });
+    document.querySelectorAll('[data-info-action]').forEach(button => {
+        button.setAttribute('aria-expanded', 'false');
+    });
+    openInfoId = null;
+}
+
+function positionHistoryInfo(id) {
+    const card = document.querySelector(`#historyList [data-row-id="${CSS.escape(String(id))}"]`);
+    const button = card && card.querySelector('[data-info-action]');
+    const anchor = card && card.querySelector('.kebab-btn');
+    const popover = card && card.querySelector('.history-info-popover');
+    if (!button || !anchor || !popover) {
+        openInfoId = null;
+        return;
+    }
+
+    const viewportGap = 12;
+    const anchorGap = 8;
+    const width = Math.min(560, window.innerWidth - viewportGap * 2);
+    popover.style.width = `${width}px`;
+    popover.style.visibility = 'hidden';
+    popover.classList.add('open');
+
+    const buttonRect = anchor.getBoundingClientRect();
+    const popoverRect = popover.getBoundingClientRect();
+    const left = Math.min(
+        window.innerWidth - width - viewportGap,
+        Math.max(viewportGap, buttonRect.right - width),
+    );
+    let top = buttonRect.bottom + anchorGap;
+    let placement = 'below';
+    if (top + popoverRect.height > window.innerHeight - viewportGap) {
+        top = Math.max(viewportGap, buttonRect.top - popoverRect.height - anchorGap);
+        placement = 'above';
+    }
+    const pointerX = Math.min(width - 16, Math.max(16, buttonRect.left + buttonRect.width / 2 - left));
+    popover.style.left = `${left}px`;
+    popover.style.top = `${top}px`;
+    popover.style.setProperty('--popover-pointer-x', `${pointerX}px`);
+    popover.dataset.placement = placement;
+    popover.style.visibility = '';
+    button.setAttribute('aria-expanded', 'true');
+}
+
+function toggleHistoryInfo(id, ev) {
+    ev.stopPropagation();
+    const wasOpen = openInfoId === String(id);
+    closeAllMenus();
+    closeHistoryInfo();
+    if (wasOpen) return;
+    openInfoId = String(id);
+    positionHistoryInfo(openInfoId);
+}
+
+function restoreOpenHistoryInfo() {
+    if (openInfoId !== null) positionHistoryInfo(openInfoId);
+}
+
 function toggleMenu(id, ev) {
     ev.stopPropagation();
     const menu = document.getElementById('menu-' + id);
     if (!menu) return;
     const wasOpen = menu.classList.contains('open');
+    closeHistoryInfo();
     closeAllMenus();
     if (!wasOpen) {
         menu.classList.add('open');
@@ -1226,7 +1305,9 @@ document.addEventListener('click', (ev) => {
                 break;
         }
     }
+    if (ev.target.closest('.history-info-popover')) return;
     if (ev.target.closest('.kebab-menu') || ev.target.closest('.kebab-btn')) return;
+    closeHistoryInfo();
     closeAllMenus();
 });
 
@@ -1343,7 +1424,113 @@ function fallback(text, done) {
     document.body.removeChild(ta);
 }
 
+function renderHistoryCard(info) {
+    const id = String(info.id);
+    const isFinished = info.status === 'finished';
+    const safeUrl = escapeAttr(info.url);
+    const urlData = `data-url="${safeUrl}"`;
+
+    let displayTitle = info.title || '';
+    if (!displayTitle && info.filename) {
+        const base = info.filename.split('/').pop().split('\\').pop();
+        displayTitle = base.replace(/\.[^.]+$/, '');
+    }
+    if (!displayTitle) displayTitle = 'Untitled download';
+
+    const menuItems = [
+        `<button data-info-action aria-expanded="false" aria-controls="info-${escapeAttr(id)}" onclick="toggleHistoryInfo('${id}', event)"><svg class="menu-icon"><use href="#i-info"/></svg>Info</button>`,
+        `<button data-url-action="open" ${urlData}><svg class="menu-icon"><use href="#i-external"/></svg>Open URL</button>`,
+        `<button data-url-action="copy" ${urlData}><svg class="menu-icon"><use href="#i-copy"/></svg>Copy URL</button>`,
+    ];
+    if (!isFinished) {
+        menuItems.push(`<button data-url-action="reload" data-download-id="${escapeAttr(id)}" ${urlData}><svg class="menu-icon"><use href="#i-sync"/></svg>Reload</button>`);
+    }
+    menuItems.push(`<button class="danger" onclick="deleteDownload('${id}')"><svg class="menu-icon"><use href="#i-trash"/></svg>Delete</button>`);
+
+    const hasPlay = isFinished && info.filename;
+    let preview;
+    if (hasPlay) {
+        const playLabel = info.filename.split('/').pop().split('\\').pop();
+        const playExt = info.filename.split('.').pop().toLowerCase();
+        preview = `
+                    <button class="history-preview" type="button" data-play-action data-download-id="${escapeAttr(id)}" data-play-label="${escapeAttr(playLabel)}" data-play-ext="${escapeAttr(playExt)}" aria-label="Play" title="Play">
+                        <span class="history-preview-fallback"><svg><use href="#i-camera"/></svg><span>No video preview</span></span>
+                        <img src="/api/thumbnail/${encodeURIComponent(id)}" alt="" loading="lazy" onerror="this.closest('.history-preview').classList.add('thumbnail-unavailable')">
+                        <span class="history-preview-play"><svg><use href="#i-play"/></svg></span>
+                    </button>`;
+    } else {
+        preview = `
+                    <div class="history-preview thumbnail-unavailable history-preview-error" aria-label="Preview unavailable">
+                        <span class="history-preview-fallback"><svg><use href="#i-camera"/></svg><span>Preview unavailable</span></span>
+                    </div>`;
+    }
+
+    const metadata = [];
+    metadata.push(`<div><strong>Status:</strong> ${escapeHtml(info.status.charAt(0).toUpperCase() + info.status.slice(1))}</div>`);
+    metadata.push(`<div class="history-url-row"><strong>Source:</strong> <span>${escapeHtml(info.url)}</span></div>`);
+    if (info.filename) {
+        const base = info.filename.split('/').pop().split('\\').pop();
+        metadata.push(`<div class="file-meta-row"><strong>File:</strong>${isFinished ? renderRenameControl(id, base) : `<span class="filename">${escapeHtml(base)}</span>`}</div>`);
+    }
+    const sizeStr = formatBytes(info.filesize);
+    const requestedFormat = formatRequestedFormat(info);
+    const mediaParts = [];
+    if (info.resolution) mediaParts.push(`<strong>Quality:</strong> ${escapeHtml(info.resolution)}`);
+    if (sizeStr) mediaParts.push(`<strong>Size:</strong> ${sizeStr}`);
+    if (requestedFormat) mediaParts.push(`<strong>Requested format:</strong> ${escapeHtml(requestedFormat)}`);
+    if (mediaParts.length) metadata.push(`<div class="history-media-row">${mediaParts.join(' &middot; ')}</div>`);
+
+    const timingParts = [];
+    const startedStr = formatDateTime(info.created_at);
+    if (startedStr) timingParts.push(`<strong>Started:</strong> ${startedStr}`);
+    const durationStr = formatDuration(info.created_at, info.finished_at);
+    if (durationStr) timingParts.push(`<strong>Duration:</strong> ${durationStr}`);
+    if (timingParts.length) metadata.push(`<div class="history-timing-row">${timingParts.join(' &middot; ')}</div>`);
+
+    let errorBlock = '';
+    if (info.status === 'error' && info.progress) {
+        const detail = String(info.progress);
+        const openAttr = openErrorIds.has(id) ? ' open' : '';
+        const showFormats = /--list-formats/i.test(detail);
+        errorBlock = `
+                        <details class="error-details"${openAttr} ontoggle="onErrorDetailsToggle('${id}', this)">
+                            <summary><svg class="chev"><use href="#i-chevron"/></svg><strong>Error details</strong></summary>
+                            <pre class="error-text">${escapeHtml(detail)}</pre>
+                            ${showFormats ? renderFormatsTable(info) : ''}
+                        </details>`;
+    }
+
+    return `
+                <article class="history-card" data-row-id="${escapeAttr(id)}">
+                    ${preview}
+                    <div class="history-card-caption">
+                        <div class="history-card-title" title="${escapeAttr(displayTitle)}">${escapeHtml(displayTitle)}</div>
+                        <div class="menu-wrap">
+                            <button class="kebab-btn" onclick="toggleMenu('${id}', event)" aria-label="More actions"><svg class="icon"><use href="#i-kebab"/></svg></button>
+                            <div id="menu-${escapeAttr(id)}" class="kebab-menu">${menuItems.join('')}</div>
+                        </div>
+                    </div>
+                    <div id="info-${escapeAttr(id)}" class="history-info-popover" role="dialog" aria-label="Download information">
+                        <div class="history-info-content">
+                            <div class="history-info-header">
+                                <strong>Info</strong>
+                                <button type="button" class="history-info-close" onclick="closeHistoryInfo()" aria-label="Close info"><svg><use href="#i-x"/></svg></button>
+                            </div>
+                            <div class="history-info-title">${escapeHtml(displayTitle)}</div>
+                            <div class="history-info-section">
+                                <div class="history-info-label">Tags</div>
+                                ${renderTagControl(info)}
+                            </div>
+                            <div class="meta history-info-meta">${metadata.join('')}</div>
+                            ${errorBlock}
+                        </div>
+                    </div>
+                </article>`;
+}
+
 function renderItem(info, inHistoryView = false) {
+    if (inHistoryView) return renderHistoryCard(info);
+
     const id = info.id;
     const isRunning = RUNNING_STATUSES.has(info.status);
     const isPaused = info.status === 'paused';
@@ -1571,19 +1758,18 @@ function fetchHistory() {
     return apiFetch('/api/history')
     .then(res => res.json())
     .then(data => {
+        const itemCount = document.getElementById('itemCount');
+        itemCount.textContent = `${data.length} ${data.length === 1 ? 'item' : 'items'}`;
         if (historyRefreshBlocked()) {
             historyFetchDeferred = true;
             return;
         }
         const reversed = data.slice().reverse();
         updateProgressIndicators(reversed);
-        refreshAvailableTags(reversed);
-        const active = reversed.filter(i => (
-            CURRENT_TAB_STATUSES.has(i.status) && matchesTagFilter(i)
-        ));
-        const done = reversed.filter(i => (
-            HISTORY_TAB_STATUSES.has(i.status) && matchesTagFilter(i)
-        ));
+        const active = reversed.filter(i => CURRENT_TAB_STATUSES.has(i.status));
+        const historyEntries = reversed.filter(i => HISTORY_TAB_STATUSES.has(i.status));
+        refreshAvailableTags(historyEntries);
+        const done = historyEntries.filter(matchesTagFilter);
 
         historyTotal = done.length;
         const maxPage = Math.max(0, Math.ceil(historyTotal / HISTORY_PAGE_SIZE) - 1);
@@ -1617,8 +1803,7 @@ function fetchHistory() {
             }
         }
 
-        const activeTabVisible   = document.getElementById('tab-current').classList.contains('active');
-        const historyTabVisible  = document.getElementById('tab-history').classList.contains('active');
+        const currentDrawerVisible = document.getElementById('currentDownloadsDrawer').open;
 
         const newActiveIds  = new Set(active.map(i => String(i.id)));
         const newHistoryIds = new Set(pageItems.map(i => String(i.id)));
@@ -1626,7 +1811,7 @@ function fetchHistory() {
         document.getElementById('activeList').innerHTML  = active.map(i => renderItem(i, false)).join('');
         document.getElementById('historyList').innerHTML = pageItems.map(i => renderItem(i, true)).join('');
 
-        if (activeTabVisible) {
+        if (currentDrawerVisible) {
             newActiveIds.forEach(id => {
                 if (!_renderedActiveIds.has(id)) {
                     const el = document.querySelector(`#activeList [data-row-id="${id}"]`);
@@ -1634,20 +1819,19 @@ function fetchHistory() {
                 }
             });
         }
-        if (historyTabVisible) {
-            newHistoryIds.forEach(id => {
-                if (!_renderedHistoryIds.has(id)) {
-                    const el = document.querySelector(`#historyList [data-row-id="${id}"]`);
-                    if (el) animateInsertedItem(el);
-                }
-            });
-        }
+        newHistoryIds.forEach(id => {
+            if (!_renderedHistoryIds.has(id)) {
+                const el = document.querySelector(`#historyList [data-row-id="${id}"]`);
+                if (el) animateInsertedItem(el);
+            }
+        });
 
         _renderedActiveIds  = newActiveIds;
         _renderedHistoryIds = newHistoryIds;
 
         bindRenameInputs();
         bindTagEditors();
+        restoreOpenHistoryInfo();
 
         if (focusRestore) {
             const newInput = focusRestore.tagId
@@ -1665,12 +1849,14 @@ function fetchHistory() {
         }
 
         const hasFilter = selectedTagFilters.length > 0;
-        document.getElementById('currentEmpty').textContent = hasFilter
-            ? 'No current downloads match this tag filter.'
-            : 'No active downloads. Paste a URL above to start.';
-        document.getElementById('historyEmpty').textContent = hasFilter
+        document.getElementById('currentEmpty').textContent = 'No current downloads.';
+        document.getElementById('historyEmptyTitle').textContent = hasFilter
+            ? 'No matching downloads'
+            : 'No downloads yet';
+        document.getElementById('historyEmptyMessage').textContent = hasFilter
             ? 'No download history matches this tag filter.'
-            : 'No completed downloads yet.';
+            : 'Paste a video URL above to get started.';
+        document.getElementById('historyEmptyAction').hidden = hasFilter;
         document.getElementById('currentEmpty').style.display = active.length ? 'none' : '';
         document.getElementById('historyEmpty').style.display = done.length ? 'none' : '';
 
@@ -1693,11 +1879,18 @@ function fetchHistory() {
         }
 
         const badge = document.getElementById('currentBadge');
+        const currentLabel = `${active.length} ${active.length === 1 ? 'item' : 'items'}`;
+        document.getElementById('currentDrawerCount').textContent = currentLabel;
+        document.getElementById('currentDownloadsButton').setAttribute(
+            'aria-label', active.length
+                ? `Current downloads, ${currentLabel}`
+                : 'Current downloads, no items',
+        );
         if (active.length) {
             badge.textContent = active.length;
-            badge.style.display = '';
+            badge.hidden = false;
         } else {
-            badge.style.display = 'none';
+            badge.hidden = true;
         }
     });
 }
@@ -1751,8 +1944,19 @@ function closePlayer(ev) {
 }
 
 document.addEventListener('keydown', (ev) => {
+    // Editors use Escape to cancel their own transient state. Respect that
+    // before treating the same key as a request to close an enclosing layer.
+    if (ev.defaultPrevented) return;
     if (ev.key === 'Escape' && document.getElementById('playerBackdrop').classList.contains('open')) {
         closePlayer();
+    } else if (ev.key === 'Escape' && document.getElementById('settingsDialog').open) {
+        ev.preventDefault();
+        closeSettings();
+    } else if (ev.key === 'Escape' && document.getElementById('currentDownloadsDrawer').open) {
+        ev.preventDefault();
+        closeCurrentDownloads();
+    } else if (ev.key === 'Escape' && openInfoId !== null) {
+        closeHistoryInfo();
     }
 
     const isPaste = (ev.key === 'v' || ev.key === 'V') && (ev.ctrlKey || ev.metaKey) && !ev.shiftKey && !ev.altKey;
@@ -1768,18 +1972,74 @@ document.addEventListener('keydown', (ev) => {
     urlInput.select();
 });
 
-function switchTab(name) {
-    document.querySelectorAll('.tab').forEach(t => {
-        t.classList.toggle('active', t.dataset.tab === name);
-    });
-    document.querySelectorAll('.tab-panel').forEach(p => {
-        p.classList.toggle('active', p.id === 'tab-' + name);
-    });
-    document.getElementById('tagFilter').style.display = name === 'preferences'
-        ? 'none'
-        : '';
-    closeAllMenus();
+function focusNewDownload() {
+    const input = document.getElementById('urlInput');
+    input.focus();
+    input.select();
 }
+
+let currentDrawerReturnFocus = null;
+
+function openCurrentDownloads() {
+    const drawer = document.getElementById('currentDownloadsDrawer');
+    if (drawer.open) return;
+    currentDrawerReturnFocus = document.activeElement;
+    closeHistoryInfo();
+    closeAllMenus();
+    hideActionError();
+    drawer.showModal();
+    document.getElementById('currentDownloadsButton').setAttribute('aria-expanded', 'true');
+}
+
+function closeCurrentDownloads() {
+    const drawer = document.getElementById('currentDownloadsDrawer');
+    if (drawer.open) drawer.close();
+}
+
+const currentDownloadsDrawer = document.getElementById('currentDownloadsDrawer');
+currentDownloadsDrawer.addEventListener('close', () => {
+    hideActionError();
+    closeAllMenus();
+    document.getElementById('currentDownloadsButton').setAttribute('aria-expanded', 'false');
+    if (currentDrawerReturnFocus && currentDrawerReturnFocus.isConnected) {
+        currentDrawerReturnFocus.focus();
+    }
+    currentDrawerReturnFocus = null;
+});
+currentDownloadsDrawer.addEventListener('click', ev => {
+    const bounds = currentDownloadsDrawer.getBoundingClientRect();
+    const outside = ev.clientX < bounds.left || ev.clientX > bounds.right
+        || ev.clientY < bounds.top || ev.clientY > bounds.bottom;
+    if (outside) closeCurrentDownloads();
+});
+
+let settingsReturnFocus = null;
+
+function openSettings() {
+    const dialog = document.getElementById('settingsDialog');
+    if (dialog.open) return;
+    settingsReturnFocus = document.activeElement;
+    closeHistoryInfo();
+    closeAllMenus();
+    hideActionError();
+    dialog.showModal();
+    document.getElementById('settingsButton').setAttribute('aria-expanded', 'true');
+    loadPreferences();
+}
+
+function closeSettings() {
+    const dialog = document.getElementById('settingsDialog');
+    if (dialog.open) dialog.close();
+}
+
+document.getElementById('settingsDialog').addEventListener('close', () => {
+    hideActionError();
+    document.getElementById('settingsButton').setAttribute('aria-expanded', 'false');
+    if (settingsReturnFocus && settingsReturnFocus.isConnected) settingsReturnFocus.focus();
+    settingsReturnFocus = null;
+});
+
+window.addEventListener('resize', closeHistoryInfo);
 
 function isPresetValue(v) {
     const sel = document.getElementById('prefFormat');
@@ -1814,7 +2074,7 @@ if (window.matchMedia) {
 }
 
 function loadPreferences() {
-    apiFetch('/api/preferences').then(r => r.json()).then(p => {
+    return apiFetch('/api/preferences').then(r => r.json()).then(p => {
         document.getElementById('prefDir').value = p.download_dir || '';
         document.getElementById('prefMax').value = p.max_concurrent || '';
 

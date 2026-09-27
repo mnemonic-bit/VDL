@@ -1,5 +1,5 @@
 const { test, expect } = require('@playwright/test');
-const { reset, seed, refresh } = require('./support.cjs');
+const { reset, seed, refresh, openCurrent, closeCurrent } = require('./support.cjs');
 
 test.beforeEach(async ({ page }) => reset(page));
 
@@ -9,6 +9,7 @@ test('SSE reconciliation renders Current metadata and moves finished rows to His
         filesize: 2048, downloaded_bytes: 512, total_bytes: 2048,
         resolution: '720p', eta: 12, title: 'Live fixture',
     });
+    await openCurrent(page);
     const current = page.locator('#activeList [data-row-id="live0001"]');
     await expect(current).toBeVisible();
     await expect(current.locator('.status-row')).toHaveCount(0);
@@ -35,7 +36,7 @@ test('SSE reconciliation renders Current metadata and moves finished rows to His
     await expect(current.locator('.action-progress-track')).toBeVisible();
 
     await seed(page, { id: 'live0001', status: 'finished', progress: '100%', file: true, resolution: '720p' });
-    await page.locator('[data-tab=history]').click();
+    await closeCurrent(page);
     await expect(page.locator('#historyList [data-row-id="live0001"]')).toBeVisible();
     await expect(page.locator('#activeList [data-row-id="live0001"]')).toHaveCount(0);
 });
@@ -46,6 +47,7 @@ test('active download shows progress around the Stop action', async ({ page }) =
         downloaded_bytes: 25, total_bytes: 100,
     });
     await refresh(page);
+    await openCurrent(page);
 
     const row = page.locator('[data-row-id="itemring1"]');
     const stop = row.getByRole('button', { name: 'Stop', exact: true });
@@ -96,6 +98,7 @@ test('active download shows progress around the Stop action', async ({ page }) =
         downloaded_bytes: 150, total_bytes: 100,
     });
     await refresh(page);
+    await openCurrent(page);
     await expect(row.locator('.action-progress-icon')).toHaveAttribute('data-progress', '100');
     await expect(row.locator('.action-progress-ring')).toHaveCSS('stroke-dashoffset', '0px');
 });
@@ -107,6 +110,7 @@ test('paused download keeps progress around the Resume action', async ({ page })
         resolution: '720p',
     });
     await refresh(page);
+    await openCurrent(page);
     await seed(page, { id: 'itemring2', status: 'paused' });
     await refresh(page);
 
@@ -141,6 +145,7 @@ test('unknown-size download shows only the action progress track', async ({ page
         speed: 1024, resolution: '720p', title: 'Unknown length fixture',
     });
     await refresh(page);
+    await openCurrent(page);
     const row = page.locator('[data-row-id="unknown1"]');
     await expect(row.locator('.status-row')).toHaveCount(0);
     await expect(row).not.toContainText('Status:');
@@ -322,6 +327,7 @@ test('pause, unpause, stop, and continue buttons call their dedicated endpoints'
         downloaded_bytes: 10, total_bytes: 100,
     });
     await refresh(page);
+    await openCurrent(page);
     const calls = [];
     for (const action of ['pause', 'unpause', 'stop', 'resume']) {
         await page.route(`**/api/${action}/actions1`, async route => {
@@ -361,6 +367,7 @@ test('pause, unpause, stop, and continue buttons call their dedicated endpoints'
 test('Stop pressed during live reconciliation still requests cancellation', async ({ page }) => {
     await seed(page, { id: 'stop0001', status: 'downloading', progress: '10%' });
     await refresh(page);
+    await openCurrent(page);
     let stopRequests = 0;
     await page.route('**/api/stop/stop0001', async route => {
         stopRequests += 1;
@@ -381,20 +388,20 @@ test('Stop pressed during live reconciliation still requests cancellation', asyn
 test('closing a row menu reconciles a deferred live update', async ({ page }) => {
     await seed(page, { id: 'menu0001', status: 'downloading', progress: '90%' });
     await refresh(page);
+    await openCurrent(page);
     await page.locator('[data-row-id="menu0001"] .kebab-btn').click();
     await seed(page, { id: 'menu0001', status: 'finished', progress: '100%', file: true });
     await page.waitForTimeout(100);
-    await page.locator('h2').click();
-    await page.locator('[data-tab=history]').click();
+    await page.locator('#currentDownloadsTitle').click();
+    await closeCurrent(page);
     await expect(page.locator('#historyList [data-row-id="menu0001"]')).toBeVisible();
 });
 
 test('History insertion animates occupied space before visibility', async ({ page }) => {
-    await page.locator('[data-tab=history]').click();
     await page.evaluate(() => {
         window.__historyAnimations = [];
         document.addEventListener('animationstart', event => {
-            if (event.target.matches('#historyList .history-item')) {
+            if (event.target.matches('#historyList .history-card')) {
                 window.__historyAnimations.push(
                     event.target.getAnimations().flatMap(animation => animation.effect.getKeyframes()),
                 );

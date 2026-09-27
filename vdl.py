@@ -557,6 +557,10 @@ def delete_download_artifacts(entry, fallback_dir=None):
         # generated download ID used to identify yt-dlp's temporary files.
         candidates.update((filename, filename + ".part", filename + ".ytdl"))
 
+    thumbnail = _thumbnail_path(entry, fallback_dir)
+    if thumbnail:
+        candidates.add(thumbnail)
+
     search_dirs = {entry.get("output_dir"), fallback_dir}
     if filename:
         search_dirs.add(os.path.dirname(os.path.abspath(filename)))
@@ -1387,6 +1391,9 @@ def _background_download(url, download_id):
                 # download — leaving the resolution column unset for some
                 # extractors. ffprobe always reflects the final container.
                 final_res = ffprobe_resolution(final_path)
+                thumbnail_path = _thumbnail_path(entry, output_dir)
+                if thumbnail_path:
+                    generate_video_thumbnail(final_path, thumbnail_path)
                 db_update_download(
                     download_id,
                     status='finished',
@@ -1433,6 +1440,55 @@ def ffprobe_resolution(path):
     except Exception:
         pass
     return None
+
+
+def _thumbnail_path(entry, fallback_dir=None):
+    """Return the stable sidecar path for one download's generated preview."""
+    directory = entry.get('output_dir')
+    if not directory and entry.get('filename'):
+        directory = os.path.dirname(os.path.abspath(entry['filename']))
+    if not directory:
+        directory = fallback_dir
+    if not directory:
+        return None
+    return os.path.join(
+        os.path.abspath(directory),
+        f".vdl_{entry['id']}.thumbnail.jpg",
+    )
+
+
+def generate_video_thumbnail(media_path, thumbnail_path):
+    """Extract a compact preview frame without making download success depend on it."""
+    for seek_time in ('1', '0'):
+        temporary_path = (
+            f"{thumbnail_path}.{uuid.uuid4().hex}.tmp.jpg"
+        )
+        try:
+            result = subprocess.run(
+                [
+                    'ffmpeg', '-v', 'error', '-ss', seek_time, '-i', media_path,
+                    '-map', '0:v:0', '-frames:v', '1', '-an', '-sn',
+                    '-vf', 'scale=480:-2:force_original_aspect_ratio=decrease',
+                    '-q:v', '4', '-f', 'image2', '-y', temporary_path,
+                ],
+                capture_output=True,
+                timeout=30,
+            )
+            if (result.returncode == 0
+                    and os.path.isfile(temporary_path)
+                    and os.path.getsize(temporary_path) > 0):
+                os.replace(temporary_path, thumbnail_path)
+                return True
+        except (OSError, subprocess.SubprocessError):
+            pass
+        finally:
+            try:
+                os.remove(temporary_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1791,28 +1847,9 @@ def events():
     return resp
 
 
-@app.route('/api/file/<download_id>', methods=['GET'])
-def stream_file(download_id):
-    """Serve a finished download to the in-app player. Uses send_file's
-    conditional/range response so the <video> element can seek.
-
-    The absolute path captured by yt-dlp at download time is stored in the
-    `filename` column. We trust that path (rather than rebuilding it from
-    the *current* download_dir preference) so playback keeps working after
-    the user changes the download directory mid-history.
-
-    Path-traversal protection: instead of confining to the current
-    `download_dir`, we confine to the union of directories captured when
-    workers start. A tampered filename cannot make its own parent trusted.
-    """
-    entry = db_get_download(download_id)
-    if entry is None or entry.get('status') != 'finished':
-        abort(404)
-    path = entry.get('filename')
-    if not path or not os.path.isfile(path):
-        abort(404)
+def _is_allowed_download_path(path):
+    """Confine media and previews to directories captured by download workers."""
     real = os.path.realpath(path)
-
     # Worker snapshots are independent of the later filename reported by
     # yt-dlp, so a corrupted filename cannot authorize its own directory.
     # Retaining every snapshot keeps old downloads playable after preferences
@@ -1830,10 +1867,26 @@ def stream_file(download_id):
         except (TypeError, ValueError):
             continue
 
-    if not any(
-        os.path.commonpath([real, base]) == base
-        for base in allowed_bases
-    ):
+    try:
+        return any(
+            os.path.commonpath([real, base]) == base
+            for base in allowed_bases
+        )
+    except ValueError:
+        return False
+
+
+@app.route('/api/file/<download_id>', methods=['GET'])
+def stream_file(download_id):
+    """Serve a finished download with range support for the in-app player."""
+    entry = db_get_download(download_id)
+    if entry is None or entry.get('status') != 'finished':
+        abort(404)
+    path = entry.get('filename')
+    if not path or not os.path.isfile(path):
+        abort(404)
+    real = os.path.realpath(path)
+    if not _is_allowed_download_path(real):
         abort(403)
     # Resolve MIME type for the browser's <video> element. mimetypes.guess_type
     # relies on the OS MIME database, which may lack entries for .webm or .mkv
@@ -1858,6 +1911,33 @@ def stream_file(download_id):
     ext = os.path.splitext(real)[1].lower()
     mimetype = _MIME_MAP.get(ext) or mimetypes.guess_type(real)[0] or 'application/octet-stream'
     return send_file(real, mimetype=mimetype, conditional=True)
+
+
+@app.route('/api/thumbnail/<download_id>', methods=['GET'])
+def stream_thumbnail(download_id):
+    """Serve a cached local preview, generating one for older video rows."""
+    entry = db_get_download(download_id)
+    if entry is None or entry.get('status') != 'finished':
+        abort(404)
+    media_path = entry.get('filename')
+    if not media_path or not os.path.isfile(media_path):
+        abort(404)
+    if not _is_allowed_download_path(media_path):
+        abort(403)
+
+    fallback_dir = db_get_preferences().get('download_dir', '.')
+    thumbnail_path = _thumbnail_path(entry, fallback_dir)
+    if not thumbnail_path or not _is_allowed_download_path(thumbnail_path):
+        abort(403)
+    if (not os.path.isfile(thumbnail_path)
+            and not generate_video_thumbnail(media_path, thumbnail_path)):
+        abort(404)
+    return send_file(
+        thumbnail_path,
+        mimetype='image/jpeg',
+        conditional=True,
+        max_age=86400,
+    )
 
 
 @app.route('/api/preferences', methods=['GET', 'POST'])

@@ -102,6 +102,20 @@
                     <circle cx="8" cy="13" r="1.4"/>
                 </g>
             </symbol>
+            <symbol id="i-info" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+                    <circle cx="8" cy="8" r="6.25"/>
+                    <path d="M8 7v4"/>
+                </g>
+                <circle cx="8" cy="4.6" r="0.9" fill="currentColor"/>
+            </symbol>
+            <symbol id="i-cog" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="8" cy="8" r="4.8"/>
+                    <circle cx="8" cy="8" r="2.1"/>
+                    <path d="M8 1.2v2M8 12.8v2M1.2 8h2M12.8 8h2M3.2 3.2l1.4 1.4M11.4 11.4l1.4 1.4M12.8 3.2l-1.4 1.4M4.6 11.4l-1.4 1.4"/>
+                </g>
+            </symbol>
             <symbol id="i-stop" viewBox="0 0 16 16">
                 <rect x="3.5" y="3.5" width="9" height="9" rx="1" fill="currentColor"/>
             </symbol>
@@ -133,83 +147,88 @@
         </defs>
     </svg>
 
-    <h2 class="app-title">
-        <svg id="appTitleIcon" class="app-title-icon" viewBox="-1.5 -1.5 19 19" aria-hidden="true">
-            <use href="#i-app-download" x="0" y="0" width="16" height="16"/>
-            <circle id="appTitleProgressTrack" class="app-title-progress-track" cx="8" cy="8" r="8.1"/>
-            <circle id="appTitleProgressRing" class="app-title-progress-ring" cx="8" cy="8" r="8.1"
-                    pathLength="100" transform="rotate(-90 8 8)" hidden/>
-        </svg>
-        <span>Video Download Helper</span>
-    </h2>
-    <form id="downloadForm" class="form-group" onsubmit="startDownload(event)">
-        <div class="url-wrap">
-            <input type="url" id="urlInput" placeholder="Enter video URL here..." required autocomplete="off">
-            <button type="button" id="urlClear" class="url-clear" aria-label="Clear URL" style="display:none;"><svg width="14" height="14"><use href="#i-x"/></svg></button>
+    <header id="appHeader" class="app-header">
+        <h2 class="app-title">
+            <svg id="appTitleIcon" class="app-title-icon" viewBox="-1.5 -1.5 19 19" aria-hidden="true">
+                <use href="#i-app-download" x="0" y="0" width="16" height="16"/>
+                <circle id="appTitleProgressTrack" class="app-title-progress-track" cx="8" cy="8" r="8.1"/>
+                <circle id="appTitleProgressRing" class="app-title-progress-ring" cx="8" cy="8" r="8.1"
+                        pathLength="100" transform="rotate(-90 8 8)" hidden/>
+            </svg>
+            <span>Video Download Helper</span>
+        </h2>
+        <div class="header-actions">
+            <button id="currentDownloadsButton" class="current-downloads-button" type="button"
+                    onclick="openCurrentDownloads()" aria-label="Current downloads"
+                    aria-haspopup="dialog" aria-controls="currentDownloadsDrawer" aria-expanded="false">
+                <svg aria-hidden="true"><use href="#i-download"/></svg>
+                <span class="current-downloads-label">Current downloads</span>
+                <span id="currentBadge" class="badge" hidden>0</span>
+            </button>
+            <button id="settingsButton" class="settings-button" type="button" onclick="openSettings()"
+                    aria-label="Settings" aria-haspopup="dialog" aria-controls="settingsDialog" aria-expanded="false">
+                <svg aria-hidden="true"><use href="#i-cog"/></svg>
+            </button>
         </div>
-        <button type="submit"><svg class="btn-icon"><use href="#i-download"/></svg><span>Download</span></button>
-    </form>
-
-    <div id="optionsContainer">
-        <details class="options-panel">
-            <summary class="options-summary">
-                <svg class="chev" viewBox="0 0 16 16" width="16" height="16">
-                    <path fill="currentColor" d="M8 12.3L1 5.5l1.4-1.4L8 9.5l5.6-5.4L15 5.5z"/>
-                </svg>
-                Download Options
-            </summary>
-            <div class="options-content">
-                <div id="optionsOverlay" class="options-overlay">
-                    <span class="options-overlay-msg">Select a URL to see available options</span>
-                </div>
-                <div class="options-row">
-                    <label for="optionsQualitySelect">Quality</label>
-                    <select id="optionsQualitySelect" class="options-select" style="flex: 1;" disabled>
-                        <option value="">Use default preference</option>
-                    </select>
-                </div>
-                <div class="options-row">
-                    <label for="optionsContainerSelect">Container Format</label>
-                    <select id="optionsContainerSelect" class="options-select" style="flex: 1;" disabled>
-                        <option value="">Automatic</option>
-                    </select>
-                </div>
-                <div class="options-row">
-                    <label for="optionsFilename">Title/Filename</label>
-                    <input type="text" id="optionsFilename" placeholder="Will be auto-filled from video title" style="flex: 1;">
-                </div>
+    </header>
+    <section class="new-download-section" aria-labelledby="newDownloadTitle">
+        <h2 id="newDownloadTitle">New download</h2>
+        <form id="downloadForm" class="form-group" onsubmit="startDownload(event)">
+            <label for="urlInput" class="visually-hidden">Download URL</label>
+            <div class="url-wrap">
+                <input type="url" id="urlInput" placeholder="Enter video URL here..." required autocomplete="off">
+                <button type="button" id="urlClear" class="url-clear" aria-label="Clear URL" style="display:none;"><svg width="14" height="14"><use href="#i-x"/></svg></button>
             </div>
-        </details>
-    </div>
+            <button type="submit"><svg class="btn-icon"><use href="#i-download"/></svg><span>Download</span></button>
+        </form>
 
-    <div class="tabs" role="tablist">
-        <button class="tab active" data-tab="current" onclick="switchTab('current')">Current<span id="currentBadge" class="badge" style="display: none;">0</span></button>
-        <button class="tab" data-tab="history" onclick="switchTab('history')">Download History</button>
-        <button class="tab" data-tab="preferences" onclick="switchTab('preferences')">Preferences</button>
-    </div>
-
-    <div id="tagFilter" class="tag-filter" aria-label="Filter downloads by tag">
-        <select id="tagMatchMode" class="tag-match-mode" aria-label="Tag match mode">
-            <option value="all">ALL</option>
-            <option value="any">ANY</option>
-        </select>
-        <div id="tagFilterPicker" class="tag-filter-picker">
-            <div id="tagFilterTokens" class="tag-filter-tokens">
-                <input id="tagFilterInput" type="text" maxlength="64" placeholder="Filter by tag" autocomplete="off" aria-label="Filter by tag" aria-expanded="false" aria-controls="tagFilterSuggestions">
-            </div>
-            <div id="tagFilterSuggestions" class="tag-suggestions tag-filter-suggestions" role="listbox" hidden></div>
+        <div id="optionsContainer">
+            <details class="options-panel">
+                <summary class="options-summary">
+                    <svg class="chev" viewBox="0 0 16 16" width="16" height="16">
+                        <path fill="currentColor" d="M8 12.3L1 5.5l1.4-1.4L8 9.5l5.6-5.4L15 5.5z"/>
+                    </svg>
+                    Download Options
+                </summary>
+                <div class="options-content">
+                    <div id="optionsOverlay" class="options-overlay">
+                        <span class="options-overlay-msg">Select a URL to see available options</span>
+                    </div>
+                    <div class="options-row">
+                        <label for="optionsQualitySelect">Quality</label>
+                        <select id="optionsQualitySelect" class="options-select" style="flex: 1;" disabled>
+                            <option value="">Use default preference</option>
+                        </select>
+                    </div>
+                    <div class="options-row">
+                        <label for="optionsContainerSelect">Container Format</label>
+                        <select id="optionsContainerSelect" class="options-select" style="flex: 1;" disabled>
+                            <option value="">Automatic</option>
+                        </select>
+                    </div>
+                    <div class="options-row">
+                        <label for="optionsFilename">Title/Filename</label>
+                        <input type="text" id="optionsFilename" placeholder="Will be auto-filled from video title" style="flex: 1;">
+                    </div>
+                </div>
+            </details>
         </div>
-        <button id="clearTagFilter" class="tag-filter-clear" type="button" hidden>Clear</button>
-    </div>
+    </section>
 
-    <div id="tab-current" class="tab-panel active">
-        <div id="activeList"></div>
-        <p id="currentEmpty" class="empty">No active downloads. Paste a URL above to start.</p>
-    </div>
-
-    <div id="tab-history" class="tab-panel">
-        <div class="tab-header">
-            <button class="clear-btn" onclick="clearHistory()" style="margin-left:auto;">Clear History</button>
+    <section id="tab-history" class="history-panel" aria-labelledby="historyTitle">
+        <h2 id="historyTitle">Download History</h2>
+        <div id="tagFilter" class="tag-filter" aria-label="Filter download history by tag">
+            <select id="tagMatchMode" class="tag-match-mode" aria-label="Tag match mode">
+                <option value="all">ALL</option>
+                <option value="any">ANY</option>
+            </select>
+            <div id="tagFilterPicker" class="tag-filter-picker">
+                <div id="tagFilterTokens" class="tag-filter-tokens">
+                    <input id="tagFilterInput" type="text" maxlength="64" placeholder="Filter by tag" autocomplete="off" aria-label="Filter by tag" aria-expanded="false" aria-controls="tagFilterSuggestions">
+                </div>
+                <div id="tagFilterSuggestions" class="tag-suggestions tag-filter-suggestions" role="listbox" hidden></div>
+            </div>
+            <button id="clearTagFilter" class="tag-filter-clear" type="button" hidden>Clear</button>
         </div>
         <div id="historyList"></div>
         <div id="historyPager" class="pager" style="display:none;">
@@ -219,8 +238,34 @@
             <button id="pagerNext" onclick="changePage(1)" aria-label="Next page">›</button>
             <button id="pagerLast" onclick="goToPage(Infinity)" aria-label="Jump to last page">»</button>
         </div>
-        <p id="historyEmpty" class="empty">No completed downloads yet.</p>
-    </div>
+        <div id="historyEmpty" class="history-empty">
+            <strong id="historyEmptyTitle">No downloads yet</strong>
+            <span id="historyEmptyMessage">Paste a video URL above to get started.</span>
+            <button id="historyEmptyAction" type="button" onclick="focusNewDownload()">Start a download</button>
+        </div>
+    </section>
+
+    <dialog id="currentDownloadsDrawer" class="current-drawer" aria-labelledby="currentDownloadsTitle" aria-modal="true">
+        <div class="current-drawer-shell">
+            <div class="current-drawer-header">
+                <div>
+                    <h2 id="currentDownloadsTitle">Current downloads</h2>
+                    <span id="currentDrawerCount">0 items</span>
+                </div>
+                <button class="current-drawer-close" type="button" onclick="closeCurrentDownloads()" aria-label="Close current downloads" autofocus>
+                    <svg aria-hidden="true"><use href="#i-x"/></svg>
+                </button>
+            </div>
+            <div class="current-drawer-body">
+                <div id="currentDrawerError" class="action-error" role="alert" aria-live="assertive" hidden>
+                    <span id="currentDrawerErrorMessage"></span>
+                    <button type="button" class="action-error-close" onclick="hideActionError()" aria-label="Dismiss error"><svg width="14" height="14"><use href="#i-x"/></svg></button>
+                </div>
+                <div id="activeList"></div>
+                <p id="currentEmpty" class="empty">No current downloads.</p>
+            </div>
+        </div>
+    </dialog>
 
     <div id="playerBackdrop" class="player-backdrop" onclick="closePlayer(event)">
         <div class="player-box" onclick="event.stopPropagation()">
@@ -230,56 +275,75 @@
         </div>
     </div>
 
-    <div id="tab-preferences" class="tab-panel">
-        <div class="pref-row">
-            <label for="prefDir">Download directory</label>
-            <input type="text" id="prefDir" style="width: 300px;">
+    <dialog id="settingsDialog" class="settings-dialog" aria-labelledby="settingsTitle" aria-modal="true">
+        <div class="settings-dialog-header">
+            <h2 id="settingsTitle">Settings</h2>
+            <button class="settings-close" type="button" onclick="closeSettings()" aria-label="Close settings" autofocus>
+                <svg aria-hidden="true"><use href="#i-x"/></svg>
+            </button>
         </div>
-        <div class="pref-row">
-            <label for="prefFormat">Quality</label>
-            <select id="prefFormat" style="width: 320px;">
-                <option value="bestvideo+bestaudio/best">Best available (video + audio merged)</option>
-                <option value="best">Best single file (no merge needed)</option>
-                <option value="bestvideo[height<=2160]+bestaudio/best">Up to 2160p (4K)</option>
-                <option value="bestvideo[height<=1440]+bestaudio/best">Up to 1440p (2K)</option>
-                <option value="bestvideo[height<=1080]+bestaudio/best">Up to 1080p (Full HD)</option>
-                <option value="bestvideo[height<=720]+bestaudio/best">Up to 720p (HD)</option>
-                <option value="bestvideo[height<=480]+bestaudio/best">Up to 480p (SD)</option>
-                <option value="worstvideo+worstaudio/worst">Smallest file (lowest quality)</option>
-                <option value="bestaudio/best">Audio only (best)</option>
-                <option value="__custom__">Custom (advanced)</option>
-            </select>
+        <div class="settings-dialog-body">
+            <div id="settingsError" class="action-error settings-error" role="alert" aria-live="assertive" hidden>
+                <span id="settingsErrorMessage"></span>
+                <button type="button" class="action-error-close" onclick="hideActionError()" aria-label="Dismiss error"><svg width="14" height="14"><use href="#i-x"/></svg></button>
+            </div>
+            <div class="pref-row">
+                <label for="prefDir">Download directory</label>
+                <input type="text" id="prefDir" style="width: 300px;">
+            </div>
+            <div class="pref-row">
+                <label for="prefFormat">Quality</label>
+                <select id="prefFormat" style="width: 320px;">
+                    <option value="bestvideo+bestaudio/best">Best available (video + audio merged)</option>
+                    <option value="best">Best single file (no merge needed)</option>
+                    <option value="bestvideo[height<=2160]+bestaudio/best">Up to 2160p (4K)</option>
+                    <option value="bestvideo[height<=1440]+bestaudio/best">Up to 1440p (2K)</option>
+                    <option value="bestvideo[height<=1080]+bestaudio/best">Up to 1080p (Full HD)</option>
+                    <option value="bestvideo[height<=720]+bestaudio/best">Up to 720p (HD)</option>
+                    <option value="bestvideo[height<=480]+bestaudio/best">Up to 480p (SD)</option>
+                    <option value="worstvideo+worstaudio/worst">Smallest file (lowest quality)</option>
+                    <option value="bestaudio/best">Audio only (best)</option>
+                    <option value="__custom__">Custom (advanced)</option>
+                </select>
+            </div>
+            <div class="pref-row" id="customFormatRow" style="display: none;">
+                <label for="prefFormatCustom">Custom format</label>
+                <input type="text" id="prefFormatCustom" style="width: 320px;" placeholder="e.g. bestvideo[ext=mp4]+bestaudio[ext=m4a]">
+            </div>
+            <div class="pref-row">
+                <label for="prefMax">Max concurrent</label>
+                <input type="number" id="prefMax" min="1" style="width: 80px;">
+            </div>
+            <div class="pref-row">
+                <label for="prefPlayer">Play videos in</label>
+                <select id="prefPlayer" style="width: 320px;">
+                    <option value="overlay">Overlay on this page</option>
+                    <option value="new_tab">New browser tab</option>
+                </select>
+            </div>
+            <div class="pref-row">
+                <label for="prefTheme">Theme</label>
+                <select id="prefTheme" style="width: 320px;">
+                    <option value="system">System (follow OS setting)</option>
+                    <option value="light">Light</option>
+                    <option value="dark">Dark</option>
+                </select>
+            </div>
+            <div class="settings-history-row">
+                <div>
+                    <strong>Download history</strong>
+                    <span>Remove completed and failed downloads and their files.</span>
+                </div>
+                <button class="clear-btn" type="button" onclick="clearHistory()">Clear History</button>
+            </div>
+            <div class="pref-actions">
+                <button id="saveBtn" type="button" onclick="savePreferences()"><svg class="btn-icon"><use href="#i-save"/></svg><span>Save</span></button>
+            </div>
         </div>
-        <div class="pref-row" id="customFormatRow" style="display: none;">
-            <label for="prefFormatCustom">Custom format</label>
-            <input type="text" id="prefFormatCustom" style="width: 320px;" placeholder="e.g. bestvideo[ext=mp4]+bestaudio[ext=m4a]">
-        </div>
-        <div class="pref-row">
-            <label for="prefMax">Max concurrent</label>
-            <input type="number" id="prefMax" min="1" style="width: 80px;">
-        </div>
-        <div class="pref-row">
-            <label for="prefPlayer">Play videos in</label>
-            <select id="prefPlayer" style="width: 320px;">
-                <option value="overlay">Overlay on this page</option>
-                <option value="new_tab">New browser tab</option>
-            </select>
-        </div>
-        <div class="pref-row">
-            <label for="prefTheme">Theme</label>
-            <select id="prefTheme" style="width: 320px;">
-                <option value="system">System (follow OS setting)</option>
-                <option value="light">Light</option>
-                <option value="dark">Dark</option>
-            </select>
-        </div>
-        <div class="pref-actions">
-            <button id="saveBtn" onclick="savePreferences()"><svg class="btn-icon"><use href="#i-save"/></svg><span>Save</span></button>
-        </div>
-    </div>
+    </dialog>
 
     <footer id="versionFooter" class="version-footer" data-ui-version="{{ ui_version }}">
-        <span>UI v{{ ui_version }}</span><span aria-hidden="true"> · </span><span id="apiVersion">API checking…</span>
+        <span id="itemCount">0 items</span><span aria-hidden="true"> · </span><span>UI v{{ ui_version }}</span><span aria-hidden="true"> · </span><span id="apiVersion">API checking…</span>
         <span aria-hidden="true"> · </span><span id="uptime">Uptime checking…</span>
         <span id="versionWarning" class="version-warning" hidden>
             <span>version mismatch</span>

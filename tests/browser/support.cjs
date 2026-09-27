@@ -16,4 +16,20 @@ async function refresh(page) {
     await page.evaluate(() => fetchHistory());
 }
 
-module.exports = { reset, seed, refresh };
+async function openCurrent(page) {
+    const drawer = page.locator('#currentDownloadsDrawer');
+    if (!(await drawer.isVisible())) {
+        await page.locator('#currentDownloadsButton').click();
+    }
+    await expect(drawer).toBeVisible();
+}
+
+async function closeCurrent(page) {
+    const drawer = page.locator('#currentDownloadsDrawer');
+    if (await drawer.isVisible()) {
+        await drawer.getByRole('button', { name: 'Close current downloads' }).click();
+    }
+    await expect(drawer).toBeHidden();
+}
+
+module.exports = { reset, seed, refresh, openCurrent, closeCurrent };

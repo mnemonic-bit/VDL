@@ -4,7 +4,7 @@ const { reset, seed, refresh } = require('./support.cjs');
 test.beforeEach(async ({ page }) => reset(page));
 
 test('light, dark, and system theme choices apply immediately', async ({ page }) => {
-    await page.locator('[data-tab=preferences]').click();
+    await page.locator('#settingsButton').click();
     await page.locator('#prefTheme').selectOption('dark');
     await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
     await page.locator('#prefTheme').selectOption('light');
@@ -18,7 +18,7 @@ test('light, dark, and system theme choices apply immediately', async ({ page })
 
 test('preferences persist and the temporary Saved icon restores to Save', async ({ page }) => {
     await page.clock.install();
-    await page.locator('[data-tab=preferences]').click();
+    await page.locator('#settingsButton').click();
     await page.locator('#prefTheme').selectOption('dark');
     await page.locator('#prefMax').fill('1');
     await page.locator('#saveBtn').click();
@@ -32,7 +32,7 @@ test('preferences persist and the temporary Saved icon restores to Save', async 
 });
 
 test('rejected preferences stay editable and are not displayed as saved', async ({ page }) => {
-    await page.locator('[data-tab=preferences]').click();
+    await page.locator('#settingsButton').click();
     const original = await (await page.request.get('/api/preferences')).json();
     await page.route('**/api/preferences', async route => {
         if (route.request().method() === 'POST') {
@@ -59,7 +59,7 @@ test('rejected preferences stay editable and are not displayed as saved', async 
     expect(persisted).toEqual(original);
 
     await seed(page, { id: 'failedpref1', status: 'finished', file: true, name: 'fixture.mp4' });
-    await page.locator('[data-tab=history]').click();
+    await page.getByRole('button', { name: 'Close settings', exact: true }).click();
     await refresh(page);
     await page.locator('[data-row-id="failedpref1"]').getByRole('button', { name: 'Play', exact: true }).click();
     await expect(page.locator('#playerBackdrop')).toHaveClass(/open/);

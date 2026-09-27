@@ -5,7 +5,6 @@ test.beforeEach(async ({ page }) => reset(page));
 
 test('overlay playback assigns MIME, supports Range, and Escape closes it', async ({ page }) => {
     await seed(page, { id: 'play0001', status: 'finished', file: true, name: 'fixture.mp4' });
-    await page.locator('[data-tab=history]').click();
     await refresh(page);
     await page.locator('[data-row-id="play0001"]').getByRole('button', { name: 'Play', exact: true }).click();
     await expect(page.locator('#playerBackdrop')).toHaveClass(/open/);
@@ -21,7 +20,6 @@ test('new-tab player mode opens the stored file endpoint', async ({ page }) => {
     await page.request.post('/__test__/preferences', { data: { player_mode: 'new_tab' } });
     await seed(page, { id: 'playtab1', status: 'finished', file: true, name: 'fixture.webm' });
     await page.reload();
-    await page.locator('[data-tab=history]').click();
     await page.evaluate(() => {
         window.__opened = null;
         window.open = (...args) => { window.__opened = args; };

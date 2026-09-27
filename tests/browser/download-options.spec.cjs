@@ -1,5 +1,5 @@
 const { test, expect } = require('@playwright/test');
-const { reset } = require('./support.cjs');
+const { reset, closeCurrent } = require('./support.cjs');
 
 test.beforeEach(async ({ page }) => reset(page));
 
@@ -76,6 +76,6 @@ test('custom filename controls the resulting downloaded basename', async ({ page
     await page.locator('#urlInput').fill('https://fixture.invalid/custom');
     await page.locator('#optionsFilename').fill('chosen-browser-name');
     await page.locator('#downloadForm button[type=submit]').click();
-    await page.locator('[data-tab=history]').click();
+    await closeCurrent(page);
     await expect(page.locator('#historyList')).toContainText('chosen-browser-name.mp4', { timeout: 5000 });
 });
