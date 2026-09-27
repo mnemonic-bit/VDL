@@ -1706,8 +1706,10 @@ let historyPage = 0;
 let historyTotal = 0;
 let _renderedActiveIds  = new Set();
 let _renderedHistoryIds = new Set();
+const pendingActiveAnimations = new Set();
+const pendingHistoryAnimations = new Set();
 
-function animateInsertedItem(element) {
+function animateInsertedItem(element, pendingAnimations, id) {
     // Rows vary with their metadata, so animate toward the natural box size
     // instead of leaving every completed row under a guessed height limit.
     const style = getComputedStyle(element);
@@ -1717,10 +1719,18 @@ function animateInsertedItem(element) {
     element.style.setProperty('--item-expanded-margin-bottom', style.marginBottom);
     element.style.setProperty('--item-expanded-border-top-width', style.borderTopWidth);
     element.style.setProperty('--item-expanded-border-bottom-width', style.borderBottomWidth);
+    pendingAnimations.add(id);
     element.classList.add('item-fade-in');
 
+    const started = event => {
+        if (event.target !== element || event.animationName !== 'item-fade-in') return;
+        pendingAnimations.delete(id);
+        element.removeEventListener('animationstart', started);
+    };
     const finish = event => {
         if (event.target !== element || event.animationName !== 'item-fade-in') return;
+        pendingAnimations.delete(id);
+        element.removeEventListener('animationstart', started);
         element.removeEventListener('animationend', finish);
         element.classList.remove('item-fade-in');
         for (const property of [
@@ -1734,6 +1744,7 @@ function animateInsertedItem(element) {
             element.style.removeProperty(property);
         }
     };
+    element.addEventListener('animationstart', started);
     element.addEventListener('animationend', finish);
 }
 
@@ -1811,22 +1822,31 @@ function fetchHistory() {
 
         const newActiveIds  = new Set(active.map(i => String(i.id)));
         const newHistoryIds = new Set(pageItems.map(i => String(i.id)));
+        // An SSE burst can replace a newly inserted node before animationstart.
+        // Retry only that pre-start window; restarting an animation already in
+        // progress makes successive reconciliations keep cards in motion.
+        pendingActiveAnimations.forEach(id => {
+            if (!newActiveIds.has(id)) pendingActiveAnimations.delete(id);
+        });
+        pendingHistoryAnimations.forEach(id => {
+            if (!newHistoryIds.has(id)) pendingHistoryAnimations.delete(id);
+        });
 
         document.getElementById('activeList').innerHTML  = active.map(i => renderItem(i, false)).join('');
         document.getElementById('historyList').innerHTML = pageItems.map(i => renderItem(i, true)).join('');
 
         if (currentDrawerVisible) {
             newActiveIds.forEach(id => {
-                if (!_renderedActiveIds.has(id)) {
+                if (!_renderedActiveIds.has(id) || pendingActiveAnimations.has(id)) {
                     const el = document.querySelector(`#activeList [data-row-id="${id}"]`);
-                    if (el) animateInsertedItem(el);
+                    if (el) animateInsertedItem(el, pendingActiveAnimations, id);
                 }
             });
         }
         newHistoryIds.forEach(id => {
-            if (!_renderedHistoryIds.has(id)) {
+            if (!_renderedHistoryIds.has(id) || pendingHistoryAnimations.has(id)) {
                 const el = document.querySelector(`#historyList [data-row-id="${id}"]`);
-                if (el) animateInsertedItem(el);
+                if (el) animateInsertedItem(el, pendingHistoryAnimations, id);
             }
         });
 

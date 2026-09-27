@@ -377,9 +377,9 @@ test('Stop pressed during live reconciliation still requests cancellation', asyn
     });
 
     const stop = page.locator('[data-row-id="stop0001"] .stop-btn');
-    const box = await stop.boundingBox();
-    expect(box).not.toBeNull();
-    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    // Hover waits for the animated drawer and the button to become stable
+    // before the raw pointer sequence exercises reconciliation mid-press.
+    await stop.hover();
     await page.mouse.down();
     await refresh(page);
     await page.mouse.up();

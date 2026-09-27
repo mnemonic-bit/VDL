@@ -157,6 +157,7 @@ test('History groups media details and shows a human-readable duration', async (
         await expect(row.locator('.history-timing-row')).toContainText('Started:');
         await expect(row.locator('.history-timing-row')).toContainText(`Duration: ${durationLabel}`);
         await expect(row).not.toContainText('Finished:');
+        await row.getByRole('button', { name: 'Close info', exact: true }).click();
     }
 });
 
@@ -190,6 +191,7 @@ test('History places a readable requested format on the media line', async ({ pa
         'Quality: 2160p · Size: 2.0 KB · Requested format: 2160p 60fps MP4 video'
     );
     await expect(idRow.locator('.fmt-code')).toHaveCount(0);
+    await idRow.getByRole('button', { name: 'Close info', exact: true }).click();
 
     const selectorRow = page.locator('[data-row-id="history-format-selector"]');
     await openInfo(selectorRow);

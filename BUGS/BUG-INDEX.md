@@ -59,6 +59,15 @@ motion, and a redundant History heading weakened the content-first hierarchy.
 Dialog hit testing and draft behavior are now covered, the drawer slides in
 with reduced-motion support, and the main content keeps only an accessible
 History label.
+Issues 35-37 were found by the GitHub Actions run for commit `e522dd9` on
+2026-09-27. Both CodeQL matrices completed their scans but could not read the
+workflow run while uploading their results because the job lacked
+`actions: read`. The Main job also exposed two browser timing races: its Stop
+test aimed at a control before the animated drawer reached its final position,
+and a burst of insert/update SSE events could replace a new History card before
+its insertion animation started. The CodeQL job now has the required scope,
+the pointer test waits for a stable target, and insertion animations remain
+pending only until a rendered card emits `animationstart`.
 
 ## Bug reports
 
@@ -96,6 +105,9 @@ History label.
 - [Bug 0032 — Header download icon is undersized and its progress ring is too thin](bug-0032-header-download-icon-is-undersized.md)
 - [Bug 0033 — Current Downloads opens unexpectedly and retains a stale count](bug-0033-current-downloads-opens-and-retains-stale-count.md)
 - [Bug 0034 — Download workflow redesign left modal and visual-hierarchy regressions](bug-0034-download-workflow-redesign-left-ui-regressions.md)
+- [Bug 0035 — CodeQL could not upload results without Actions read access](bug-0035-codeql-could-not-upload-without-actions-read.md)
+- [Bug 0036 — Animated drawer made the Stop reconciliation test miss its target](bug-0036-animated-drawer-made-stop-test-miss-target.md)
+- [Bug 0037 — SSE bursts could cancel History insertion animations before they started](bug-0037-sse-bursts-cancelled-history-insertion-animation.md)
 
 ## Accepted UI decisions
 
