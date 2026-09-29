@@ -555,8 +555,7 @@ function resetOptions() {
 }
 
 let availableTags = [];
-let selectedSearchTerms = [];
-let tagMatchMode = 'all';
+let searchTerms = [];
 const editingTagIds = new Set();
 const tagDrafts = new Map();
 const pendingTagCommits = new Set();
@@ -576,7 +575,6 @@ function refreshAvailableTags(rows) {
         (Array.isArray(row.tags) ? row.tags : []).forEach(tag => names.add(tag));
     });
     availableTags = sortTags(Array.from(names));
-    renderTagFilter();
 }
 
 function parseSearchTerms(value) {
@@ -598,143 +596,53 @@ function parseSearchTerms(value) {
     return terms.map(term => term.trim()).filter(Boolean);
 }
 
-function addSearchTerms(terms) {
-    const selected = new Set(selectedSearchTerms.map(tagSearchKey));
-    let changed = false;
-    terms.forEach(term => {
-        const value = String(term || '').trim();
-        const key = tagSearchKey(value);
-        if (!key || selected.has(key)) return;
-        selected.add(key);
-        selectedSearchTerms.push(value);
-        changed = true;
-    });
-    return changed;
-}
-
-function searchTermLabel(term) {
-    return /\s/.test(term) ? `"${term}"` : term;
-}
-
-function renderTagFilterSuggestions(open) {
-    const input = document.getElementById('tagFilterInput');
-    const suggestions = document.getElementById('tagFilterSuggestions');
-    if (!input || !suggestions) return;
-    const query = tagSearchKey(parseSearchTerms(input.value).join(' '));
-    const selected = new Set(selectedSearchTerms.map(tagSearchKey));
-    const matches = availableTags.filter(tag => (
-        !selected.has(tagSearchKey(tag)) && (!query || tagSearchKey(tag).includes(query))
-    ));
-    suggestions.innerHTML = '';
-    matches.forEach(tag => {
-        const button = document.createElement('button');
-        button.type = 'button';
-        button.className = 'tag-suggestion';
-        button.setAttribute('role', 'option');
-        button.textContent = tag;
-        button.addEventListener('mousedown', event => event.preventDefault());
-        button.addEventListener('click', () => {
-            addSearchTerms([tag]);
-            input.value = '';
-            historyPage = 0;
-            renderTagFilter();
-            fetchHistory();
-            input.focus();
-        });
-        suggestions.appendChild(button);
-    });
-    suggestions.hidden = !open || matches.length === 0;
-    input.setAttribute('aria-expanded', String(!suggestions.hidden));
-}
-
-function renderTagFilter() {
-    const tokens = document.getElementById('tagFilterTokens');
-    const input = document.getElementById('tagFilterInput');
-    const clear = document.getElementById('clearTagFilter');
-    if (!tokens || !input || !clear) return;
-    tokens.querySelectorAll('.tag-filter-chip').forEach(chip => chip.remove());
-    selectedSearchTerms.forEach(term => {
-        const chip = document.createElement('span');
-        chip.className = 'tag-chip tag-filter-chip';
-        chip.append(document.createTextNode(searchTermLabel(term)));
-        const remove = document.createElement('button');
-        remove.type = 'button';
-        remove.setAttribute('aria-label', `Remove ${term} search term`);
-        remove.textContent = '×';
-        remove.addEventListener('mousedown', event => event.preventDefault());
-        remove.addEventListener('click', () => {
-            selectedSearchTerms = selectedSearchTerms.filter(value => value !== term);
-            historyPage = 0;
-            renderTagFilter();
-            fetchHistory();
-        });
-        chip.appendChild(remove);
-        tokens.insertBefore(chip, input);
-    });
-    clear.hidden = selectedSearchTerms.length === 0;
-    renderTagFilterSuggestions(document.activeElement === input);
-}
-
 function matchesSearchFilter(info) {
-    if (selectedSearchTerms.length === 0) return true;
+    if (searchTerms.length === 0) return true;
     const title = tagSearchKey(info.title);
     const tags = new Set((Array.isArray(info.tags) ? info.tags : []).map(tagSearchKey));
     const matches = term => {
         const key = tagSearchKey(term);
         return tags.has(key) || title.includes(key);
     };
-    if (tagMatchMode === 'any') {
-        return selectedSearchTerms.some(matches);
-    }
-    return selectedSearchTerms.every(matches);
+    return searchTerms.some(matches);
 }
 
-function tagFilterCommitDraft() {
-    const input = document.getElementById('tagFilterInput');
-    if (!input) return;
-    const terms = parseSearchTerms(input.value);
-    if (!addSearchTerms(terms)) return;
-    input.value = '';
+function setHistorySearchExpanded(expanded) {
+    const search = document.getElementById('historySearch');
+    const toggle = document.getElementById('historySearchToggle');
+    search.classList.toggle('expanded', expanded);
+    toggle.setAttribute('aria-expanded', String(expanded));
+}
+
+function applyHistorySearch() {
+    const input = document.getElementById('historySearchInput');
+    searchTerms = parseSearchTerms(input.value);
     historyPage = 0;
-    renderTagFilter();
     fetchHistory();
 }
 
-const tagFilterInput = document.getElementById('tagFilterInput');
-tagFilterInput.addEventListener('focus', () => renderTagFilterSuggestions(true));
-tagFilterInput.addEventListener('input', () => renderTagFilterSuggestions(true));
-tagFilterInput.addEventListener('keydown', event => {
-    if (event.key === 'Enter') {
-        event.preventDefault();
-        tagFilterCommitDraft();
-    } else if (event.key === 'Backspace' && !tagFilterInput.value && selectedSearchTerms.length) {
-        selectedSearchTerms.pop();
-        historyPage = 0;
-        renderTagFilter();
-        fetchHistory();
-    } else if (event.key === 'Escape') {
-        tagFilterInput.value = '';
-        renderTagFilterSuggestions(false);
-        tagFilterInput.blur();
-    }
+const historySearch = document.getElementById('historySearch');
+const historySearchToggle = document.getElementById('historySearchToggle');
+const historySearchInput = document.getElementById('historySearchInput');
+historySearchToggle.addEventListener('click', () => {
+    setHistorySearchExpanded(true);
+    historySearchInput.focus();
 });
-tagFilterInput.addEventListener('blur', () => {
-    setTimeout(() => renderTagFilterSuggestions(false), 0);
+historySearchInput.addEventListener('focus', () => setHistorySearchExpanded(true));
+historySearchInput.addEventListener('input', applyHistorySearch);
+historySearchInput.addEventListener('keydown', event => {
+    if (event.key !== 'Escape') return;
+    event.preventDefault();
+    historySearchInput.value = '';
+    applyHistorySearch();
+    setHistorySearchExpanded(false);
+    historySearchToggle.focus();
 });
-document.getElementById('tagFilterPicker').addEventListener('click', () => {
-    tagFilterInput.focus();
-});
-document.getElementById('tagMatchMode').addEventListener('change', event => {
-    tagMatchMode = event.target.value === 'any' ? 'any' : 'all';
-    historyPage = 0;
-    fetchHistory();
-});
-document.getElementById('clearTagFilter').addEventListener('click', () => {
-    selectedSearchTerms = [];
-    tagFilterInput.value = '';
-    historyPage = 0;
-    renderTagFilter();
-    fetchHistory();
+historySearchInput.addEventListener('blur', () => {
+    setTimeout(() => {
+        if (historySearch.contains(document.activeElement)) return;
+        if (!historySearchInput.value) setHistorySearchExpanded(false);
+    }, 0);
 });
 
 function tagChipHtml(tag, removable) {
@@ -1921,7 +1829,7 @@ function fetchHistory() {
             }
         }
 
-        const hasFilter = selectedSearchTerms.length > 0;
+        const hasFilter = searchTerms.length > 0;
         document.getElementById('currentEmpty').textContent = 'No current downloads.';
         document.getElementById('historyEmptyTitle').textContent = hasFilter
             ? 'No matching downloads'

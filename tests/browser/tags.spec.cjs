@@ -76,7 +76,7 @@ test('tag affordance fills its row and disappears when editing starts', async ({
     expect(hintColor).not.toBe(inputColor);
 });
 
-test('History tag filter supports ALL and ANY without hiding Current downloads', async ({ page }) => {
+test('Header search uses ANY matching without hiding Current downloads', async ({ page }) => {
     for (const row of [
         { id: 'current-both', status: 'cancelled' },
         { id: 'current-music', status: 'interrupted' },
@@ -93,25 +93,20 @@ test('History tag filter supports ALL and ANY without hiding Current downloads',
     }
     await refresh(page);
 
-    const filter = page.locator('#tagFilter');
-    await filter.locator('input').click();
-    await filter.getByRole('option', { name: 'Music Videos', exact: true }).click();
-    await filter.getByRole('option', { name: 'Tutorial', exact: true }).click();
-    await expect(page.locator('#historyList [data-row-id]')).toHaveCount(1);
+    const search = page.locator('#historySearch');
+    const input = search.locator('input');
+    await search.locator('button').click();
+    await input.fill('"Music Videos" Tutorial');
+    await expect(page.locator('#historyList [data-row-id]')).toHaveCount(2);
     await expect(page.locator('[data-row-id="history-both"]')).toBeVisible();
+    await expect(page.locator('[data-row-id="history-tutorial"]')).toBeVisible();
     await openCurrent(page);
     await expect(page.locator('#activeList [data-row-id]')).toHaveCount(2);
     await expect(page.locator('[data-row-id="current-both"]')).toBeVisible();
     await expect(page.locator('[data-row-id="current-music"]')).toBeVisible();
     await closeCurrent(page);
 
-    await filter.locator('select').selectOption('any');
-    await expect(page.locator('#historyList [data-row-id]')).toHaveCount(2);
-    await openCurrent(page);
-    await expect(page.locator('#activeList [data-row-id]')).toHaveCount(2);
-    await closeCurrent(page);
-
-    await filter.getByRole('button', { name: 'Clear', exact: true }).click();
+    await input.fill('');
     await expect(page.locator('#historyList [data-row-id]')).toHaveCount(2);
 });
 
@@ -144,27 +139,58 @@ test('History search matches title fragments, tags, and quoted phrases', async (
     await attachTag(page, 'history-hybrid', 'Music Videos');
     await refresh(page);
 
-    const filter = page.locator('#tagFilter');
-    const input = filter.locator('input');
+    const search = page.locator('#historySearch');
+    const input = search.locator('input');
+    await search.locator('button').click();
 
     await input.fill('alpin "Music Videos"');
-    await input.press('Enter');
-    await expect(filter.locator('.tag-filter-chip')).toHaveText([
-        'alpin×',
-        '"Music Videos"×',
-    ]);
-    await expect(page.locator('#historyList [data-row-id]')).toHaveCount(1);
+    await expect(input).toHaveValue('alpin "Music Videos"');
+    await expect(page.locator('#historyList [data-row-id]')).toHaveCount(2);
     await expect(page.locator('[data-row-id="history-hybrid"]')).toBeVisible();
+    await expect(page.locator('[data-row-id="history-other"]')).toBeVisible();
 
-    await filter.getByRole('button', { name: 'Clear', exact: true }).click();
     await input.fill('"exact title I am"');
-    await input.press('Enter');
     await expect(page.locator('#historyList [data-row-id]')).toHaveCount(1);
     await expect(page.locator('[data-row-id="history-phrase"]')).toBeVisible();
 
-    await filter.getByRole('button', { name: 'Clear', exact: true }).click();
     await input.fill('sun');
-    await input.press('Enter');
     await expect(page.locator('#historyList [data-row-id]')).toHaveCount(1);
     await expect(page.locator('[data-row-id="history-hybrid"]')).toBeVisible();
+});
+
+test('Header search expands from the leftmost magnifier', async ({ page }) => {
+    const header = page.locator('#appHeader');
+    const search = header.locator('#historySearch');
+    const toggle = search.locator('#historySearchToggle');
+    const input = search.locator('#historySearchInput');
+
+    await expect(toggle.locator('use')).toHaveAttribute('href', '#i-search');
+    await expect(input).toHaveAttribute('type', 'text');
+    await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    await expect(input).toBeHidden();
+    await expect(header.locator('select')).toHaveCount(0);
+    expect(await search.evaluate(element => (
+        element.getBoundingClientRect().right <= document.querySelector('#newDownloadButton').getBoundingClientRect().left
+    ))).toBeTruthy();
+
+    await toggle.click();
+    await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    await expect(input).toBeVisible();
+    await expect(input).toBeFocused();
+
+    await input.press('Escape');
+    await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    await expect(input).toBeHidden();
+    await expect(toggle).toBeFocused();
+
+    await page.setViewportSize({ width: 390, height: 800 });
+    await toggle.click();
+    await expect(input).toBeVisible();
+    expect(await search.evaluate(element => {
+        const box = element.getBoundingClientRect();
+        return {
+            left: Math.round(box.left),
+            right: Math.round(window.innerWidth - box.right),
+        };
+    })).toEqual({ left: 12, right: 12 });
 });
