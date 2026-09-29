@@ -161,6 +161,63 @@ test('History groups media details and shows a human-readable duration', async (
     }
 });
 
+test('History info panel keeps its details aligned and copies the source URL', async ({ page }) => {
+    const url = 'https://fixture.invalid/info-panel';
+    await seed(page, {
+        id: 'info-panel', status: 'finished', file: true,
+        name: 'aligned.mp4', title: 'Aligned information', url,
+    });
+    await refresh(page);
+
+    const row = page.locator('[data-row-id="info-panel"]');
+    await openInfo(row);
+    const popover = row.locator('.history-info-popover');
+    const header = popover.locator('.history-info-header');
+
+    await expect(header.locator('.history-info-heading')).toHaveText('INFO');
+    await expect(header.locator('.history-info-heading use')).toHaveAttribute('href', '#i-info');
+
+    const layout = await popover.evaluate(element => {
+        const content = element.querySelector('.history-info-content');
+        const headerElement = element.querySelector('.history-info-header');
+        const title = element.querySelector('.history-info-title');
+        const tags = element.querySelector('.history-info-section');
+        const file = element.querySelector('.file-meta-row');
+        const status = element.querySelector('.history-status-row');
+        const source = element.querySelector('.history-url-row');
+        const rect = node => node.getBoundingClientRect();
+        return {
+            topGap: Math.round(rect(headerElement).top - rect(content).top),
+            firstLineGap: Math.round(rect(title).top - rect(headerElement).bottom),
+            ordered: rect(tags).top < rect(file).top
+                && rect(file).top < rect(status).top
+                && rect(status).top < rect(source).top,
+            fileCenters: Math.abs(
+                rect(file.querySelector('strong')).top + rect(file.querySelector('strong')).height / 2
+                - rect(file.querySelector('.rename-wrap')).top - rect(file.querySelector('.rename-wrap')).height / 2
+            ),
+        };
+    });
+    expect(Math.abs(layout.topGap - layout.firstLineGap)).toBeLessThanOrEqual(1);
+    expect(layout.ordered).toBe(true);
+    expect(layout.fileCenters).toBeLessThan(1);
+
+    const tagRow = popover.locator('.tag-display-row');
+    const displayHeight = (await tagRow.boundingBox()).height;
+    await tagRow.click();
+    const tagInput = popover.locator('.tag-entry-input');
+    await expect(tagInput).toBeFocused();
+    const editorHeight = (await popover.locator('.tag-token-input').boundingBox()).height;
+    expect(editorHeight).toBe(displayHeight);
+    await tagInput.press('Escape');
+    await expect(popover.locator('.tag-display-row')).toBeVisible();
+
+    const copyButton = popover.getByRole('button', { name: 'Copy source URL', exact: true });
+    await copyButton.click();
+    await expect(popover.getByRole('button', { name: 'Copied', exact: true }).locator('use')).toHaveAttribute('href', '#i-check');
+    expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(url);
+});
+
 test('History places a readable requested format on the media line', async ({ page }) => {
     await seed(page, {
         id: 'history-format-id',
@@ -262,7 +319,7 @@ test('stored URL remains data for Open, Reload, Continue, and Copy actions', asy
     await refresh(page);
     const errorRow = page.locator('[data-row-id="safe-error"]');
     const actions = errorRow.locator('[data-url-action]');
-    await expect(actions).toHaveCount(3);
+    await expect(actions).toHaveCount(4);
     for (const action of await actions.all()) {
         await expect(action).not.toHaveAttribute('onclick', /./);
         expect(await action.getAttribute('data-url')).toBe(url);

@@ -68,6 +68,13 @@ and a burst of insert/update SSE events could replace a new History card before
 its insertion animation started. The CodeQL job now has the required scope,
 the pointer test waits for a stable target, and insertion animations remain
 pending only until a rendered card emits `animationstart`.
+Issue 38 was reported and resolved on 2026-09-29. The History Info popover had
+an understated and unevenly spaced heading, placed File after Status and
+Source, misaligned the File label with its rename control, offered no inline
+way to copy Source, and grew when Tags entered edit mode. The heading now uses
+the shared info icon and uppercase text, the detail rows follow the intended
+order and alignment, Source has a compact copy action, and the Tags display
+and edit states keep the same height.
 
 ## Bug reports
 
@@ -108,6 +115,7 @@ pending only until a rendered card emits `animationstart`.
 - [Bug 0035 — CodeQL could not upload results without Actions read access](bug-0035-codeql-could-not-upload-without-actions-read.md)
 - [Bug 0036 — Animated drawer made the Stop reconciliation test miss its target](bug-0036-animated-drawer-made-stop-test-miss-target.md)
 - [Bug 0037 — SSE bursts could cancel History insertion animations before they started](bug-0037-sse-bursts-cancelled-history-insertion-animation.md)
+- [Bug 0038 — History info panel had inconsistent layout and no source-copy action](bug-0038-history-info-panel-had-inconsistent-layout-and-missing-source-copy.md)
 
 ## Accepted UI decisions
 

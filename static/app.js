@@ -1397,16 +1397,30 @@ function openUrl(url) {
     }
 }
 
-const COPY_URL_HTML    = '<svg class="menu-icon"><use href="#i-copy"/></svg>Copy URL';
 const COPIED_HTML      = '<svg class="menu-icon"><use href="#i-check"/></svg>Copied';
+const COPIED_ICON_HTML = '<svg><use href="#i-check"/></svg>';
 
 function copyToClipboard(text, btn) {
     const done = () => {
         if (!btn) return;
         if (btn._copyTimer) clearTimeout(btn._copyTimer);
-        btn.innerHTML = COPIED_HTML;
+        if (btn._copyOriginalHtml === undefined) {
+            btn._copyOriginalHtml = btn.innerHTML;
+            btn._copyOriginalLabel = btn.getAttribute('aria-label');
+            btn._copyOriginalTitle = btn.getAttribute('title');
+        }
+        btn.innerHTML = btn.classList.contains('history-source-copy') ? COPIED_ICON_HTML : COPIED_HTML;
+        btn.setAttribute('aria-label', 'Copied');
+        btn.setAttribute('title', 'Copied');
         btn._copyTimer = setTimeout(() => {
-            btn.innerHTML = COPY_URL_HTML;
+            btn.innerHTML = btn._copyOriginalHtml;
+            if (btn._copyOriginalLabel === null) btn.removeAttribute('aria-label');
+            else btn.setAttribute('aria-label', btn._copyOriginalLabel);
+            if (btn._copyOriginalTitle === null) btn.removeAttribute('title');
+            else btn.setAttribute('title', btn._copyOriginalTitle);
+            delete btn._copyOriginalHtml;
+            delete btn._copyOriginalLabel;
+            delete btn._copyOriginalTitle;
             btn._copyTimer = null;
         }, 1500);
     };
@@ -1470,12 +1484,12 @@ function renderHistoryCard(info) {
     }
 
     const metadata = [];
-    metadata.push(`<div><strong>Status:</strong> ${escapeHtml(info.status.charAt(0).toUpperCase() + info.status.slice(1))}</div>`);
-    metadata.push(`<div class="history-url-row"><strong>Source:</strong> <span>${escapeHtml(info.url)}</span></div>`);
     if (info.filename) {
         const base = info.filename.split('/').pop().split('\\').pop();
         metadata.push(`<div class="file-meta-row"><strong>File:</strong>${isFinished ? renderRenameControl(id, base) : `<span class="filename">${escapeHtml(base)}</span>`}</div>`);
     }
+    metadata.push(`<div class="history-status-row"><strong>Status:</strong> ${escapeHtml(info.status.charAt(0).toUpperCase() + info.status.slice(1))}</div>`);
+    metadata.push(`<div class="history-url-row"><strong>Source:</strong> <span>${escapeHtml(info.url)}</span><button type="button" class="history-source-copy" data-url-action="copy" ${urlData} aria-label="Copy source URL" title="Copy source URL"><svg><use href="#i-copy"/></svg></button></div>`);
     const sizeStr = formatBytes(info.filesize);
     const requestedFormat = formatRequestedFormat(info);
     const mediaParts = [];
@@ -1517,7 +1531,7 @@ function renderHistoryCard(info) {
                     <div id="info-${escapeAttr(id)}" class="history-info-popover" role="dialog" aria-label="Download information">
                         <div class="history-info-content">
                             <div class="history-info-header">
-                                <strong>Info</strong>
+                                <span class="history-info-heading"><svg aria-hidden="true"><use href="#i-info"/></svg><strong>INFO</strong></span>
                                 <button type="button" class="history-info-close" onclick="closeHistoryInfo()" aria-label="Close info"><svg><use href="#i-x"/></svg></button>
                             </div>
                             <div class="history-info-title">${escapeHtml(displayTitle)}</div>
