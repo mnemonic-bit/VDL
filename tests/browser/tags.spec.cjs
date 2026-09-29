@@ -95,7 +95,7 @@ test('Header search uses ANY matching without hiding Current downloads', async (
 
     const search = page.locator('#historySearch');
     const input = search.locator('input');
-    await search.locator('button').click();
+    await search.locator('#historySearchToggle').click();
     await input.fill('"Music Videos" Tutorial');
     await expect(page.locator('#historyList [data-row-id]')).toHaveCount(2);
     await expect(page.locator('[data-row-id="history-both"]')).toBeVisible();
@@ -106,7 +106,8 @@ test('Header search uses ANY matching without hiding Current downloads', async (
     await expect(page.locator('[data-row-id="current-music"]')).toBeVisible();
     await closeCurrent(page);
 
-    await input.fill('');
+    await search.locator('#historySearchClear').click();
+    await expect(input).toHaveValue('');
     await expect(page.locator('#historyList [data-row-id]')).toHaveCount(2);
 });
 
@@ -141,7 +142,7 @@ test('History search matches title fragments, tags, and quoted phrases', async (
 
     const search = page.locator('#historySearch');
     const input = search.locator('input');
-    await search.locator('button').click();
+    await search.locator('#historySearchToggle').click();
 
     await input.fill('alpin "Music Videos"');
     await expect(input).toHaveValue('alpin "Music Videos"');
@@ -163,6 +164,7 @@ test('Header search expands from the leftmost magnifier', async ({ page }) => {
     const search = header.locator('#historySearch');
     const toggle = search.locator('#historySearchToggle');
     const input = search.locator('#historySearchInput');
+    const clear = search.locator('#historySearchClear');
 
     await expect(toggle.locator('use')).toHaveAttribute('href', '#i-search');
     await expect(input).toHaveAttribute('type', 'text');
@@ -177,6 +179,29 @@ test('Header search expands from the leftmost magnifier', async ({ page }) => {
     await expect(toggle).toHaveAttribute('aria-expanded', 'true');
     await expect(input).toBeVisible();
     await expect(input).toBeFocused();
+    await expect(clear).toBeHidden();
+    expect(await search.evaluate(element => {
+        const searchStyle = getComputedStyle(element);
+        const inputStyle = getComputedStyle(element.querySelector('input'));
+        return {
+            borderStyle: searchStyle.borderStyle,
+            borderWidth: searchStyle.borderWidth,
+            borderRadius: searchStyle.borderRadius,
+            inputBorderWidth: inputStyle.borderWidth,
+        };
+    })).toEqual({
+        borderStyle: 'solid',
+        borderWidth: '1px',
+        borderRadius: '999px',
+        inputBorderWidth: '0px',
+    });
+
+    await input.fill('alpine');
+    await expect(clear).toBeVisible();
+    await clear.click();
+    await expect(input).toHaveValue('');
+    await expect(input).toBeFocused();
+    await expect(clear).toBeHidden();
 
     await input.press('Escape');
     await expect(toggle).toHaveAttribute('aria-expanded', 'false');

@@ -34,8 +34,17 @@ test('fixed header opens the full-height Current drawer and Settings dialog', as
     const newDownloadButton = page.locator('#newDownloadButton');
     const currentButton = page.locator('#currentDownloadsButton');
     const settingsButton = page.locator('#settingsButton');
-    await expect(newDownloadButton).toContainText('New download');
+    await expect(newDownloadButton).toHaveText('');
+    expect(await newDownloadButton.evaluate(button => {
+        const box = button.getBoundingClientRect();
+        return {
+            width: Math.round(box.width),
+            height: Math.round(box.height),
+            borderRadius: getComputedStyle(button).borderRadius,
+        };
+    })).toEqual({ width: 40, height: 40, borderRadius: '50%' });
     await expect(currentButton).toContainText('Current downloads');
+    await expect(currentButton).toBeVisible();
     await expect(currentButton.locator('#currentBadge')).toHaveText('1');
     expect(await currentButton.evaluate((button, settings) => (
         button.getBoundingClientRect().right <= document.querySelector(settings).getBoundingClientRect().left
@@ -92,8 +101,28 @@ test('fixed header opens the full-height Current drawer and Settings dialog', as
     await expect(dialog).toBeHidden();
 });
 
+test('Current downloads button only appears while the drawer has work', async ({ page }) => {
+    const button = page.locator('#currentDownloadsButton');
+    await expect(button).toBeHidden();
+
+    await seed(page, { id: 'interrupted-only', status: 'interrupted' });
+    await refresh(page);
+    await expect(button).toBeVisible();
+
+    await seed(page, { id: 'paused-active', status: 'paused' });
+    await refresh(page);
+    await expect(button).toBeVisible();
+
+    await seed(page, { id: 'interrupted-only', status: 'finished', file: true });
+    await seed(page, { id: 'paused-active', status: 'finished', file: true });
+    await refresh(page);
+    await expect(button).toBeHidden();
+});
+
 test('Current drawer respects reduced-motion preferences', async ({ page }) => {
     await page.emulateMedia({ reducedMotion: 'reduce' });
+    await seed(page, { id: 'reduced-motion', status: 'downloading' });
+    await refresh(page);
     await page.locator('#currentDownloadsButton').click();
 
     const drawer = page.locator('#currentDownloadsDrawer');

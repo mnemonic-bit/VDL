@@ -176,16 +176,19 @@
                 <input id="historySearchInput" class="header-search-input" type="text" maxlength="256"
                        placeholder="Search title or tag; quote phrases" autocomplete="off"
                        aria-label="Search history by title or tag">
+                <button id="historySearchClear" class="header-search-clear" type="button"
+                        aria-label="Clear search" hidden>
+                    <svg aria-hidden="true"><use href="#i-x"/></svg>
+                </button>
             </div>
             <button id="newDownloadButton" class="new-download-button" type="button"
                     onclick="openNewDownload()" aria-label="New download"
                     aria-haspopup="dialog" aria-controls="newDownloadDialog" aria-expanded="false">
                 <svg aria-hidden="true"><use href="#i-plus"/></svg>
-                <span class="new-download-label">New download</span>
             </button>
             <button id="currentDownloadsButton" class="current-downloads-button" type="button"
                     onclick="openCurrentDownloads()" aria-label="Current downloads"
-                    aria-haspopup="dialog" aria-controls="currentDownloadsDrawer" aria-expanded="false">
+                    aria-haspopup="dialog" aria-controls="currentDownloadsDrawer" aria-expanded="false" hidden>
                 <svg aria-hidden="true"><use href="#i-download"/></svg>
                 <span class="current-downloads-label">Current downloads</span>
                 <span id="currentBadge" class="badge" hidden>0</span>

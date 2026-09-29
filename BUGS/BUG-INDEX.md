@@ -75,6 +75,11 @@ way to copy Source, and grew when Tags entered edit mode. The heading now uses
 the shared info icon and uppercase text, the detail rows follow the intended
 order and alignment, Source has a compact copy action, and the Tags display
 and edit states keep the same height.
+Issue 39 was reported and resolved on 2026-09-29. The primary New download
+action occupied unnecessary header space with a text label, while Current
+downloads remained visible even when its drawer was empty. New download is now
+a compact circular plus action, and Current downloads is hidden until the
+drawer contains active or resumable work.
 
 ## Bug reports
 
@@ -116,6 +121,7 @@ and edit states keep the same height.
 - [Bug 0036 — Animated drawer made the Stop reconciliation test miss its target](bug-0036-animated-drawer-made-stop-test-miss-target.md)
 - [Bug 0037 — SSE bursts could cancel History insertion animations before they started](bug-0037-sse-bursts-cancelled-history-insertion-animation.md)
 - [Bug 0038 — History info panel had inconsistent layout and no source-copy action](bug-0038-history-info-panel-had-inconsistent-layout-and-missing-source-copy.md)
+- [Bug 0039 — Header download actions occupied space without useful state](bug-0039-header-download-actions-occupied-space-without-useful-state.md)
 
 ## Accepted UI decisions
 

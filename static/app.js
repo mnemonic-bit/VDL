@@ -616,6 +616,7 @@ function setHistorySearchExpanded(expanded) {
 
 function applyHistorySearch() {
     const input = document.getElementById('historySearchInput');
+    document.getElementById('historySearchClear').hidden = !input.value;
     searchTerms = parseSearchTerms(input.value);
     historyPage = 0;
     fetchHistory();
@@ -624,12 +625,18 @@ function applyHistorySearch() {
 const historySearch = document.getElementById('historySearch');
 const historySearchToggle = document.getElementById('historySearchToggle');
 const historySearchInput = document.getElementById('historySearchInput');
+const historySearchClear = document.getElementById('historySearchClear');
 historySearchToggle.addEventListener('click', () => {
     setHistorySearchExpanded(true);
     historySearchInput.focus();
 });
 historySearchInput.addEventListener('focus', () => setHistorySearchExpanded(true));
 historySearchInput.addEventListener('input', applyHistorySearch);
+historySearchClear.addEventListener('click', () => {
+    historySearchInput.value = '';
+    applyHistorySearch();
+    historySearchInput.focus();
+});
 historySearchInput.addEventListener('keydown', event => {
     if (event.key !== 'Escape') return;
     event.preventDefault();
@@ -1860,9 +1867,11 @@ function fetchHistory() {
         }
 
         const badge = document.getElementById('currentBadge');
+        const currentButton = document.getElementById('currentDownloadsButton');
         const currentLabel = `${active.length} ${active.length === 1 ? 'item' : 'items'}`;
         document.getElementById('currentDrawerCount').textContent = currentLabel;
-        document.getElementById('currentDownloadsButton').setAttribute(
+        currentButton.hidden = active.length === 0;
+        currentButton.setAttribute(
             'aria-label', active.length
                 ? `Current downloads, ${currentLabel}`
                 : 'Current downloads, no items',
@@ -2025,8 +2034,11 @@ currentDownloadsDrawer.addEventListener('close', () => {
     hideActionError();
     closeAllMenus();
     document.getElementById('currentDownloadsButton').setAttribute('aria-expanded', 'false');
-    if (currentDrawerReturnFocus && currentDrawerReturnFocus.isConnected) {
+    if (currentDrawerReturnFocus && currentDrawerReturnFocus.isConnected
+            && !currentDrawerReturnFocus.hidden) {
         currentDrawerReturnFocus.focus();
+    } else {
+        document.getElementById('newDownloadButton').focus();
     }
     currentDrawerReturnFocus = null;
 });
