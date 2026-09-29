@@ -184,14 +184,14 @@
     </header>
 
     <section id="tab-history" class="history-panel" aria-label="Download history">
-        <div id="tagFilter" class="tag-filter" aria-label="Filter download history by tag">
-            <select id="tagMatchMode" class="tag-match-mode" aria-label="Tag match mode">
+        <div id="tagFilter" class="tag-filter" aria-label="Search download history by title or tag">
+            <select id="tagMatchMode" class="tag-match-mode" aria-label="Search match mode">
                 <option value="all">ALL</option>
                 <option value="any">ANY</option>
             </select>
             <div id="tagFilterPicker" class="tag-filter-picker">
                 <div id="tagFilterTokens" class="tag-filter-tokens">
-                    <input id="tagFilterInput" type="text" maxlength="64" placeholder="Filter by tag" autocomplete="off" aria-label="Filter by tag" aria-expanded="false" aria-controls="tagFilterSuggestions">
+                    <input id="tagFilterInput" type="text" maxlength="256" placeholder="Search title or tag; quote phrases" autocomplete="off" aria-label="Search by title or tag" aria-expanded="false" aria-controls="tagFilterSuggestions">
                 </div>
                 <div id="tagFilterSuggestions" class="tag-suggestions tag-filter-suggestions" role="listbox" hidden></div>
             </div>

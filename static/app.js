@@ -555,7 +555,7 @@ function resetOptions() {
 }
 
 let availableTags = [];
-let selectedTagFilters = [];
+let selectedSearchTerms = [];
 let tagMatchMode = 'all';
 const editingTagIds = new Set();
 const tagDrafts = new Map();
@@ -576,19 +576,54 @@ function refreshAvailableTags(rows) {
         (Array.isArray(row.tags) ? row.tags : []).forEach(tag => names.add(tag));
     });
     availableTags = sortTags(Array.from(names));
-    const available = new Set(availableTags);
-    selectedTagFilters = selectedTagFilters.filter(tag => available.has(tag));
     renderTagFilter();
+}
+
+function parseSearchTerms(value) {
+    const terms = [];
+    let draft = '';
+    let quoted = false;
+
+    for (const character of String(value || '')) {
+        if (character === '"') {
+            quoted = !quoted;
+        } else if (/\s/.test(character) && !quoted) {
+            if (draft) terms.push(draft);
+            draft = '';
+        } else {
+            draft += character;
+        }
+    }
+    if (draft) terms.push(draft);
+    return terms.map(term => term.trim()).filter(Boolean);
+}
+
+function addSearchTerms(terms) {
+    const selected = new Set(selectedSearchTerms.map(tagSearchKey));
+    let changed = false;
+    terms.forEach(term => {
+        const value = String(term || '').trim();
+        const key = tagSearchKey(value);
+        if (!key || selected.has(key)) return;
+        selected.add(key);
+        selectedSearchTerms.push(value);
+        changed = true;
+    });
+    return changed;
+}
+
+function searchTermLabel(term) {
+    return /\s/.test(term) ? `"${term}"` : term;
 }
 
 function renderTagFilterSuggestions(open) {
     const input = document.getElementById('tagFilterInput');
     const suggestions = document.getElementById('tagFilterSuggestions');
     if (!input || !suggestions) return;
-    const query = tagSearchKey(input.value.trim());
-    const selected = new Set(selectedTagFilters);
+    const query = tagSearchKey(parseSearchTerms(input.value).join(' '));
+    const selected = new Set(selectedSearchTerms.map(tagSearchKey));
     const matches = availableTags.filter(tag => (
-        !selected.has(tag) && (!query || tagSearchKey(tag).includes(query))
+        !selected.has(tagSearchKey(tag)) && (!query || tagSearchKey(tag).includes(query))
     ));
     suggestions.innerHTML = '';
     matches.forEach(tag => {
@@ -599,7 +634,7 @@ function renderTagFilterSuggestions(open) {
         button.textContent = tag;
         button.addEventListener('mousedown', event => event.preventDefault());
         button.addEventListener('click', () => {
-            selectedTagFilters.push(tag);
+            addSearchTerms([tag]);
             input.value = '';
             historyPage = 0;
             renderTagFilter();
@@ -618,17 +653,17 @@ function renderTagFilter() {
     const clear = document.getElementById('clearTagFilter');
     if (!tokens || !input || !clear) return;
     tokens.querySelectorAll('.tag-filter-chip').forEach(chip => chip.remove());
-    selectedTagFilters.forEach(tag => {
+    selectedSearchTerms.forEach(term => {
         const chip = document.createElement('span');
         chip.className = 'tag-chip tag-filter-chip';
-        chip.append(document.createTextNode(tag));
+        chip.append(document.createTextNode(searchTermLabel(term)));
         const remove = document.createElement('button');
         remove.type = 'button';
-        remove.setAttribute('aria-label', `Remove ${tag} filter`);
+        remove.setAttribute('aria-label', `Remove ${term} search term`);
         remove.textContent = '×';
         remove.addEventListener('mousedown', event => event.preventDefault());
         remove.addEventListener('click', () => {
-            selectedTagFilters = selectedTagFilters.filter(name => name !== tag);
+            selectedSearchTerms = selectedSearchTerms.filter(value => value !== term);
             historyPage = 0;
             renderTagFilter();
             fetchHistory();
@@ -636,29 +671,29 @@ function renderTagFilter() {
         chip.appendChild(remove);
         tokens.insertBefore(chip, input);
     });
-    clear.hidden = selectedTagFilters.length === 0;
+    clear.hidden = selectedSearchTerms.length === 0;
     renderTagFilterSuggestions(document.activeElement === input);
 }
 
-function matchesTagFilter(info) {
-    if (selectedTagFilters.length === 0) return true;
-    const tags = new Set(Array.isArray(info.tags) ? info.tags : []);
+function matchesSearchFilter(info) {
+    if (selectedSearchTerms.length === 0) return true;
+    const title = tagSearchKey(info.title);
+    const tags = new Set((Array.isArray(info.tags) ? info.tags : []).map(tagSearchKey));
+    const matches = term => {
+        const key = tagSearchKey(term);
+        return tags.has(key) || title.includes(key);
+    };
     if (tagMatchMode === 'any') {
-        return selectedTagFilters.some(tag => tags.has(tag));
+        return selectedSearchTerms.some(matches);
     }
-    return selectedTagFilters.every(tag => tags.has(tag));
+    return selectedSearchTerms.every(matches);
 }
 
 function tagFilterCommitDraft() {
     const input = document.getElementById('tagFilterInput');
     if (!input) return;
-    const query = tagSearchKey(input.value.trim());
-    if (!query) return;
-    const match = availableTags.find(tag => (
-        !selectedTagFilters.includes(tag) && tagSearchKey(tag) === query
-    ));
-    if (!match) return;
-    selectedTagFilters.push(match);
+    const terms = parseSearchTerms(input.value);
+    if (!addSearchTerms(terms)) return;
     input.value = '';
     historyPage = 0;
     renderTagFilter();
@@ -669,11 +704,11 @@ const tagFilterInput = document.getElementById('tagFilterInput');
 tagFilterInput.addEventListener('focus', () => renderTagFilterSuggestions(true));
 tagFilterInput.addEventListener('input', () => renderTagFilterSuggestions(true));
 tagFilterInput.addEventListener('keydown', event => {
-    if (event.key === 'Enter' || event.key === ',') {
+    if (event.key === 'Enter') {
         event.preventDefault();
         tagFilterCommitDraft();
-    } else if (event.key === 'Backspace' && !tagFilterInput.value && selectedTagFilters.length) {
-        selectedTagFilters.pop();
+    } else if (event.key === 'Backspace' && !tagFilterInput.value && selectedSearchTerms.length) {
+        selectedSearchTerms.pop();
         historyPage = 0;
         renderTagFilter();
         fetchHistory();
@@ -695,7 +730,7 @@ document.getElementById('tagMatchMode').addEventListener('change', event => {
     fetchHistory();
 });
 document.getElementById('clearTagFilter').addEventListener('click', () => {
-    selectedTagFilters = [];
+    selectedSearchTerms = [];
     tagFilterInput.value = '';
     historyPage = 0;
     renderTagFilter();
@@ -1798,7 +1833,7 @@ function fetchHistory() {
         const active = reversed.filter(i => CURRENT_TAB_STATUSES.has(i.status));
         const historyEntries = reversed.filter(i => HISTORY_TAB_STATUSES.has(i.status));
         refreshAvailableTags(historyEntries);
-        const done = historyEntries.filter(matchesTagFilter);
+        const done = historyEntries.filter(matchesSearchFilter);
 
         historyTotal = done.length;
         const maxPage = Math.max(0, Math.ceil(historyTotal / HISTORY_PAGE_SIZE) - 1);
@@ -1886,13 +1921,13 @@ function fetchHistory() {
             }
         }
 
-        const hasFilter = selectedTagFilters.length > 0;
+        const hasFilter = selectedSearchTerms.length > 0;
         document.getElementById('currentEmpty').textContent = 'No current downloads.';
         document.getElementById('historyEmptyTitle').textContent = hasFilter
             ? 'No matching downloads'
             : 'No downloads yet';
         document.getElementById('historyEmptyMessage').textContent = hasFilter
-            ? 'No download history matches this tag filter.'
+            ? 'No download history matches these search terms.'
             : 'Add a video URL to get started.';
         document.getElementById('historyEmptyAction').hidden = hasFilter;
         document.getElementById('currentEmpty').style.display = active.length ? 'none' : '';

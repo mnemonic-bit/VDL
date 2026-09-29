@@ -114,3 +114,57 @@ test('History tag filter supports ALL and ANY without hiding Current downloads',
     await filter.getByRole('button', { name: 'Clear', exact: true }).click();
     await expect(page.locator('#historyList [data-row-id]')).toHaveCount(2);
 });
+
+test('History search matches title fragments, tags, and quoted phrases', async ({ page }) => {
+    for (const row of [
+        {
+            id: 'history-hybrid',
+            status: 'finished',
+            title: 'An Alpine Sunset Walk',
+            file: true,
+            name: 'hybrid.mp4',
+        },
+        {
+            id: 'history-phrase',
+            status: 'finished',
+            title: 'This Is the Exact Title I Am Looking For',
+            file: true,
+            name: 'phrase.mp4',
+        },
+        {
+            id: 'history-other',
+            status: 'finished',
+            title: 'An Alpine Tutorial',
+            file: true,
+            name: 'other.mp4',
+        },
+    ]) {
+        await seed(page, row);
+    }
+    await attachTag(page, 'history-hybrid', 'Music Videos');
+    await refresh(page);
+
+    const filter = page.locator('#tagFilter');
+    const input = filter.locator('input');
+
+    await input.fill('alpin "Music Videos"');
+    await input.press('Enter');
+    await expect(filter.locator('.tag-filter-chip')).toHaveText([
+        'alpin×',
+        '"Music Videos"×',
+    ]);
+    await expect(page.locator('#historyList [data-row-id]')).toHaveCount(1);
+    await expect(page.locator('[data-row-id="history-hybrid"]')).toBeVisible();
+
+    await filter.getByRole('button', { name: 'Clear', exact: true }).click();
+    await input.fill('"exact title I am"');
+    await input.press('Enter');
+    await expect(page.locator('#historyList [data-row-id]')).toHaveCount(1);
+    await expect(page.locator('[data-row-id="history-phrase"]')).toBeVisible();
+
+    await filter.getByRole('button', { name: 'Clear', exact: true }).click();
+    await input.fill('sun');
+    await input.press('Enter');
+    await expect(page.locator('#historyList [data-row-id]')).toHaveCount(1);
+    await expect(page.locator('[data-row-id="history-hybrid"]')).toBeVisible();
+});
