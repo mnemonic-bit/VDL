@@ -29,6 +29,9 @@
     --danger-2:     #c0392b;
     --orange:       #f39c12;
     --orange-2:     #d68910;
+    --favorite:     #d99000;
+    --favorite-outline: #9aa0a6;
+    --favorite-hover-bg: rgba(0,0,0,0.52);
     --tab-bg:       #ffffff;
 }
 html[data-theme="dark"] {
@@ -62,6 +65,9 @@ html[data-theme="dark"] {
     --danger-2:     #c0392b;
     --orange:       #f39c12;
     --orange-2:     #d68910;
+    --favorite:     #ffc247;
+    --favorite-outline: #9aa0a6;
+    --favorite-hover-bg: rgba(0,0,0,0.62);
     --tab-bg:       #23272d;
 }
 html, body { background: var(--bg); color: var(--fg); }
@@ -366,6 +372,7 @@ button { padding: 10px 20px; cursor: pointer; }
     border-radius: 8px;
     box-shadow: 0 2px 8px var(--menu-shadow);
 }
+.history-preview-wrap { position: relative; }
 .history-preview {
     position: relative;
     display: block;
@@ -409,7 +416,6 @@ button.history-preview { cursor: pointer; }
     justify-content: center;
     color: white;
     background: transparent;
-    transition: background 0.15s ease;
 }
 .history-preview-play svg {
     width: 42px;
@@ -419,8 +425,50 @@ button.history-preview { cursor: pointer; }
     background: var(--preview-scrim);
     filter: drop-shadow(0 1px 3px var(--menu-shadow));
 }
-button.history-preview:hover .history-preview-play,
-button.history-preview:focus-visible .history-preview-play { background: var(--preview-scrim); }
+button.history-preview:focus-visible .history-preview-play svg {
+    outline: 2px solid var(--link);
+    outline-offset: 2px;
+}
+.favorite-toggle {
+    position: absolute;
+    top: 9px;
+    right: 9px;
+    z-index: 3;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 36px;
+    height: 36px;
+    padding: 7px;
+    border: 0;
+    border-radius: 50%;
+    color: var(--favorite-outline);
+    background: transparent;
+    cursor: pointer;
+    transition: color 0.15s ease, background-color 0.15s ease;
+}
+.favorite-toggle:hover {
+    color: var(--favorite);
+    background: var(--favorite-hover-bg);
+    filter: drop-shadow(0 1px 3px var(--menu-shadow));
+}
+.favorite-toggle:focus-visible {
+    color: var(--favorite);
+    outline: 2px solid var(--link);
+    outline-offset: 2px;
+}
+.favorite-toggle:disabled { cursor: wait; opacity: 0.7; }
+.favorite-toggle svg {
+    width: 22px;
+    height: 22px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.5;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+}
+.favorite-toggle[aria-pressed="true"] { color: var(--favorite); }
+.favorite-toggle[aria-pressed="true"] svg { fill: currentColor; }
 .history-card-caption {
     display: flex;
     align-items: center;

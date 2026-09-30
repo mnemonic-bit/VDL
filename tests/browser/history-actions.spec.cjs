@@ -394,11 +394,84 @@ test('History cards show preview first and preview click starts playback', async
     await expect(card.locator('.history-info-popover')).toBeHidden();
     const children = await card.locator(':scope > *').evaluateAll(elements =>
         elements.map(element => element.className));
-    expect(children[0]).toContain('history-preview');
+    expect(children[0]).toContain('history-preview-wrap');
+    const playOverlay = card.locator('.history-preview-play');
+    const playCircle = playOverlay.locator('svg');
+    await expect(playOverlay).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)');
+    const playBackground = await playCircle
+        .evaluate(element => getComputedStyle(element).backgroundColor);
+    const playAlpha = Number(playBackground.match(/[\d.]+(?=\)$)/)[0]);
+    expect(playAlpha).toBeGreaterThan(0.5);
+    expect(playAlpha).toBeLessThan(0.7);
+    await card.locator('.history-preview').hover();
+    await page.waitForTimeout(200);
+    await expect(playOverlay).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)');
+    await expect(playCircle).toHaveCSS('background-color', playBackground);
 
     await card.locator('.history-preview').click();
     await expect(page.locator('#playerBackdrop')).toHaveClass(/open/);
     await expect(page.locator('#playerVideo source')).toHaveAttribute('src', '/api/file/preview01');
+});
+
+test('favorite sorting runs on reload and filtering without moving a clicked card', async ({ page }) => {
+    await seed(page, {
+        id: 'favorite-old', status: 'finished', file: true,
+        name: 'favorite-old.mp4', title: 'Older video',
+    });
+    await seed(page, {
+        id: 'favorite-new', status: 'finished', file: true,
+        name: 'favorite-new.mp4', title: 'Newer video',
+    });
+    await refresh(page);
+
+    const cards = page.locator('#historyList [data-row-id]');
+    await expect(cards.first()).toHaveAttribute('data-row-id', 'favorite-new');
+
+    const oldCard = page.locator('[data-row-id="favorite-old"]');
+    const star = oldCard.getByRole('button', { name: 'Add to favorites' });
+    await expect(star).toHaveAttribute('aria-pressed', 'false');
+    await expect(star.locator('svg')).toHaveCSS('fill', 'none');
+    await expect(star).toHaveCSS('color', 'rgb(154, 160, 166)');
+    await expect(star).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)');
+    await star.focus();
+    await expect(star).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)');
+    await star.hover();
+    await page.waitForTimeout(200);
+    const playBackground = await oldCard.locator('.history-preview-play svg')
+        .evaluate(element => getComputedStyle(element).backgroundColor);
+    const starBackground = await star
+        .evaluate(element => getComputedStyle(element).backgroundColor);
+    const playAlpha = Number(playBackground.match(/[\d.]+(?=\)$)/)[0]);
+    const starAlpha = Number(starBackground.match(/[\d.]+(?=\)$)/)[0]);
+    expect(starAlpha).toBeLessThan(playAlpha);
+    expect(playAlpha - starAlpha).toBeLessThan(0.1);
+    await star.click();
+
+    await expect(cards.first()).toHaveAttribute('data-row-id', 'favorite-new');
+    const selectedStar = page.locator('[data-row-id="favorite-old"]')
+        .getByRole('button', { name: 'Remove from favorites' });
+    await expect(selectedStar).toHaveAttribute('aria-pressed', 'true');
+    expect(await selectedStar.locator('svg').evaluate(element => {
+        const style = getComputedStyle(element);
+        return style.fill === style.color;
+    })).toBeTruthy();
+
+    await page.reload();
+    await expect(cards.first()).toHaveAttribute('data-row-id', 'favorite-old');
+
+    await page.locator('#historySearchToggle').click();
+    await page.locator('#historySearchInput').fill('video');
+    await expect(cards.first()).toHaveAttribute('data-row-id', 'favorite-old');
+
+    await selectedStar.click();
+    await expect(cards.first()).toHaveAttribute('data-row-id', 'favorite-old');
+    await page.locator('#historySearchClear').click();
+    await expect(cards.first()).toHaveAttribute('data-row-id', 'favorite-new');
+    await expect(page.locator('[data-row-id="favorite-old"]')
+        .getByRole('button', { name: 'Add to favorites' }))
+        .toHaveAttribute('aria-pressed', 'false');
+    await page.reload();
+    await expect(cards.first()).toHaveAttribute('data-row-id', 'favorite-new');
 });
 
 test('History info is wider on desktop and points back to its menu', async ({ page }) => {

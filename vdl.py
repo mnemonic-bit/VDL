@@ -333,6 +333,9 @@ def init_db():
             # precision or giving small and large downloads equal weight.
             ("downloaded_bytes", "ALTER TABLE downloads ADD COLUMN downloaded_bytes INTEGER"),
             ("total_bytes", "ALTER TABLE downloads ADD COLUMN total_bytes INTEGER"),
+            # Existing libraries start unstarred; favorites are an explicit
+            # user choice rather than something inferred during migration.
+            ("favorite", "ALTER TABLE downloads ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0"),
         ]:
             if col not in existing_cols:
                 conn.execute(ddl)
@@ -458,8 +461,28 @@ def db_get_download(download_id):
         if row is None:
             return None
         result = dict(row)
+        result["favorite"] = bool(result["favorite"])
         result["tags"] = _db_download_tags(conn, download_id)
         return result
+
+
+def db_set_download_favorite(download_id, favorite):
+    """Persist one explicit favorite state and report whether it changed."""
+    with _db_lock, db() as conn:
+        row = conn.execute(
+            "SELECT favorite FROM downloads WHERE id = ?", (download_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        changed = bool(row["favorite"]) != favorite
+        if changed:
+            conn.execute(
+                "UPDATE downloads SET favorite = ? WHERE id = ?",
+                (int(favorite), download_id),
+            )
+    if changed:
+        event_bus.publish("change", {"reason": "favorite", "id": download_id})
+    return changed
 
 
 TAG_MAX_LENGTH = 64
@@ -649,8 +672,8 @@ def db_list_downloads():
         rows = conn.execute(
             "SELECT id, url, status, progress, created_at, "
             "filename, resolution, filesize, speed, eta, title, finished_at, "
-            "formats, requested_format, downloaded_bytes, total_bytes "
-            "FROM downloads ORDER BY created_at ASC"
+            "formats, requested_format, downloaded_bytes, total_bytes, favorite "
+            "FROM downloads ORDER BY created_at DESC"
         ).fetchall()
         downloads = [dict(r) for r in rows]
         tags_by_download = {}
@@ -664,6 +687,7 @@ def db_list_downloads():
                 row["name"]
             )
         for download in downloads:
+            download["favorite"] = bool(download["favorite"])
             download["tags"] = tags_by_download.get(download["id"], [])
         return downloads
 
@@ -1786,6 +1810,23 @@ def clear_history():
 @app.route('/api/history', methods=['GET'])
 def get_history():
     return jsonify(db_list_downloads())
+
+
+@app.route('/api/favorite/<download_id>', methods=['POST'])
+def set_download_favorite(download_id):
+    payload = request.get_json(silent=True) or {}
+    favorite = payload.get('favorite')
+    if not isinstance(favorite, bool):
+        return jsonify({"error": "Favorite must be true or false"}), 400
+
+    changed = db_set_download_favorite(download_id, favorite)
+    if changed is None:
+        return jsonify({"error": "Unknown download id"}), 404
+    return jsonify({
+        "id": download_id,
+        "favorite": favorite,
+        "changed": changed,
+    })
 
 
 @app.route('/api/tags/<download_id>', methods=['POST', 'DELETE'])

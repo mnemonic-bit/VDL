@@ -619,7 +619,7 @@ function applyHistorySearch() {
     document.getElementById('historySearchClear').hidden = !input.value;
     searchTerms = parseSearchTerms(input.value);
     historyPage = 0;
-    fetchHistory();
+    fetchHistory({ sortFavorites: true });
 }
 
 const historySearch = document.getElementById('historySearch');
@@ -980,6 +980,23 @@ function deleteDownload(id) {
         .catch(() => fetchHistory());
 }
 
+function toggleFavorite(button) {
+    if (button.disabled) return;
+    button.disabled = true;
+    const id = button.dataset.downloadId;
+    const favorite = button.dataset.favorite === 'true';
+    apiAction('/api/favorite/' + encodeURIComponent(id), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ favorite }),
+    })
+        .then(() => fetchHistory())
+        .catch(() => {
+            button.disabled = false;
+            return fetchHistory();
+        });
+}
+
 function clearHistory() {
     apiAction('/api/clear/preview')
         .then(r => r.json())
@@ -1001,6 +1018,7 @@ function clearHistory() {
 let openMenuId = null;
 let openInfoId = null;
 let historyFetchDeferred = false;
+let historyFavoriteSortDeferred = false;
 const heldRowActionPointers = new Set();
 
 function historyRefreshBlocked() {
@@ -1010,9 +1028,11 @@ function historyRefreshBlocked() {
 function resumeDeferredHistoryFetch() {
     if (historyRefreshBlocked() || !historyFetchDeferred) return;
     historyFetchDeferred = false;
+    const sortFavorites = historyFavoriteSortDeferred;
+    historyFavoriteSortDeferred = false;
     // requestAnimationFrame runs after the click synthesized for pointerup, so
     // the pressed action can finish before reconciliation replaces its row.
-    scheduleFetch();
+    scheduleFetch({ sortFavorites });
 }
 
 document.addEventListener('pointerdown', (ev) => {
@@ -1232,6 +1252,9 @@ function toggleMenu(id, ev) {
 }
 
 document.addEventListener('click', (ev) => {
+    const favoriteAction = ev.target.closest('[data-favorite-action]');
+    if (favoriteAction) toggleFavorite(favoriteAction);
+
     const playAction = ev.target.closest('[data-play-action]');
     if (playAction) {
         playVideo(
@@ -1416,21 +1439,33 @@ function renderHistoryCard(info) {
     menuItems.push(`<button class="danger" onclick="deleteDownload('${id}')"><svg class="menu-icon"><use href="#i-trash"/></svg>Delete</button>`);
 
     const hasPlay = isFinished && info.filename;
+    const favorite = Boolean(info.favorite);
+    const favoriteLabel = favorite ? 'Remove from favorites' : 'Add to favorites';
+    const favoriteButton = `
+                    <button class="favorite-toggle" type="button" data-favorite-action data-download-id="${escapeAttr(id)}" data-favorite="${favorite ? 'false' : 'true'}" aria-label="${favoriteLabel}" title="${favoriteLabel}" aria-pressed="${favorite}">
+                        <svg aria-hidden="true"><use href="#i-star"/></svg>
+                    </button>`;
     let preview;
     if (hasPlay) {
         const playLabel = info.filename.split('/').pop().split('\\').pop();
         const playExt = info.filename.split('.').pop().toLowerCase();
         preview = `
+                <div class="history-preview-wrap">
                     <button class="history-preview" type="button" data-play-action data-download-id="${escapeAttr(id)}" data-play-label="${escapeAttr(playLabel)}" data-play-ext="${escapeAttr(playExt)}" aria-label="Play" title="Play">
                         <span class="history-preview-fallback"><svg><use href="#i-camera"/></svg><span>No video preview</span></span>
                         <img src="/api/thumbnail/${encodeURIComponent(id)}" alt="" loading="lazy" onerror="this.closest('.history-preview').classList.add('thumbnail-unavailable')">
                         <span class="history-preview-play"><svg><use href="#i-play"/></svg></span>
-                    </button>`;
+                    </button>
+                    ${favoriteButton}
+                </div>`;
     } else {
         preview = `
+                <div class="history-preview-wrap">
                     <div class="history-preview thumbnail-unavailable history-preview-error" aria-label="Preview unavailable">
                         <span class="history-preview-fallback"><svg><use href="#i-camera"/></svg><span>Preview unavailable</span></span>
-                    </div>`;
+                    </div>
+                    ${favoriteButton}
+                </div>`;
     }
 
     const metadata = [];
@@ -1668,6 +1703,7 @@ function renderItem(info, inHistoryView = false) {
 const HISTORY_PAGE_SIZE = 10;
 let historyPage = 0;
 let historyTotal = 0;
+let historyOrderIds = [];
 let _renderedActiveIds  = new Set();
 let _renderedHistoryIds = new Set();
 const pendingActiveAnimations = new Set();
@@ -1728,9 +1764,10 @@ function goToPage(target) {
     fetchHistory();
 }
 
-function fetchHistory() {
+function fetchHistory({ sortFavorites = false } = {}) {
     if (historyRefreshBlocked()) {
         historyFetchDeferred = true;
+        historyFavoriteSortDeferred ||= sortFavorites;
         return Promise.resolve();
     }
 
@@ -1743,10 +1780,26 @@ function fetchHistory() {
             historyFetchDeferred = true;
             return;
         }
-        const reversed = data.slice().reverse();
-        updateProgressIndicators(reversed);
-        const active = reversed.filter(i => CURRENT_TAB_STATUSES.has(i.status));
-        const historyEntries = reversed.filter(i => HISTORY_TAB_STATUSES.has(i.status));
+        updateProgressIndicators(data);
+        const active = data.filter(i => CURRENT_TAB_STATUSES.has(i.status));
+        let historyEntries = data.filter(i => HISTORY_TAB_STATUSES.has(i.status));
+        if (sortFavorites) {
+            // The API is newest-first, and modern stable sorting preserves
+            // that date order inside each favorite group.
+            historyEntries = historyEntries.slice().sort(
+                (left, right) => Number(Boolean(right.favorite))
+                    - Number(Boolean(left.favorite)));
+        } else if (historyOrderIds.length) {
+            // Reconciliation must not make a card jump when its star changes.
+            // Newly completed downloads still enter first; known cards retain
+            // the order last chosen by the user or by a filter execution.
+            const knownIds = new Set(historyOrderIds);
+            const byId = new Map(historyEntries.map(info => [String(info.id), info]));
+            const unseen = historyEntries.filter(info => !knownIds.has(String(info.id)));
+            const known = historyOrderIds.map(id => byId.get(id)).filter(Boolean);
+            historyEntries = unseen.concat(known);
+        }
+        historyOrderIds = historyEntries.map(info => String(info.id));
         refreshAvailableTags(historyEntries);
         const done = historyEntries.filter(matchesSearchFilter);
 
@@ -2171,12 +2224,16 @@ function savePreferences() {
 loadPreferences();
 
 let pendingFetch = false;
-function scheduleFetch() {
+let pendingFavoriteSort = false;
+function scheduleFetch({ sortFavorites = false } = {}) {
+    pendingFavoriteSort ||= sortFavorites;
     if (pendingFetch) return;
     pendingFetch = true;
     requestAnimationFrame(() => {
         pendingFetch = false;
-        fetchHistory();
+        const applyFavoriteSort = pendingFavoriteSort;
+        pendingFavoriteSort = false;
+        fetchHistory({ sortFavorites: applyFavoriteSort });
     });
 }
 
@@ -2191,4 +2248,6 @@ function connectEventStream() {
 }
 
 connectEventStream();
-fetchHistory();
+// A fresh page has no visual order to preserve, so establish favorite-first
+// ordering once. Later reconciliations keep that order until a filter runs.
+fetchHistory({ sortFavorites: true });

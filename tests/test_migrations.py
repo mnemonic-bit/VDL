@@ -53,13 +53,14 @@ class SchemaMigrationTest(unittest.TestCase):
                     "filename", "resolution", "filesize", "speed", "eta",
                     "title", "finished_at", "formats", "requested_format",
                     "output_dir", "requested_filename",
-                    "downloaded_bytes", "total_bytes",
+                    "downloaded_bytes", "total_bytes", "favorite",
                 })
                 self.assertTrue({"tags", "download_tags"}.issubset(tables))
                 self.assertEqual(
                     vdl.db_get_download("legacy1")["status"],
                     "interrupted",
                 )
+                self.assertIs(vdl.db_get_download("legacy1")["favorite"], False)
                 self.assertEqual(vdl.db_get_preferences(), {
                     "download_dir": vdl.DEFAULT_DOWNLOAD_DIR,
                     "format": "best",

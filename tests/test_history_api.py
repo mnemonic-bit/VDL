@@ -6,6 +6,44 @@ from tests.support.app_case import AppCase
 
 
 class HistoryApiTest(AppCase):
+    def test_favorites_are_persisted_without_changing_date_order(self):
+        older_id = self.insert("older001")
+        newer_id = self.insert("newer001")
+
+        response = self.client.post(
+            f"/api/favorite/{older_id}", json={"favorite": True}
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), {
+            "id": older_id,
+            "favorite": True,
+            "changed": True,
+        })
+        rows = self.client.get("/api/history").get_json()
+        self.assertEqual([row["id"] for row in rows], [newer_id, older_id])
+        self.assertIs(rows[0]["favorite"], False)
+        self.assertIs(rows[1]["favorite"], True)
+
+        response = self.client.post(
+            f"/api/favorite/{older_id}", json={"favorite": False}
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [row["id"] for row in self.client.get("/api/history").get_json()],
+            [newer_id, older_id],
+        )
+
+    def test_favorite_rejects_invalid_state_and_unknown_download(self):
+        download_id = self.insert("favorite1")
+        invalid = self.client.post(
+            f"/api/favorite/{download_id}", json={"favorite": 1}
+        )
+        missing = self.client.post(
+            "/api/favorite/missing1", json={"favorite": True}
+        )
+        self.assertEqual(invalid.status_code, 400)
+        self.assertEqual(missing.status_code, 404)
+
     def test_history_exposes_persisted_progress_bytes(self):
         download_id = self.insert("bytes001")
         vdl.db_update_download(
