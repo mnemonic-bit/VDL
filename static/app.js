@@ -2658,18 +2658,29 @@ currentDownloadsDrawer.addEventListener('click', ev => {
     if (outside) closeCurrentDownloads();
 });
 
+let settingsOpenPromise = null;
+
 function openSettings() {
     const page = document.getElementById('settingsPage');
     closeAllMenus();
-    if (!page.hidden) return;
+    if (!page.hidden) return Promise.resolve();
+    if (settingsOpenPromise) return settingsOpenPromise;
     closeHistoryInfo();
     hideActionError();
-    document.getElementById('tab-history').hidden = true;
-    page.hidden = false;
-    document.body.classList.add('settings-open');
-    window.scrollTo({ top: 0 });
-    loadPreferences();
-    if (document.getElementById('userList')) loadUsers();
+    // Keep the form unavailable until its server values are applied so a late
+    // response cannot overwrite a choice made immediately after opening it.
+    settingsOpenPromise = Promise.allSettled([
+        loadPreferences(),
+        loadUsers(),
+    ]).then(() => {
+        document.getElementById('tab-history').hidden = true;
+        page.hidden = false;
+        document.body.classList.add('settings-open');
+        window.scrollTo({ top: 0 });
+    }).finally(() => {
+        settingsOpenPromise = null;
+    });
+    return settingsOpenPromise;
 }
 
 function closeSettings() {
@@ -3063,8 +3074,14 @@ if (window.matchMedia) {
     else if (mq.addListener) mq.addListener(onChange);
 }
 
+let preferencesLoadGeneration = 0;
+
 function loadPreferences() {
+    const generation = ++preferencesLoadGeneration;
     return apiFetch('/api/preferences').then(r => r.json()).then(p => {
+        // A settings-open refresh supersedes the bootstrap request if the two
+        // overlap; only the newest response may populate editable controls.
+        if (generation !== preferencesLoadGeneration) return;
         document.getElementById('prefDir').value = p.download_dir || '';
         document.getElementById('prefMax').value = p.max_concurrent || '';
         const configuredPageSize = Number(p.history_page_size);

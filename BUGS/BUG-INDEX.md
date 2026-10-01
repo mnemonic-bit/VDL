@@ -112,6 +112,13 @@ flows. Follow-up review also refined the final-administrator guard and the
 feedback shown for locked roles and rows. Users now share one table with an
 empty creation row, explicit Save/Cancel state, application dialogs, backend
 last-active-admin enforcement, and explanatory lock tooltips.
+Issue 44 was reported from two intermittent GitHub Actions failures on
+2026-10-01. A late Preferences response could restore the saved System theme
+after a test selected Dark, while an early-exiting digest parser could close
+Buildx's output pipe and make `pipefail` report status 255. Settings now waits
+for its data and rejects stale preference responses. Image publication now
+resolves every digest from structured manifest JSON and retries brief registry
+propagation delays.
 
 ## Bug reports
 
@@ -158,6 +165,7 @@ last-active-admin enforcement, and explanatory lock tooltips.
 - [Bug 0041 — History video previews were redundant and Firefox-incompatible](bug-0041-history-video-previews-were-redundant-and-firefox-incompatible.md)
 - [Bug 0042 — UI cleanup left navigation, preview, pagination, and authorization gaps](bug-0042-ui-cleanup-left-navigation-preview-pagination-and-authorization-gaps.md)
 - [Bug 0043 — User administration was fragmented and lacked safe edit guards](bug-0043-user-administration-was-fragmented-and-lacked-safe-edit-guards.md)
+- [Bug 0044 — GitHub Actions had intermittent theme and image-digest failures](bug-0044-github-actions-had-intermittent-theme-and-image-digest-failures.md)
 
 ## Accepted UI decisions
 

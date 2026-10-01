@@ -182,11 +182,31 @@ jobs:
               run: |
                   set -euo pipefail
                   raw_manifest="$RUNNER_TEMP/manifest.json"
-                  docker buildx imagetools inspect "$IMAGE:$GITHUB_SHA" --raw > "$raw_manifest"
-                  index=$(docker buildx imagetools inspect "$IMAGE:$GITHUB_SHA" | awk '$1 == "Digest:" { print $2; exit }')
-                  amd64=$(jq -r '.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64") | .digest' "$raw_manifest")
-                  arm64=$(jq -r '.manifests[] | select(.platform.os == "linux" and .platform.architecture == "arm64") | .digest' "$raw_manifest")
-                  if [[ ! "$index" =~ ^sha256:[0-9a-f]{64}$ || ! "$amd64" =~ ^sha256:[0-9a-f]{64}$ || ! "$arm64" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                  inspect_error="$RUNNER_TEMP/manifest-inspect.log"
+                  index=''
+                  amd64=''
+                  arm64=''
+                  resolved=false
+                  for attempt in 1 2 3 4 5 6; do
+                      if docker buildx imagetools inspect "$IMAGE:$GITHUB_SHA" \
+                              --format '{{json .Manifest}}' \
+                              > "$raw_manifest" 2> "$inspect_error"; then
+                          index=$(jq -r '.digest // empty' "$raw_manifest") || index=''
+                          amd64=$(jq -r '(.manifests // [])[] | select(.platform.os == "linux" and .platform.architecture == "amd64") | .digest' "$raw_manifest") || amd64=''
+                          arm64=$(jq -r '(.manifests // [])[] | select(.platform.os == "linux" and .platform.architecture == "arm64") | .digest' "$raw_manifest") || arm64=''
+                          if [[ "$index" =~ ^sha256:[0-9a-f]{64}$ && "$amd64" =~ ^sha256:[0-9a-f]{64}$ && "$arm64" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                              resolved=true
+                              break
+                          fi
+                      fi
+                      # GHCR can briefly expose a tag before every manifest is
+                      # consistently readable from the registry edge.
+                      if [[ "$attempt" -lt 6 ]]; then
+                          sleep 5
+                      fi
+                  done
+                  if [[ "$resolved" != true ]]; then
+                      cat "$inspect_error" >&2
                       echo "Could not resolve the index and both platform digests" >&2
                       exit 1
                   fi

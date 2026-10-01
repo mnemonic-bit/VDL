@@ -16,6 +16,35 @@ test('light, dark, and system theme choices apply immediately', async ({ page })
     await expect(page.locator('html')).toHaveAttribute('data-theme', 'light');
 });
 
+test('Settings waits for preferences before accepting edits', async ({ page }) => {
+    let releasePreferences;
+    let markRequestStarted;
+    const requestStarted = new Promise(resolve => {
+        markRequestStarted = resolve;
+    });
+    await page.route('**/api/preferences', async route => {
+        if (route.request().method() !== 'GET') {
+            await route.continue();
+            return;
+        }
+        markRequestStarted();
+        await new Promise(resolve => {
+            releasePreferences = resolve;
+        });
+        await route.continue();
+    });
+
+    await page.locator('#accountMenuButton').click();
+    await page.locator('#settingsButton').click();
+    await requestStarted;
+    await expect(page.locator('#settingsPage')).toBeHidden();
+
+    releasePreferences();
+    await expect(page.locator('#settingsPage')).toBeVisible();
+    await page.locator('#prefTheme').selectOption('dark');
+    await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
+});
+
 test('preferences persist and the temporary Saved icon restores to Save', async ({ page }) => {
     await page.clock.install();
     await openSettings(page);
