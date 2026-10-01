@@ -32,6 +32,7 @@
     --favorite:     #d99000;
     --favorite-outline: #9aa0a6;
     --favorite-hover-bg: rgba(0,0,0,0.52);
+    --quality-4k-bg: rgba(31,138,59,0.52);
     --tab-bg:       #ffffff;
     --drop-backdrop: rgba(255,255,255,0.94);
     --drop-panel:   rgba(31,138,59,0.10);
@@ -70,6 +71,7 @@ html[data-theme="dark"] {
     --favorite:     #ffc247;
     --favorite-outline: #9aa0a6;
     --favorite-hover-bg: rgba(0,0,0,0.62);
+    --quality-4k-bg: rgba(31,138,59,0.62);
     --tab-bg:       #23272d;
     --drop-backdrop: rgba(26,29,33,0.94);
     --drop-panel:   rgba(31,138,59,0.18);
@@ -536,6 +538,26 @@ button.history-preview:focus-visible {
 }
 .history-preview.preview-loading { cursor: progress; }
 .history-preview.preview-playing .history-preview-video { opacity: 1; }
+.history-preview-label {
+    position: absolute;
+    z-index: 3;
+    padding: 4px 7px;
+    border-radius: 3px;
+    color: var(--on-brand);
+    background: var(--favorite-hover-bg);
+    font-size: 0.72rem;
+    font-weight: 700;
+    line-height: 1;
+    letter-spacing: 0.02em;
+    pointer-events: none;
+}
+.history-preview-new {
+    top: 9px;
+    left: 9px;
+    background: var(--quality-4k-bg);
+}
+.history-preview-quality { right: 9px; bottom: 9px; }
+.history-preview-quality.is-4k { background: var(--quality-4k-bg); }
 .history-preview-fallback {
     position: absolute;
     inset: 0;

@@ -420,6 +420,10 @@ def init_db():
             # Existing libraries start unstarred; favorites are an explicit
             # user choice rather than something inferred during migration.
             ("favorite", "ALTER TABLE downloads ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0"),
+            # A view is an explicit preview activation. Keeping the counter
+            # independent of media requests avoids counting range fetches,
+            # downloads, and generated hover previews as watches.
+            ("view_count", "ALTER TABLE downloads ADD COLUMN view_count INTEGER NOT NULL DEFAULT 0"),
             # URL downloads and local uploads share the library, but upload
             # rows have no remote source or requested yt-dlp format.
             ("source_type", "ALTER TABLE downloads ADD COLUMN source_type TEXT NOT NULL DEFAULT 'download'"),
@@ -709,6 +713,7 @@ def db_get_download(download_id):
             return None
         result = dict(row)
         result["favorite"] = bool(result["favorite"])
+        result["quality"] = classify_video_quality(result["resolution"])
         result["tags"] = _db_download_tags(conn, download_id)
         return result
 
@@ -753,6 +758,60 @@ def db_set_download_favorite(download_id, favorite):
     if changed:
         event_bus.publish("change", {"reason": "favorite", "id": download_id})
     return changed
+
+
+def db_increment_view_count(download_id):
+    """Atomically record one explicit playback activation."""
+    with _db_lock, db() as conn:
+        cursor = conn.execute(
+            "UPDATE downloads SET view_count = view_count + 1 "
+            "WHERE id = ? AND status = 'finished'",
+            (download_id,),
+        )
+        if cursor.rowcount != 1:
+            return None
+        view_count = conn.execute(
+            "SELECT view_count FROM downloads WHERE id = ?",
+            (download_id,),
+        ).fetchone()["view_count"]
+    event_bus.publish("change", {"reason": "view", "id": download_id})
+    return view_count
+
+
+def classify_video_quality(resolution):
+    """Return a compact display tier for a stored video resolution."""
+    value = str(resolution or '').strip().lower()
+    aliases = {
+        '8k': '8k',
+        '4k': '4k',
+        'uhd': '4k',
+        '2k': '2k',
+        'qhd': '2k',
+    }
+    if value in aliases:
+        return aliases[value]
+
+    dimensions = re.fullmatch(r'(\d+)\s*[x×]\s*(\d+)', value)
+    vertical = re.fullmatch(r'(\d+)\s*p?', value)
+    if dimensions:
+        height = int(dimensions.group(2))
+    elif vertical:
+        height = int(vertical.group(1))
+    else:
+        return None
+
+    for minimum, label in (
+        (4320, '8k'),
+        (2160, '4k'),
+        (1440, '2k'),
+        (1080, '1080'),
+        (720, '720p'),
+        (480, '480p'),
+        (360, '360p'),
+    ):
+        if height >= minimum:
+            return label
+    return str(height) if height > 0 else None
 
 
 TAG_MAX_LENGTH = 64
@@ -971,6 +1030,7 @@ def db_list_downloads(user_id=None, is_admin=False):
             "downloads.created_at, "
             "filename, resolution, filesize, speed, eta, title, finished_at, "
             "formats, requested_format, downloaded_bytes, total_bytes, favorite, "
+            "view_count, "
             "source_type, owner_user_id, visibility, "
             "COALESCE(users.username, downloads.owner_username) "
             "AS downloaded_by "
@@ -993,6 +1053,9 @@ def db_list_downloads(user_id=None, is_admin=False):
             )
         for download in downloads:
             download["favorite"] = bool(download["favorite"])
+            download["quality"] = classify_video_quality(
+                download["resolution"]
+            )
             download["tags"] = tags_by_download.get(download["id"], [])
             download["can_manage_visibility"] = (
                 is_admin or download["owner_user_id"] == user_id
@@ -3202,6 +3265,24 @@ def set_download_favorite(download_id):
         "favorite": favorite,
         "changed": changed,
     })
+
+
+@app.route('/api/view/<download_id>', methods=['POST'])
+def record_download_view(download_id):
+    entry = _visible_download(download_id)
+    if entry is None or entry.get('status') != 'finished':
+        return jsonify({"error": "Video is not available"}), 404
+    path = entry.get('filename')
+    if not path or not os.path.isfile(path):
+        return jsonify({"error": "Video is not available"}), 404
+    real = os.path.realpath(path)
+    if not _is_allowed_download_path(real):
+        abort(403)
+
+    view_count = db_increment_view_count(download_id)
+    if view_count is None:
+        return jsonify({"error": "Video is not available"}), 404
+    return jsonify({"id": download_id, "view_count": view_count})
 
 
 @app.route('/api/tags/<download_id>', methods=['POST', 'DELETE'])

@@ -1629,6 +1629,7 @@ document.addEventListener('click', (ev) => {
     const playAction = ev.target.closest('[data-play-action]');
     if (playAction) {
         stopHoverPreview();
+        recordView(playAction.dataset.downloadId);
         playVideo(
             playAction.dataset.downloadId,
             playAction.dataset.playLabel,
@@ -1834,6 +1835,14 @@ function renderHistoryCard(info) {
                     <button class="favorite-toggle" type="button" data-favorite-action data-download-id="${escapeAttr(id)}" data-favorite="${favorite ? 'false' : 'true'}" aria-label="${favoriteLabel}" title="${favoriteLabel}" aria-pressed="${favorite}">
                         <svg aria-hidden="true"><use href="#i-star"/></svg>
                     </button>`;
+    const viewCount = Math.max(0, Number.parseInt(info.view_count, 10) || 0);
+    const newBadge = viewCount === 0
+        ? '<span class="history-preview-label history-preview-new">new</span>'
+        : '';
+    const quality = String(info.quality || '');
+    const qualityBadge = quality
+        ? `<span class="history-preview-label history-preview-quality${quality === '4k' ? ' is-4k' : ''}">${escapeHtml(quality)}</span>`
+        : '';
     let preview;
     if (hasPlay) {
         const playLabel = info.filename.split('/').pop().split('\\').pop();
@@ -1844,6 +1853,8 @@ function renderHistoryCard(info) {
                         <span class="history-preview-fallback"><svg><use href="#i-camera"/></svg><span>No video preview</span></span>
                         <img src="/api/thumbnail/${encodeURIComponent(id)}" alt="" loading="lazy" onerror="this.closest('.history-preview').classList.add('thumbnail-unavailable')">
                         <video class="history-preview-video" muted playsinline loop preload="none" aria-hidden="true"></video>
+                        ${newBadge}
+                        ${qualityBadge}
                     </button>
                     ${favoriteButton}
                 </div>`;
@@ -1884,7 +1895,10 @@ function renderHistoryCard(info) {
 
     const metadata = [];
     metadata.push(`<div class="history-status-row"><strong>Status:</strong> ${escapeHtml(info.status.charAt(0).toUpperCase() + info.status.slice(1))}</div>`);
-    metadata.push(`<div class="history-owner-row"><strong>Downloaded by:</strong> <span>${escapeHtml(info.downloaded_by || 'Unknown user')}</span></div>`);
+    const viewSummary = viewCount === 0
+        ? '<strong class="history-view-new">NEW</strong>'
+        : `<span><strong>Views:</strong> ${viewCount}</span>`;
+    metadata.push(`<div class="history-owner-row"><span><strong>Downloaded by:</strong> ${escapeHtml(info.downloaded_by || 'Unknown user')}</span> &middot; ${viewSummary}</div>`);
     const sizeStr = formatBytes(info.filesize);
     const requestedFormat = formatRequestedFormat(info);
     const mediaParts = [];
@@ -2444,6 +2458,13 @@ function playVideo(id, label, ext) {
             // still open when policy or platform support rejects the request.
         }
     }
+}
+
+function recordView(id) {
+    // Playback starts immediately; view accounting must never make opening the
+    // player depend on a second network round trip.
+    apiFetch('/api/view/' + encodeURIComponent(id), { method: 'POST' })
+        .catch(() => {});
 }
 
 function closePlayer(ev) {

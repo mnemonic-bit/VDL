@@ -299,7 +299,8 @@ test('History info shows the downloader and changes video visibility', async ({ 
     const row = page.locator('[data-row-id="visibility-row"]');
     await openInfo(row);
     const popover = row.locator('.history-info-popover');
-    await expect(popover.locator('.history-owner-row')).toHaveText('Downloaded by: admin');
+    await expect(popover.locator('.history-owner-row')).toHaveText(
+        'Downloaded by: admin · NEW');
 
     const visibility = popover.getByLabel('Visibility');
     await expect(visibility).toHaveValue('public');
@@ -481,6 +482,42 @@ test('History cards show preview first and preview click starts playback', async
     await preview.click();
     await expect(page.locator('#playerBackdrop')).toHaveClass(/open/);
     await expect(page.locator('#playerVideo source')).toHaveAttribute('src', '/api/file/preview01');
+});
+
+test('History preview labels show compact quality and clear new after playback', async ({ page }) => {
+    await seed(page, {
+        id: 'quality-4k', status: 'finished', file: true,
+        name: 'quality-4k.mp4', resolution: '3840x2160',
+    });
+    await seed(page, {
+        id: 'quality-hd', status: 'finished', file: true,
+        name: 'quality-hd.mp4', resolution: '720p',
+    });
+    await refresh(page);
+
+    const fourK = page.locator('[data-row-id="quality-4k"]');
+    const hd = page.locator('[data-row-id="quality-hd"]');
+    await expect(fourK.locator('.history-preview-quality')).toHaveText('4k');
+    await expect(fourK.locator('.history-preview-new')).toHaveText('new');
+    await expect(fourK.locator('.history-preview-new')).toHaveCSS(
+        'background-color', 'rgba(31, 138, 59, 0.52)');
+    await expect(fourK.locator('.history-preview-quality')).toHaveCSS(
+        'background-color', 'rgba(31, 138, 59, 0.52)');
+    await expect(hd.locator('.history-preview-quality')).toHaveText('720p');
+    await expect(hd.locator('.history-preview-quality')).toHaveCSS(
+        'background-color', 'rgba(0, 0, 0, 0.52)');
+
+    await fourK.getByRole('button', { name: 'Play', exact: true }).click();
+    await expect.poll(async () => {
+        const rows = await page.request.get('/api/history').then(response => response.json());
+        return rows.find(row => row.id === 'quality-4k').view_count;
+    }).toBe(1);
+    await expect(fourK.locator('.history-preview-new')).toHaveCount(0);
+    await expect(hd.locator('.history-preview-new')).toHaveCount(1);
+    await page.keyboard.press('Escape');
+    await openInfo(fourK);
+    await expect(fourK.locator('.history-owner-row')).toHaveText(
+        'Downloaded by: admin · Views: 1');
 });
 
 test('hover previews wait before loading and only play one montage at a time', async ({ page }) => {

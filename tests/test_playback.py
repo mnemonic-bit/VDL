@@ -6,6 +6,55 @@ from tests.support.app_case import AppCase
 
 
 class PlaybackTest(AppCase):
+    def test_quality_classification_uses_compact_standard_tiers(self):
+        cases = {
+            "7680x4320": "8k",
+            "2160p": "4k",
+            "2560x1440": "2k",
+            "1080p": "1080",
+            "720p": "720p",
+            "480p": "480p",
+            "360p": "360p",
+            "240p": "240",
+            "audio only": None,
+            None: None,
+        }
+        for resolution, expected in cases.items():
+            with self.subTest(resolution=resolution):
+                self.assertEqual(
+                    vdl.classify_video_quality(resolution), expected
+                )
+
+    def test_preview_activation_counts_views_but_media_requests_do_not(self):
+        self.finished_file()
+        vdl.db_update_download("test0001", resolution="2160p")
+
+        media = self.client.get("/api/file/test0001")
+        media.close()
+        self.assertEqual(vdl.db_get_download("test0001")["view_count"], 0)
+
+        first = self.client.post("/api/view/test0001")
+        second = self.client.post("/api/view/test0001")
+
+        self.assertEqual(first.get_json(), {
+            "id": "test0001", "view_count": 1,
+        })
+        self.assertEqual(second.get_json(), {
+            "id": "test0001", "view_count": 2,
+        })
+        row = self.client.get("/api/history").get_json()[0]
+        self.assertEqual(row["view_count"], 2)
+        self.assertEqual(row["quality"], "4k")
+
+    def test_view_count_rejects_unplayable_rows(self):
+        self.insert("active01")
+        self.assertEqual(
+            self.client.post("/api/view/active01").status_code, 404
+        )
+        self.assertEqual(
+            self.client.post("/api/view/missing1").status_code, 404
+        )
+
     def test_stored_path_survives_preference_change_and_supports_ranges(self):
         payload = bytes(range(100))
         self.finished_file(data=payload)

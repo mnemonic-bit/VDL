@@ -93,6 +93,7 @@ class VideoVisibilityTest(AppCase):
             ('post', f'/api/favorite/{private_id}', {
                 'json': {'favorite': True}
             }),
+            ('post', f'/api/view/{private_id}', {}),
             ('post', f'/api/tags/{private_id}', {
                 'json': {'tag': 'hidden'}
             }),
