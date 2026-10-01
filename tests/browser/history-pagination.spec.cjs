@@ -1,5 +1,5 @@
 const { test, expect } = require('@playwright/test');
-const { reset, seed, refresh } = require('./support.cjs');
+const { reset, seed, refresh, openSettings } = require('./support.cjs');
 
 test.beforeEach(async ({ page }) => reset(page));
 
@@ -18,10 +18,11 @@ test('History pagination preserves ordering and clamps after a page becomes empt
     await expect(page.locator('#historyList [data-row-id]').first()).toHaveAttribute('data-row-id', 'page0021');
     await expect(page.locator('#pagerInfo')).toHaveText('Page 1 of 3 · 21 items');
     await expect(page.locator('#pagerPrev')).toBeDisabled();
-    await expect(page.locator('#pagerFirst')).toBeDisabled();
-    await expect(page.locator('#pagerLast')).toBeVisible();
+    await expect(page.locator('#pagerFirst')).toBeHidden();
+    await expect(page.locator('#pagerLast')).toBeHidden();
 
-    await page.locator('#pagerLast').click();
+    await page.locator('#pagerNext').click();
+    await page.locator('#pagerNext').click();
     await expect(page.locator('#historyList [data-row-id]')).toHaveCount(1);
     await expect(page.locator('#historyList [data-row-id="page0001"]')).toBeVisible();
     await expect(page.locator('#pagerNext')).toBeDisabled();
@@ -37,4 +38,29 @@ test('History pagination preserves ordering and clamps after a page becomes empt
     await page.locator('#pagerPrev').click();
     await expect(page.locator('#historyList [data-row-id]').first()).toHaveAttribute('data-row-id', 'page0021');
     await expect(page.locator('#pagerPrev')).toBeDisabled();
+});
+
+test('page-size preference controls pagination and enables long-range jumps', async ({ page }) => {
+    for (let index = 1; index <= 21; index += 1) {
+        await seed(page, {
+            id: `size${String(index).padStart(4, '0')}`,
+            status: 'finished',
+        });
+    }
+    await refresh(page);
+
+    await openSettings(page);
+    await page.locator('#prefPageSize').selectOption('5');
+    await page.locator('#saveBtn').click();
+    await expect(page.locator('#saveBtn')).toContainText('Saved');
+    await page.getByRole('button', { name: 'Back to videos', exact: true }).click();
+
+    await expect(page.locator('#historyList [data-row-id]')).toHaveCount(5);
+    await expect(page.locator('#pagerInfo')).toHaveText('Page 1 of 5 · 21 items');
+    await expect(page.locator('#pagerFirst')).toBeVisible();
+    await expect(page.locator('#pagerFirst')).toBeDisabled();
+    await expect(page.locator('#pagerLast')).toBeVisible();
+    await page.locator('#pagerLast').click();
+    await expect(page.locator('#pagerInfo')).toHaveText('Page 5 of 5 · 21 items');
+    await expect(page.locator('#historyList [data-row-id]')).toHaveCount(1);
 });

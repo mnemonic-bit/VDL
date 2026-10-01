@@ -7,6 +7,29 @@ from tests.support.app_case import AppCase
 
 
 class PreferencesTest(AppCase):
+    def test_history_page_size_is_available_validated_and_persists(self):
+        self.assertEqual(
+            self.client.get("/api/preferences").get_json()["history_page_size"],
+            "10",
+        )
+
+        response = self.client.post(
+            "/api/preferences",
+            json={"history_page_size": "20"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["history_page_size"], "20")
+        rejected = self.client.post(
+            "/api/preferences",
+            json={"history_page_size": "12"},
+        )
+        self.assertEqual(rejected.status_code, 400)
+        self.assertEqual(
+            vdl.db_get_preferences()["history_page_size"],
+            "20",
+        )
+
     def test_fullscreen_preference_is_available_and_persists(self):
         self.assertEqual(
             self.client.get("/api/preferences").get_json()["start_fullscreen"],

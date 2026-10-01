@@ -1,10 +1,10 @@
 const { test, expect } = require('@playwright/test');
-const { reset, seed, refresh } = require('./support.cjs');
+const { reset, seed, refresh, openSettings } = require('./support.cjs');
 
 test.beforeEach(async ({ page }) => reset(page));
 
 test('light, dark, and system theme choices apply immediately', async ({ page }) => {
-    await page.locator('#settingsButton').click();
+    await openSettings(page);
     await page.locator('#prefTheme').selectOption('dark');
     await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
     await page.locator('#prefTheme').selectOption('light');
@@ -18,9 +18,10 @@ test('light, dark, and system theme choices apply immediately', async ({ page })
 
 test('preferences persist and the temporary Saved icon restores to Save', async ({ page }) => {
     await page.clock.install();
-    await page.locator('#settingsButton').click();
+    await openSettings(page);
     await page.locator('#prefTheme').selectOption('dark');
     await page.locator('#prefMax').fill('1');
+    await page.locator('#prefPageSize').selectOption('20');
     await page.locator('#saveBtn').click();
     await expect(page.locator('#saveBtn use')).toHaveAttribute('href', '#i-check');
     await page.clock.fastForward(1600);
@@ -28,11 +29,12 @@ test('preferences persist and the temporary Saved icon restores to Save', async 
     await expect(page.locator('#saveBtn')).toBeEnabled();
     const preferences = await (await page.request.get('/api/preferences')).json();
     expect(preferences.max_concurrent).toBe('1');
+    expect(preferences.history_page_size).toBe('20');
     expect(preferences.theme).toBe('dark');
 });
 
 test('rejected preferences stay editable and are not displayed as saved', async ({ page }) => {
-    await page.locator('#settingsButton').click();
+    await openSettings(page);
     const original = await (await page.request.get('/api/preferences')).json();
     await page.route('**/api/preferences', async route => {
         if (route.request().method() === 'POST') {
@@ -66,7 +68,7 @@ test('rejected preferences stay editable and are not displayed as saved', async 
 });
 
 test('settings sections navigate and search across General and Playback', async ({ page }) => {
-    await page.locator('#settingsButton').click();
+    await openSettings(page);
     await expect(page.locator('#tab-history')).toBeHidden();
     await expect(page.getByRole('heading', { name: 'General', exact: true })).toBeVisible();
     await expect(page.getByRole('heading', { name: 'Playback', exact: true })).toBeVisible();
@@ -84,7 +86,7 @@ test('settings sections navigate and search across General and Playback', async 
 });
 
 test('Clear History is grouped in the Danger Zone section', async ({ page }) => {
-    await page.locator('#settingsButton').click();
+    await openSettings(page);
     const dangerZone = page.locator('#settings-danger');
 
     await expect(page.locator('#settings-general').getByRole(
@@ -108,7 +110,7 @@ test('saved full-screen playback preference requests full screen for the overlay
     await seed(page, { id: 'fullscreen1', status: 'finished', file: true, name: 'fixture.mp4' });
     await refresh(page);
 
-    await page.locator('#settingsButton').click();
+    await openSettings(page);
     await page.locator('#prefStartFullscreen').check();
     await page.locator('#saveBtn').click();
     await page.getByRole('button', { name: 'Back to videos', exact: true }).click();

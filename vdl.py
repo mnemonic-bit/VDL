@@ -460,6 +460,7 @@ def init_db():
         defaults = {
             "download_dir": DEFAULT_DOWNLOAD_DIR,
             "format": "best",
+            "history_page_size": "10",
             "max_concurrent": "3",
             "player_mode": "overlay",
             "start_fullscreen": "false",
@@ -2685,6 +2686,7 @@ def remove_download(download_id):
 
 
 @app.route('/api/clear/preview', methods=['GET'])
+@admin_required
 def clear_history_preview():
     placeholders = ",".join("?" * len(HISTORY_STATUSES))
     with db() as conn:
@@ -2696,6 +2698,7 @@ def clear_history_preview():
 
 
 @app.route('/api/clear', methods=['POST'])
+@admin_required
 def clear_history():
     try:
         removed, files_deleted = db_clear_history()
@@ -2921,7 +2924,7 @@ def preferences():
         return jsonify(db_get_preferences())
     data = request.json or {}
     allowed = {
-        'download_dir', 'format', 'max_concurrent', 'player_mode',
+        'download_dir', 'format', 'history_page_size', 'max_concurrent', 'player_mode',
         'start_fullscreen', 'theme',
     }
     updates = {k: v for k, v in data.items() if k in allowed and v is not None}
@@ -2934,6 +2937,10 @@ def preferences():
             )
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
+    if "history_page_size" in updates:
+        updates["history_page_size"] = str(updates["history_page_size"])
+        if updates["history_page_size"] not in {'5', '10', '20', '50'}:
+            return jsonify({"error": "Videos per page must be 5, 10, 20, or 50"}), 400
     db_set_preferences(updates)
     return jsonify(db_get_preferences())
 

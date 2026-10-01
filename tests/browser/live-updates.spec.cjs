@@ -418,7 +418,7 @@ test('History insertion animates occupied space before visibility', async ({ pag
     await expect(page.locator('[data-row-id="animate1"]')).not.toHaveClass(/item-fade-in/);
 });
 
-test('health checks use the scheduled clock and recovery hides the banner', async ({ page }) => {
+test('health checks use the scheduled clock and recovery clears the footer status', async ({ page }) => {
     await page.clock.install();
     let unavailable = false;
     let count = 0;
@@ -428,12 +428,17 @@ test('health checks use the scheduled clock and recovery hides the banner', asyn
         await route.fulfill({ status: 200, contentType: 'application/json', body: '{"ok":true,"version":"0.2.0"}' });
     });
     await page.reload();
-    await expect(page.locator('#serverBanner')).toBeHidden();
+    const footer = page.locator('#versionFooter');
+    const serverStatus = page.locator('#serverStatus');
+    await expect(serverStatus).toBeHidden();
     unavailable = true;
     await page.clock.fastForward(30_001);
-    await expect(page.locator('#serverBanner')).toBeVisible();
+    await expect(serverStatus).toBeVisible();
+    await expect(footer).toHaveClass(/server-unavailable/);
+    await expect(serverStatus).toContainText('Server is not available');
     unavailable = false;
     await page.clock.fastForward(30_001);
-    await expect(page.locator('#serverBanner')).toBeHidden();
+    await expect(serverStatus).toBeHidden();
+    await expect(footer).not.toHaveClass(/server-unavailable/);
     expect(count).toBeGreaterThanOrEqual(3);
 });

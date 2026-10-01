@@ -1,5 +1,5 @@
 const { test, expect } = require('@playwright/test');
-const { reset, seed, refresh, openCurrent } = require('./support.cjs');
+const { reset, seed, refresh, openCurrent, openSettings } = require('./support.cjs');
 
 test.beforeEach(async ({ page }) => reset(page));
 
@@ -75,7 +75,7 @@ test('failed Reload does not resubmit and reports the error', async ({ page }) =
 
 test('failed Clear reports the error and preserves History', async ({ page }) => {
     await seed(page, { id: 'failclear', status: 'finished', file: true });
-    await page.locator('#settingsButton').click();
+    await openSettings(page);
     await refresh(page);
     await reject(page, '/api/clear', 'clear was rejected');
     page.once('dialog', dialog => dialog.accept());

@@ -80,8 +80,19 @@ class AuthenticationTest(AppCase):
 
         page = client.get('/').get_data(as_text=True)
 
-        self.assertNotIn('id="settings-users"', page)
-        self.assertEqual(client.get('/api/users').status_code, 403)
+        self.assertEqual({
+            'users_section_visible': 'id="settings-users"' in page,
+            'danger_section_visible': 'id="settings-danger"' in page,
+            'users_api_status': client.get('/api/users').status_code,
+            'clear_preview_api_status': client.get('/api/clear/preview').status_code,
+            'clear_api_status': client.post('/api/clear').status_code,
+        }, {
+            'users_section_visible': False,
+            'danger_section_visible': False,
+            'users_api_status': 403,
+            'clear_preview_api_status': 403,
+            'clear_api_status': 403,
+        })
 
     def test_signed_in_user_is_redirected_away_from_login(self):
         response = self.client.get('/login')

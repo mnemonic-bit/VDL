@@ -43,4 +43,21 @@ async function openNewDownload(page) {
     await expect(dialog).toBeVisible();
 }
 
-module.exports = { reset, seed, refresh, openCurrent, closeCurrent, openNewDownload };
+async function openSettings(page) {
+    const settings = page.locator('#settingsPage');
+    if (!(await settings.isVisible())) {
+        await page.locator('#accountMenuButton').click();
+        await page.locator('#settingsButton').click();
+    }
+    await expect(settings).toBeVisible();
+}
+
+module.exports = {
+    reset,
+    seed,
+    refresh,
+    openCurrent,
+    closeCurrent,
+    openNewDownload,
+    openSettings,
+};

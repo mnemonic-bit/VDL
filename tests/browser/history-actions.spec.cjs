@@ -1,5 +1,5 @@
 const { test, expect } = require('@playwright/test');
-const { reset, seed, refresh, openCurrent } = require('./support.cjs');
+const { reset, seed, refresh, openCurrent, openSettings } = require('./support.cjs');
 
 async function openInfo(row) {
     await row.locator('.kebab-btn').click();
@@ -33,6 +33,8 @@ test('fixed header opens the Current drawer and full Settings page', async ({ pa
 
     const newDownloadButton = page.locator('#newDownloadButton');
     const currentButton = page.locator('#currentDownloadsButton');
+    const accountButton = page.locator('#accountMenuButton');
+    const accountMenu = page.locator('#accountMenu');
     const settingsButton = page.locator('#settingsButton');
     await expect(newDownloadButton).toHaveText('');
     expect(await newDownloadButton.evaluate(button => {
@@ -46,9 +48,13 @@ test('fixed header opens the Current drawer and full Settings page', async ({ pa
     await expect(currentButton).toContainText('Current downloads');
     await expect(currentButton).toBeVisible();
     await expect(currentButton.locator('#currentBadge')).toHaveText('1');
-    expect(await currentButton.evaluate((button, settings) => (
-        button.getBoundingClientRect().right <= document.querySelector(settings).getBoundingClientRect().left
-    ), '#settingsButton')).toBeTruthy();
+    await expect(accountButton).toContainText('admin');
+    await expect(accountButton).toHaveAttribute('aria-expanded', 'false');
+    await expect(accountMenu).toBeHidden();
+    expect(await accountButton.evaluate((button, currentSelector) => (
+        button.getBoundingClientRect().left
+            >= document.querySelector(currentSelector).getBoundingClientRect().right
+    ), '#currentDownloadsButton')).toBeTruthy();
 
     await newDownloadButton.click();
     const newDownloadDialog = page.locator('#newDownloadDialog');
@@ -84,10 +90,17 @@ test('fixed header opens the Current drawer and full Settings page', async ({ pa
     await expect(drawer).toBeHidden();
     await expect(currentButton).toBeFocused();
 
+    await accountButton.click();
+    await expect(accountMenu).toBeVisible();
+    await expect(accountButton).toHaveAttribute('aria-expanded', 'true');
+    expect(await accountMenu.evaluate((menu, buttonSelector) => (
+        Math.abs(menu.getBoundingClientRect().right
+            - document.querySelector(buttonSelector).getBoundingClientRect().right) < 2
+    ), '#accountMenuButton')).toBeTruthy();
     await expect(settingsButton).toBeVisible();
-    await expect(settingsButton).toHaveAttribute('aria-label', 'Settings');
     await expect(settingsButton.locator('use')).toHaveAttribute('href', '#i-cog');
-    await expect(settingsButton).toHaveText('');
+    await expect(settingsButton).toContainText('Preferences');
+    await expect(accountMenu.getByRole('menuitem', { name: 'Sign out' })).toBeVisible();
     await settingsButton.click();
 
     const settingsPage = page.locator('#settingsPage');
@@ -99,6 +112,26 @@ test('fixed header opens the Current drawer and full Settings page', async ({ pa
     await settingsPage.getByRole('button', { name: 'Back to videos', exact: true }).click();
     await expect(settingsPage).toBeHidden();
     await expect(page.locator('#tab-history')).toBeVisible();
+    await expect(accountButton).toBeFocused();
+});
+
+test('account menu supports keyboard navigation and closes outside', async ({ page }) => {
+    const accountButton = page.locator('#accountMenuButton');
+    const accountMenu = page.locator('#accountMenu');
+
+    await accountButton.focus();
+    await accountButton.press('ArrowDown');
+    await expect(accountMenu).toBeVisible();
+    await expect(page.locator('#settingsButton')).toBeFocused();
+    await page.locator('#settingsButton').press('ArrowDown');
+    await expect(accountMenu.getByRole('menuitem', { name: 'Sign out' })).toBeFocused();
+    await page.keyboard.press('Escape');
+    await expect(accountMenu).toBeHidden();
+    await expect(accountButton).toBeFocused();
+
+    await accountButton.click();
+    await page.locator('#tab-history').click({ position: { x: 1, y: 1 } });
+    await expect(accountMenu).toBeHidden();
 });
 
 test('Current downloads button only appears while the drawer has work', async ({ page }) => {
@@ -455,6 +488,11 @@ test('hover previews wait before loading and only play one montage at a time', a
     await expect(firstVideo).toHaveAttribute('src', '/api/preview/hover01?v=3');
     await expect(first).toHaveClass(/preview-playing/);
 
+    await page.locator('[data-row-id="hover01"] .favorite-toggle').hover();
+    await expect(firstVideo).toHaveAttribute('src', '/api/preview/hover01?v=3');
+    await expect(first).toHaveClass(/preview-playing/);
+    expect(await page.evaluate(() => window.__hoverPreviewPauses)).toBe(0);
+
     await second.hover();
     await expect(firstVideo).not.toHaveAttribute('src', /./);
     await expect(first).not.toHaveClass(/preview-playing/);
@@ -641,7 +679,7 @@ test('fixed footer reports every stored download', async ({ page }) => {
 
 test('Clear History confirms and deletes stored files', async ({ page }) => {
     await seed(page, { id: 'clear001', status: 'finished', file: true });
-    await page.locator('#settingsButton').click();
+    await openSettings(page);
     page.once('dialog', dialog => dialog.accept());
     await page.getByRole('button', { name: 'Clear History', exact: true }).click();
     await expect(page.locator('[data-row-id="clear001"]')).toHaveCount(0);
@@ -651,7 +689,7 @@ test('Clear History confirms and deletes stored files', async ({ page }) => {
 test('Clear History leaves resumable Current rows intact', async ({ page }) => {
     await seed(page, { id: 'finished1', status: 'finished', file: true });
     await seed(page, { id: 'cancelled1', status: 'cancelled', progress: 'Stopped' });
-    await page.locator('#settingsButton').click();
+    await openSettings(page);
     page.once('dialog', dialog => dialog.accept());
     await page.getByRole('button', { name: 'Clear History', exact: true }).click();
     await page.getByRole('button', { name: 'Back to videos', exact: true }).click();

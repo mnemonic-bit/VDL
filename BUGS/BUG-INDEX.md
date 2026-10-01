@@ -97,6 +97,14 @@ uses Firefox-compatible level-2.1 encoding, and preserves the favorite star's
 state-specific tooltip. The related full player now omits its repeated title
 and reveals an inner top-right close control only during mouse activity or
 keyboard focus.
+Issue 42 was reported and resolved during a UI cleanup review on 2026-10-01.
+Account actions crowded the header, operational status was fragmented,
+favorite-star hover stopped moving previews, History pagination was rigid,
+and its long-range controls appeared for only three pages. More importantly,
+normal users could see and invoke the destructive Danger Zone. Account actions
+now live in a rightmost username menu, status stays compact in the footer,
+preview and pagination behavior follow their intended boundaries, and both the
+Danger Zone markup and clear-history APIs are restricted to administrators.
 
 ## Bug reports
 
@@ -141,6 +149,7 @@ keyboard focus.
 - [Bug 0039 — Header download actions occupied space without useful state](bug-0039-header-download-actions-occupied-space-without-useful-state.md)
 - [Bug 0040 — Open tabs retain stale UI code after an application upgrade](bug-0040-open-tabs-retain-stale-ui-after-upgrade.md)
 - [Bug 0041 — History video previews were redundant and Firefox-incompatible](bug-0041-history-video-previews-were-redundant-and-firefox-incompatible.md)
+- [Bug 0042 — UI cleanup left navigation, preview, pagination, and authorization gaps](bug-0042-ui-cleanup-left-navigation-preview-pagination-and-authorization-gaps.md)
 
 ## Accepted UI decisions
 

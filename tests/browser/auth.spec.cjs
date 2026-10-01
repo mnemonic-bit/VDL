@@ -1,5 +1,5 @@
 const { test, expect } = require('@playwright/test');
-const { reset } = require('./support.cjs');
+const { reset, openSettings } = require('./support.cjs');
 
 test('private content redirects to sign in and accepts a valid account', async ({ page }) => {
     await page.goto('/');
@@ -14,9 +14,18 @@ test('private content redirects to sign in and accepts a valid account', async (
     await expect(page.getByText('Video Download Helper')).toBeVisible();
 });
 
+test('account menu signs the current user out', async ({ page }) => {
+    await reset(page);
+    await page.locator('#accountMenuButton').click();
+    await page.getByRole('menuitem', { name: 'Sign out' }).click();
+
+    await expect(page).toHaveURL(/\/login$/);
+    await expect(page.getByRole('heading', { name: 'Sign in' })).toBeVisible();
+});
+
 test('administrator can add, suspend, reset, and remove a user', async ({ page }) => {
     await reset(page);
-    await page.getByRole('button', { name: 'Settings' }).click();
+    await openSettings(page);
     await page.getByRole('button', { name: 'Users' }).click();
 
     await page.getByLabel('New username').fill('browser-user');

@@ -76,6 +76,7 @@ class SchemaMigrationTest(unittest.TestCase):
                 self.assertEqual(vdl.db_get_preferences(), {
                     "download_dir": vdl.DEFAULT_DOWNLOAD_DIR,
                     "format": "best",
+                    "history_page_size": "10",
                     "max_concurrent": "3",
                     "player_mode": "overlay",
                     "start_fullscreen": "false",

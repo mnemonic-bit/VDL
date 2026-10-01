@@ -8,8 +8,6 @@ const CURRENT_TAB_STATUSES = new Set(['starting', 'downloading', 'paused', 'canc
 const HISTORY_TAB_STATUSES = new Set(['finished', 'error']);
 const TERMINAL_STATUSES = new Set(['finished', 'error', 'cancelled', 'interrupted']);
 
-let _bannerDismissed = false;
-
 const favicon = document.getElementById('appFavicon');
 const idleFaviconHref = favicon ? favicon.getAttribute('href') : '';
 const appTitleIcon = document.getElementById('appTitleIcon');
@@ -123,25 +121,26 @@ function updateProgressIndicators(downloads) {
     updateFavicon(aggregate);
 }
 
-function showServerBanner() {
-    _bannerDismissed = false;
-    document.getElementById('serverBanner').style.display = '';
+function showServerStatus() {
+    document.getElementById('serverStatus').hidden = false;
+    document.getElementById('versionFooter').classList.add('server-unavailable');
 }
 
-function hideServerBanner() {
-    document.getElementById('serverBanner').style.display = 'none';
+function hideServerStatus() {
+    document.getElementById('serverStatus').hidden = true;
+    document.getElementById('versionFooter').classList.remove('server-unavailable');
 }
 
 function apiFetch(url, options) {
     return fetch(url, options).then(res => {
-        hideServerBanner();
+        hideServerStatus();
         if (res.status === 401) {
             window.location.assign('/login');
             throw new Error('Your session has ended. Sign in again.');
         }
         return res;
     }).catch(err => {
-        showServerBanner();
+        showServerStatus();
         throw err;
     });
 }
@@ -423,6 +422,7 @@ function checkHealth() {
             updateUptime(data && data.uptime_seconds, false);
         })
         .catch(() => {
+            showServerStatus();
             updateApiVersion(null, true);
             updateUptime(null, true);
         });
@@ -785,6 +785,56 @@ const historySearch = document.getElementById('historySearch');
 const historySearchToggle = document.getElementById('historySearchToggle');
 const historySearchInput = document.getElementById('historySearchInput');
 const historySearchClear = document.getElementById('historySearchClear');
+
+function closeAccountMenu(restoreFocus = false) {
+    const menu = document.getElementById('accountMenu');
+    const button = document.getElementById('accountMenuButton');
+    if (menu.hidden) return;
+    menu.hidden = true;
+    button.setAttribute('aria-expanded', 'false');
+    if (restoreFocus) button.focus();
+}
+
+function openAccountMenu({ focusFirst = false } = {}) {
+    closeHistoryInfo();
+    closeAllMenus();
+    const menu = document.getElementById('accountMenu');
+    const button = document.getElementById('accountMenuButton');
+    menu.hidden = false;
+    button.setAttribute('aria-expanded', 'true');
+    if (focusFirst) menu.querySelector('[role="menuitem"]').focus();
+}
+
+const accountMenuButton = document.getElementById('accountMenuButton');
+const accountMenu = document.getElementById('accountMenu');
+accountMenuButton.addEventListener('click', event => {
+    event.stopPropagation();
+    if (accountMenu.hidden) openAccountMenu();
+    else closeAccountMenu();
+});
+accountMenuButton.addEventListener('keydown', event => {
+    if (event.key !== 'ArrowDown') return;
+    event.preventDefault();
+    openAccountMenu({ focusFirst: true });
+});
+accountMenu.addEventListener('keydown', event => {
+    const items = Array.from(accountMenu.querySelectorAll('[role="menuitem"]'));
+    const current = items.indexOf(document.activeElement);
+    let next = null;
+    if (event.key === 'ArrowDown') next = (current + 1) % items.length;
+    else if (event.key === 'ArrowUp') next = (current - 1 + items.length) % items.length;
+    else if (event.key === 'Home') next = 0;
+    else if (event.key === 'End') next = items.length - 1;
+    else if (event.key === 'Escape') {
+        event.preventDefault();
+        closeAccountMenu(true);
+        return;
+    }
+    if (next === null) return;
+    event.preventDefault();
+    items[next].focus();
+});
+
 historySearchToggle.addEventListener('click', () => {
     setHistorySearchExpanded(true);
     historySearchInput.focus();
@@ -1331,6 +1381,7 @@ function closeAllMenus() {
     const hadOpenMenu = openMenuId !== null;
     document.querySelectorAll('.kebab-menu.open').forEach(m => m.classList.remove('open'));
     openMenuId = null;
+    closeAccountMenu();
     if (hadOpenMenu) {
         // Schedule after the click finishes so switching directly to another
         // menu keeps its actions stable and defers the refresh again.
@@ -1448,7 +1499,8 @@ function stopHoverPreview(preview = activeHoverPreview || pendingHoverPreview) {
 function startHoverPreview(preview) {
     hoverPreviewTimer = null;
     pendingHoverPreview = null;
-    if (!preview.isConnected || !preview.matches(':hover') || !hoverPreviewsEnabled()) return;
+    const hoverRegion = preview.closest('.history-preview-wrap') || preview;
+    if (!preview.isConnected || !hoverRegion.matches(':hover') || !hoverPreviewsEnabled()) return;
 
     if (activeHoverPreview && activeHoverPreview !== preview) {
         stopHoverPreview(activeHoverPreview);
@@ -1500,10 +1552,15 @@ document.addEventListener('pointerover', (ev) => {
 });
 
 document.addEventListener('pointerout', (ev) => {
-    const preview = ev.target.closest
-        ? ev.target.closest('button.history-preview[data-play-action]')
+    const hoverRegion = ev.target.closest
+        ? ev.target.closest('.history-preview-wrap')
         : null;
-    if (!preview || (ev.relatedTarget && preview.contains(ev.relatedTarget))) return;
+    const preview = hoverRegion
+        ? hoverRegion.querySelector('button.history-preview[data-play-action]')
+        : null;
+    // The favorite control overlays the preview as a sibling, so the wrapper
+    // is the stable hover boundary even while the pointer is over that control.
+    if (!preview || (ev.relatedTarget && hoverRegion.contains(ev.relatedTarget))) return;
     stopHoverPreview(preview);
 });
 
@@ -1989,7 +2046,9 @@ function renderItem(info, inHistoryView = false) {
             `;
 }
 
-const HISTORY_PAGE_SIZE = 10;
+const DEFAULT_HISTORY_PAGE_SIZE = 10;
+const HISTORY_PAGE_SIZES = new Set([5, 10, 20, 50]);
+let historyPageSize = DEFAULT_HISTORY_PAGE_SIZE;
 let historyPage = 0;
 let historyTotal = 0;
 let historyOrderIds = [];
@@ -2038,7 +2097,7 @@ function animateInsertedItem(element, pendingAnimations, id) {
 }
 
 function changePage(delta) {
-    const maxPage = Math.max(0, Math.ceil(historyTotal / HISTORY_PAGE_SIZE) - 1);
+    const maxPage = Math.max(0, Math.ceil(historyTotal / historyPageSize) - 1);
     const next = Math.min(maxPage, Math.max(0, historyPage + delta));
     if (next === historyPage) return;
     historyPage = next;
@@ -2046,7 +2105,7 @@ function changePage(delta) {
 }
 
 function goToPage(target) {
-    const maxPage = Math.max(0, Math.ceil(historyTotal / HISTORY_PAGE_SIZE) - 1);
+    const maxPage = Math.max(0, Math.ceil(historyTotal / historyPageSize) - 1);
     const next = Math.min(maxPage, Math.max(0, target));
     if (next === historyPage) return;
     historyPage = next;
@@ -2093,10 +2152,10 @@ function fetchHistory({ sortFavorites = false } = {}) {
         const done = historyEntries.filter(matchesSearchFilter);
 
         historyTotal = done.length;
-        const maxPage = Math.max(0, Math.ceil(historyTotal / HISTORY_PAGE_SIZE) - 1);
+        const maxPage = Math.max(0, Math.ceil(historyTotal / historyPageSize) - 1);
         if (historyPage > maxPage) historyPage = maxPage;
-        const start = historyPage * HISTORY_PAGE_SIZE;
-        const pageItems = done.slice(start, start + HISTORY_PAGE_SIZE);
+        const start = historyPage * historyPageSize;
+        const pageItems = done.slice(start, start + historyPageSize);
 
         let focusRestore = null;
         const ae = document.activeElement;
@@ -2192,13 +2251,13 @@ function fetchHistory({ sortFavorites = false } = {}) {
         document.getElementById('historyEmpty').style.display = done.length ? 'none' : '';
 
         const pager = document.getElementById('historyPager');
-        if (historyTotal > HISTORY_PAGE_SIZE) {
+        if (historyTotal > historyPageSize) {
             pager.style.display = '';
             document.getElementById('pagerInfo').textContent =
                 `Page ${historyPage + 1} of ${maxPage + 1} · ${historyTotal} items`;
             document.getElementById('pagerPrev').disabled = historyPage <= 0;
             document.getElementById('pagerNext').disabled = historyPage >= maxPage;
-            const showJump = maxPage >= 2;
+            const showJump = maxPage >= 3;
             const first = document.getElementById('pagerFirst');
             const last = document.getElementById('pagerLast');
             first.style.display = showJump ? '' : 'none';
@@ -2330,6 +2389,9 @@ document.addEventListener('keydown', (ev) => {
     } else if (ev.key === 'Escape' && document.getElementById('currentDownloadsDrawer').open) {
         ev.preventDefault();
         closeCurrentDownloads();
+    } else if (ev.key === 'Escape' && !document.getElementById('accountMenu').hidden) {
+        ev.preventDefault();
+        closeAccountMenu(true);
     } else if (ev.key === 'Escape' && openInfoId !== null) {
         closeHistoryInfo();
     }
@@ -2433,14 +2495,13 @@ currentDownloadsDrawer.addEventListener('click', ev => {
 
 function openSettings() {
     const page = document.getElementById('settingsPage');
+    closeAllMenus();
     if (!page.hidden) return;
     closeHistoryInfo();
-    closeAllMenus();
     hideActionError();
     document.getElementById('tab-history').hidden = true;
     page.hidden = false;
     document.body.classList.add('settings-open');
-    document.getElementById('settingsButton').setAttribute('aria-pressed', 'true');
     window.scrollTo({ top: 0 });
     loadPreferences();
     if (document.getElementById('userList')) loadUsers();
@@ -2452,10 +2513,9 @@ function closeSettings() {
     page.hidden = true;
     document.getElementById('tab-history').hidden = false;
     document.body.classList.remove('settings-open');
-    document.getElementById('settingsButton').setAttribute('aria-pressed', 'false');
     hideActionError();
     window.scrollTo({ top: 0 });
-    document.getElementById('settingsButton').focus();
+    document.getElementById('accountMenuButton').focus();
 }
 
 const settingsSearchInput = document.getElementById('settingsSearchInput');
@@ -2661,6 +2721,16 @@ function loadPreferences() {
     return apiFetch('/api/preferences').then(r => r.json()).then(p => {
         document.getElementById('prefDir').value = p.download_dir || '';
         document.getElementById('prefMax').value = p.max_concurrent || '';
+        const configuredPageSize = Number(p.history_page_size);
+        const nextPageSize = HISTORY_PAGE_SIZES.has(configuredPageSize)
+            ? configuredPageSize
+            : DEFAULT_HISTORY_PAGE_SIZE;
+        document.getElementById('prefPageSize').value = String(nextPageSize);
+        if (historyPageSize !== nextPageSize) {
+            historyPageSize = nextPageSize;
+            historyPage = 0;
+            if (historyTotal > 0) fetchHistory();
+        }
 
         const stored = p.format || 'bestvideo+bestaudio/best';
         const sel = document.getElementById('prefFormat');
@@ -2711,6 +2781,7 @@ function savePreferences() {
     const body = {
         download_dir: document.getElementById('prefDir').value,
         format: fmt || 'best',
+        history_page_size: document.getElementById('prefPageSize').value,
         max_concurrent: document.getElementById('prefMax').value,
         player_mode: document.getElementById('prefPlayer').value,
         start_fullscreen: document.getElementById('prefStartFullscreen').checked
@@ -2722,6 +2793,12 @@ function savePreferences() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
     }).then(() => {
+        const nextPageSize = Number(body.history_page_size);
+        if (historyPageSize !== nextPageSize) {
+            historyPageSize = nextPageSize;
+            historyPage = 0;
+            fetchHistory();
+        }
         playerMode = body.player_mode;
         startVideosFullscreen = body.start_fullscreen === 'true';
         applyTheme(body.theme);
@@ -2756,7 +2833,7 @@ function connectEventStream() {
     es.addEventListener('ready', scheduleFetch);
     es.addEventListener('change', scheduleFetch);
     es.addEventListener('error', () => {
-        showServerBanner();
+        showServerStatus();
     });
     return es;
 }

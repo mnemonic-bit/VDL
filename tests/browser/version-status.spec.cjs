@@ -23,7 +23,8 @@ test('version mismatch offers a same-tab refresh link to the current UI', async 
 
     const messageBox = await message.boundingBox();
     const linkBox = await refreshLink.boundingBox();
-    expect(linkBox.y).toBeGreaterThanOrEqual(messageBox.y + messageBox.height);
+    expect(Math.abs(linkBox.y - messageBox.y)).toBeLessThan(2);
+    expect(linkBox.x).toBeGreaterThanOrEqual(messageBox.x + messageBox.width);
 
     apiVersion = uiVersion;
     await refreshLink.click();

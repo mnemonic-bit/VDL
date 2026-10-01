@@ -21,10 +21,6 @@
     </script>
 </head>
 <body>
-    <div id="serverBanner" class="server-banner" style="display:none;" role="alert">
-        <span>Server is not available — actions will not work until the connection is restored.</span>
-        <button type="button" class="server-banner-close" onclick="hideServerBanner()" aria-label="Dismiss"><svg width="14" height="14"><use href="#i-x"/></svg></button>
-    </div>
     <div id="actionError" class="action-error" role="alert" aria-live="assertive" hidden>
         <span id="actionErrorMessage"></span>
         <button type="button" class="action-error-close" onclick="hideActionError()" aria-label="Dismiss error"><svg width="14" height="14"><use href="#i-x"/></svg></button>
@@ -138,6 +134,12 @@
                     <path d="M8 1.2v2M8 12.8v2M1.2 8h2M12.8 8h2M3.2 3.2l1.4 1.4M11.4 11.4l1.4 1.4M12.8 3.2l-1.4 1.4M4.6 11.4l-1.4 1.4"/>
                 </g>
             </symbol>
+            <symbol id="i-sign-out" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M6.5 2.5H3.2a1 1 0 0 0-1 1v9a1 1 0 0 0 1 1h3.3"/>
+                    <path d="M9.5 5l3 3-3 3M12.5 8H5.8"/>
+                </g>
+            </symbol>
             <symbol id="i-stop" viewBox="0 0 16 16">
                 <rect x="3.5" y="3.5" width="9" height="9" rx="1" fill="currentColor"/>
             </symbol>
@@ -183,7 +185,6 @@
             <span>Video Download Helper</span>
         </h2>
         <div class="header-actions">
-            <span id="currentUsername" class="current-username">{{ current_user.username }}</span>
             <div id="historySearch" class="header-search" role="search">
                 <button id="historySearchToggle" class="header-search-toggle" type="button"
                         aria-label="Search history" aria-expanded="false" aria-controls="historySearchInput">
@@ -209,13 +210,26 @@
                 <span class="current-downloads-label">Current downloads</span>
                 <span id="currentBadge" class="badge" hidden>0</span>
             </button>
-            <button id="settingsButton" class="settings-button" type="button" onclick="openSettings()"
-                    aria-label="Settings" aria-controls="settingsPage" aria-pressed="false">
-                <svg aria-hidden="true"><use href="#i-cog"/></svg>
-            </button>
-            <form method="post" action="{{ url_for('logout') }}" class="logout-form">
-                <button class="logout-button" type="submit">Sign out</button>
-            </form>
+            <div class="account-menu-wrap">
+                <button id="accountMenuButton" class="account-menu-button" type="button"
+                        aria-haspopup="menu" aria-expanded="false" aria-controls="accountMenu">
+                    <span id="currentUsername" class="current-username">{{ current_user.username }}</span>
+                    <svg aria-hidden="true"><use href="#i-chevron"/></svg>
+                </button>
+                <div id="accountMenu" class="account-menu" role="menu" hidden>
+                    <button id="settingsButton" class="account-menu-item" type="button"
+                            onclick="openSettings()" role="menuitem" aria-controls="settingsPage">
+                        <svg aria-hidden="true"><use href="#i-cog"/></svg>
+                        <span>Preferences</span>
+                    </button>
+                    <form method="post" action="{{ url_for('logout') }}" class="logout-form" role="none">
+                        <button class="account-menu-item logout-button" type="submit" role="menuitem">
+                            <svg aria-hidden="true"><use href="#i-sign-out"/></svg>
+                            <span>Sign out</span>
+                        </button>
+                    </form>
+                </div>
+            </div>
         </div>
     </header>
 
@@ -254,8 +268,10 @@
             <nav class="settings-nav" aria-label="Settings sections">
                 <button type="button" class="active" data-settings-section="general" aria-current="page">General</button>
                 <button type="button" data-settings-section="playback">Playback</button>
-                {% if is_admin %}<button type="button" data-settings-section="users">Users</button>{% endif %}
+                {% if is_admin %}
+                <button type="button" data-settings-section="users">Users</button>
                 <button type="button" class="danger" data-settings-section="danger">Danger Zone</button>
+                {% endif %}
             </nav>
             <div class="settings-content">
                 <div id="settingsError" class="action-error settings-error" role="alert" aria-live="assertive" hidden>
@@ -303,6 +319,18 @@
                             <span>How many downloads may run at the same time.</span>
                         </div>
                         <input type="number" id="prefMax" min="1">
+                    </div>
+                    <div class="setting-item" data-setting-keywords="videos items per page pagination history library">
+                        <div class="setting-copy">
+                            <label for="prefPageSize">Videos per page</label>
+                            <span>How many videos are shown on each library page.</span>
+                        </div>
+                        <select id="prefPageSize">
+                            <option value="5">5</option>
+                            <option value="10">10</option>
+                            <option value="20">20</option>
+                            <option value="50">50</option>
+                        </select>
                     </div>
                     <div class="setting-item" data-setting-keywords="theme appearance light dark system color">
                         <div class="setting-copy">
@@ -355,6 +383,7 @@
                 </section>
                 {% endif %}
 
+                {% if is_admin %}
                 <section id="settings-danger" class="settings-section settings-danger" data-settings-name="danger" tabindex="-1">
                     <h2>Danger Zone</h2>
                     <div class="setting-item settings-history-row" data-setting-keywords="clear delete remove download history files completed failed">
@@ -365,6 +394,7 @@
                         <button class="clear-btn" type="button" onclick="clearHistory()">Clear History</button>
                     </div>
                 </section>
+                {% endif %}
 
                 <p id="settingsNoResults" class="settings-no-results" role="status" hidden>No settings match your search.</p>
                 <div class="pref-actions">
@@ -459,6 +489,7 @@
     </div>
 
     <footer id="versionFooter" class="version-footer" data-ui-version="{{ ui_version }}">
+        <span id="serverStatus" class="server-status" role="alert" hidden>Server is not available — actions will not work until the connection is restored.</span>
         <span id="itemCount">0 items</span><span aria-hidden="true"> · </span><span>UI v{{ ui_version }}</span><span aria-hidden="true"> · </span><span id="apiVersion">API checking…</span>
         <span aria-hidden="true"> · </span><span id="uptime">Uptime checking…</span>
         <span id="versionWarning" class="version-warning" hidden>
