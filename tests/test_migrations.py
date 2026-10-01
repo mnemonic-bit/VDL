@@ -23,11 +23,21 @@ class SchemaMigrationTest(unittest.TestCase):
                         key TEXT PRIMARY KEY,
                         value TEXT NOT NULL
                     );
+                    CREATE TABLE users (
+                        id INTEGER PRIMARY KEY,
+                        username TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                        password_hash TEXT,
+                        suspended INTEGER NOT NULL DEFAULT 0,
+                        session_version INTEGER NOT NULL DEFAULT 0,
+                        created_at REAL NOT NULL
+                    );
                     INSERT INTO downloads(id, url, status, progress, created_at)
                     VALUES ('legacy1', 'https://fixture.invalid/legacy',
                             'downloading', '31%', 1);
                     INSERT INTO preferences(key, value)
                     VALUES ('theme', 'dark');
+                    INSERT INTO users(username, password_hash, created_at)
+                    VALUES ('legacy-user', 'legacy-hash', 1);
                 """)
 
             old_path = vdl.DB_PATH
@@ -42,6 +52,11 @@ class SchemaMigrationTest(unittest.TestCase):
                     columns = {
                         row[1] for row in connection.execute(
                             "PRAGMA table_info(downloads)"
+                        )
+                    }
+                    user_columns = {
+                        row[1] for row in connection.execute(
+                            "PRAGMA table_info(users)"
                         )
                     }
                     tables = {
@@ -62,9 +77,15 @@ class SchemaMigrationTest(unittest.TestCase):
                     "tags", "download_tags", "app_config", "roles", "users",
                     "user_roles",
                 }.issubset(tables))
+                self.assertIn("name", user_columns)
                 admin = vdl.db_get_user_by_username("admin")
                 self.assertEqual(admin["roles"], ["admin"])
+                self.assertEqual(admin["name"], "admin")
                 self.assertIsNone(admin["password_hash"])
+                self.assertEqual(
+                    vdl.db_get_user_by_username("legacy-user")["name"],
+                    "legacy-user",
+                )
                 self.assertEqual(
                     vdl.db_get_download("legacy1")["status"],
                     "interrupted",

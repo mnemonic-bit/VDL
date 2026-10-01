@@ -425,6 +425,20 @@ def init_db():
             if col not in existing_cols:
                 conn.execute(ddl)
 
+        existing_user_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(users)")
+        }
+        for col, ddl in [
+            # Login names remain stable account identifiers while this field
+            # gives the administration UI a human-readable label.
+            ("name", "ALTER TABLE users ADD COLUMN name TEXT NOT NULL DEFAULT ''"),
+        ]:
+            if col not in existing_user_cols:
+                conn.execute(ddl)
+        conn.execute(
+            "UPDATE users SET name = username WHERE name = ''"
+        )
+
         # Roles are rows rather than a users-table enum so deployments can add
         # role names later without another schema migration. The join table is
         # intentionally many-to-many even though today's UI assigns one role.
@@ -438,8 +452,8 @@ def init_db():
         ).fetchone()
         if bootstrap_created is None:
             conn.execute(
-                "INSERT OR IGNORE INTO users(username, password_hash, created_at) "
-                "VALUES ('admin', NULL, ?)",
+                "INSERT OR IGNORE INTO users(username, name, password_hash, created_at) "
+                "VALUES ('admin', 'admin', NULL, ?)",
                 (time.time(),),
             )
             conn.execute(
@@ -934,7 +948,7 @@ def db_set_preferences(updates: dict):
 
 def _db_user(conn, where, values):
     row = conn.execute(
-        "SELECT id, username, password_hash, suspended, session_version, "
+        "SELECT id, username, name, password_hash, suspended, session_version, "
         f"created_at FROM users WHERE {where}",
         values,
     ).fetchone()
@@ -1014,6 +1028,16 @@ def _validated_username(value):
     return username
 
 
+def _validated_user_name(value):
+    if not isinstance(value, str):
+        raise ValueError('Name is required')
+    name = unicodedata.normalize('NFC', value).strip()
+    if (not name or len(name) > 128
+            or any(ord(character) < 32 for character in name)):
+        raise ValueError('Name must be between 1 and 128 visible characters')
+    return name
+
+
 def _validated_password(value):
     if not isinstance(value, str) or len(value) < 8:
         raise ValueError('Password must contain at least 8 characters')
@@ -1045,19 +1069,20 @@ def db_set_initial_admin_password(user_id, password):
         return _db_user(conn, "id = ?", (user_id,))
 
 
-def db_create_user(username, password, role_name):
+def db_create_user(username, password, role_name, name=None):
     username = _validated_username(username)
+    name = _validated_user_name(username if name is None else name)
     password_hash = generate_password_hash(_validated_password(password))
     with _db_lock, db() as conn:
         role_id = _db_role_id(conn, role_name)
         try:
             cursor = conn.execute(
-                "INSERT INTO users(username, password_hash, created_at) "
-                "VALUES (?, ?, ?)",
-                (username, password_hash, time.time()),
+                "INSERT INTO users(username, name, password_hash, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (username, name, password_hash, time.time()),
             )
         except sqlite3.IntegrityError as exc:
-            raise ValueError('A user with that name already exists') from exc
+            raise ValueError('A user with that login name already exists') from exc
         conn.execute(
             "INSERT INTO user_roles(user_id, role_id) VALUES (?, ?)",
             (cursor.lastrowid, role_id),
@@ -1076,7 +1101,7 @@ def _db_other_active_admin_exists(conn, user_id):
     ).fetchone() is not None
 
 
-def db_update_user(user_id, *, username=None, password=None,
+def db_update_user(user_id, *, username=None, name=None, password=None,
                    role_name=None, suspended=None):
     with _db_lock, db() as conn:
         user = _db_user(conn, "id = ?", (user_id,))
@@ -1085,14 +1110,17 @@ def db_update_user(user_id, *, username=None, password=None,
         if role_name is not None and not isinstance(role_name, str):
             raise ValueError('Unknown role')
 
-        removes_active_admin = (
+        demotes_admin = (
+            'admin' in user['roles']
+            and role_name is not None
+            and role_name.casefold() != 'admin'
+        )
+        suspends_active_admin = (
             'admin' in user['roles']
             and not user['suspended']
-            and (suspended is True
-                 or (role_name is not None
-                     and role_name.casefold() != 'admin'))
+            and suspended is True
         )
-        if (removes_active_admin
+        if ((demotes_admin or suspends_active_admin)
                 and not _db_other_active_admin_exists(conn, user_id)):
             raise ValueError('At least one active administrator is required')
 
@@ -1111,7 +1139,12 @@ def db_update_user(user_id, *, username=None, password=None,
                     (username, user_id),
                 )
             except sqlite3.IntegrityError as exc:
-                raise ValueError('A user with that name already exists') from exc
+                raise ValueError('A user with that login name already exists') from exc
+        if name is not None:
+            conn.execute(
+                "UPDATE users SET name = ? WHERE id = ?",
+                (_validated_user_name(name), user_id),
+            )
         if suspended is not None:
             if not isinstance(suspended, bool):
                 raise ValueError('Suspended must be true or false')
@@ -2272,6 +2305,7 @@ def users():
             data.get('username'),
             data.get('password'),
             data.get('role', 'normal'),
+            data.get('name'),
         )
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
@@ -2295,7 +2329,7 @@ def user(user_id):
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return jsonify({"error": "A JSON object is required"}), 400
-    allowed = {'username', 'password', 'role', 'suspended'}
+    allowed = {'username', 'name', 'password', 'role', 'suspended'}
     if not any(key in data for key in allowed):
         return jsonify({"error": "No user changes provided"}), 400
     if user_id == g.current_user['id'] and data.get('suspended') is True:
@@ -2305,6 +2339,7 @@ def user(user_id):
         updated = db_update_user(
             user_id,
             username=data.get('username') if 'username' in data else None,
+            name=data.get('name') if 'name' in data else None,
             password=data.get('password') if 'password' in data else None,
             role_name=data.get('role') if 'role' in data else None,
             suspended=data.get('suspended') if 'suspended' in data else None,

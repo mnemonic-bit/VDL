@@ -105,6 +105,13 @@ normal users could see and invoke the destructive Danger Zone. Account actions
 now live in a rightmost username menu, status stays compact in the footer,
 preview and pagination behavior follow their intended boundaries, and both the
 Danger Zone markup and clear-history APIs are restricted to administrators.
+Issue 43 was reported and resolved through a Preferences Users review on
+2026-10-01. Account editors were fragmented, lacked a distinct display name
+and single-row draft lifecycle, and used inconsistent creation and removal
+flows. Follow-up review also refined the final-administrator guard and the
+feedback shown for locked roles and rows. Users now share one table with an
+empty creation row, explicit Save/Cancel state, application dialogs, backend
+last-active-admin enforcement, and explanatory lock tooltips.
 
 ## Bug reports
 
@@ -150,6 +157,7 @@ Danger Zone markup and clear-history APIs are restricted to administrators.
 - [Bug 0040 — Open tabs retain stale UI code after an application upgrade](bug-0040-open-tabs-retain-stale-ui-after-upgrade.md)
 - [Bug 0041 — History video previews were redundant and Firefox-incompatible](bug-0041-history-video-previews-were-redundant-and-firefox-incompatible.md)
 - [Bug 0042 — UI cleanup left navigation, preview, pagination, and authorization gaps](bug-0042-ui-cleanup-left-navigation-preview-pagination-and-authorization-gaps.md)
+- [Bug 0043 — User administration was fragmented and lacked safe edit guards](bug-0043-user-administration-was-fragmented-and-lacked-safe-edit-guards.md)
 
 ## Accepted UI decisions
 

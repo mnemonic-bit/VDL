@@ -119,6 +119,7 @@ class AuthenticationTest(AppCase):
 
         created = self.client.post('/api/users', json={
             'username': 'person',
+            'name': 'Person Example',
             'password': 'first-password',
             'role': 'normal',
         })
@@ -126,6 +127,7 @@ class AuthenticationTest(AppCase):
         stored = vdl.db_get_user_by_username('person')
 
         self.assertEqual(created.status_code, 201)
+        self.assertEqual(user['name'], 'Person Example')
         self.assertNotIn('password_hash', user)
         self.assertTrue(check_password_hash(
             stored['password_hash'], 'first-password'
@@ -133,11 +135,13 @@ class AuthenticationTest(AppCase):
 
         changed = self.client.patch(f"/api/users/{user['id']}", json={
             'username': 'renamed',
+            'name': 'Renamed Person',
             'password': 'second-password',
             'role': 'normal',
             'suspended': True,
         })
         self.assertEqual(changed.status_code, 200)
+        self.assertEqual(changed.get_json()['name'], 'Renamed Person')
         self.assertTrue(changed.get_json()['suspended'])
 
         suspended_client = vdl.app.test_client()
@@ -181,6 +185,39 @@ class AuthenticationTest(AppCase):
         self.assertIn(
             'active administrator', responses[-1].get_json()['error']
         )
+
+        backup = vdl.db_create_user(
+            'backup-admin', 'backup-password', 'admin'
+        )
+        allowed = self.client.patch(
+            f"/api/users/{admin['id']}", json={'role': 'normal'}
+        )
+        self.assertEqual(allowed.status_code, 200)
+        self.assertIn(
+            'admin', vdl.db_get_user_by_id(backup['id'])['roles']
+        )
+
+    def test_suspended_last_administrator_cannot_be_demoted(self):
+        original_admin = vdl.db_get_user_by_username('admin')
+        suspended_admin = vdl.db_create_user(
+            'backup-admin', 'backup-password', 'admin'
+        )
+        vdl.db_update_user(suspended_admin['id'], suspended=True)
+        with vdl._db_lock, vdl.db() as connection:
+            normal_role = connection.execute(
+                "SELECT id FROM roles WHERE name = 'normal'"
+            ).fetchone()['id']
+            connection.execute(
+                "DELETE FROM user_roles WHERE user_id = ?",
+                (original_admin['id'],),
+            )
+            connection.execute(
+                "INSERT INTO user_roles(user_id, role_id) VALUES (?, ?)",
+                (original_admin['id'], normal_role),
+            )
+
+        with self.assertRaisesRegex(ValueError, 'active administrator'):
+            vdl.db_update_user(suspended_admin['id'], role_name='normal')
 
     def test_password_reset_invalidates_an_existing_session(self):
         user = vdl.db_create_user('viewer', 'viewer-password', 'normal')

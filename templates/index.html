@@ -370,16 +370,20 @@
                 <section id="settings-users" class="settings-section" data-settings-name="users" tabindex="-1">
                     <h2>Users</h2>
                     <p class="settings-section-intro">Add accounts and manage access to this application.</p>
-                    <form id="addUserForm" class="user-create-form" onsubmit="addUser(event)"
-                          data-setting-keywords="users accounts add create role password">
-                        <input id="newUsername" type="text" maxlength="64" required
-                               placeholder="Username" autocomplete="off" aria-label="New username">
-                        <input id="newUserPassword" type="password" minlength="8" required
-                               placeholder="Initial password" autocomplete="new-password" aria-label="Initial password">
-                        <select id="newUserRole" aria-label="New user role"></select>
-                        <button type="submit">Add user</button>
-                    </form>
-                    <div id="userList" class="user-list" aria-live="polite"></div>
+                    <div class="user-table-scroll" data-setting-keywords="users accounts add create role name suspend remove">
+                        <table class="user-table">
+                            <thead>
+                                <tr>
+                                    <th scope="col">Login Name</th>
+                                    <th scope="col">Name</th>
+                                    <th scope="col">Role</th>
+                                    <th scope="col"><span class="visually-hidden">Actions</span></th>
+                                </tr>
+                            </thead>
+                            <tbody id="userList" aria-live="polite"></tbody>
+                        </table>
+                    </div>
+                    <form id="addUserForm" onsubmit="addUser(event)"></form>
                 </section>
                 {% endif %}
 
@@ -403,6 +407,30 @@
             </div>
         </div>
     </section>
+
+    {% if is_admin %}
+    <dialog id="userRemoveDialog" class="user-dialog" aria-labelledby="userRemoveTitle" aria-modal="true">
+        <form method="dialog" class="user-dialog-card">
+            <h2 id="userRemoveTitle">Remove user?</h2>
+            <p>Remove <strong id="userRemoveName"></strong>? This account will no longer be able to sign in.</p>
+            <div class="user-dialog-actions">
+                <button type="submit" value="cancel">Cancel</button>
+                <button type="submit" value="remove" class="danger">Remove</button>
+            </div>
+        </form>
+    </dialog>
+    <dialog id="userCreatedDialog" class="user-dialog" aria-labelledby="userCreatedTitle" aria-modal="true">
+        <form method="dialog" class="user-dialog-card">
+            <h2 id="userCreatedTitle">User added</h2>
+            <p>Share this generated initial password with <strong id="userCreatedName"></strong>. It is shown only once.</p>
+            <label for="userCreatedPassword">Initial password</label>
+            <input id="userCreatedPassword" type="text" readonly>
+            <div class="user-dialog-actions">
+                <button type="submit" value="close">Done</button>
+            </div>
+        </form>
+    </dialog>
+    {% endif %}
 
     <dialog id="newDownloadDialog" class="new-download-dialog" aria-labelledby="newDownloadTitle" aria-modal="true">
         <div class="new-download-dialog-header">

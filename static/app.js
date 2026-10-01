@@ -2673,39 +2673,133 @@ settingsSearchInput.addEventListener('keydown', event => {
 
 let managedRoles = [];
 let managedCurrentUserId = null;
+let managedUsers = [];
+let managedUserEditId = null;
+let managedUserDraft = null;
+let managedRemoveUserId = null;
+const NEW_USER_ROW_ID = 'new';
+const USER_EDIT_LOCK_TITLE = 'Save or cancel the current user changes before editing another user';
 
 function userRoleOptions(selectedRole) {
     return managedRoles.map(role => (
-        `<option value="${escapeAttr(role)}"${role === selectedRole ? ' selected' : ''}>${escapeHtml(role)}</option>`
+        `<option value="${escapeAttr(role)}"${role === selectedRole ? ' selected' : ''}>${escapeHtml(role.charAt(0).toUpperCase() + role.slice(1))}</option>`
     )).join('');
 }
 
-function renderUsers(users) {
+function managedUserValues(row) {
+    return {
+        username: row.querySelector('.user-login-input').value,
+        name: row.querySelector('.user-name-input').value,
+        role: row.querySelector('.user-role-input').value,
+    };
+}
+
+function userEditActions(rowId, isNew) {
+    const saveAction = isNew ? '' : ` onclick="updateUser(${rowId})"`;
+    const saveType = isNew ? 'submit' : 'button';
+    const form = isNew ? ' form="addUserForm"' : '';
+    return `<button type="${saveType}"${form} class="user-action user-save"${saveAction} aria-label="Save" title="Save">
+                <svg aria-hidden="true"><use href="#i-check"/></svg>
+            </button>
+            <button type="button" class="user-action user-cancel" onclick="cancelUserEdit()" aria-label="Cancel" title="Cancel">
+                <svg aria-hidden="true"><use href="#i-x"/></svg>
+            </button>`;
+}
+
+function userDefaultActions(user, locked) {
+    const isCurrent = user.id === managedCurrentUserId;
+    const disabled = locked || isCurrent;
+    const suspendLabel = user.suspended ? 'Resume' : 'Suspend';
+    const suspendIcon = user.suspended ? 'i-play' : 'i-pause';
+    const disabledReason = isCurrent
+        ? ` title="You cannot ${user.suspended ? 'resume' : 'suspend'} your own account"`
+        : ` title="${suspendLabel}"`;
+    return `<button type="button" class="user-action user-suspend" onclick="setUserSuspended(${user.id}, ${!user.suspended})"
+                    aria-label="${suspendLabel}" aria-pressed="${user.suspended}"${disabled ? ' disabled' : ''}${disabledReason}>
+                <svg aria-hidden="true"><use href="#${suspendIcon}"/></svg>
+            </button>
+            <button type="button" class="user-action user-remove" onclick="removeUser(${user.id})"
+                    aria-label="Remove" title="Remove"${disabled ? ' disabled' : ''}>
+                <svg aria-hidden="true"><use href="#i-trash"/></svg>
+            </button>`;
+}
+
+function renderManagedUserRow(user) {
+    const rowId = String(user.id);
+    const editing = managedUserEditId === rowId;
+    const locked = managedUserEditId !== null && !editing;
+    const values = editing ? managedUserDraft : {
+        username: user.username,
+        name: user.name,
+        role: user.roles[0] || '',
+    };
+    const disabled = locked ? ' disabled' : '';
+    const lockedClass = locked ? ' user-row-locked' : '';
+    const lockedTitle = locked ? ` title="${USER_EDIT_LOCK_TITLE}"` : '';
+    const hasOtherActiveAdmin = managedUsers.some(candidate => (
+        candidate.id !== user.id
+        && candidate.roles.includes('admin')
+        && !candidate.suspended
+    ));
+    const disableRoleChange = user.roles.includes('admin') && !hasOtherActiveAdmin;
+    const roleDisabled = locked || disableRoleChange ? ' disabled' : '';
+    const roleTitle = locked
+        ? ` title="${USER_EDIT_LOCK_TITLE}"`
+        : disableRoleChange
+        ? ' title="You cannot change the role of the last administrator on the system"'
+        : '';
+    const currentLabel = user.id === managedCurrentUserId
+        ? '<span class="user-you">you</span>' : '';
+    return `<tr class="user-row${editing ? ' user-row-editing' : ''}${user.suspended ? ' user-row-suspended' : ''}${lockedClass}" data-user-id="${user.id}"${lockedTitle}>
+                <td>
+                    <div class="user-field-with-status">
+                        <input class="user-login-input" type="text" maxlength="64" required value="${escapeAttr(values.username)}"
+                               aria-label="Login name for ${escapeAttr(user.username)}"${disabled}
+                               oninput="userFieldChanged('${rowId}', 'username', this)" onkeydown="userFieldKeydown(event)">
+                        ${currentLabel}
+                    </div>
+                </td>
+                <td><input class="user-name-input" type="text" maxlength="128" required value="${escapeAttr(values.name)}"
+                           aria-label="Name for ${escapeAttr(user.username)}"${disabled}
+                           oninput="userFieldChanged('${rowId}', 'name', this)" onkeydown="userFieldKeydown(event)"></td>
+                <td><div class="user-role-field"${roleTitle}>
+                    <select class="user-role-input" aria-label="Role for ${escapeAttr(user.username)}"${roleDisabled}
+                            onchange="userFieldChanged('${rowId}', 'role', this)" onkeydown="userFieldKeydown(event)">${userRoleOptions(values.role)}</select>
+                </div></td>
+                <td class="user-actions">${editing ? userEditActions(rowId, false) : userDefaultActions(user, locked)}</td>
+            </tr>`;
+}
+
+function renderNewUserRow() {
+    const editing = managedUserEditId === NEW_USER_ROW_ID;
+    const locked = managedUserEditId !== null && !editing;
+    const values = editing ? managedUserDraft : { username: '', name: '', role: 'normal' };
+    const disabled = locked ? ' disabled' : '';
+    const lockedClass = locked ? ' user-row-locked' : '';
+    const lockedTitle = locked ? ` title="${USER_EDIT_LOCK_TITLE}"` : '';
+    const actions = editing ? userEditActions(NEW_USER_ROW_ID, true) : (
+        `<button type="button" class="user-action user-add" onclick="startNewUser()" aria-label="Add user" title="${locked ? USER_EDIT_LOCK_TITLE : 'Add user'}"${disabled}>
+            <svg aria-hidden="true"><use href="#i-plus"/></svg>
+        </button>`
+    );
+    return `<tr class="user-row user-row-new${editing ? ' user-row-editing' : ''}${lockedClass}" data-user-id="${NEW_USER_ROW_ID}"${lockedTitle}>
+                <td><input id="newUsername" form="addUserForm" class="user-login-input" type="text" maxlength="64" required
+                           value="${escapeAttr(values.username)}" placeholder="Login name" autocomplete="off" aria-label="New login name"${disabled}
+                           oninput="userFieldChanged('${NEW_USER_ROW_ID}', 'username', this)" onkeydown="userFieldKeydown(event)"></td>
+                <td><input id="newUserName" form="addUserForm" class="user-name-input" type="text" maxlength="128" required
+                           value="${escapeAttr(values.name)}" placeholder="Name" autocomplete="off" aria-label="New user name"${disabled}
+                           oninput="userFieldChanged('${NEW_USER_ROW_ID}', 'name', this)" onkeydown="userFieldKeydown(event)"></td>
+                <td><select id="newUserRole" form="addUserForm" class="user-role-input" aria-label="New user role"${disabled}
+                            onchange="userFieldChanged('${NEW_USER_ROW_ID}', 'role', this)" onkeydown="userFieldKeydown(event)">${userRoleOptions(values.role)}</select></td>
+                <td class="user-actions">${actions}</td>
+            </tr>`;
+}
+
+function renderUsers(users = null) {
     const list = document.getElementById('userList');
     if (!list) return;
-    const roleSelect = document.getElementById('newUserRole');
-    roleSelect.innerHTML = userRoleOptions('normal');
-    list.innerHTML = users.map(user => {
-        const role = user.roles[0] || '';
-        const isCurrent = user.id === managedCurrentUserId;
-        return `<article class="user-row" data-user-id="${user.id}">
-                    <div class="user-row-heading">
-                        <strong>${escapeHtml(user.username)}${isCurrent ? ' (you)' : ''}</strong>
-                        <span class="user-role">${escapeHtml(role)}</span>
-                        ${user.suspended ? '<span class="user-suspended">Suspended</span>' : ''}
-                    </div>
-                    <div class="user-editor">
-                        <input class="user-name-input" type="text" maxlength="64" value="${escapeAttr(user.username)}" aria-label="Username for ${escapeAttr(user.username)}">
-                        <select class="user-role-input" aria-label="Role for ${escapeAttr(user.username)}">${userRoleOptions(role)}</select>
-                        <input class="user-password-input" type="password" minlength="8" placeholder="New password (optional)" autocomplete="new-password" aria-label="New password for ${escapeAttr(user.username)}">
-                    </div>
-                    <div class="user-actions">
-                        <button type="button" onclick="updateUser(${user.id})">Save changes</button>
-                        <button type="button" onclick="setUserSuspended(${user.id}, ${!user.suspended})"${isCurrent ? ' disabled title="You cannot suspend your own account"' : ''}>${user.suspended ? 'Resume' : 'Suspend'}</button>
-                        <button type="button" class="user-remove" onclick="removeUser(${user.id})"${isCurrent ? ' disabled title="You cannot remove your own account"' : ''}>Remove</button>
-                    </div>
-                </article>`;
-    }).join('') || '<p class="empty">No users.</p>';
+    if (users !== null) managedUsers = users;
+    list.innerHTML = managedUsers.map(renderManagedUserRow).join('') + renderNewUserRow();
 }
 
 function loadUsers() {
@@ -2713,35 +2807,109 @@ function loadUsers() {
     return apiAction('/api/users').then(response => response.json()).then(data => {
         managedRoles = data.roles || [];
         managedCurrentUserId = data.current_user_id;
+        managedUserEditId = null;
+        managedUserDraft = null;
         renderUsers(data.users || []);
     }).catch(() => {});
 }
 
+function focusManagedUserField(rowId, field) {
+    requestAnimationFrame(() => {
+        const row = document.querySelector(`[data-user-id="${rowId}"]`);
+        const control = row && row.querySelector(`.user-${field === 'username' ? 'login' : field}-input`);
+        if (!control) return;
+        control.focus();
+        if (typeof control.setSelectionRange === 'function') {
+            control.setSelectionRange(control.value.length, control.value.length);
+        }
+    });
+}
+
+function userFieldChanged(rowId, field, control) {
+    if (managedUserEditId !== null && managedUserEditId !== rowId) return;
+    if (managedUserEditId === null) {
+        managedUserEditId = rowId;
+        managedUserDraft = managedUserValues(control.closest('.user-row'));
+        renderUsers();
+        focusManagedUserField(rowId, field);
+        return;
+    }
+    managedUserDraft[field] = control.value;
+}
+
+function userFieldKeydown(event) {
+    if (event.key === 'Escape' && managedUserEditId !== null) {
+        event.preventDefault();
+        cancelUserEdit();
+    }
+}
+
+function startNewUser() {
+    if (managedUserEditId !== null) return;
+    const row = document.querySelector(`[data-user-id="${NEW_USER_ROW_ID}"]`);
+    managedUserEditId = NEW_USER_ROW_ID;
+    managedUserDraft = managedUserValues(row);
+    renderUsers();
+    focusManagedUserField(NEW_USER_ROW_ID, 'username');
+}
+
+function cancelUserEdit() {
+    managedUserEditId = null;
+    managedUserDraft = null;
+    renderUsers();
+}
+
+function generatedInitialPassword() {
+    if (!window.crypto || typeof window.crypto.getRandomValues !== 'function') {
+        throw new Error('A secure initial password could not be generated');
+    }
+    const bytes = new Uint8Array(16);
+    window.crypto.getRandomValues(bytes);
+    return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function showCreatedUserDialog(user, password) {
+    const dialog = document.getElementById('userCreatedDialog');
+    document.getElementById('userCreatedName').textContent = user.name || user.username;
+    const passwordInput = document.getElementById('userCreatedPassword');
+    passwordInput.value = password;
+    dialog.showModal();
+    passwordInput.select();
+}
+
 function addUser(event) {
     event.preventDefault();
+    if (managedUserEditId !== NEW_USER_ROW_ID) return;
+    let password;
+    try {
+        password = generatedInitialPassword();
+    } catch (error) {
+        showActionError(error.message);
+        return;
+    }
     const body = {
-        username: document.getElementById('newUsername').value,
-        password: document.getElementById('newUserPassword').value,
-        role: document.getElementById('newUserRole').value,
+        username: managedUserDraft.username,
+        name: managedUserDraft.name,
+        password,
+        role: managedUserDraft.role,
     };
     apiAction('/api/users', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
-    }).then(() => {
-        document.getElementById('addUserForm').reset();
+    }).then(response => response.json()).then(user => {
+        showCreatedUserDialog(user, password);
         return loadUsers();
     }).catch(() => {});
 }
 
 function updateUser(userId) {
-    const row = document.querySelector(`[data-user-id="${userId}"]`);
-    const password = row.querySelector('.user-password-input').value;
+    if (managedUserEditId !== String(userId) || !managedUserDraft) return;
     const body = {
-        username: row.querySelector('.user-name-input').value,
-        role: row.querySelector('.user-role-input').value,
+        username: managedUserDraft.username,
+        name: managedUserDraft.name,
+        role: managedUserDraft.role,
     };
-    if (password) body.password = password;
     apiAction(`/api/users/${userId}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
@@ -2764,11 +2932,24 @@ function setUserSuspended(userId, suspended) {
 }
 
 function removeUser(userId) {
-    const row = document.querySelector(`[data-user-id="${userId}"]`);
-    const username = row.querySelector('.user-name-input').value;
-    if (!confirm(`Remove user “${username}”?`)) return;
-    apiAction(`/api/users/${userId}`, { method: 'DELETE' })
-        .then(loadUsers).catch(() => {});
+    const user = managedUsers.find(candidate => candidate.id === userId);
+    const dialog = document.getElementById('userRemoveDialog');
+    if (!user || !dialog || managedUserEditId !== null) return;
+    managedRemoveUserId = userId;
+    document.getElementById('userRemoveName').textContent = user.name || user.username;
+    dialog.returnValue = '';
+    dialog.showModal();
+}
+
+const userRemoveDialog = document.getElementById('userRemoveDialog');
+if (userRemoveDialog) {
+    userRemoveDialog.addEventListener('close', () => {
+        const userId = managedRemoveUserId;
+        managedRemoveUserId = null;
+        if (userRemoveDialog.returnValue !== 'remove' || userId === null) return;
+        apiAction(`/api/users/${userId}`, { method: 'DELETE' })
+            .then(loadUsers).catch(() => {});
+    });
 }
 
 window.addEventListener('resize', closeHistoryInfo);
