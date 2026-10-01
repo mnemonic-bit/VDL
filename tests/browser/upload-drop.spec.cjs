@@ -53,7 +53,8 @@ test('dropping a desktop video uploads it into History', async ({ page }) => {
     await expect(card.getByRole('button', { name: 'Open URL' })).toHaveCount(0);
     await expect(card.getByRole('button', { name: 'Copy URL' })).toHaveCount(0);
     await card.getByRole('button', { name: 'Info', exact: true }).click();
-    await expect(card.locator('.history-url-row')).toHaveText('Source: Local upload');
+    await expect(card.locator('.history-source-section .history-info-label')).toHaveText('Source');
+    await expect(card.locator('.history-source-field > span')).toHaveText('Local upload');
     await expect(card.locator('.history-media-row')).toContainText('Quality: 360p');
     await expect(card.locator('.history-media-row')).not.toContainText('Requested format');
     await expect(card.locator('.history-timing-row')).toContainText('Added:');

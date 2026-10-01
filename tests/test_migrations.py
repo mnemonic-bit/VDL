@@ -55,7 +55,8 @@ class SchemaMigrationTest(unittest.TestCase):
                     "title", "finished_at", "formats", "requested_format",
                     "output_dir", "requested_filename",
                     "downloaded_bytes", "total_bytes", "favorite",
-                    "source_type",
+                    "source_type", "owner_user_id", "owner_username",
+                    "visibility",
                 })
                 self.assertTrue({
                     "tags", "download_tags", "app_config", "roles", "users",
@@ -72,6 +73,10 @@ class SchemaMigrationTest(unittest.TestCase):
                 self.assertEqual(
                     vdl.db_get_download("legacy1")["source_type"],
                     "download",
+                )
+                self.assertEqual(
+                    vdl.db_get_download("legacy1")["visibility"],
+                    "public",
                 )
                 self.assertEqual(vdl.db_get_preferences(), {
                     "download_dir": vdl.DEFAULT_DOWNLOAD_DIR,

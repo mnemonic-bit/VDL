@@ -759,11 +759,25 @@ function matchesSearchFilter(info) {
     if (searchTerms.length === 0) return true;
     const title = tagSearchKey(info.title);
     const tags = new Set((Array.isArray(info.tags) ? info.tags : []).map(tagSearchKey));
-    const matches = term => {
+    const userTerms = [];
+    const contentTerms = [];
+    searchTerms.forEach(term => {
+        const key = tagSearchKey(term);
+        if (key.startsWith('user:')) userTerms.push(key.slice('user:'.length).trim());
+        else contentTerms.push(term);
+    });
+
+    if (userTerms.length) {
+        const downloadedBy = tagSearchKey(info.downloaded_by);
+        if (!userTerms.some(user => user && user === downloadedBy)) return false;
+    }
+    if (contentTerms.length === 0) return true;
+
+    const matchesContent = term => {
         const key = tagSearchKey(term);
         return tags.has(key) || title.includes(key);
     };
-    return searchTerms.some(matches);
+    return contentTerms.some(matchesContent);
 }
 
 function setHistorySearchExpanded(expanded) {
@@ -1045,11 +1059,12 @@ function stopDownload(id) {
 
 const renameDrafts = new Map();
 
-function renderRenameControl(id, basename) {
+function renderRenameControl(id, basename, fullWidth = false) {
     if (renameDrafts.has(id)) {
         const draft = renameDrafts.get(id);
-        const widthStyle = draft.width ? `style="width:${draft.width}px"` : '';
-        return `<span class="rename-wrap" data-rename-id="${id}" data-mode="edit">
+        const widthStyle = draft.width && !fullWidth ? `style="width:${draft.width}px"` : '';
+        const widthClass = fullWidth ? ' rename-wrap-block' : '';
+        return `<span class="rename-wrap${widthClass}" data-rename-id="${id}" data-mode="edit">
                     <input class="rename-input" type="text" ${widthStyle} value="${escapeAttr(draft.value)}" data-orig="${escapeAttr(basename)}" oninput="renameOnInput('${id}', this.value)" />
                     <button class="rename-btn confirm" type="button" title="Save" aria-label="Save" onclick="renameCommit('${id}')">
                         <svg class="icon"><use href="#i-check"/></svg>
@@ -1059,7 +1074,8 @@ function renderRenameControl(id, basename) {
                     </button>
                 </span>`;
     }
-    return `<span class="rename-wrap" data-rename-id="${id}" data-mode="display">
+    const widthClass = fullWidth ? ' rename-wrap-block' : '';
+    return `<span class="rename-wrap${widthClass}" data-rename-id="${id}" data-mode="display">
                 <span class="rename-display" data-orig="${escapeAttr(basename)}">${escapeHtml(basename)}</span>
                 <button class="rename-btn" type="button" title="Edit name" aria-label="Edit name" onclick="renameStart('${id}')">
                     <svg class="icon"><use href="#i-pencil"/></svg>
@@ -1206,6 +1222,28 @@ function toggleFavorite(button) {
         .then(() => fetchHistory())
         .catch(() => {
             button.disabled = false;
+            return fetchHistory();
+        });
+}
+
+function changeDownloadVisibility(select) {
+    if (select.disabled) return;
+    const id = select.dataset.downloadId;
+    const previous = select.dataset.current;
+    const visibility = select.value;
+    select.disabled = true;
+    apiAction('/api/visibility/' + encodeURIComponent(id), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ visibility }),
+    })
+        .then(() => {
+            select.dataset.current = visibility;
+            return fetchHistory();
+        })
+        .catch(() => {
+            select.value = previous;
+            select.disabled = false;
             return fetchHistory();
         });
 }
@@ -1412,23 +1450,39 @@ function positionHistoryInfo(id) {
 
     const viewportGap = 12;
     const anchorGap = 8;
+    const appHeader = document.getElementById('appHeader');
+    const headerBottom = appHeader ? appHeader.getBoundingClientRect().bottom : 0;
+    const viewportTop = Math.max(viewportGap, headerBottom + viewportGap);
     const width = Math.min(560, window.innerWidth - viewportGap * 2);
     popover.style.width = `${width}px`;
+    popover.style.setProperty(
+        '--history-info-max-height',
+        `${Math.max(80, window.innerHeight - viewportTop - viewportGap)}px`,
+    );
     popover.style.visibility = 'hidden';
     popover.classList.add('open');
 
     const buttonRect = anchor.getBoundingClientRect();
-    const popoverRect = popover.getBoundingClientRect();
     const left = Math.min(
         window.innerWidth - width - viewportGap,
         Math.max(viewportGap, buttonRect.right - width),
     );
-    let top = buttonRect.bottom + anchorGap;
-    let placement = 'below';
-    if (top + popoverRect.height > window.innerHeight - viewportGap) {
-        top = Math.max(viewportGap, buttonRect.top - popoverRect.height - anchorGap);
-        placement = 'above';
-    }
+    const availableBelow = Math.max(0, window.innerHeight - viewportGap
+        - buttonRect.bottom - anchorGap);
+    const availableAbove = Math.max(0, buttonRect.top - anchorGap - viewportTop);
+    const naturalHeight = popover.getBoundingClientRect().height;
+    let placement = naturalHeight <= availableBelow || availableBelow >= availableAbove
+        ? 'below'
+        : 'above';
+    const availableHeight = placement === 'below' ? availableBelow : availableAbove;
+    popover.style.setProperty(
+        '--history-info-max-height',
+        `${Math.max(80, availableHeight)}px`,
+    );
+    const popoverHeight = popover.getBoundingClientRect().height;
+    const top = placement === 'below'
+        ? buttonRect.bottom + anchorGap
+        : buttonRect.top - popoverHeight - anchorGap;
     const pointerX = Math.min(width - 16, Math.max(16, buttonRect.left + buttonRect.width / 2 - left));
     popover.style.left = `${left}px`;
     popover.style.top = `${top}px`;
@@ -1701,8 +1755,7 @@ function openUrl(url) {
     }
 }
 
-const COPIED_HTML      = '<svg class="menu-icon"><use href="#i-check"/></svg>Copied';
-const COPIED_ICON_HTML = '<svg><use href="#i-check"/></svg>';
+const COPIED_HTML = '<svg class="menu-icon"><use href="#i-check"/></svg>Copied';
 
 function copyToClipboard(text, btn) {
     const done = () => {
@@ -1713,7 +1766,7 @@ function copyToClipboard(text, btn) {
             btn._copyOriginalLabel = btn.getAttribute('aria-label');
             btn._copyOriginalTitle = btn.getAttribute('title');
         }
-        btn.innerHTML = btn.classList.contains('history-source-copy') ? COPIED_ICON_HTML : COPIED_HTML;
+        btn.innerHTML = COPIED_HTML;
         btn.setAttribute('aria-label', 'Copied');
         btn.setAttribute('title', 'Copied');
         btn._copyTimer = setTimeout(() => {
@@ -1804,15 +1857,34 @@ function renderHistoryCard(info) {
                 </div>`;
     }
 
-    const metadata = [];
+    let fileControl = '';
     if (info.filename) {
         const base = info.filename.split('/').pop().split('\\').pop();
-        metadata.push(`<div class="file-meta-row"><strong>File:</strong>${isFinished ? renderRenameControl(id, base) : `<span class="filename">${escapeHtml(base)}</span>`}</div>`);
+        fileControl = `
+                            <div class="history-info-section history-file-section">
+                                <div class="history-info-label">File</div>
+                                ${isFinished
+        ? renderRenameControl(id, base, true)
+        : `<div class="history-file-value filename">${escapeHtml(base)}</div>`}
+                            </div>`;
     }
+
+    const sourceControl = isUpload
+        ? `<div class="history-info-section history-source-section">
+                                <div class="history-info-label">Source</div>
+                                <div class="history-source-field"><span>Local upload</span></div>
+                            </div>`
+        : `<div class="history-info-section history-source-section">
+                                <div class="history-info-label">Original URL</div>
+                                <div class="history-source-field">
+                                    <span>${escapeHtml(info.url)}</span>
+                                    <button type="button" class="history-source-copy" data-url-action="copy" ${urlData} aria-label="Copy original URL" title="Copy original URL"><svg class="menu-icon"><use href="#i-copy"/></svg>Copy</button>
+                                </div>
+                            </div>`;
+
+    const metadata = [];
     metadata.push(`<div class="history-status-row"><strong>Status:</strong> ${escapeHtml(info.status.charAt(0).toUpperCase() + info.status.slice(1))}</div>`);
-    metadata.push(isUpload
-        ? '<div class="history-url-row"><strong>Source:</strong> <span>Local upload</span></div>'
-        : `<div class="history-url-row"><strong>Source:</strong> <span>${escapeHtml(info.url)}</span><button type="button" class="history-source-copy" data-url-action="copy" ${urlData} aria-label="Copy source URL" title="Copy source URL"><svg><use href="#i-copy"/></svg></button></div>`);
+    metadata.push(`<div class="history-owner-row"><strong>Downloaded by:</strong> <span>${escapeHtml(info.downloaded_by || 'Unknown user')}</span></div>`);
     const sizeStr = formatBytes(info.filesize);
     const requestedFormat = formatRequestedFormat(info);
     const mediaParts = [];
@@ -1844,6 +1916,20 @@ function renderHistoryCard(info) {
                         </details>`;
     }
 
+    const visibility = info.visibility === 'private' ? 'private' : 'public';
+    const visibilityDisabled = info.can_manage_visibility
+        ? ''
+        : ' disabled title="Only the downloader or an administrator can change visibility"';
+    const visibilityControl = `
+                            <div class="history-info-section history-visibility-section">
+                                <label class="history-info-label" for="visibility-${escapeAttr(id)}">Visibility</label>
+                                <select id="visibility-${escapeAttr(id)}" data-visibility-select data-download-id="${escapeAttr(id)}" data-current="${visibility}" onchange="changeDownloadVisibility(this)"${visibilityDisabled}>
+                                    <option value="public"${visibility === 'public' ? ' selected' : ''}>Public</option>
+                                    <option value="private"${visibility === 'private' ? ' selected' : ''}>Private</option>
+                                </select>
+                                <div class="history-visibility-help">${visibility === 'public' ? 'Visible to all users' : 'Visible only to you and administrators'}</div>
+                            </div>`;
+
     return `
                 <article class="history-card" data-row-id="${escapeAttr(id)}">
                     ${preview}
@@ -1865,6 +1951,9 @@ function renderHistoryCard(info) {
                                 <div class="history-info-label">Tags</div>
                                 ${renderTagControl(info)}
                             </div>
+                            ${fileControl}
+                            ${visibilityControl}
+                            ${sourceControl}
                             <div class="meta history-info-meta">${metadata.join('')}</div>
                             ${errorBlock}
                         </div>

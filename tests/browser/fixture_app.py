@@ -67,7 +67,14 @@ def test_row():
     data = request.get_json() or {}
     download_id = data.get("id", "browser1")
     if vdl.db_get_download(download_id) is None:
-        vdl.db_insert_download(download_id, data.get("url", "https://fixture.invalid/video"))
+        owner_name = data.get("downloaded_by", "admin")
+        owner = vdl.db_get_user_by_username(owner_name)
+        vdl.db_insert_download(
+            download_id,
+            data.get("url", "https://fixture.invalid/video"),
+            owner["id"] if owner else None,
+            owner["username"] if owner else owner_name,
+        )
     filename = None
     if data.get("file"):
         os.makedirs(os.environ["DOWNLOADS_DIR"], exist_ok=True)
@@ -88,6 +95,8 @@ def test_row():
         updates.setdefault("finished_at", time.time())
     if updates:
         vdl.db_update_download(download_id, **updates)
+    if data.get("visibility") in ("public", "private"):
+        vdl.db_set_download_visibility(download_id, data["visibility"])
     return jsonify(vdl.db_get_download(download_id))
 
 

@@ -413,6 +413,14 @@ def init_db():
             # URL downloads and local uploads share the library, but upload
             # rows have no remote source or requested yt-dlp format.
             ("source_type", "ALTER TABLE downloads ADD COLUMN source_type TEXT NOT NULL DEFAULT 'download'"),
+            # Keep both the stable account identity and a display-name
+            # snapshot. The snapshot still identifies the downloader after an
+            # administrator removes that account; the join below reflects
+            # account renames while it exists.
+            ("owner_user_id", "ALTER TABLE downloads ADD COLUMN owner_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL"),
+            ("owner_username", "ALTER TABLE downloads ADD COLUMN owner_username TEXT"),
+            # Existing shared libraries must remain visible after upgrading.
+            ("visibility", "ALTER TABLE downloads ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public' CHECK (visibility IN ('public', 'private'))"),
         ]:
             if col not in existing_cols:
                 conn.execute(ddl)
@@ -488,28 +496,35 @@ def init_db():
         )
 
 
-def db_insert_download(download_id, url):
+def db_insert_download(download_id, url, owner_user_id=None,
+                       owner_username=None):
     with _db_lock, db() as conn:
         conn.execute(
-            "INSERT INTO downloads(id, url, status, progress, created_at) "
-            "VALUES (?, ?, 'starting', '0%', ?)",
-            (download_id, url, time.time()),
+            "INSERT INTO downloads(id, url, status, progress, created_at, "
+            "owner_user_id, owner_username) "
+            "VALUES (?, ?, 'starting', '0%', ?, ?, ?)",
+            (
+                download_id, url, time.time(), owner_user_id,
+                owner_username,
+            ),
         )
     event_bus.publish('change', {'reason': 'insert', 'id': download_id})
 
 
-def db_insert_upload(download_id, upload_name, title, filesize, output_dir):
+def db_insert_upload(download_id, upload_name, title, filesize, output_dir,
+                     owner_user_id=None, owner_username=None):
     """Register a local upload before the browser starts transferring it."""
     with _db_lock, db() as conn:
         conn.execute(
             "INSERT INTO downloads("
             "id, url, status, progress, created_at, filesize, title, "
             "output_dir, requested_filename, downloaded_bytes, total_bytes, "
-            "source_type"
-            ") VALUES (?, '', 'starting', '0%', ?, ?, ?, ?, ?, 0, ?, 'upload')",
+            "source_type, owner_user_id, owner_username"
+            ") VALUES (?, '', 'starting', '0%', ?, ?, ?, ?, ?, 0, ?, "
+            "'upload', ?, ?)",
             (
                 download_id, time.time(), filesize, title, output_dir,
-                upload_name, filesize,
+                upload_name, filesize, owner_user_id, owner_username,
             ),
         )
     event_bus.publish('change', {'reason': 'insert', 'id': download_id})
@@ -592,7 +607,13 @@ def _db_download_tags(conn, download_id):
 def db_get_download(download_id):
     with db() as conn:
         row = conn.execute(
-            "SELECT * FROM downloads WHERE id = ?", (download_id,)
+            "SELECT downloads.*, "
+            "COALESCE(users.username, downloads.owner_username) "
+            "AS downloaded_by "
+            "FROM downloads "
+            "LEFT JOIN users ON users.id = downloads.owner_user_id "
+            "WHERE downloads.id = ?",
+            (download_id,),
         ).fetchone()
         if row is None:
             return None
@@ -600,6 +621,29 @@ def db_get_download(download_id):
         result["favorite"] = bool(result["favorite"])
         result["tags"] = _db_download_tags(conn, download_id)
         return result
+
+
+def db_set_download_visibility(download_id, visibility):
+    """Persist public/private visibility and report whether it changed."""
+    if visibility not in ('public', 'private'):
+        raise ValueError('Visibility must be public or private')
+    with _db_lock, db() as conn:
+        row = conn.execute(
+            "SELECT visibility FROM downloads WHERE id = ?", (download_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        changed = row['visibility'] != visibility
+        if changed:
+            conn.execute(
+                "UPDATE downloads SET visibility = ? WHERE id = ?",
+                (visibility, download_id),
+            )
+    if changed:
+        event_bus.publish(
+            'change', {'reason': 'visibility', 'id': download_id}
+        )
+    return changed
 
 
 def db_set_download_favorite(download_id, favorite):
@@ -646,12 +690,24 @@ def _validated_tag_name(value):
     return display_name, display_name.casefold()
 
 
-def db_list_tags():
+def db_list_tags(user_id=None, is_admin=False):
     """Return every tag still attached to at least one download entry."""
     with db() as conn:
+        visibility_sql = ""
+        values = ()
+        if user_id is not None and not is_admin:
+            visibility_sql = (
+                " JOIN download_tags ON download_tags.tag_id = tags.id "
+                "JOIN downloads ON downloads.id = download_tags.download_id "
+                "WHERE downloads.visibility = 'public' "
+                "OR downloads.owner_user_id = ? "
+            )
+            values = (user_id,)
         return [
             row["name"] for row in conn.execute(
-                "SELECT name FROM tags ORDER BY name COLLATE NOCASE, name"
+                "SELECT DISTINCT tags.name FROM tags " + visibility_sql
+                + "ORDER BY tags.name COLLATE NOCASE, tags.name",
+                values,
             )
         ]
 
@@ -810,14 +866,29 @@ def db_clear_history():
     return rows, files_deleted
 
 
-def db_list_downloads():
+def db_list_downloads(user_id=None, is_admin=False):
     with db() as conn:
+        visibility_sql = ""
+        values = ()
+        if user_id is not None and not is_admin:
+            visibility_sql = (
+                "WHERE downloads.visibility = 'public' "
+                "OR downloads.owner_user_id = ? "
+            )
+            values = (user_id,)
         rows = conn.execute(
-            "SELECT id, url, status, progress, created_at, "
+            "SELECT downloads.id, url, status, progress, "
+            "downloads.created_at, "
             "filename, resolution, filesize, speed, eta, title, finished_at, "
             "formats, requested_format, downloaded_bytes, total_bytes, favorite, "
-            "source_type "
-            "FROM downloads ORDER BY created_at DESC"
+            "source_type, owner_user_id, visibility, "
+            "COALESCE(users.username, downloads.owner_username) "
+            "AS downloaded_by "
+            "FROM downloads "
+            "LEFT JOIN users ON users.id = downloads.owner_user_id "
+            + visibility_sql
+            + "ORDER BY downloads.created_at DESC",
+            values,
         ).fetchall()
         downloads = [dict(r) for r in rows]
         tags_by_download = {}
@@ -833,6 +904,12 @@ def db_list_downloads():
         for download in downloads:
             download["favorite"] = bool(download["favorite"])
             download["tags"] = tags_by_download.get(download["id"], [])
+            download["can_manage_visibility"] = (
+                is_admin or download["owner_user_id"] == user_id
+            )
+            # The stable account id is an authorization detail; clients only
+            # need the display name and this derived capability.
+            download.pop("owner_user_id")
         return downloads
 
 
@@ -1024,6 +1101,13 @@ def db_update_user(user_id, *, username=None, password=None,
             try:
                 conn.execute(
                     "UPDATE users SET username = ? WHERE id = ?",
+                    (username, user_id),
+                )
+                # Keep the fallback label current in case this account is
+                # removed later and the foreign key becomes NULL.
+                conn.execute(
+                    "UPDATE downloads SET owner_username = ? "
+                    "WHERE owner_user_id = ?",
                     (username, user_id),
                 )
             except sqlite3.IntegrityError as exc:
@@ -2247,6 +2331,27 @@ def health():
     return response
 
 
+def _visible_download(download_id):
+    """Return a row the signed-in user may see, hiding private ids as 404."""
+    entry = db_get_download(download_id)
+    if entry is None:
+        return None
+    if (
+        entry.get('visibility') == 'public'
+        or entry.get('owner_user_id') == g.current_user['id']
+        or 'admin' in g.current_user['roles']
+    ):
+        return entry
+    return None
+
+
+def _can_manage_download_visibility(entry):
+    return (
+        entry.get('owner_user_id') == g.current_user['id']
+        or 'admin' in g.current_user['roles']
+    )
+
+
 @app.route('/api/download', methods=['POST'])
 def add_download():
     data = request.json or {}
@@ -2262,7 +2367,12 @@ def add_download():
             return jsonify({"error": str(exc)}), 400
 
     download_id = str(uuid.uuid4())[:8]
-    db_insert_download(download_id, url)
+    db_insert_download(
+        download_id,
+        url,
+        g.current_user['id'],
+        g.current_user['username'],
+    )
 
     # Store per-download format override if provided (selected quality)
     format_override = data.get('format')
@@ -2299,7 +2409,13 @@ def start_video_upload():
     title = os.path.splitext(original_name)[0] or original_name
     try:
         db_insert_upload(
-            download_id, original_name, title, filesize, output_dir
+            download_id,
+            original_name,
+            title,
+            filesize,
+            output_dir,
+            g.current_user['id'],
+            g.current_user['username'],
         )
     except sqlite3.Error:
         return jsonify({"error": "Unable to start the video upload"}), 500
@@ -2312,7 +2428,7 @@ def start_video_upload():
 @app.route('/api/upload/<download_id>', methods=['PUT'])
 def receive_video_upload(download_id):
     """Stream one registered upload to disk while publishing byte progress."""
-    entry = db_get_download(download_id)
+    entry = _visible_download(download_id)
     if entry is None:
         return jsonify({"error": "Unknown upload id"}), 404
     if entry.get('source_type') != 'upload':
@@ -2544,7 +2660,7 @@ def resume_download(download_id):
     """Restart the worker for a cancelled or interrupted download, keeping the
     same id so yt-dlp's continuedl logic finds and reuses the existing .part
     file."""
-    entry = db_get_download(download_id)
+    entry = _visible_download(download_id)
     if entry is None:
         return jsonify({"error": "Unknown download id"}), 404
     if entry['status'] not in ('cancelled', 'interrupted'):
@@ -2573,7 +2689,7 @@ def resume_download(download_id):
 
 @app.route('/api/stop/<download_id>', methods=['POST'])
 def stop_download(download_id):
-    entry = db_get_download(download_id)
+    entry = _visible_download(download_id)
     if entry is None:
         return jsonify({"error": "Unknown download id"}), 404
     # Stopping a paused download is also valid -- request_cancel() drops the
@@ -2586,7 +2702,7 @@ def stop_download(download_id):
 
 @app.route('/api/pause/<download_id>', methods=['POST'])
 def pause_download(download_id):
-    entry = db_get_download(download_id)
+    entry = _visible_download(download_id)
     if entry is None:
         return jsonify({"error": "Unknown download id"}), 404
     if entry['status'] not in ('starting', 'downloading'):
@@ -2600,7 +2716,7 @@ def unpause_download(download_id):
     """Wake a paused worker. Distinct from /api/resume, which restarts the
     worker thread for cancelled/interrupted rows -- here the worker is still
     alive, so we just clear the flag and the progress_hook loop exits."""
-    entry = db_get_download(download_id)
+    entry = _visible_download(download_id)
     if entry is None:
         return jsonify({"error": "Unknown download id"}), 404
     if entry['status'] != 'paused':
@@ -2618,7 +2734,7 @@ def rename_download(download_id):
     extension is preserved automatically: if the user typed a basename
     without (or with a different) extension we re-append the original one.
     """
-    entry = db_get_download(download_id)
+    entry = _visible_download(download_id)
     if entry is None:
         return jsonify({"error": "Unknown download id"}), 404
     if entry.get('status') != 'finished':
@@ -2668,7 +2784,7 @@ def rename_download(download_id):
 
 @app.route('/api/remove/<download_id>', methods=['POST'])
 def remove_download(download_id):
-    entry = db_get_download(download_id)
+    entry = _visible_download(download_id)
     if entry is None:
         return jsonify({"error": "Unknown download id"}), 404
     fallback_dir = db_get_preferences().get("download_dir", ".")
@@ -2709,11 +2825,42 @@ def clear_history():
 
 @app.route('/api/history', methods=['GET'])
 def get_history():
-    return jsonify(db_list_downloads())
+    return jsonify(db_list_downloads(
+        g.current_user['id'],
+        is_admin='admin' in g.current_user['roles'],
+    ))
+
+
+@app.route('/api/visibility/<download_id>', methods=['POST'])
+def set_download_visibility(download_id):
+    entry = _visible_download(download_id)
+    if entry is None:
+        return jsonify({"error": "Unknown download id"}), 404
+    if not _can_manage_download_visibility(entry):
+        return jsonify({
+            "error": (
+                "Only the downloader or an administrator can change "
+                "visibility"
+            )
+        }), 403
+
+    payload = request.get_json(silent=True) or {}
+    visibility = payload.get('visibility')
+    try:
+        changed = db_set_download_visibility(download_id, visibility)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({
+        "id": download_id,
+        "visibility": visibility,
+        "changed": changed,
+    })
 
 
 @app.route('/api/favorite/<download_id>', methods=['POST'])
 def set_download_favorite(download_id):
+    if _visible_download(download_id) is None:
+        return jsonify({"error": "Unknown download id"}), 404
     payload = request.get_json(silent=True) or {}
     favorite = payload.get('favorite')
     if not isinstance(favorite, bool):
@@ -2731,6 +2878,8 @@ def set_download_favorite(download_id):
 
 @app.route('/api/tags/<download_id>', methods=['POST', 'DELETE'])
 def download_tags(download_id):
+    if _visible_download(download_id) is None:
+        return jsonify({"error": "Unknown download id"}), 404
     payload = request.get_json(silent=True) or {}
     try:
         if request.method == 'POST':
@@ -2745,7 +2894,10 @@ def download_tags(download_id):
     return jsonify({
         "id": download_id,
         "tags": tags,
-        "available_tags": db_list_tags(),
+        "available_tags": db_list_tags(
+            g.current_user['id'],
+            is_admin='admin' in g.current_user['roles'],
+        ),
         "changed": changed,
     })
 
@@ -2820,7 +2972,7 @@ def _is_allowed_download_path(path):
 @app.route('/api/file/<download_id>', methods=['GET'])
 def stream_file(download_id):
     """Serve a finished download for playback or browser download."""
-    entry = db_get_download(download_id)
+    entry = _visible_download(download_id)
     if entry is None or entry.get('status') != 'finished':
         abort(404)
     path = entry.get('filename')
@@ -2864,7 +3016,7 @@ def stream_file(download_id):
 @app.route('/api/thumbnail/<download_id>', methods=['GET'])
 def stream_thumbnail(download_id):
     """Serve a cached local preview, generating one for older video rows."""
-    entry = db_get_download(download_id)
+    entry = _visible_download(download_id)
     if entry is None or entry.get('status') != 'finished':
         abort(404)
     media_path = entry.get('filename')
@@ -2891,7 +3043,7 @@ def stream_thumbnail(download_id):
 @app.route('/api/preview/<download_id>', methods=['GET'])
 def stream_preview(download_id):
     """Serve a cached hover montage, generating it on first use."""
-    entry = db_get_download(download_id)
+    entry = _visible_download(download_id)
     if entry is None or entry.get('status') != 'finished':
         abort(404)
     media_path = entry.get('filename')

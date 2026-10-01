@@ -244,25 +244,33 @@ test('History info panel keeps its details aligned and copies the source URL', a
         const headerElement = element.querySelector('.history-info-header');
         const title = element.querySelector('.history-info-title');
         const tags = element.querySelector('.history-info-section');
-        const file = element.querySelector('.file-meta-row');
+        const file = element.querySelector('.history-file-section');
+        const visibility = element.querySelector('.history-visibility-section');
         const status = element.querySelector('.history-status-row');
-        const source = element.querySelector('.history-url-row');
+        const source = element.querySelector('.history-source-section');
         const rect = node => node.getBoundingClientRect();
         return {
             topGap: Math.round(rect(headerElement).top - rect(content).top),
             firstLineGap: Math.round(rect(title).top - rect(headerElement).bottom),
             ordered: rect(tags).top < rect(file).top
-                && rect(file).top < rect(status).top
-                && rect(status).top < rect(source).top,
-            fileCenters: Math.abs(
-                rect(file.querySelector('strong')).top + rect(file.querySelector('strong')).height / 2
-                - rect(file.querySelector('.rename-wrap')).top - rect(file.querySelector('.rename-wrap')).height / 2
+                && rect(file).top < rect(visibility).top
+                && rect(visibility).top < rect(source).top
+                && rect(source).top < rect(status).top,
+            fileWidthDifference: Math.abs(
+                rect(file.querySelector('.rename-wrap')).width
+                - rect(visibility.querySelector('select')).width
             ),
+            fileHeight: Math.round(rect(file.querySelector('.rename-wrap')).height),
+            visibilityHeight: Math.round(rect(visibility.querySelector('select')).height),
         };
     });
     expect(Math.abs(layout.topGap - layout.firstLineGap)).toBeLessThanOrEqual(1);
     expect(layout.ordered).toBe(true);
-    expect(layout.fileCenters).toBeLessThan(1);
+    expect(layout.fileWidthDifference).toBeLessThanOrEqual(1);
+    expect(layout.fileHeight).toBe(layout.visibilityHeight);
+    await expect(popover.locator('.history-file-section .history-info-label')).toHaveText('File');
+    await expect(popover.locator('.history-source-section .history-info-label')).toHaveText('Original URL');
+    await expect(popover.locator('.history-source-field > span')).toHaveText(url);
 
     const tagRow = popover.locator('.tag-display-row');
     const displayHeight = (await tagRow.boundingBox()).height;
@@ -274,10 +282,34 @@ test('History info panel keeps its details aligned and copies the source URL', a
     await tagInput.press('Escape');
     await expect(popover.locator('.tag-display-row')).toBeVisible();
 
-    const copyButton = popover.getByRole('button', { name: 'Copy source URL', exact: true });
+    const copyButton = popover.getByRole('button', { name: 'Copy original URL', exact: true });
+    await expect(copyButton).toHaveText('Copy');
     await copyButton.click();
     await expect(popover.getByRole('button', { name: 'Copied', exact: true }).locator('use')).toHaveAttribute('href', '#i-check');
     expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(url);
+});
+
+test('History info shows the downloader and changes video visibility', async ({ page }) => {
+    await seed(page, {
+        id: 'visibility-row', status: 'finished', file: true,
+        name: 'visibility.mp4', title: 'Visibility controls',
+    });
+    await refresh(page);
+
+    const row = page.locator('[data-row-id="visibility-row"]');
+    await openInfo(row);
+    const popover = row.locator('.history-info-popover');
+    await expect(popover.locator('.history-owner-row')).toHaveText('Downloaded by: admin');
+
+    const visibility = popover.getByLabel('Visibility');
+    await expect(visibility).toHaveValue('public');
+    await visibility.selectOption('private');
+    await expect(visibility).toHaveValue('private');
+    await expect(popover.locator('.history-visibility-help')).toHaveText(
+        'Visible only to you and administrators');
+
+    const rows = await page.request.get('/api/history').then(response => response.json());
+    expect(rows.find(item => item.id === 'visibility-row').visibility).toBe('private');
 });
 
 test('History places a readable requested format on the media line', async ({ page }) => {
@@ -343,11 +375,11 @@ test('Copy URL stays in Info and is omitted from the three-dot menu', async ({ p
     await row.locator('.kebab-btn').click();
     await expect(row.locator('.kebab-menu').getByRole('button', { name: 'Copy URL', exact: true })).toHaveCount(0);
     await row.getByRole('button', { name: 'Info', exact: true }).click();
-    await row.getByRole('button', { name: 'Copy source URL', exact: true }).click();
+    await row.getByRole('button', { name: 'Copy original URL', exact: true }).click();
     await expect(row.getByRole('button', { name: 'Copied', exact: true }).locator('use')).toHaveAttribute('href', '#i-check');
     expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(url);
     await page.clock.fastForward(1600);
-    await expect(row.getByRole('button', { name: 'Copy source URL', exact: true })).toBeVisible();
+    await expect(row.getByRole('button', { name: 'Copy original URL', exact: true })).toBeVisible();
 });
 
 test('error details fold and Reload removes then resubmits the stored URL', async ({ page }) => {
@@ -405,6 +437,14 @@ test('renamed filename remains data when Play is clicked', async ({ page }) => {
     await row.locator('.rename-input').fill(hostileName);
     await row.getByRole('button', { name: 'Save', exact: true }).click();
     await expect(row.locator('.rename-display')).toContainText(hostileName);
+
+    const dialogTop = await row.locator('.history-info-popover').evaluate(element => (
+        element.getBoundingClientRect().top
+    ));
+    const headerBottom = await page.locator('#appHeader').evaluate(element => (
+        element.getBoundingClientRect().bottom
+    ));
+    expect(dialogTop).toBeGreaterThan(headerBottom);
 
     await row.getByRole('button', { name: 'Close info', exact: true }).click();
 

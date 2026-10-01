@@ -159,6 +159,53 @@ test('History search matches title fragments, tags, and quoted phrases', async (
     await expect(page.locator('[data-row-id="history-hybrid"]')).toBeVisible();
 });
 
+test('History search filters by downloader with the user qualifier', async ({ page }) => {
+    for (const row of [
+        {
+            id: 'alice-tutorial',
+            status: 'finished',
+            title: 'Alpine Tutorial',
+            downloaded_by: 'Alice Smith',
+        },
+        {
+            id: 'alice-news',
+            status: 'finished',
+            title: 'Weekly News',
+            downloaded_by: 'Alice Smith',
+        },
+        {
+            id: 'bob-tutorial',
+            status: 'finished',
+            title: 'City Tutorial',
+            downloaded_by: 'Bob',
+        },
+    ]) {
+        await seed(page, row);
+    }
+    await refresh(page);
+
+    const input = page.locator('#historySearchInput');
+    await page.locator('#historySearchToggle').click();
+
+    await input.fill('user:"alice smith"');
+    await expect(page.locator('#historyList [data-row-id]')).toHaveCount(2);
+    await expect(page.locator('[data-row-id="alice-tutorial"]')).toBeVisible();
+    await expect(page.locator('[data-row-id="alice-news"]')).toBeVisible();
+
+    await input.fill('USER:"ALICE SMITH" tutorial');
+    await expect(page.locator('#historyList [data-row-id]')).toHaveCount(1);
+    await expect(page.locator('[data-row-id="alice-tutorial"]')).toBeVisible();
+
+    await input.fill('user:"Alice Smith" user:bob');
+    await expect(page.locator('#historyList [data-row-id]')).toHaveCount(3);
+    await expect(page.locator('[data-row-id="alice-news"]')).toBeVisible();
+    await expect(page.locator('[data-row-id="bob-tutorial"]')).toBeVisible();
+
+    await input.fill('user:');
+    await expect(page.locator('#historyList [data-row-id]')).toHaveCount(0);
+    await expect(page.locator('#historyEmptyTitle')).toHaveText('No matching downloads');
+});
+
 test('Header search expands from the leftmost magnifier', async ({ page }) => {
     const header = page.locator('#appHeader');
     const search = header.locator('#historySearch');
@@ -168,6 +215,8 @@ test('Header search expands from the leftmost magnifier', async ({ page }) => {
 
     await expect(toggle.locator('use')).toHaveAttribute('href', '#i-search');
     await expect(input).toHaveAttribute('type', 'text');
+    await expect(input).toHaveAttribute('placeholder', 'Search title, tag, or user:name');
+    await expect(input).toHaveAttribute('aria-label', 'Search history by title, tag, or user');
     await expect(toggle).toHaveAttribute('aria-expanded', 'false');
     await expect(input).toBeHidden();
     await expect(header.locator('select')).toHaveCount(0);

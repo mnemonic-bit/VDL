@@ -52,6 +52,7 @@ Flask + `yt-dlp` video-downloader UI. **Single-process, single-file backend** ([
 - **History tab** shows: `finished` + `error` only
 
 ## CONVENTIONS
+- **Keep codebase-memory in sync:** if the `codebase-memory-mcp` index is stale or otherwise out of sync with the current repository, immediately re-index the current repository before relying on graph results.
 - **Comment culture**: rationale-not-what. Existing comments explain *why* (e.g. why `speed=0.0` not `None`, why `continuedl=True` is explicit, why we drop the head on full queue). Match this register.
 - **Frontend has NO build step**: `app.js` loads raw. No `import`/`export`, no bundler, no transpiler. Browser globals only.
 - **Icons** live in [`index.html` `<defs>`](file:///workspace/templates/index.html#L28-L121) — reference via `<svg><use href="#i-name"/></svg>`. Never inline duplicate SVG paths in JS templates.
