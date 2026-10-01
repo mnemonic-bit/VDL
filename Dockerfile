@@ -7,6 +7,7 @@ ARG VDL_GID=10001
 
 ENV DOWNLOADS_DIR=/downloads \
     DOWNLOADS_DB=/data/downloads.db \
+    VDL_INGEST_DIR=/ingest \
     HOST=0.0.0.0 \
     PORT=5000 \
     FLASK_DEBUG=0 \
@@ -25,7 +26,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid "${VDL_GID}" vdl \
     && useradd --uid "${VDL_UID}" --gid vdl --create-home --home-dir /home/vdl vdl \
-    && install -d -o vdl -g vdl /data /downloads /home/vdl/.cache/deno
+    && install -d -o vdl -g vdl /data /downloads /ingest /home/vdl/.cache/deno
 
 COPY --from=deno /deno /usr/local/bin/deno
 
@@ -41,7 +42,7 @@ COPY static/ static/
 RUN chmod 0555 /app/docker-entrypoint.sh \
     && chmod -R a-w /app
 
-VOLUME ["/downloads", "/data"]
+VOLUME ["/downloads", "/data", "/ingest"]
 EXPOSE 5000
 
 USER 10001:10001

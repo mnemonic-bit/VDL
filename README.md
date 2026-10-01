@@ -54,6 +54,47 @@ VDL_PORT=8080 docker compose up --build -d
 Stop containers with `docker compose down`. This preserves `vdl-data` and
 `vdl-downloads`; `docker compose down -v` intentionally deletes both volumes.
 
+### Watched ingest folder
+
+Compose mounts the repository's `./ingest` directory at `/ingest` read-only in
+the container. Copy a movie into that host directory and VDL will add a
+validated copy to Download History after the file has remained unchanged for
+60 seconds. The original stays in `./ingest`; remove it after the History item
+appears to keep the periodic directory scan small. Receipts in SQLite prevent
+an unchanged source from being imported again across restarts.
+
+A file appearing under its final name cannot prove that its writer is done.
+For a guaranteed completion handoff, copy under an ignored temporary name and
+rename it only after the copy completes. Both paths must be in the ingest
+directory so the rename is atomic:
+
+```bash
+cp /path/to/movie.mkv ./ingest/.movie.mkv.part
+mv ./ingest/.movie.mkv.part ./ingest/movie.mkv
+```
+
+Direct copies are supported as a convenience: VDL requires three unchanged
+observations spanning the settle period, compares device, inode, size, and
+nanosecond modification time before and after copying, then validates the
+copy with `ffprobe` before publishing it. A stalled writer can still exceed
+any finite settle period, which is why the temporary-name protocol is the
+strict option.
+
+Set `VDL_INGEST_HOST_DIR` to bind another host folder. The container only needs
+read and search permission on it:
+
+```bash
+VDL_INGEST_HOST_DIR=/srv/vdl/ingest docker compose up --build -d
+```
+
+`VDL_INGEST_SCAN_SECONDS` defaults to `10` and
+`VDL_INGEST_SETTLE_SECONDS` defaults to `60`; both accept values of at least
+one second. The scan is flat and uses directory metadata only, so idle cost is
+proportional to the number of top-level inbox entries, not their byte size.
+Hidden files, directories, symlinks, and names ending in `.part`, `.partial`,
+`.tmp`, `.crdownload`, or `.download` are ignored. Native runs can opt in with
+`VDL_INGEST_DIR`; leaving it unset disables the watcher.
+
 ### First sign-in and user access
 
 The first visit asks you to set a password for the built-in `admin` account;
@@ -72,7 +113,8 @@ or Docker Compose) is required to use `compose.yaml` through Podman.
 ```bash
 docker build --pull -t vdl:local .
 docker run --rm -p 127.0.0.1:5000:5000 \
-  -v vdl-downloads:/downloads -v vdl-data:/data vdl:local
+  -v vdl-downloads:/downloads -v vdl-data:/data \
+  -v /srv/vdl/ingest:/ingest:ro vdl:local
 ```
 
 The image contains yt-dlp `2026.08.19`, Deno `2.9.5`, EJS, curl-cffi,
@@ -85,6 +127,7 @@ Published multi-platform images are available from GHCR:
 docker pull ghcr.io/mnemonic-bit/vdl:latest
 docker run --rm -p 127.0.0.1:5000:5000 \
   -v vdl-downloads:/downloads -v vdl-data:/data \
+  -v /srv/vdl/ingest:/ingest:ro \
   ghcr.io/mnemonic-bit/vdl:latest
 ```
 
@@ -140,17 +183,20 @@ Rollback starts the previous image against the same two volumes. Startup
 automatically creates the access-control tables when upgrading an older
 database.
 
-Bind mounts are supported in place of the named volumes, but both host paths
-must already be writable by UID/GID 10001:
+Bind mounts are supported in place of the named volumes. The data and download
+paths must already be writable by UID/GID 10001; the ingest path only needs to
+be readable and searchable:
 
 ```bash
 sudo install -d -o 10001 -g 10001 /srv/vdl/data /srv/vdl/downloads
+sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0755 /srv/vdl/ingest
 docker run --rm -p 127.0.0.1:5000:5000 \
-  -v /srv/vdl/data:/data -v /srv/vdl/downloads:/downloads vdl:local
+  -v /srv/vdl/data:/data -v /srv/vdl/downloads:/downloads \
+  -v /srv/vdl/ingest:/ingest:ro vdl:local
 ```
 
-The entrypoint fails with a clear ownership error instead of starting a server
-that cannot create its database or media files.
+The entrypoint fails with a clear storage-access error instead of starting a
+server that cannot create its database, write media, or read the ingest mount.
 
 ## Network exposure
 

@@ -20,6 +20,7 @@ import subprocess
 import mimetypes
 import copy
 import secrets
+import stat
 import tempfile
 import unicodedata
 from contextlib import contextmanager
@@ -363,6 +364,15 @@ def init_db():
                 created_at  REAL NOT NULL,
                 PRIMARY KEY (download_id, tag_id)
             );
+            CREATE TABLE IF NOT EXISTS ingest_receipts (
+                source_path TEXT PRIMARY KEY,
+                device      INTEGER NOT NULL,
+                inode       INTEGER NOT NULL,
+                filesize    INTEGER NOT NULL,
+                mtime_ns    INTEGER NOT NULL,
+                download_id TEXT NOT NULL,
+                ingested_at REAL NOT NULL
+            );
             CREATE INDEX IF NOT EXISTS download_tags_tag_id
                 ON download_tags(tag_id);
             CREATE TRIGGER IF NOT EXISTS delete_unused_tag
@@ -542,6 +552,72 @@ def db_insert_upload(download_id, upload_name, title, filesize, output_dir,
             ),
         )
     event_bus.publish('change', {'reason': 'insert', 'id': download_id})
+
+
+def db_insert_ingested_video(download_id, source_path, source_signature,
+                             upload_name, title, filesize, output_dir,
+                             filename, resolution):
+    """Atomically register a watched-folder video and its source receipt."""
+    now = time.time()
+    device, inode, _signature_size, mtime_ns = source_signature
+    with _db_lock, db() as conn:
+        conn.execute(
+            "INSERT INTO downloads("
+            "id, url, status, progress, created_at, filename, resolution, "
+            "filesize, speed, eta, title, finished_at, output_dir, "
+            "requested_filename, downloaded_bytes, total_bytes, source_type"
+            ") VALUES (?, '', 'finished', '100%', ?, ?, ?, ?, 0, 0, ?, ?, "
+            "?, ?, ?, ?, 'upload')",
+            (
+                download_id, now, filename, resolution, filesize, title, now,
+                output_dir, upload_name, filesize, filesize,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO ingest_receipts("
+            "source_path, device, inode, filesize, mtime_ns, download_id, "
+            "ingested_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(source_path) DO UPDATE SET "
+            "device = excluded.device, inode = excluded.inode, "
+            "filesize = excluded.filesize, mtime_ns = excluded.mtime_ns, "
+            "download_id = excluded.download_id, "
+            "ingested_at = excluded.ingested_at",
+            (
+                source_path, device, inode, filesize, mtime_ns, download_id,
+                now,
+            ),
+        )
+    event_bus.publish('change', {'reason': 'insert', 'id': download_id})
+
+
+def db_get_ingest_receipts(directory):
+    """Return source signatures already imported from one watched folder."""
+    directory = os.path.realpath(directory)
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT source_path, device, inode, filesize, mtime_ns "
+            "FROM ingest_receipts"
+        ).fetchall()
+    return {
+        row['source_path']: (
+            row['device'], row['inode'], row['filesize'], row['mtime_ns'],
+        )
+        for row in rows
+        if os.path.dirname(row['source_path']) == directory
+    }
+
+
+def db_prune_ingest_receipts(directory, visible_paths):
+    """Forget removed inbox files so a later replacement can be imported."""
+    receipts = db_get_ingest_receipts(directory)
+    missing = set(receipts).difference(visible_paths)
+    if not missing:
+        return
+    with _db_lock, db() as conn:
+        conn.executemany(
+            "DELETE FROM ingest_receipts WHERE source_path = ?",
+            ((path,) for path in missing),
+        )
 
 
 def db_update_download(download_id, *, status=None, progress=None,
@@ -2016,6 +2092,223 @@ def _reserve_upload_path(directory, filename):
     raise OSError('Unable to choose an unused filename for the upload')
 
 
+class IngestSourceChanged(Exception):
+    """The watched source stopped matching the settled scan candidate."""
+
+
+def _ingest_signature(metadata):
+    return (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+    )
+
+
+def _source_signature(path):
+    try:
+        metadata = os.stat(path, follow_symlinks=False)
+    except (FileNotFoundError, OSError) as exc:
+        raise IngestSourceChanged() from exc
+    if not stat.S_ISREG(metadata.st_mode):
+        raise IngestSourceChanged()
+    return _ingest_signature(metadata)
+
+
+def _ingest_watched_file(source_path, expected_signature):
+    """Copy one settled inbox file into the library without publishing early."""
+    source_path = os.path.abspath(source_path)
+    original_name = _validated_upload_filename(os.path.basename(source_path))
+    output_dir = os.path.abspath(_prepare_download_directory(
+        db_get_preferences().get('download_dir', '.')
+    ))
+    if os.path.realpath(output_dir) == os.path.dirname(source_path):
+        raise ValueError(
+            'The ingest folder and download directory must be different'
+        )
+
+    download_id = str(uuid.uuid4())[:8]
+    title = os.path.splitext(original_name)[0] or original_name
+    temporary_path = None
+    final_path = None
+    registered = False
+    received = 0
+    descriptor = None
+    try:
+        flags = os.O_RDONLY
+        if hasattr(os, 'O_NOFOLLOW'):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(source_path, flags)
+        with os.fdopen(descriptor, 'rb') as source:
+            descriptor = None
+            if _ingest_signature(os.fstat(source.fileno())) != expected_signature:
+                raise IngestSourceChanged()
+            with tempfile.NamedTemporaryFile(
+                    mode='wb', dir=output_dir,
+                    prefix=f'.vdl_{download_id}.', suffix='.ingest.part',
+                    delete=False) as temporary:
+                temporary_path = temporary.name
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    temporary.write(chunk)
+                    received += len(chunk)
+                temporary.flush()
+            if _ingest_signature(os.fstat(source.fileno())) != expected_signature:
+                raise IngestSourceChanged()
+
+        if received != expected_signature[2]:
+            raise IngestSourceChanged()
+        if _source_signature(source_path) != expected_signature:
+            raise IngestSourceChanged()
+        resolution = inspect_uploaded_video(temporary_path)
+        # ffprobe is bounded, but a host writer can still resume while it runs.
+        # A final comparison prevents that changed source from being published.
+        if _source_signature(source_path) != expected_signature:
+            raise IngestSourceChanged()
+
+        with _upload_lock:
+            final_path = _reserve_upload_path(output_dir, original_name)
+            os.replace(temporary_path, final_path)
+            temporary_path = None
+
+        db_insert_ingested_video(
+            download_id,
+            source_path,
+            expected_signature,
+            original_name,
+            title,
+            received,
+            output_dir,
+            final_path,
+            resolution,
+        )
+        registered = True
+        print(
+            f'VDL ingest: added {original_name!r} as {download_id}',
+            flush=True,
+        )
+        return download_id
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        for path in (
+                temporary_path,
+                final_path if final_path and not registered else None):
+            if not path:
+                continue
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+
+
+_INGEST_TEMP_SUFFIXES = (
+    '.part', '.partial', '.tmp', '.crdownload', '.download',
+)
+
+
+class IngestFolderWatcher:
+    """Periodically reconcile a flat drop folder into the video library."""
+
+    def __init__(self, directory, scan_seconds=10.0, settle_seconds=60.0):
+        self.directory = os.path.realpath(directory)
+        self.scan_seconds = scan_seconds
+        self.settle_seconds = settle_seconds
+        self._candidates = {}
+
+    @staticmethod
+    def _eligible_name(name):
+        lowered = name.lower()
+        return (
+            not name.startswith('.')
+            and not lowered.endswith(_INGEST_TEMP_SUFFIXES)
+        )
+
+    def scan_once(self, now=None):
+        """Observe candidates once and import only settled regular files."""
+        now = time.monotonic() if now is None else now
+        receipts = db_get_ingest_receipts(self.directory)
+        visible_paths = set()
+        try:
+            with os.scandir(self.directory) as entries:
+                for entry in entries:
+                    if not self._eligible_name(entry.name):
+                        continue
+                    try:
+                        metadata = entry.stat(follow_symlinks=False)
+                    except (FileNotFoundError, OSError):
+                        continue
+                    if not stat.S_ISREG(metadata.st_mode):
+                        continue
+
+                    path = os.path.join(self.directory, entry.name)
+                    signature = _ingest_signature(metadata)
+                    visible_paths.add(path)
+                    if receipts.get(path) == signature:
+                        self._candidates.pop(path, None)
+                        continue
+
+                    candidate = self._candidates.get(path)
+                    if candidate is None or candidate['signature'] != signature:
+                        self._candidates[path] = {
+                            'signature': signature,
+                            'stable_since': now,
+                            'observations': 1,
+                            'failed': False,
+                        }
+                        continue
+
+                    candidate['observations'] += 1
+                    if (
+                        candidate['failed']
+                        or candidate['observations'] < 3
+                        or now - candidate['stable_since'] < self.settle_seconds
+                    ):
+                        continue
+
+                    try:
+                        _ingest_watched_file(path, signature)
+                    except IngestSourceChanged:
+                        # The next scan starts a fresh quiet period from a new
+                        # stat instead of treating a racing writer as an error.
+                        self._candidates.pop(path, None)
+                    except Exception as exc:
+                        # A malformed movie should not be copied and probed on
+                        # every pass. A modification or restart makes it
+                        # eligible again after the operator fixes the source.
+                        candidate['failed'] = True
+                        print(
+                            f'VDL ingest: could not add {entry.name!r}: {exc}',
+                            flush=True,
+                        )
+                    else:
+                        self._candidates.pop(path, None)
+        except OSError as exc:
+            print(
+                f'VDL ingest: unable to scan {self.directory!r}: {exc}',
+                flush=True,
+            )
+            return
+
+        for path in set(self._candidates).difference(visible_paths):
+            self._candidates.pop(path, None)
+        db_prune_ingest_receipts(self.directory, visible_paths)
+
+    def run(self, stop_event):
+        while not stop_event.is_set():
+            try:
+                self.scan_once()
+            except Exception as exc:
+                # One DB or filesystem failure must not permanently kill the
+                # only reconciliation thread.
+                print(f'VDL ingest: scan failed: {exc}', flush=True)
+            stop_event.wait(self.scan_seconds)
+
+
 def _thumbnail_path(entry, fallback_dir=None):
     """Return the stable sidecar path for one download's generated preview."""
     directory = entry.get('output_dir')
@@ -3138,6 +3431,109 @@ def preferences():
 
 init_db()
 
+_ingest_service_lock = threading.Lock()
+_ingest_thread = None
+_ingest_stop_event = None
+
+
+def _positive_seconds_from_env(name, default):
+    value = os.environ.get(name, str(default))
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f'{name} must be a positive number') from exc
+    if not math.isfinite(seconds) or seconds < 1:
+        raise RuntimeError(f'{name} must be at least 1 second')
+    return seconds
+
+
+def _remove_stale_ingest_partials(directory):
+    """Discard unpublished copies left by an interrupted ingest process."""
+    pattern = re.compile(r'^\.vdl_[0-9a-f]{8}\..+\.ingest\.part$')
+    try:
+        with os.scandir(directory) as entries:
+            paths = [
+                entry.path for entry in entries
+                if pattern.fullmatch(entry.name)
+                and entry.is_file(follow_symlinks=False)
+            ]
+    except OSError:
+        return
+    for path in paths:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def start_ingest_watcher():
+    """Start the optional watched-folder importer exactly once."""
+    global _ingest_thread, _ingest_stop_event
+    configured_dir = os.environ.get('VDL_INGEST_DIR', '').strip()
+    if not configured_dir:
+        return None
+
+    directory = os.path.realpath(os.path.abspath(configured_dir))
+    if not os.path.isdir(directory):
+        raise RuntimeError(
+            f'VDL_INGEST_DIR is not a directory: {configured_dir}'
+        )
+    if not os.access(directory, os.R_OK | os.X_OK):
+        raise RuntimeError(
+            f'VDL_INGEST_DIR is not readable: {configured_dir}'
+        )
+    scan_seconds = _positive_seconds_from_env(
+        'VDL_INGEST_SCAN_SECONDS', 10
+    )
+    settle_seconds = _positive_seconds_from_env(
+        'VDL_INGEST_SETTLE_SECONDS', 60
+    )
+    output_dir = os.path.realpath(os.path.abspath(_prepare_download_directory(
+        db_get_preferences().get('download_dir', '.')
+    )))
+    if directory == output_dir:
+        raise RuntimeError(
+            'VDL_INGEST_DIR and the download directory must be different'
+        )
+
+    with _ingest_service_lock:
+        if _ingest_thread is not None and _ingest_thread.is_alive():
+            return _ingest_thread
+        _remove_stale_ingest_partials(output_dir)
+        watcher = IngestFolderWatcher(
+            directory,
+            scan_seconds=scan_seconds,
+            settle_seconds=settle_seconds,
+        )
+        _ingest_stop_event = threading.Event()
+        _ingest_thread = threading.Thread(
+            target=watcher.run,
+            args=(_ingest_stop_event,),
+            name='vdl-ingest',
+            daemon=True,
+        )
+        _ingest_thread.start()
+        print(
+            f'VDL ingest: watching {directory!r} every {scan_seconds:g}s '
+            f'(settle {settle_seconds:g}s)',
+            flush=True,
+        )
+        return _ingest_thread
+
+
+def stop_ingest_watcher():
+    """Stop the optional importer after the HTTP server exits."""
+    global _ingest_thread, _ingest_stop_event
+    with _ingest_service_lock:
+        thread = _ingest_thread
+        stop_event = _ingest_stop_event
+        _ingest_thread = None
+        _ingest_stop_event = None
+    if stop_event is not None:
+        stop_event.set()
+    if thread is not None and thread is not threading.current_thread():
+        thread.join(timeout=5)
+
 
 def _port_number(value):
     try:
@@ -3176,11 +3572,21 @@ def main(argv=None):
     # /api/events doesn't block other requests.
     host  = os.environ.get("HOST", "127.0.0.1")
     debug = os.environ.get("FLASK_DEBUG", "1") == "1"
+    # Werkzeug executes main once in its debug parent and again in the serving
+    # child. Only the child may own the singleton ingest thread.
+    owns_ingest_watcher = (
+        not debug or os.environ.get('WERKZEUG_RUN_MAIN') == 'true'
+    )
+    ingest_thread = start_ingest_watcher() if owns_ingest_watcher else None
     print(
         f'VDL startup: UI v{APP_VERSION} | API v{APP_VERSION}',
         flush=True,
     )
-    app.run(host=host, port=args.port, debug=debug, threaded=True)
+    try:
+        app.run(host=host, port=args.port, debug=debug, threaded=True)
+    finally:
+        if ingest_thread is not None:
+            stop_ingest_watcher()
 
 
 if __name__ == '__main__':

@@ -75,7 +75,7 @@ class SchemaMigrationTest(unittest.TestCase):
                 })
                 self.assertTrue({
                     "tags", "download_tags", "app_config", "roles", "users",
-                    "user_roles",
+                    "user_roles", "ingest_receipts",
                 }.issubset(tables))
                 self.assertIn("name", user_columns)
                 admin = vdl.db_get_user_by_username("admin")

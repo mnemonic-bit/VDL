@@ -19,10 +19,11 @@ suffix="$$-$(date +%s)"
 name="vdl-smoke-$suffix"
 data_volume="vdl-smoke-data-$suffix"
 media_volume="vdl-smoke-media-$suffix"
+ingest_volume="vdl-smoke-ingest-$suffix"
 
 cleanup() {
     "$engine" rm -f "$name" >/dev/null 2>&1 || true
-    "$engine" volume rm "$data_volume" "$media_volume" >/dev/null 2>&1 || true
+    "$engine" volume rm "$data_volume" "$media_volume" "$ingest_volume" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
 
@@ -50,8 +51,15 @@ fi
 
 "$engine" volume create "$data_volume" >/dev/null
 "$engine" volume create "$media_volume" >/dev/null
+"$engine" volume create "$ingest_volume" >/dev/null
+"$engine" run --rm --entrypoint ffmpeg \
+    -v "$ingest_volume:/ingest" "$image" \
+    -v error -f lavfi -i color=c=black:s=16x16:d=0.2 \
+    -c:v mpeg4 -an -y /ingest/watched-folder.mp4
 "$engine" run -d --name "$name" \
-    -v "$data_volume:/data" -v "$media_volume:/downloads" "$image" >/dev/null
+    -e VDL_INGEST_SCAN_SECONDS=1 -e VDL_INGEST_SETTLE_SECONDS=1 \
+    -v "$data_volume:/data" -v "$media_volume:/downloads" \
+    -v "$ingest_volume:/ingest:ro" "$image" >/dev/null
 
 for attempt in $(seq 1 40); do
     if "$engine" exec "$name" python -c \
@@ -86,6 +94,7 @@ PY
 import json
 import os
 import subprocess
+import time
 import http.cookiejar
 import urllib.parse
 import urllib.request
@@ -141,6 +150,22 @@ with opener.open(base_url + '/api/history') as response:
 assert uploaded['status'] == 'finished', uploaded
 assert uploaded['source_type'] == 'upload', uploaded
 assert uploaded['resolution'] == '16p', uploaded
+for _attempt in range(20):
+    with opener.open(base_url + '/api/history') as response:
+        watched = next(
+            (
+                row for row in json.load(response)
+                if row['title'] == 'watched-folder'
+            ),
+            None,
+        )
+    if watched is not None:
+        break
+    time.sleep(0.25)
+assert watched is not None, 'watched-folder.mp4 was not ingested'
+assert watched['status'] == 'finished', watched
+assert watched['source_type'] == 'upload', watched
+assert watched['resolution'] == '16p', watched
 remove = urllib.request.Request(
     f'http://127.0.0.1:5000/api/remove/{upload_id}',
     data=b'',
@@ -190,7 +215,9 @@ PY
 
 "$engine" rm -f "$name" >/dev/null
 "$engine" run -d --name "$name" \
-    -v "$data_volume:/data" -v "$media_volume:/downloads" "$image" >/dev/null
+    -e VDL_INGEST_SCAN_SECONDS=1 -e VDL_INGEST_SETTLE_SECONDS=1 \
+    -v "$data_volume:/data" -v "$media_volume:/downloads" \
+    -v "$ingest_volume:/ingest:ro" "$image" >/dev/null
 for attempt in $(seq 1 40); do
     if "$engine" exec "$name" python -c \
         "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/api/health', timeout=1)" \
@@ -223,7 +250,9 @@ opener.open(login, timeout=3).close()
 with opener.open(base_url + '/api/preferences') as response:
     assert json.load(response)['theme'] == 'dark'
 with opener.open(base_url + '/api/history') as response:
-    assert any(row['id'] == 'persist1' for row in json.load(response))
+    history = json.load(response)
+assert any(row['id'] == 'persist1' for row in history)
+assert sum(row['title'] == 'watched-folder' for row in history) == 1, history
 with opener.open(base_url + '/api/file/persist1') as response:
     assert response.read() == b'persistent media'
 PY
