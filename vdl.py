@@ -14,6 +14,7 @@ import time
 import subprocess
 import mimetypes
 import copy
+import tempfile
 import unicodedata
 from contextlib import contextmanager
 from pathlib import Path
@@ -236,6 +237,7 @@ TERMINAL_STATUSES = HISTORY_STATUSES + ('cancelled', 'interrupted')
 # connection cause "database is locked" errors. We open a fresh connection
 # per operation and guard writes with this lock.
 _db_lock = threading.Lock()
+_upload_lock = threading.Lock()
 _NO_UPDATE = object()
 
 # Workers wait here before entering yt-dlp. A FIFO queue keeps a burst in
@@ -336,6 +338,9 @@ def init_db():
             # Existing libraries start unstarred; favorites are an explicit
             # user choice rather than something inferred during migration.
             ("favorite", "ALTER TABLE downloads ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0"),
+            # URL downloads and local uploads share the library, but upload
+            # rows have no remote source or requested yt-dlp format.
+            ("source_type", "ALTER TABLE downloads ADD COLUMN source_type TEXT NOT NULL DEFAULT 'download'"),
         ]:
             if col not in existing_cols:
                 conn.execute(ddl)
@@ -375,6 +380,23 @@ def db_insert_download(download_id, url):
             "INSERT INTO downloads(id, url, status, progress, created_at) "
             "VALUES (?, ?, 'starting', '0%', ?)",
             (download_id, url, time.time()),
+        )
+    event_bus.publish('change', {'reason': 'insert', 'id': download_id})
+
+
+def db_insert_upload(download_id, upload_name, title, filesize, output_dir):
+    """Register a local upload before the browser starts transferring it."""
+    with _db_lock, db() as conn:
+        conn.execute(
+            "INSERT INTO downloads("
+            "id, url, status, progress, created_at, filesize, title, "
+            "output_dir, requested_filename, downloaded_bytes, total_bytes, "
+            "source_type"
+            ") VALUES (?, '', 'starting', '0%', ?, ?, ?, ?, ?, 0, ?, 'upload')",
+            (
+                download_id, time.time(), filesize, title, output_dir,
+                upload_name, filesize,
+            ),
         )
     event_bus.publish('change', {'reason': 'insert', 'id': download_id})
 
@@ -672,7 +694,8 @@ def db_list_downloads():
         rows = conn.execute(
             "SELECT id, url, status, progress, created_at, "
             "filename, resolution, filesize, speed, eta, title, finished_at, "
-            "formats, requested_format, downloaded_bytes, total_bytes, favorite "
+            "formats, requested_format, downloaded_bytes, total_bytes, favorite, "
+            "source_type "
             "FROM downloads ORDER BY created_at DESC"
         ).fetchall()
         downloads = [dict(r) for r in rows]
@@ -1466,6 +1489,84 @@ def ffprobe_resolution(path):
     return None
 
 
+def inspect_uploaded_video(path):
+    """Validate an upload with ffprobe and return its optional resolution."""
+    try:
+        result = subprocess.run(
+            [
+                'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                '-show_entries', 'stream=height', '-of', 'json', path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            'ffprobe is required to validate uploaded videos'
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError('The uploaded video could not be inspected') from exc
+    except OSError as exc:
+        raise RuntimeError(
+            f'Unable to inspect the uploaded video: {exc}'
+        ) from exc
+
+    try:
+        streams = json.loads(result.stdout or '{}').get('streams') or []
+    except (AttributeError, json.JSONDecodeError) as exc:
+        raise ValueError('The uploaded file is not a supported video') from exc
+    if result.returncode != 0 or not streams:
+        raise ValueError('The uploaded file does not contain a video stream')
+
+    height = streams[0].get('height')
+    try:
+        height = int(height)
+    except (TypeError, ValueError):
+        height = 0
+    return f'{height}p' if height > 0 else None
+
+
+def _validated_upload_filename(value):
+    """Return a safe basename while preserving the desktop filename."""
+    if not isinstance(value, str):
+        raise ValueError('Uploaded file must have a filename')
+    # Some clients still submit a browser-era C:\\fakepath prefix. Treat both
+    # separator styles as untrusted path components and retain only the leaf.
+    name = unicodedata.normalize(
+        'NFC', value.replace('\\', '/').rsplit('/', 1)[-1]
+    ).strip()
+    if (not name or name in ('.', '..') or '\x00' in name
+            or any(ord(character) < 32 for character in name)):
+        raise ValueError('Uploaded file must have a valid filename')
+    # Leave enough bytes for a collision suffix on filesystems with the usual
+    # 255-byte component limit instead of failing late after a large transfer.
+    if len(os.fsencode(name)) > 240:
+        raise ValueError('Uploaded filename is too long')
+    return name
+
+
+def _reserve_upload_path(directory, filename):
+    """Atomically reserve a collision-safe destination in the library."""
+    stem, extension = os.path.splitext(filename)
+    for suffix in range(10000):
+        candidate_name = (
+            filename if suffix == 0 else f'{stem} ({suffix}){extension}'
+        )
+        candidate = os.path.join(directory, candidate_name)
+        try:
+            descriptor = os.open(
+                candidate,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+        except FileExistsError:
+            continue
+        os.close(descriptor)
+        return candidate
+    raise OSError('Unable to choose an unused filename for the upload')
+
+
 def _thumbnail_path(entry, fallback_dir=None):
     """Return the stable sidecar path for one download's generated preview."""
     directory = entry.get('output_dir')
@@ -1575,6 +1676,203 @@ def add_download():
     thread.start()
 
     return jsonify({"message": "Download started", "id": download_id})
+
+
+@app.route('/api/upload', methods=['POST'])
+def start_video_upload():
+    """Register a dropped video so it is visible before transfer begins."""
+    data = request.get_json(silent=True) or {}
+    try:
+        original_name = _validated_upload_filename(data.get('filename'))
+        filesize = data.get('filesize')
+        if (isinstance(filesize, bool) or not isinstance(filesize, int)
+                or filesize <= 0):
+            raise ValueError('Uploaded video size must be a positive integer')
+        output_dir = _prepare_download_directory(
+            db_get_preferences().get('download_dir', '.')
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    download_id = str(uuid.uuid4())[:8]
+    output_dir = os.path.abspath(output_dir)
+    title = os.path.splitext(original_name)[0] or original_name
+    try:
+        db_insert_upload(
+            download_id, original_name, title, filesize, output_dir
+        )
+    except sqlite3.Error:
+        return jsonify({"error": "Unable to start the video upload"}), 500
+    return jsonify({
+        "message": "Video upload registered",
+        "id": download_id,
+    }), 202
+
+
+@app.route('/api/upload/<download_id>', methods=['PUT'])
+def receive_video_upload(download_id):
+    """Stream one registered upload to disk while publishing byte progress."""
+    entry = db_get_download(download_id)
+    if entry is None:
+        return jsonify({"error": "Unknown upload id"}), 404
+    if entry.get('source_type') != 'upload':
+        return jsonify({"error": "Entry is not a local upload"}), 409
+    if entry.get('status') != 'starting':
+        return jsonify({
+            "error": f"Cannot upload from status '{entry.get('status')}'"
+        }), 409
+
+    with _worker_condition:
+        if download_id in _live_worker_ids:
+            return jsonify({"error": "Upload is already active"}), 409
+        _live_worker_ids.add(download_id)
+
+    original_name = entry.get('requested_filename')
+    expected_size = int(entry.get('total_bytes') or 0)
+    output_dir = entry.get('output_dir')
+    temporary_path = None
+    final_path = None
+    registered = False
+    received = 0
+    try:
+        if is_cancel_requested(download_id):
+            raise DownloadCancelled()
+        output_dir = os.path.abspath(_prepare_download_directory(output_dir))
+        db_update_download(
+            download_id,
+            status='downloading',
+            progress='0%',
+            downloaded_bytes=0,
+            total_bytes=expected_size,
+        )
+        with tempfile.NamedTemporaryFile(
+                mode='wb', dir=output_dir,
+                prefix=f'.vdl_{download_id}.', suffix='.upload.part',
+                delete=False) as temporary:
+            temporary_path = temporary.name
+            while True:
+                if is_cancel_requested(download_id):
+                    raise DownloadCancelled()
+                chunk = request.stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                received += len(chunk)
+                if received > expected_size:
+                    raise ValueError('Uploaded video is larger than declared')
+                temporary.write(chunk)
+                percent = (received / expected_size) * 100
+                db_update_download(
+                    download_id,
+                    status='downloading',
+                    progress=f'{percent:.1f}%',
+                    downloaded_bytes=received,
+                    total_bytes=expected_size,
+                )
+
+        if is_cancel_requested(download_id):
+            raise DownloadCancelled()
+        if received != expected_size:
+            raise ValueError('Uploaded video ended before all bytes arrived')
+        try:
+            resolution = inspect_uploaded_video(temporary_path)
+        except ValueError as exc:
+            db_update_download(
+                download_id, status='error', progress=str(exc),
+                finished_at=time.time(),
+            )
+            return jsonify({"error": str(exc)}), 415
+        except RuntimeError as exc:
+            db_update_download(
+                download_id, status='error', progress=str(exc),
+                finished_at=time.time(),
+            )
+            return jsonify({"error": str(exc)}), 503
+
+        if is_cancel_requested(download_id):
+            raise DownloadCancelled()
+
+        with _upload_lock:
+            final_path = _reserve_upload_path(output_dir, original_name)
+            os.replace(temporary_path, final_path)
+            temporary_path = None
+        if is_cancel_requested(download_id):
+            raise DownloadCancelled()
+
+        db_update_download(
+            download_id,
+            status='finished',
+            progress='100%',
+            filename=final_path,
+            filesize=received,
+            resolution=resolution,
+            speed=0.0,
+            eta=0,
+            finished_at=time.time(),
+            downloaded_bytes=received,
+            total_bytes=received,
+        )
+        registered = True
+        return jsonify({
+            "message": "Video added to library",
+            "id": download_id,
+            "filename": os.path.basename(final_path),
+        })
+    except DownloadCancelled:
+        db_update_download(
+            download_id,
+            status='cancelled',
+            progress='Cancelled',
+            downloaded_bytes=received,
+            total_bytes=expected_size,
+            finished_at=time.time(),
+        )
+        return jsonify({"error": "Upload cancelled"}), 409
+    except ValueError as exc:
+        db_update_download(
+            download_id, status='error', progress=str(exc),
+            downloaded_bytes=received, total_bytes=expected_size,
+            finished_at=time.time(),
+        )
+        return jsonify({"error": str(exc)}), 400
+    except (OSError, sqlite3.Error) as exc:
+        message = f'Unable to store the uploaded video: {exc}'
+        db_update_download(
+            download_id, status='error', progress=message,
+            downloaded_bytes=received, total_bytes=expected_size,
+            finished_at=time.time(),
+        )
+        return jsonify({"error": message}), 500
+    except Exception as exc:
+        if is_cancel_requested(download_id):
+            db_update_download(
+                download_id, status='cancelled', progress='Cancelled',
+                downloaded_bytes=received, total_bytes=expected_size,
+                finished_at=time.time(),
+            )
+            return jsonify({"error": "Upload cancelled"}), 409
+        message = f'Upload failed: {exc}'
+        db_update_download(
+            download_id, status='error', progress=message,
+            downloaded_bytes=received, total_bytes=expected_size,
+            finished_at=time.time(),
+        )
+        return jsonify({"error": message}), 500
+    finally:
+        for path in (
+                temporary_path,
+                final_path if final_path and not registered else None):
+            if not path:
+                continue
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+        clear_cancel(download_id)
+        with _worker_condition:
+            _live_worker_ids.discard(download_id)
+            _worker_condition.notify_all()
 
 
 @app.route('/api/probe', methods=['POST'])
@@ -1919,7 +2217,7 @@ def _is_allowed_download_path(path):
 
 @app.route('/api/file/<download_id>', methods=['GET'])
 def stream_file(download_id):
-    """Serve a finished download with range support for the in-app player."""
+    """Serve a finished download for playback or browser download."""
     entry = db_get_download(download_id)
     if entry is None or entry.get('status') != 'finished':
         abort(404)
@@ -1951,7 +2249,14 @@ def stream_file(download_id):
     }
     ext = os.path.splitext(real)[1].lower()
     mimetype = _MIME_MAP.get(ext) or mimetypes.guess_type(real)[0] or 'application/octet-stream'
-    return send_file(real, mimetype=mimetype, conditional=True)
+    as_attachment = request.args.get('download') == '1'
+    return send_file(
+        real,
+        mimetype=mimetype,
+        conditional=True,
+        as_attachment=as_attachment,
+        download_name=os.path.basename(real) if as_attachment else None,
+    )
 
 
 @app.route('/api/thumbnail/<download_id>', methods=['GET'])

@@ -28,3 +28,19 @@ test('new-tab player mode opens the stored file endpoint', async ({ page }) => {
     await expect.poll(() => page.evaluate(() => window.__opened)).not.toBeNull();
     expect((await page.evaluate(() => window.__opened))[0]).toBe('/api/file/playtab1');
 });
+
+test('three-dot menu downloads the stored video to the browser', async ({ page }) => {
+    await seed(page, {
+        id: 'download-file', status: 'finished', file: true, name: 'saved video.mp4',
+    });
+    await refresh(page);
+
+    const row = page.locator('[data-row-id="download-file"]');
+    await row.locator('.kebab-btn').click();
+    const downloadPromise = page.waitForEvent('download');
+    await row.getByRole('button', { name: 'Download file', exact: true }).click();
+    const download = await downloadPromise;
+
+    expect(download.suggestedFilename()).toBe('saved video.mp4');
+    expect(await download.failure()).toBeNull();
+});

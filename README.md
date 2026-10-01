@@ -2,7 +2,8 @@
 
 A lightweight local video-downloader UI powered by yt-dlp. VDL provides a
 browser interface for choosing formats, tracking concurrent downloads, pausing
-or resuming work, organising entries with tags, and playing completed media.
+or resuming work, importing local videos by dropping them onto the page,
+organising entries with tags, and playing completed media.
 Live progress arrives over Server-Sent Events without browser polling.
 
 [![Latest release](https://img.shields.io/github/v/release/mnemonic-bit/VDL?display_name=tag&sort=semver)](https://github.com/mnemonic-bit/VDL/releases/latest)

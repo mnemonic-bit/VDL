@@ -181,6 +181,161 @@ function apiAction(url, options) {
         });
 }
 
+const uploadDropOverlay = document.getElementById('uploadDropOverlay');
+const uploadDropTitle = document.getElementById('uploadDropTitle');
+const uploadDropDetail = document.getElementById('uploadDropDetail');
+let uploadDragDepth = 0;
+let uploadInProgress = false;
+let uploadOverlayTimer = null;
+const activeUploadRequests = new Map();
+
+function isFileDrag(event) {
+    return event.dataTransfer
+        && Array.from(event.dataTransfer.types || []).includes('Files');
+}
+
+function showUploadOverlay(title, detail, uploading = false) {
+    clearTimeout(uploadOverlayTimer);
+    uploadDropTitle.textContent = title;
+    uploadDropDetail.textContent = detail;
+    uploadDropOverlay.classList.add('active');
+    uploadDropOverlay.classList.toggle('uploading', uploading);
+    uploadDropOverlay.setAttribute('aria-hidden', 'false');
+    if (!uploadDropOverlay.open) uploadDropOverlay.showModal();
+}
+
+function hideUploadOverlay() {
+    uploadDropOverlay.classList.remove('active', 'uploading');
+    uploadDropOverlay.setAttribute('aria-hidden', 'true');
+    if (uploadDropOverlay.open) uploadDropOverlay.close();
+}
+
+function transferDroppedVideo(id, file) {
+    return new Promise((resolve, reject) => {
+        const request = new XMLHttpRequest();
+        activeUploadRequests.set(String(id), request);
+        request.open('PUT', '/api/upload/' + encodeURIComponent(id));
+        request.setRequestHeader(
+            'Content-Type', file.type || 'application/octet-stream');
+        request.onload = () => {
+            const data = (() => {
+                try { return JSON.parse(request.responseText || '{}'); }
+                catch (error) { return {}; }
+            })();
+            if (request.status >= 200 && request.status < 300) {
+                resolve(data);
+            } else if (request.status === 409 && data.error === 'Upload cancelled') {
+                resolve(data);
+            } else {
+                reject(new Error(data.error || request.statusText || 'Upload failed'));
+            }
+        };
+        request.onerror = () => reject(new Error('Upload connection failed'));
+        request.onabort = () => resolve({ cancelled: true });
+        request.onloadend = () => {
+            activeUploadRequests.delete(String(id));
+            fetchHistory({ sortFavorites: true }).catch(() => {});
+        };
+        request.send(file);
+    });
+}
+
+async function registerDroppedVideo(file) {
+    const response = await apiFetch('/api/upload', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename: file.name, filesize: file.size }),
+    });
+    if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(data.error || response.statusText || 'Upload failed');
+    }
+    const data = await response.json();
+    return {
+        file,
+        id: data.id,
+        completion: transferDroppedVideo(data.id, file),
+    };
+}
+
+async function uploadDroppedVideos(files) {
+    if (uploadInProgress || !files.length) return;
+    uploadInProgress = true;
+    hideActionError();
+    const failures = [];
+    const transfers = [];
+
+    for (let index = 0; index < files.length; index += 1) {
+        const file = files[index];
+        const prefix = files.length > 1 ? `${index + 1} of ${files.length}: ` : '';
+        showUploadOverlay('Preparing upload…', prefix + file.name, true);
+        try {
+            transfers.push(await registerDroppedVideo(file));
+        } catch (error) {
+            failures.push(`${file.name}: ${error.message || 'Upload failed'}`);
+        }
+    }
+
+    uploadInProgress = false;
+    await fetchHistory().catch(() => {});
+    if (transfers.length > 0) {
+        const noun = transfers.length === 1 ? 'Upload' : `${transfers.length} uploads`;
+        showUploadOverlay(
+            `${noun} started`,
+            'Track progress or stop it from Current downloads.',
+        );
+        uploadOverlayTimer = setTimeout(hideUploadOverlay, 900);
+    } else {
+        hideUploadOverlay();
+    }
+
+    const results = await Promise.allSettled(
+        transfers.map(transfer => transfer.completion));
+    results.forEach((result, index) => {
+        if (result.status === 'rejected') {
+            failures.push(
+                `${transfers[index].file.name}: ${result.reason.message || 'Upload failed'}`);
+        }
+    });
+    if (failures.length) showActionError(failures.join(' '));
+}
+
+document.addEventListener('dragenter', event => {
+    if (!isFileDrag(event) || uploadInProgress) return;
+    event.preventDefault();
+    uploadDragDepth += 1;
+    showUploadOverlay(
+        'Drop video to add it',
+        'The original file will be copied into your library.',
+    );
+});
+
+document.addEventListener('dragover', event => {
+    if (!isFileDrag(event)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = uploadInProgress ? 'none' : 'copy';
+});
+
+document.addEventListener('dragleave', event => {
+    if (!isFileDrag(event) || uploadInProgress) return;
+    uploadDragDepth = Math.max(0, uploadDragDepth - 1);
+    if (uploadDragDepth === 0) hideUploadOverlay();
+});
+
+document.addEventListener('drop', event => {
+    if (!isFileDrag(event)) return;
+    event.preventDefault();
+    uploadDragDepth = 0;
+    if (uploadInProgress) return;
+    const files = Array.from(event.dataTransfer.files || []);
+    uploadDroppedVideos(files);
+});
+
+uploadDropOverlay.addEventListener('cancel', event => {
+    event.preventDefault();
+    if (!uploadInProgress) hideUploadOverlay();
+});
+
 function updateApiVersion(version, unavailable) {
     const footer = document.getElementById('versionFooter');
     const apiVersion = document.getElementById('apiVersion');
@@ -825,8 +980,12 @@ function bindTagSuggestionButtons(shell) {
 
 function stopDownload(id) {
     closeAllMenus();
+    const uploadRequest = activeUploadRequests.get(String(id));
     apiAction('/api/stop/' + encodeURIComponent(id), { method: 'POST' })
-        .then(() => fetchHistory())
+        .then(() => {
+            if (uploadRequest) uploadRequest.abort();
+            return fetchHistory();
+        })
         .catch(() => fetchHistory());
 }
 
@@ -1263,6 +1422,19 @@ document.addEventListener('click', (ev) => {
             playAction.dataset.playExt,
         );
     }
+    const fileDownloadAction = ev.target.closest('[data-file-download-action]');
+    if (fileDownloadAction) {
+        closeAllMenus();
+        const link = document.createElement('a');
+        link.href = '/api/file/'
+            + encodeURIComponent(fileDownloadAction.dataset.downloadId)
+            + '?download=1';
+        link.download = '';
+        link.hidden = true;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+    }
     const urlAction = ev.target.closest('[data-url-action]');
     if (urlAction) {
         const url = urlAction.dataset.url;
@@ -1418,6 +1590,8 @@ function fallback(text, done) {
 function renderHistoryCard(info) {
     const id = String(info.id);
     const isFinished = info.status === 'finished';
+    const isUpload = info.source_type === 'upload';
+    const hasPlay = isFinished && info.filename;
     const safeUrl = escapeAttr(info.url);
     const urlData = `data-url="${safeUrl}"`;
 
@@ -1430,15 +1604,21 @@ function renderHistoryCard(info) {
 
     const menuItems = [
         `<button data-info-action aria-expanded="false" aria-controls="info-${escapeAttr(id)}" onclick="toggleHistoryInfo('${id}', event)"><svg class="menu-icon"><use href="#i-info"/></svg>Info</button>`,
-        `<button data-url-action="open" ${urlData}><svg class="menu-icon"><use href="#i-external"/></svg>Open URL</button>`,
-        `<button data-url-action="copy" ${urlData}><svg class="menu-icon"><use href="#i-copy"/></svg>Copy URL</button>`,
     ];
+    if (!isUpload) {
+        menuItems.push(
+            `<button data-url-action="open" ${urlData}><svg class="menu-icon"><use href="#i-external"/></svg>Open URL</button>`,
+            `<button data-url-action="copy" ${urlData}><svg class="menu-icon"><use href="#i-copy"/></svg>Copy URL</button>`,
+        );
+    }
+    if (hasPlay) {
+        menuItems.push(`<button data-file-download-action data-download-id="${escapeAttr(id)}"><svg class="menu-icon"><use href="#i-download"/></svg>Download file</button>`);
+    }
     if (!isFinished) {
         menuItems.push(`<button data-url-action="reload" data-download-id="${escapeAttr(id)}" ${urlData}><svg class="menu-icon"><use href="#i-sync"/></svg>Reload</button>`);
     }
     menuItems.push(`<button class="danger" onclick="deleteDownload('${id}')"><svg class="menu-icon"><use href="#i-trash"/></svg>Delete</button>`);
 
-    const hasPlay = isFinished && info.filename;
     const favorite = Boolean(info.favorite);
     const favoriteLabel = favorite ? 'Remove from favorites' : 'Add to favorites';
     const favoriteButton = `
@@ -1474,7 +1654,9 @@ function renderHistoryCard(info) {
         metadata.push(`<div class="file-meta-row"><strong>File:</strong>${isFinished ? renderRenameControl(id, base) : `<span class="filename">${escapeHtml(base)}</span>`}</div>`);
     }
     metadata.push(`<div class="history-status-row"><strong>Status:</strong> ${escapeHtml(info.status.charAt(0).toUpperCase() + info.status.slice(1))}</div>`);
-    metadata.push(`<div class="history-url-row"><strong>Source:</strong> <span>${escapeHtml(info.url)}</span><button type="button" class="history-source-copy" data-url-action="copy" ${urlData} aria-label="Copy source URL" title="Copy source URL"><svg><use href="#i-copy"/></svg></button></div>`);
+    metadata.push(isUpload
+        ? '<div class="history-url-row"><strong>Source:</strong> <span>Local upload</span></div>'
+        : `<div class="history-url-row"><strong>Source:</strong> <span>${escapeHtml(info.url)}</span><button type="button" class="history-source-copy" data-url-action="copy" ${urlData} aria-label="Copy source URL" title="Copy source URL"><svg><use href="#i-copy"/></svg></button></div>`);
     const sizeStr = formatBytes(info.filesize);
     const requestedFormat = formatRequestedFormat(info);
     const mediaParts = [];
@@ -1485,8 +1667,11 @@ function renderHistoryCard(info) {
 
     const timingParts = [];
     const startedStr = formatDateTime(info.created_at);
-    if (startedStr) timingParts.push(`<strong>Started:</strong> ${startedStr}`);
-    const durationStr = formatDuration(info.created_at, info.finished_at);
+    if (startedStr) timingParts.push(
+        `<strong>${isUpload ? 'Added' : 'Started'}:</strong> ${startedStr}`);
+    const durationStr = isUpload
+        ? null
+        : formatDuration(info.created_at, info.finished_at);
     if (durationStr) timingParts.push(`<strong>Duration:</strong> ${durationStr}`);
     if (timingParts.length) metadata.push(`<div class="history-timing-row">${timingParts.join(' &middot; ')}</div>`);
 
@@ -1540,6 +1725,7 @@ function renderItem(info, inHistoryView = false) {
     const isCancelled = info.status === 'cancelled';
     const isTerminal = TERMINAL_STATUSES.has(info.status);
     const isFinished = info.status === 'finished';
+    const isUpload = info.source_type === 'upload';
     const isCurrentTabStopped = !inHistoryView && (isCancelled || info.status === 'interrupted');
 
     // URLs stay in data attributes and are read through dataset by the
@@ -1555,13 +1741,15 @@ function renderItem(info, inHistoryView = false) {
         primary = `<button class="stop-btn icon-only" onclick="stopDownload('${id}')" aria-label="Stop" title="Stop">${renderActionProgressIcon('i-pause', info)}</button>`;
     } else if (isPaused) {
         primary = `<button class="continue-btn" onclick="unpauseDownload('${id}')">${renderActionProgressIcon('i-play', info)}Resume</button>`;
-    } else if (isCancelled || info.status === 'interrupted') {
+    } else if (!isUpload && (isCancelled || info.status === 'interrupted')) {
         primary = `<button class="continue-btn icon-only" data-url-action="continue" data-download-id="${id}" ${urlData} aria-label="Continue" title="Continue">${renderActionProgressIcon('i-play', info)}</button>`;
     }
 
-    menuItems.push(`<button data-url-action="open" ${urlData}><svg class="menu-icon"><use href="#i-external"/></svg>Open URL</button>`);
+    if (!isUpload) {
+        menuItems.push(`<button data-url-action="open" ${urlData}><svg class="menu-icon"><use href="#i-external"/></svg>Open URL</button>`);
+    }
 
-    if (isRunning) {
+    if (isRunning && !isUpload) {
         menuItems.push(`<button onclick="pauseDownload('${id}')"><svg class="menu-icon"><use href="#i-pause"/></svg>Pause</button>`);
     }
 
@@ -1573,9 +1761,11 @@ function renderItem(info, inHistoryView = false) {
         if (!isFinished && !isCancelled && info.status !== 'interrupted') {
             menuItems.push(`<button data-url-action="reload" data-download-id="${id}" ${urlData}><svg class="menu-icon"><use href="#i-sync"/></svg>Reload</button>`);
         }
-        menuItems.push(`<button data-url-action="copy" ${urlData}><svg class="menu-icon"><use href="#i-copy"/></svg>Copy URL</button>`);
+        if (!isUpload) {
+            menuItems.push(`<button data-url-action="copy" ${urlData}><svg class="menu-icon"><use href="#i-copy"/></svg>Copy URL</button>`);
+        }
         menuItems.push(`<button class="danger" onclick="deleteDownload('${id}')"><svg class="menu-icon"><use href="#i-trash"/></svg>Delete</button>`);
-    } else {
+    } else if (!isUpload) {
         menuItems.push(`<button data-url-action="copy" ${urlData}><svg class="menu-icon"><use href="#i-copy"/></svg>Copy URL</button>`);
     }
 
@@ -1607,7 +1797,7 @@ function renderItem(info, inHistoryView = false) {
     const summarySize = formatBytes(info.filesize);
     if (summarySize) downloadSummaryParts.push(`<strong>Total size:</strong> ${summarySize}`);
     if (info.resolution) downloadSummaryParts.push(`<strong>Quality:</strong> ${info.resolution}`);
-    downloadSummaryParts.push(`<strong>Downloaded:</strong> ${downloadedPercent === null ? '&mdash;' : `${downloadedPercent}%`}`);
+    downloadSummaryParts.push(`<strong>${isUpload ? 'Uploaded' : 'Downloaded'}:</strong> ${downloadedPercent === null ? '&mdash;' : `${downloadedPercent}%`}`);
     const downloadSummaryRow = isCurrentRow
         ? `<div class="meta download-summary-row">
                         <span>${downloadSummaryParts.join(' &middot; ')}</span>
@@ -1896,7 +2086,7 @@ function fetchHistory({ sortFavorites = false } = {}) {
             : 'No downloads yet';
         document.getElementById('historyEmptyMessage').textContent = hasFilter
             ? 'No download history matches these search terms.'
-            : 'Add a video URL to get started.';
+            : 'Add a video URL or drop a local video here to get started.';
         document.getElementById('historyEmptyAction').hidden = hasFilter;
         document.getElementById('currentEmpty').style.display = active.length ? 'none' : '';
         document.getElementById('historyEmpty').style.display = done.length ? 'none' : '';

@@ -2,6 +2,7 @@
 
 import os
 import sys
+import threading
 import time
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -15,10 +16,21 @@ from tests.support.fake_ytdlp import FakeYoutubeDL  # noqa: E402
 
 vdl.yt_dlp.YoutubeDL = FakeYoutubeDL
 vdl.ffprobe_resolution = lambda _path: "360p"
+upload_inspection_gate = threading.Event()
+upload_inspection_gate.set()
+
+
+def inspect_uploaded_video(_path):
+    upload_inspection_gate.wait(5)
+    return "360p"
+
+
+vdl.inspect_uploaded_video = inspect_uploaded_video
 
 
 @vdl.app.post("/__test__/reset")
 def test_reset():
+    upload_inspection_gate.set()
     for row in vdl.db_list_downloads():
         if row["status"] in ("starting", "downloading", "paused"):
             vdl.request_cancel(row["id"])
@@ -30,6 +42,18 @@ def test_reset():
         vdl._pause_flags.clear()
     vdl.init_db()
     FakeYoutubeDL.reset()
+    return jsonify({"ok": True})
+
+
+@vdl.app.post("/__test__/hold-uploads")
+def test_hold_uploads():
+    upload_inspection_gate.clear()
+    return jsonify({"ok": True})
+
+
+@vdl.app.post("/__test__/release-uploads")
+def test_release_uploads():
+    upload_inspection_gate.set()
     return jsonify({"ok": True})
 
 

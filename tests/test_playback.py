@@ -19,6 +19,20 @@ class PlaybackTest(AppCase):
         self.assertEqual(response.headers["Content-Type"], "video/mp4")
         response.close()
 
+    def test_download_response_uses_the_stored_basename_as_an_attachment(self):
+        payload = b"downloadable media"
+        self.finished_file(name="saved video.mp4", data=payload)
+
+        response = self.client.get("/api/file/test0001?download=1")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, payload)
+        self.assertEqual(
+            response.headers["Content-Disposition"],
+            "attachment; filename=\"saved video.mp4\"",
+        )
+        response.close()
+
     def test_supported_audio_and_video_extensions_have_stable_mime_types(self):
         cases = {
             "mp4": "video/mp4",

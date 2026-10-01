@@ -77,6 +77,55 @@ PY
 
 "$engine" exec "$name" python - <<'PY'
 import json
+import os
+import subprocess
+import urllib.request
+
+media_path = '/tmp/upload-smoke.mp4'
+subprocess.run(
+    [
+        'ffmpeg', '-v', 'error', '-f', 'lavfi',
+        '-i', 'color=c=black:s=16x16:d=0.2',
+        '-c:v', 'mpeg4', '-an', '-y', media_path,
+    ],
+    check=True,
+)
+with open(media_path, 'rb') as media:
+    payload = media.read()
+
+start = urllib.request.Request(
+    'http://127.0.0.1:5000/api/upload',
+    data=json.dumps({
+        'filename': 'container-upload.mp4',
+        'filesize': len(payload),
+    }).encode(),
+    headers={'Content-Type': 'application/json'},
+    method='POST',
+)
+with urllib.request.urlopen(start, timeout=3) as response:
+    upload_id = json.load(response)['id']
+transfer = urllib.request.Request(
+    f'http://127.0.0.1:5000/api/upload/{upload_id}',
+    data=payload,
+    headers={'Content-Type': 'video/mp4'},
+    method='PUT',
+)
+urllib.request.urlopen(transfer, timeout=10).close()
+with urllib.request.urlopen('http://127.0.0.1:5000/api/history') as response:
+    uploaded = next(row for row in json.load(response) if row['id'] == upload_id)
+assert uploaded['status'] == 'finished', uploaded
+assert uploaded['source_type'] == 'upload', uploaded
+assert uploaded['resolution'] == '16p', uploaded
+remove = urllib.request.Request(
+    f'http://127.0.0.1:5000/api/remove/{upload_id}',
+    data=b'',
+    method='POST',
+)
+urllib.request.urlopen(remove, timeout=3).close()
+PY
+
+"$engine" exec "$name" python - <<'PY'
+import json
 import sqlite3
 import time
 import urllib.request
