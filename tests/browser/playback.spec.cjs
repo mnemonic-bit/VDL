@@ -38,7 +38,7 @@ test('three-dot menu downloads the stored video to the browser', async ({ page }
     const row = page.locator('[data-row-id="download-file"]');
     await row.locator('.kebab-btn').click();
     const downloadPromise = page.waitForEvent('download');
-    await row.getByRole('button', { name: 'Download file', exact: true }).click();
+    await row.getByRole('button', { name: 'Download', exact: true }).click();
     const download = await downloadPromise;
 
     expect(download.suggestedFilename()).toBe('saved video.mp4');

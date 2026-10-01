@@ -301,18 +301,20 @@ test('inline rename supports cancel, save, and extension preservation', async ({
     await expect(row.locator('.rename-display')).toHaveText('renamed.mp4');
 });
 
-test('Copy URL uses plain confirmation icon and restores the copy action', async ({ page }) => {
+test('Copy URL stays in Info and is omitted from the three-dot menu', async ({ page }) => {
     await page.clock.install();
     const url = 'https://fixture.invalid/copy';
     await seed(page, { id: 'copy0001', status: 'finished', file: true, url });
     await refresh(page);
     const row = page.locator('[data-row-id="copy0001"]');
     await row.locator('.kebab-btn').click();
-    await row.getByRole('button', { name: 'Copy URL', exact: true }).click();
+    await expect(row.locator('.kebab-menu').getByRole('button', { name: 'Copy URL', exact: true })).toHaveCount(0);
+    await row.getByRole('button', { name: 'Info', exact: true }).click();
+    await row.getByRole('button', { name: 'Copy source URL', exact: true }).click();
     await expect(row.getByRole('button', { name: 'Copied', exact: true }).locator('use')).toHaveAttribute('href', '#i-check');
     expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(url);
     await page.clock.fastForward(1600);
-    await expect(row.getByRole('button', { name: 'Copy URL', exact: true })).toBeVisible();
+    await expect(row.getByRole('button', { name: 'Copy source URL', exact: true })).toBeVisible();
 });
 
 test('error details fold and Reload removes then resubmits the stored URL', async ({ page }) => {
@@ -339,7 +341,7 @@ test('error details fold and Reload removes then resubmits the stored URL', asyn
     expect(calls).toEqual(['remove', url]);
 });
 
-test('stored URL remains data for Open, Reload, Continue, and Copy actions', async ({ page }) => {
+test('stored URL remains data for Open, Reload, Continue, and Info Copy actions', async ({ page }) => {
     const url = "https://fixture.invalid/a');window.__injected=1;//<b>";
     for (const [id, status] of [['safe-error', 'error'], ['safe-cancel', 'cancelled']]) {
         await seed(page, { id, status, progress: 'fixture error', url });
@@ -348,7 +350,7 @@ test('stored URL remains data for Open, Reload, Continue, and Copy actions', asy
     await refresh(page);
     const errorRow = page.locator('[data-row-id="safe-error"]');
     const actions = errorRow.locator('[data-url-action]');
-    await expect(actions).toHaveCount(4);
+    await expect(actions).toHaveCount(3);
     for (const action of await actions.all()) {
         await expect(action).not.toHaveAttribute('onclick', /./);
         expect(await action.getAttribute('data-url')).toBe(url);

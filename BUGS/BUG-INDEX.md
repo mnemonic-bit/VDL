@@ -80,6 +80,13 @@ action occupied unnecessary header space with a text label, while Current
 downloads remained visible even when its drawer was empty. New download is now
 a compact circular plus action, and Current downloads is hidden until the
 drawer contains active or resumable work.
+Issue 40 was reported after deploying version `0.20.1` on 2026-10-01. An
+already-open tab continued to render the previous **Download file** action even
+though the replacement container, current bundle, and fresh browser sessions
+all exposed **Download**. The existing footer warning detects the UI/API
+version mismatch but does not keep an old client from continuing to interact
+with the newer backend or make the required refresh prominent near the active
+workflow.
 
 ## Bug reports
 
@@ -122,6 +129,7 @@ drawer contains active or resumable work.
 - [Bug 0037 — SSE bursts could cancel History insertion animations before they started](bug-0037-sse-bursts-cancelled-history-insertion-animation.md)
 - [Bug 0038 — History info panel had inconsistent layout and no source-copy action](bug-0038-history-info-panel-had-inconsistent-layout-and-missing-source-copy.md)
 - [Bug 0039 — Header download actions occupied space without useful state](bug-0039-header-download-actions-occupied-space-without-useful-state.md)
+- [Bug 0040 — Open tabs retain stale UI code after an application upgrade](bug-0040-open-tabs-retain-stale-ui-after-upgrade.md)
 
 ## Accepted UI decisions
 

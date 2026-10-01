@@ -1606,13 +1606,10 @@ function renderHistoryCard(info) {
         `<button data-info-action aria-expanded="false" aria-controls="info-${escapeAttr(id)}" onclick="toggleHistoryInfo('${id}', event)"><svg class="menu-icon"><use href="#i-info"/></svg>Info</button>`,
     ];
     if (!isUpload) {
-        menuItems.push(
-            `<button data-url-action="open" ${urlData}><svg class="menu-icon"><use href="#i-external"/></svg>Open URL</button>`,
-            `<button data-url-action="copy" ${urlData}><svg class="menu-icon"><use href="#i-copy"/></svg>Copy URL</button>`,
-        );
+        menuItems.push(`<button data-url-action="open" ${urlData}><svg class="menu-icon"><use href="#i-external"/></svg>Open URL</button>`);
     }
     if (hasPlay) {
-        menuItems.push(`<button data-file-download-action data-download-id="${escapeAttr(id)}"><svg class="menu-icon"><use href="#i-download"/></svg>Download file</button>`);
+        menuItems.push(`<button data-file-download-action data-download-id="${escapeAttr(id)}"><svg class="menu-icon"><use href="#i-download"/></svg>Download</button>`);
     }
     if (!isFinished) {
         menuItems.push(`<button data-url-action="reload" data-download-id="${escapeAttr(id)}" ${urlData}><svg class="menu-icon"><use href="#i-sync"/></svg>Reload</button>`);
