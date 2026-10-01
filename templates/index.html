@@ -209,7 +209,7 @@
                 <span id="currentBadge" class="badge" hidden>0</span>
             </button>
             <button id="settingsButton" class="settings-button" type="button" onclick="openSettings()"
-                    aria-label="Settings" aria-haspopup="dialog" aria-controls="settingsDialog" aria-expanded="false">
+                    aria-label="Settings" aria-controls="settingsPage" aria-pressed="false">
                 <svg aria-hidden="true"><use href="#i-cog"/></svg>
             </button>
         </div>
@@ -228,6 +228,127 @@
             <strong id="historyEmptyTitle">No downloads yet</strong>
             <span id="historyEmptyMessage">Add a video URL or drop a local video here to get started.</span>
             <button id="historyEmptyAction" type="button" onclick="focusNewDownload()">Start a download</button>
+        </div>
+    </section>
+
+    <section id="settingsPage" class="settings-page" aria-labelledby="settingsTitle" hidden>
+        <div class="settings-page-header">
+            <button class="settings-back" type="button" onclick="closeSettings()" aria-label="Back to videos">
+                <svg aria-hidden="true"><use href="#i-chevron"/></svg>
+            </button>
+            <div>
+                <h1 id="settingsTitle">Settings</h1>
+                <p>Choose how downloads and playback work.</p>
+            </div>
+        </div>
+        <div class="settings-search" role="search">
+            <svg aria-hidden="true"><use href="#i-search"/></svg>
+            <label for="settingsSearchInput" class="visually-hidden">Search settings</label>
+            <input id="settingsSearchInput" type="search" placeholder="Search settings" autocomplete="off">
+        </div>
+        <div class="settings-layout">
+            <nav class="settings-nav" aria-label="Settings sections">
+                <button type="button" class="active" data-settings-section="general" aria-current="page">General</button>
+                <button type="button" data-settings-section="playback">Playback</button>
+                <button type="button" class="danger" data-settings-section="danger">Danger Zone</button>
+            </nav>
+            <div class="settings-content">
+                <div id="settingsError" class="action-error settings-error" role="alert" aria-live="assertive" hidden>
+                    <span id="settingsErrorMessage"></span>
+                    <button type="button" class="action-error-close" onclick="hideActionError()" aria-label="Dismiss error"><svg width="14" height="14"><use href="#i-x"/></svg></button>
+                </div>
+
+                <section id="settings-general" class="settings-section" data-settings-name="general" tabindex="-1">
+                    <h2>General</h2>
+                    <div class="setting-item" data-setting-keywords="download directory folder location path">
+                        <div class="setting-copy">
+                            <label for="prefDir">Download directory</label>
+                            <span>Where completed videos and partial downloads are stored.</span>
+                        </div>
+                        <input type="text" id="prefDir">
+                    </div>
+                    <div class="setting-item" data-setting-keywords="quality format resolution audio video default">
+                        <div class="setting-copy">
+                            <label for="prefFormat">Quality</label>
+                            <span>The default format used for new downloads.</span>
+                        </div>
+                        <select id="prefFormat">
+                            <option value="bestvideo+bestaudio/best">Best available (video + audio merged)</option>
+                            <option value="best">Best single file (no merge needed)</option>
+                            <option value="bestvideo[height<=2160]+bestaudio/best">Up to 2160p (4K)</option>
+                            <option value="bestvideo[height<=1440]+bestaudio/best">Up to 1440p (2K)</option>
+                            <option value="bestvideo[height<=1080]+bestaudio/best">Up to 1080p (Full HD)</option>
+                            <option value="bestvideo[height<=720]+bestaudio/best">Up to 720p (HD)</option>
+                            <option value="bestvideo[height<=480]+bestaudio/best">Up to 480p (SD)</option>
+                            <option value="worstvideo+worstaudio/worst">Smallest file (lowest quality)</option>
+                            <option value="bestaudio/best">Audio only (best)</option>
+                            <option value="__custom__">Custom (advanced)</option>
+                        </select>
+                    </div>
+                    <div class="setting-item" id="customFormatRow" data-setting-keywords="custom advanced format selector yt-dlp" data-setting-available="false" hidden>
+                        <div class="setting-copy">
+                            <label for="prefFormatCustom">Custom format</label>
+                            <span>An advanced yt-dlp format selector.</span>
+                        </div>
+                        <input type="text" id="prefFormatCustom" placeholder="e.g. bestvideo[ext=mp4]+bestaudio[ext=m4a]">
+                    </div>
+                    <div class="setting-item" data-setting-keywords="maximum concurrent simultaneous parallel downloads workers">
+                        <div class="setting-copy">
+                            <label for="prefMax">Max concurrent downloads</label>
+                            <span>How many downloads may run at the same time.</span>
+                        </div>
+                        <input type="number" id="prefMax" min="1">
+                    </div>
+                    <div class="setting-item" data-setting-keywords="theme appearance light dark system color">
+                        <div class="setting-copy">
+                            <label for="prefTheme">Theme</label>
+                            <span>Use a light, dark, or system-matched appearance.</span>
+                        </div>
+                        <select id="prefTheme">
+                            <option value="system">System (follow OS setting)</option>
+                            <option value="light">Light</option>
+                            <option value="dark">Dark</option>
+                        </select>
+                    </div>
+                </section>
+
+                <section id="settings-playback" class="settings-section" data-settings-name="playback" tabindex="-1">
+                    <h2>Playback</h2>
+                    <div class="setting-item" data-setting-keywords="play videos player overlay new browser tab window">
+                        <div class="setting-copy">
+                            <label for="prefPlayer">Play videos in</label>
+                            <span>Choose between the built-in player and a browser tab.</span>
+                        </div>
+                        <select id="prefPlayer">
+                            <option value="overlay">Overlay on this page</option>
+                            <option value="new_tab">New browser tab</option>
+                        </select>
+                    </div>
+                    <div class="setting-item" data-setting-keywords="start videos full screen fullscreen player display">
+                        <div class="setting-copy">
+                            <label for="prefStartFullscreen">Start videos in full screen</label>
+                            <span id="prefStartFullscreenHint">Automatically enter full screen when the built-in player opens.</span>
+                        </div>
+                        <input type="checkbox" id="prefStartFullscreen" aria-describedby="prefStartFullscreenHint">
+                    </div>
+                </section>
+
+                <section id="settings-danger" class="settings-section settings-danger" data-settings-name="danger" tabindex="-1">
+                    <h2>Danger Zone</h2>
+                    <div class="setting-item settings-history-row" data-setting-keywords="clear delete remove download history files completed failed">
+                        <div class="setting-copy">
+                            <strong>Download history</strong>
+                            <span>Remove completed and failed downloads and their files.</span>
+                        </div>
+                        <button class="clear-btn" type="button" onclick="clearHistory()">Clear History</button>
+                    </div>
+                </section>
+
+                <p id="settingsNoResults" class="settings-no-results" role="status" hidden>No settings match your search.</p>
+                <div class="pref-actions">
+                    <button id="saveBtn" type="button" onclick="savePreferences()"><svg class="btn-icon"><use href="#i-save"/></svg><span>Save</span></button>
+                </div>
+            </div>
         </div>
     </section>
 
@@ -314,73 +435,6 @@
             <video id="playerVideo" controls autoplay></video>
         </div>
     </div>
-
-    <dialog id="settingsDialog" class="settings-dialog" aria-labelledby="settingsTitle" aria-modal="true">
-        <div class="settings-dialog-header">
-            <h2 id="settingsTitle">Settings</h2>
-            <button class="settings-close" type="button" onclick="closeSettings()" aria-label="Close settings" autofocus>
-                <svg aria-hidden="true"><use href="#i-x"/></svg>
-            </button>
-        </div>
-        <div class="settings-dialog-body">
-            <div id="settingsError" class="action-error settings-error" role="alert" aria-live="assertive" hidden>
-                <span id="settingsErrorMessage"></span>
-                <button type="button" class="action-error-close" onclick="hideActionError()" aria-label="Dismiss error"><svg width="14" height="14"><use href="#i-x"/></svg></button>
-            </div>
-            <div class="pref-row">
-                <label for="prefDir">Download directory</label>
-                <input type="text" id="prefDir" style="width: 300px;">
-            </div>
-            <div class="pref-row">
-                <label for="prefFormat">Quality</label>
-                <select id="prefFormat" style="width: 320px;">
-                    <option value="bestvideo+bestaudio/best">Best available (video + audio merged)</option>
-                    <option value="best">Best single file (no merge needed)</option>
-                    <option value="bestvideo[height<=2160]+bestaudio/best">Up to 2160p (4K)</option>
-                    <option value="bestvideo[height<=1440]+bestaudio/best">Up to 1440p (2K)</option>
-                    <option value="bestvideo[height<=1080]+bestaudio/best">Up to 1080p (Full HD)</option>
-                    <option value="bestvideo[height<=720]+bestaudio/best">Up to 720p (HD)</option>
-                    <option value="bestvideo[height<=480]+bestaudio/best">Up to 480p (SD)</option>
-                    <option value="worstvideo+worstaudio/worst">Smallest file (lowest quality)</option>
-                    <option value="bestaudio/best">Audio only (best)</option>
-                    <option value="__custom__">Custom (advanced)</option>
-                </select>
-            </div>
-            <div class="pref-row" id="customFormatRow" style="display: none;">
-                <label for="prefFormatCustom">Custom format</label>
-                <input type="text" id="prefFormatCustom" style="width: 320px;" placeholder="e.g. bestvideo[ext=mp4]+bestaudio[ext=m4a]">
-            </div>
-            <div class="pref-row">
-                <label for="prefMax">Max concurrent</label>
-                <input type="number" id="prefMax" min="1" style="width: 80px;">
-            </div>
-            <div class="pref-row">
-                <label for="prefPlayer">Play videos in</label>
-                <select id="prefPlayer" style="width: 320px;">
-                    <option value="overlay">Overlay on this page</option>
-                    <option value="new_tab">New browser tab</option>
-                </select>
-            </div>
-            <div class="pref-row">
-                <label for="prefTheme">Theme</label>
-                <select id="prefTheme" style="width: 320px;">
-                    <option value="system">System (follow OS setting)</option>
-                    <option value="light">Light</option>
-                    <option value="dark">Dark</option>
-                </select>
-            </div>
-            <div class="settings-history-row">
-                <div>
-                    <strong>Download history</strong>
-                    <span>Remove completed and failed downloads and their files.</span>
-                </div>
-                <button class="clear-btn" type="button" onclick="clearHistory()">Clear History</button>
-            </div>
-            <div class="pref-actions">
-                <button id="saveBtn" type="button" onclick="savePreferences()"><svg class="btn-icon"><use href="#i-save"/></svg><span>Save</span></button>
-            </div>
-        </div>
-    </dialog>
 
     <footer id="versionFooter" class="version-footer" data-ui-version="{{ ui_version }}">
         <span id="itemCount">0 items</span><span aria-hidden="true"> · </span><span>UI v{{ ui_version }}</span><span aria-hidden="true"> · </span><span id="apiVersion">API checking…</span>

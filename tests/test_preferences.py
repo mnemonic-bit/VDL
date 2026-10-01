@@ -7,6 +7,20 @@ from tests.support.app_case import AppCase
 
 
 class PreferencesTest(AppCase):
+    def test_fullscreen_preference_is_available_and_persists(self):
+        self.assertEqual(
+            self.client.get("/api/preferences").get_json()["start_fullscreen"],
+            "false",
+        )
+
+        response = self.client.post(
+            "/api/preferences",
+            json={"start_fullscreen": "true"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["start_fullscreen"], "true")
+
     def test_rejects_empty_and_unusable_download_directories(self):
         original = vdl.db_get_preferences()["download_dir"]
         blocking_file = os.path.join(self.temp_dir.name, "not-a-directory")

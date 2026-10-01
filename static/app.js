@@ -155,7 +155,7 @@ function showActionError(message) {
     if (document.getElementById('newDownloadDialog').open) {
         errorId = 'newDownloadError';
         messageId = 'newDownloadErrorMessage';
-    } else if (document.getElementById('settingsDialog').open) {
+    } else if (!document.getElementById('settingsPage').hidden) {
         errorId = 'settingsError';
         messageId = 'settingsErrorMessage';
     } else if (document.getElementById('currentDownloadsDrawer').open) {
@@ -2225,6 +2225,7 @@ function fetchHistory({ sortFavorites = false } = {}) {
 }
 
 let playerMode = 'overlay';
+let startVideosFullscreen = false;
 
 // MIME types for <source type="..."> — tells the browser the codec upfront so
 // it doesn't have to sniff, which is required for WEBM on some browsers.
@@ -2278,6 +2279,19 @@ function playVideo(id, label, ext) {
     video.appendChild(source);
     video.load();
     document.getElementById('playerBackdrop').classList.add('open');
+    if (startVideosFullscreen) {
+        try {
+            if (video.requestFullscreen) {
+                const request = video.requestFullscreen();
+                if (request) request.catch(() => {});
+            } else if (video.webkitEnterFullscreen) {
+                video.webkitEnterFullscreen();
+            }
+        } catch (error) {
+            // Full screen is a browser-controlled enhancement. Playback must
+            // still open when policy or platform support rejects the request.
+        }
+    }
 }
 
 function closePlayer(ev) {
@@ -2306,7 +2320,7 @@ document.addEventListener('keydown', (ev) => {
     } else if (ev.key === 'Escape' && document.getElementById('newDownloadDialog').open) {
         ev.preventDefault();
         closeNewDownload();
-    } else if (ev.key === 'Escape' && document.getElementById('settingsDialog').open) {
+    } else if (ev.key === 'Escape' && !document.getElementById('settingsPage').hidden) {
         ev.preventDefault();
         closeSettings();
     } else if (ev.key === 'Escape' && document.getElementById('currentDownloadsDrawer').open) {
@@ -2340,7 +2354,7 @@ function openNewDownload() {
         // Avoid stacking modal workflows if a paste shortcut is pressed while
         // another dialog has focus; paste within its editable controls remains
         // available through the guard in the keydown handler above.
-        if (document.getElementById('settingsDialog').open
+        if (!document.getElementById('settingsPage').hidden
                 || document.getElementById('currentDownloadsDrawer').open
                 || document.getElementById('playerBackdrop').classList.contains('open')) return;
         newDownloadReturnFocus = document.activeElement;
@@ -2413,30 +2427,94 @@ currentDownloadsDrawer.addEventListener('click', ev => {
     if (outside) closeCurrentDownloads();
 });
 
-let settingsReturnFocus = null;
-
 function openSettings() {
-    const dialog = document.getElementById('settingsDialog');
-    if (dialog.open) return;
-    settingsReturnFocus = document.activeElement;
+    const page = document.getElementById('settingsPage');
+    if (!page.hidden) return;
     closeHistoryInfo();
     closeAllMenus();
     hideActionError();
-    dialog.showModal();
-    document.getElementById('settingsButton').setAttribute('aria-expanded', 'true');
+    document.getElementById('tab-history').hidden = true;
+    page.hidden = false;
+    document.body.classList.add('settings-open');
+    document.getElementById('settingsButton').setAttribute('aria-pressed', 'true');
+    window.scrollTo({ top: 0 });
     loadPreferences();
 }
 
 function closeSettings() {
-    const dialog = document.getElementById('settingsDialog');
-    if (dialog.open) dialog.close();
+    const page = document.getElementById('settingsPage');
+    if (page.hidden) return;
+    page.hidden = true;
+    document.getElementById('tab-history').hidden = false;
+    document.body.classList.remove('settings-open');
+    document.getElementById('settingsButton').setAttribute('aria-pressed', 'false');
+    hideActionError();
+    window.scrollTo({ top: 0 });
+    document.getElementById('settingsButton').focus();
 }
 
-document.getElementById('settingsDialog').addEventListener('close', () => {
-    hideActionError();
-    document.getElementById('settingsButton').setAttribute('aria-expanded', 'false');
-    if (settingsReturnFocus && settingsReturnFocus.isConnected) settingsReturnFocus.focus();
-    settingsReturnFocus = null;
+const settingsSearchInput = document.getElementById('settingsSearchInput');
+const settingsSections = Array.from(document.querySelectorAll('.settings-section'));
+const settingsNavButtons = Array.from(document.querySelectorAll('[data-settings-section]'));
+
+function setActiveSettingsSection(name) {
+    settingsNavButtons.forEach(button => {
+        const active = button.dataset.settingsSection === name;
+        button.classList.toggle('active', active);
+        if (active) button.setAttribute('aria-current', 'page');
+        else button.removeAttribute('aria-current');
+    });
+}
+
+function applySettingsSearch() {
+    const terms = settingsSearchInput.value.toLocaleLowerCase().trim()
+        .split(/\s+/).filter(Boolean);
+    let resultCount = 0;
+    let firstMatchingSection = null;
+
+    settingsSections.forEach(section => {
+        let sectionMatches = 0;
+        section.querySelectorAll('.setting-item').forEach(item => {
+            const searchable = `${item.textContent} ${item.dataset.settingKeywords || ''}`
+                .toLocaleLowerCase();
+            const available = item.dataset.settingAvailable !== 'false';
+            const matches = available && terms.every(term => searchable.includes(term));
+            item.hidden = !matches;
+            if (matches) sectionMatches += 1;
+        });
+        section.hidden = terms.length > 0 && sectionMatches === 0;
+        if (sectionMatches > 0 && firstMatchingSection === null) {
+            firstMatchingSection = section.dataset.settingsName;
+        }
+        resultCount += sectionMatches;
+    });
+
+    document.getElementById('settingsNoResults').hidden = resultCount !== 0;
+    if (terms.length > 0 && firstMatchingSection !== null) {
+        setActiveSettingsSection(firstMatchingSection);
+    }
+}
+
+settingsNavButtons.forEach(button => {
+    button.addEventListener('click', () => {
+        settingsSearchInput.value = '';
+        applySettingsSearch();
+        const name = button.dataset.settingsSection;
+        setActiveSettingsSection(name);
+        document.getElementById(`settings-${name}`).scrollIntoView({
+            behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches
+                ? 'auto' : 'smooth',
+            block: 'start',
+        });
+    });
+});
+
+settingsSearchInput.addEventListener('input', applySettingsSearch);
+settingsSearchInput.addEventListener('keydown', event => {
+    if (event.key !== 'Escape' || !settingsSearchInput.value) return;
+    event.stopPropagation();
+    settingsSearchInput.value = '';
+    applySettingsSearch();
 });
 
 window.addEventListener('resize', closeHistoryInfo);
@@ -2449,7 +2527,8 @@ function isPresetValue(v) {
 function refreshCustomVisibility() {
     const sel = document.getElementById('prefFormat');
     const row = document.getElementById('customFormatRow');
-    row.style.display = sel.value === '__custom__' ? '' : 'none';
+    row.dataset.settingAvailable = String(sel.value === '__custom__');
+    applySettingsSearch();
 }
 
 document.getElementById('prefFormat').addEventListener('change', refreshCustomVisibility);
@@ -2491,6 +2570,9 @@ function loadPreferences() {
 
         playerMode = (p.player_mode === 'new_tab') ? 'new_tab' : 'overlay';
         document.getElementById('prefPlayer').value = playerMode;
+        startVideosFullscreen = p.start_fullscreen === 'true';
+        document.getElementById('prefStartFullscreen').checked = startVideosFullscreen;
+        refreshFullscreenAvailability();
 
         const theme = ['light', 'dark', 'system'].includes(p.theme) ? p.theme : 'system';
         document.getElementById('prefTheme').value = theme;
@@ -2501,6 +2583,19 @@ function loadPreferences() {
 document.getElementById('prefTheme').addEventListener('change', (ev) => {
     applyTheme(ev.target.value);
 });
+
+function refreshFullscreenAvailability() {
+    const overlay = document.getElementById('prefPlayer').value === 'overlay';
+    const checkbox = document.getElementById('prefStartFullscreen');
+    checkbox.disabled = !overlay;
+    document.getElementById('prefStartFullscreenHint').textContent = overlay
+        ? 'Automatically enter full screen when the built-in player opens.'
+        : 'Available when videos play in the overlay on this page.';
+}
+
+document.getElementById('prefPlayer').addEventListener(
+    'change', refreshFullscreenAvailability,
+);
 
 function savePreferences() {
     const sel = document.getElementById('prefFormat');
@@ -2513,6 +2608,8 @@ function savePreferences() {
         format: fmt || 'best',
         max_concurrent: document.getElementById('prefMax').value,
         player_mode: document.getElementById('prefPlayer').value,
+        start_fullscreen: document.getElementById('prefStartFullscreen').checked
+            ? 'true' : 'false',
         theme: document.getElementById('prefTheme').value,
     };
     apiAction('/api/preferences', {
@@ -2521,6 +2618,7 @@ function savePreferences() {
         body: JSON.stringify(body),
     }).then(() => {
         playerMode = body.player_mode;
+        startVideosFullscreen = body.start_fullscreen === 'true';
         applyTheme(body.theme);
         const btn = document.getElementById('saveBtn');
         btn.innerHTML = '<svg class="btn-icon"><use href="#i-check"/></svg><span>Saved</span>';

@@ -59,8 +59,64 @@ test('rejected preferences stay editable and are not displayed as saved', async 
     expect(persisted).toEqual(original);
 
     await seed(page, { id: 'failedpref1', status: 'finished', file: true, name: 'fixture.mp4' });
-    await page.getByRole('button', { name: 'Close settings', exact: true }).click();
+    await page.getByRole('button', { name: 'Back to videos', exact: true }).click();
     await refresh(page);
     await page.locator('[data-row-id="failedpref1"]').getByRole('button', { name: 'Play', exact: true }).click();
     await expect(page.locator('#playerBackdrop')).toHaveClass(/open/);
+});
+
+test('settings sections navigate and search across General and Playback', async ({ page }) => {
+    await page.locator('#settingsButton').click();
+    await expect(page.locator('#tab-history')).toBeHidden();
+    await expect(page.getByRole('heading', { name: 'General', exact: true })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Playback', exact: true })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Danger Zone', exact: true })).toBeVisible();
+
+    await page.getByRole('button', { name: 'Playback', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Playback', exact: true }))
+        .toHaveAttribute('aria-current', 'page');
+
+    await page.getByRole('searchbox', { name: 'Search settings' }).fill('full screen');
+    await expect(page.getByText('Start videos in full screen', { exact: true })).toBeVisible();
+    await expect(page.getByText('Download directory', { exact: true })).toBeHidden();
+    await page.getByRole('searchbox', { name: 'Search settings' }).fill('not a setting');
+    await expect(page.getByText('No settings match your search.')).toBeVisible();
+});
+
+test('Clear History is grouped in the Danger Zone section', async ({ page }) => {
+    await page.locator('#settingsButton').click();
+    const dangerZone = page.locator('#settings-danger');
+
+    await expect(page.locator('#settings-general').getByRole(
+        'button', { name: 'Clear History', exact: true })).toHaveCount(0);
+    await expect(dangerZone.getByRole(
+        'button', { name: 'Clear History', exact: true })).toBeVisible();
+    await page.getByRole('button', { name: 'Danger Zone', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Danger Zone', exact: true }))
+        .toHaveAttribute('aria-current', 'page');
+});
+
+test('saved full-screen playback preference requests full screen for the overlay', async ({ page }) => {
+    await page.addInitScript(() => {
+        HTMLVideoElement.prototype.requestFullscreen = function requestFullscreen() {
+            window.__fullscreenRequestCount = (window.__fullscreenRequestCount || 0) + 1;
+            return Promise.resolve();
+        };
+    });
+    await page.reload();
+    await expect(page.locator('#prefDir')).not.toHaveValue('');
+    await seed(page, { id: 'fullscreen1', status: 'finished', file: true, name: 'fixture.mp4' });
+    await refresh(page);
+
+    await page.locator('#settingsButton').click();
+    await page.locator('#prefStartFullscreen').check();
+    await page.locator('#saveBtn').click();
+    await page.getByRole('button', { name: 'Back to videos', exact: true }).click();
+    await page.locator('[data-row-id="fullscreen1"]')
+        .getByRole('button', { name: 'Play', exact: true }).click();
+
+    await expect(page.locator('#playerBackdrop')).toHaveClass(/open/);
+    expect(await page.evaluate(() => window.__fullscreenRequestCount)).toBe(1);
+    const preferences = await (await page.request.get('/api/preferences')).json();
+    expect(preferences.start_fullscreen).toBe('true');
 });

@@ -81,6 +81,6 @@ test('failed Clear reports the error and preserves History', async ({ page }) =>
     page.once('dialog', dialog => dialog.accept());
     await page.getByRole('button', { name: 'Clear History', exact: true }).click();
     await expect(page.getByText('clear was rejected')).toBeVisible();
-    await page.getByRole('button', { name: 'Close settings', exact: true }).click();
+    await page.getByRole('button', { name: 'Back to videos', exact: true }).click();
     await expect(page.locator('[data-row-id="failclear"]')).toBeVisible();
 });

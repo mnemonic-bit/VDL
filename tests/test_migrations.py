@@ -71,6 +71,7 @@ class SchemaMigrationTest(unittest.TestCase):
                     "format": "best",
                     "max_concurrent": "3",
                     "player_mode": "overlay",
+                    "start_fullscreen": "false",
                     "theme": "dark",
                 })
             finally:

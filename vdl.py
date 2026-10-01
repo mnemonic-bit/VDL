@@ -355,6 +355,7 @@ def init_db():
             "format": "best",
             "max_concurrent": "3",
             "player_mode": "overlay",
+            "start_fullscreen": "false",
             "theme": "system",
         }
         for k, v in defaults.items():
@@ -2475,7 +2476,10 @@ def preferences():
     if request.method == 'GET':
         return jsonify(db_get_preferences())
     data = request.json or {}
-    allowed = {'download_dir', 'format', 'max_concurrent', 'player_mode', 'theme'}
+    allowed = {
+        'download_dir', 'format', 'max_concurrent', 'player_mode',
+        'start_fullscreen', 'theme',
+    }
     updates = {k: v for k, v in data.items() if k in allowed and v is not None}
     if not updates:
         return jsonify({"error": "No valid preference fields provided"}), 400

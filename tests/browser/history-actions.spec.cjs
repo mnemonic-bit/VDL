@@ -9,7 +9,7 @@ async function openInfo(row) {
 
 test.beforeEach(async ({ page }) => reset(page));
 
-test('fixed header opens the full-height Current drawer and Settings dialog', async ({ page }) => {
+test('fixed header opens the Current drawer and full Settings page', async ({ page }) => {
     await seed(page, { id: 'drawer001', status: 'downloading', progress: '25%' });
     await refresh(page);
 
@@ -90,15 +90,15 @@ test('fixed header opens the full-height Current drawer and Settings dialog', as
     await expect(settingsButton).toHaveText('');
     await settingsButton.click();
 
-    const dialog = page.locator('#settingsDialog');
-    await expect(dialog).toBeVisible();
-    expect(await dialog.evaluate(element => element.matches(':modal'))).toBe(true);
-    expect(await dialog.evaluate(element => getComputedStyle(element, '::backdrop').backgroundColor))
-        .not.toBe('rgba(0, 0, 0, 0)');
-    await expect(dialog.getByRole('button', { name: 'Clear History' })).toBeVisible();
-    await expect(dialog.getByRole('button', { name: 'Save', exact: true })).toBeVisible();
-    await dialog.getByRole('button', { name: 'Close settings', exact: true }).click();
-    await expect(dialog).toBeHidden();
+    const settingsPage = page.locator('#settingsPage');
+    await expect(settingsPage).toBeVisible();
+    await expect(page.locator('#tab-history')).toBeHidden();
+    await expect(settingsPage.getByRole('navigation', { name: 'Settings sections' })).toBeVisible();
+    await expect(settingsPage.getByRole('button', { name: 'Clear History' })).toBeVisible();
+    await expect(settingsPage.getByRole('button', { name: 'Save', exact: true })).toBeVisible();
+    await settingsPage.getByRole('button', { name: 'Back to videos', exact: true }).click();
+    await expect(settingsPage).toBeHidden();
+    await expect(page.locator('#tab-history')).toBeVisible();
 });
 
 test('Current downloads button only appears while the drawer has work', async ({ page }) => {
@@ -654,7 +654,7 @@ test('Clear History leaves resumable Current rows intact', async ({ page }) => {
     await page.locator('#settingsButton').click();
     page.once('dialog', dialog => dialog.accept());
     await page.getByRole('button', { name: 'Clear History', exact: true }).click();
-    await page.getByRole('button', { name: 'Close settings', exact: true }).click();
+    await page.getByRole('button', { name: 'Back to videos', exact: true }).click();
     await openCurrent(page);
     await expect(page.locator('[data-row-id="cancelled1"]')).toBeVisible();
 });
