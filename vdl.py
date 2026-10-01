@@ -1,5 +1,10 @@
 import argparse
+import base64
 import gc
+import hashlib
+import hmac
+import io
+import ipaddress
 
 from flask import (
     Flask, Response, abort, g, jsonify, redirect, render_template, request,
@@ -62,6 +67,32 @@ APP_VERSION = _load_app_version()
 # A monotonic clock measures process lifetime without wall-clock corrections
 # making the displayed uptime jump backwards or forwards.
 APP_STARTED_AT = time.monotonic()
+COMPANION_PROTOCOL = 1
+COMPANION_PROTOCOLS = (COMPANION_PROTOCOL,)
+COMPANION_PACKAGE_VERSION = '1.0.0'
+COMPANION_XPI_NAME = 'vdl-companion-firefox.xpi'
+COMPANION_XPI_PATH = (
+    Path(__file__).resolve().parent / 'browser-extension' / 'dist'
+    / COMPANION_XPI_NAME
+)
+COMPANION_XPI_CHECKSUM_PATH = COMPANION_XPI_PATH.with_suffix('.xpi.sha256')
+COMPANION_ENDPOINTS = {
+    'extension_pair', 'extension_status', 'extension_downloads',
+    'extension_token', 'extension_preflight',
+}
+EXTENSION_NO_STORE_ENDPOINTS = COMPANION_ENDPOINTS | {
+    'extension_pairing_codes', 'extension_current_pairing_code',
+    'extension_connections', 'extension_connection',
+}
+
+# Pairing codes deliberately disappear on restart. The bounded rate windows
+# have the same process lifetime and never retain request bodies or credentials.
+_pairing_codes = {}
+_pairing_lock = threading.Lock()
+_companion_rate_lock = threading.Lock()
+_failed_pair_rates = {}
+_failed_pair_global = []
+_token_download_rates = {}
 
 
 def _get_uptime_seconds():
@@ -151,9 +182,37 @@ def _normalized_http_origin(value):
     return parsed.scheme.lower(), parsed.hostname.lower(), port
 
 
+def _is_extension_origin(value):
+    """Accept only Firefox's opaque per-install extension origin."""
+    if not value:
+        return False
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == 'moz-extension'
+        and bool(parsed.hostname)
+        and parsed.username is None
+        and parsed.password is None
+        and port is None
+        and parsed.path in ('', '/')
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
 @app.before_request
 def reject_cross_origin_api_mutation():
     """Keep browser form submissions from mutating the service."""
+    if request.endpoint in COMPANION_ENDPOINTS:
+        origin = request.headers.get('Origin')
+        if origin is not None and not _is_extension_origin(origin):
+            return _companion_error(
+                400, 'invalid_request', 'Invalid extension origin'
+            )
+        return None
     if request.method not in ('POST', 'PUT', 'PATCH', 'DELETE'):
         return None
 
@@ -177,8 +236,12 @@ def require_authenticated_user():
     """Resolve the signed session before any private UI or API is served."""
     # Static styling is needed by the sign-in page, and the data-free health
     # probe must remain available to container runtimes before anyone signs in.
-    if request.endpoint in ('static', 'login', 'health'):
+    if request.endpoint in (
+            'static', 'login', 'health', 'browser_extension_package',
+            *COMPANION_ENDPOINTS):
         return None
+    if request.path.startswith('/browser-extension/'):
+        abort(404)
 
     user_id = session.get('user_id')
     user = db_get_user_by_id(user_id) if user_id is not None else None
@@ -193,6 +256,21 @@ def require_authenticated_user():
     if request.path.startswith('/api/'):
         return jsonify({"error": "Authentication required"}), 401
     return redirect(url_for('login'))
+
+
+@app.after_request
+def companion_response_headers(response):
+    """Apply the narrow CORS and cache boundary to companion responses."""
+    if request.endpoint not in EXTENSION_NO_STORE_ENDPOINTS:
+        return response
+    response.headers['Cache-Control'] = 'no-store'
+    if request.endpoint not in COMPANION_ENDPOINTS:
+        return response
+    origin = request.headers.get('Origin')
+    if origin and _is_extension_origin(origin):
+        response.headers['Access-Control-Allow-Origin'] = origin
+        response.headers.add('Vary', 'Origin')
+    return response
 
 
 def admin_required(view):
@@ -373,6 +451,20 @@ def init_db():
                 download_id TEXT NOT NULL,
                 ingested_at REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS extension_tokens (
+                id                     TEXT PRIMARY KEY,
+                user_id                INTEGER NOT NULL
+                                           REFERENCES users(id) ON DELETE CASCADE,
+                token_verifier         BLOB NOT NULL,
+                device_label           TEXT NOT NULL,
+                extension_version      TEXT NOT NULL,
+                protocol_version       INTEGER NOT NULL,
+                paired_session_version INTEGER NOT NULL,
+                created_at             REAL NOT NULL,
+                last_used_at           REAL
+            );
+            CREATE INDEX IF NOT EXISTS extension_tokens_user_id
+                ON extension_tokens(user_id);
             CREATE INDEX IF NOT EXISTS download_tags_tag_id
                 ON download_tags(tag_id);
             CREATE TRIGGER IF NOT EXISTS delete_unused_tag
@@ -435,9 +527,18 @@ def init_db():
             ("owner_username", "ALTER TABLE downloads ADD COLUMN owner_username TEXT"),
             # Existing shared libraries must remain visible after upgrading.
             ("visibility", "ALTER TABLE downloads ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public' CHECK (visibility IN ('public', 'private'))"),
+            # Browser credentials remain process-only; these fields record only
+            # the download's resume policy and idempotency key.
+            ("browser_authenticated", "ALTER TABLE downloads ADD COLUMN browser_authenticated INTEGER NOT NULL DEFAULT 0"),
+            ("extension_request_id", "ALTER TABLE downloads ADD COLUMN extension_request_id TEXT"),
         ]:
             if col not in existing_cols:
                 conn.execute(ddl)
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS downloads_extension_request "
+            "ON downloads(owner_user_id, extension_request_id) "
+            "WHERE extension_request_id IS NOT NULL"
+        )
 
         existing_user_cols = {
             row["name"] for row in conn.execute("PRAGMA table_info(users)")
@@ -1031,7 +1132,7 @@ def db_list_downloads(user_id=None, is_admin=False):
             "filename, resolution, filesize, speed, eta, title, finished_at, "
             "formats, requested_format, downloaded_bytes, total_bytes, favorite, "
             "view_count, "
-            "source_type, owner_user_id, visibility, "
+            "source_type, owner_user_id, visibility, browser_authenticated, "
             "COALESCE(users.username, downloads.owner_username) "
             "AS downloaded_by "
             "FROM downloads "
@@ -1053,6 +1154,9 @@ def db_list_downloads(user_id=None, is_admin=False):
             )
         for download in downloads:
             download["favorite"] = bool(download["favorite"])
+            download["browser_authenticated"] = bool(
+                download["browser_authenticated"]
+            )
             download["quality"] = classify_video_quality(
                 download["resolution"]
             )
@@ -1155,6 +1259,522 @@ def db_list_users():
         ]
         return [_public_user(_db_user(conn, "id = ?", (user_id,)))
                 for user_id in ids]
+
+
+def _b64url(data):
+    return base64.urlsafe_b64encode(data).decode('ascii').rstrip('=')
+
+
+def _credential_verifier(value):
+    key = str(app.secret_key).encode('utf-8')
+    return hmac.new(key, value.encode('utf-8'), hashlib.sha256).digest()
+
+
+def _companion_error(status, code, message):
+    response = jsonify({'error': message, 'code': code})
+    response.headers['Cache-Control'] = 'no-store'
+    return response, status
+
+
+def _bundled_extension():
+    """Return verified package metadata without trusting a mutable artifact."""
+    try:
+        expected_line = COMPANION_XPI_CHECKSUM_PATH.read_text(
+            encoding='ascii'
+        ).strip()
+        expected, filename = expected_line.split(None, 1)
+        filename = filename.lstrip('*')
+        if (not re.fullmatch(r'[0-9a-f]{64}', expected)
+                or filename != COMPANION_XPI_NAME):
+            return None
+        actual = hashlib.sha256(COMPANION_XPI_PATH.read_bytes()).hexdigest()
+    except (OSError, ValueError):
+        return None
+    if not hmac.compare_digest(actual, expected):
+        return None
+    return {
+        'version': COMPANION_PACKAGE_VERSION,
+        'url': '/browser-extension/vdl-companion-firefox.xpi',
+        'sha256': actual,
+    }
+
+
+def _validated_device_label(value):
+    if not isinstance(value, str):
+        raise ValueError('Device label is required')
+    label = unicodedata.normalize('NFC', value).strip()
+    if (not 1 <= len(label) <= 80
+            or any(unicodedata.category(char).startswith('C') for char in label)):
+        raise ValueError('Device label must contain 1 to 80 visible characters')
+    return label
+
+
+def _validated_extension_version(value):
+    if (not isinstance(value, str) or not value or len(value) > 64
+            or not re.fullmatch(r'[0-9A-Za-z][0-9A-Za-z.+-]*', value)):
+        raise ValueError('Invalid extension version')
+    return value
+
+
+def _companion_protocol_error():
+    package = _bundled_extension()
+    return jsonify({
+        'error': 'Companion update required',
+        'code': 'incompatible_protocol',
+        'supported_protocols': list(COMPANION_PROTOCOLS),
+        'extension_url': (
+            package['url'] if package else
+            '/browser-extension/vdl-companion-firefox.xpi'
+        ),
+    }), 426
+
+
+def _require_companion_protocol():
+    raw = request.headers.get('X-VDL-Companion-Protocol')
+    if raw != str(COMPANION_PROTOCOL):
+        return _companion_protocol_error()
+    try:
+        _validated_extension_version(
+            request.headers.get('X-VDL-Companion-Version')
+        )
+    except ValueError:
+        return _companion_error(
+            400, 'invalid_request', 'Invalid companion version header'
+        )
+    return None
+
+
+def _read_json_body(limit, *, require_length=False):
+    """Enforce route limits before Flask is allowed to decode JSON."""
+    if request.mimetype != 'application/json':
+        return None, _companion_error(
+            415, 'unsupported_media_type', 'Content-Type must be application/json'
+        )
+    if require_length and request.content_length is None:
+        return None, _companion_error(
+            400, 'invalid_request', 'Content-Length is required'
+        )
+    if request.content_length is not None and request.content_length > limit:
+        return None, _companion_error(
+            413, 'request_too_large', 'Request body is too large'
+        )
+    raw = request.get_data(cache=True)
+    if len(raw) > limit:
+        return None, _companion_error(
+            413, 'request_too_large', 'Request body is too large'
+        )
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError, UnicodeDecodeError):
+        return None, _companion_error(400, 'invalid_request', 'Invalid JSON request')
+    if not isinstance(data, dict):
+        return None, _companion_error(400, 'invalid_request', 'A JSON object is required')
+    return data, None
+
+
+def _prune_rate_window(values, now, seconds=60):
+    cutoff = now - seconds
+    return [timestamp for timestamp in values if timestamp > cutoff]
+
+
+def _failed_pair_rate_limited(remote_addr):
+    now = time.time()
+    key = remote_addr or ''
+    with _companion_rate_lock:
+        global _failed_pair_global
+        _failed_pair_global = _prune_rate_window(_failed_pair_global, now)
+        values = _prune_rate_window(_failed_pair_rates.get(key, []), now)
+        _failed_pair_rates[key] = values
+        return len(values) >= 10 or len(_failed_pair_global) >= 60
+
+
+def _record_failed_pair(remote_addr):
+    now = time.time()
+    key = remote_addr or ''
+    with _companion_rate_lock:
+        global _failed_pair_global
+        _failed_pair_global = _prune_rate_window(_failed_pair_global, now)
+        values = _prune_rate_window(_failed_pair_rates.get(key, []), now)
+        values.append(now)
+        _failed_pair_rates[key] = values
+        _failed_pair_global.append(now)
+        # An attacker can vary addresses, so retain only currently live keys.
+        if len(_failed_pair_rates) > 1024:
+            stale = [item for item, stamps in _failed_pair_rates.items()
+                     if not _prune_rate_window(stamps, now)]
+            for item in stale[:len(_failed_pair_rates) - 1024]:
+                _failed_pair_rates.pop(item, None)
+            while len(_failed_pair_rates) > 1024:
+                _failed_pair_rates.pop(next(iter(_failed_pair_rates)))
+
+
+def _token_rate_limited(token_id, request_id):
+    now = time.time()
+    with _companion_rate_lock:
+        values = [
+            (seen_id, timestamp)
+            for seen_id, timestamp in _token_download_rates.get(token_id, [])
+            if timestamp > now - 60
+        ]
+        if any(seen_id == request_id for seen_id, _timestamp in values):
+            _token_download_rates[token_id] = values
+            return False
+        if len(values) >= 10:
+            _token_download_rates[token_id] = values
+            return True
+        values.append((request_id, now))
+        _token_download_rates[token_id] = values
+        while len(_token_download_rates) > 4096:
+            _token_download_rates.pop(next(iter(_token_download_rates)))
+        return False
+
+
+def _new_pairing_code(user_id):
+    raw = 'VDL1-' + _b64url(secrets.token_bytes(16))
+    now = time.time()
+    record = {
+        'verifier': _credential_verifier(raw),
+        'user_id': user_id,
+        'created_at': now,
+        'expires_at': now + 300,
+    }
+    with _pairing_lock:
+        _pairing_codes[user_id] = record
+    return raw, record['expires_at']
+
+
+def _consume_pairing_code(code):
+    if (not isinstance(code, str)
+            or not re.fullmatch(r'VDL1-[A-Za-z0-9_-]{22}', code)):
+        return None
+    verifier = _credential_verifier(code)
+    now = time.time()
+    with _pairing_lock:
+        matched_user_id = None
+        for user_id, record in list(_pairing_codes.items()):
+            if record['expires_at'] <= now:
+                _pairing_codes.pop(user_id, None)
+                continue
+            if hmac.compare_digest(record['verifier'], verifier):
+                matched_user_id = user_id
+        if matched_user_id is None:
+            return None
+        # Consume before the database write so even a lost/error response can
+        # never replay the credential.
+        _pairing_codes.pop(matched_user_id, None)
+        return matched_user_id
+
+
+def _new_companion_token(user, device_label, extension_version):
+    token_id = _b64url(secrets.token_bytes(16))
+    token = f'vdlx_{token_id}.{_b64url(secrets.token_bytes(32))}'
+    with _db_lock, db() as conn:
+        conn.execute(
+            "INSERT INTO extension_tokens("
+            "id, user_id, token_verifier, device_label, extension_version, "
+            "protocol_version, paired_session_version, created_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                token_id, user['id'], _credential_verifier(token),
+                device_label, extension_version, COMPANION_PROTOCOL,
+                user['session_version'], time.time(),
+            ),
+        )
+    return token_id, token
+
+
+def _companion_authenticate():
+    header = request.headers.get('Authorization', '')
+    match = re.fullmatch(
+        r'Bearer (vdlx_([A-Za-z0-9_-]{22})\.[A-Za-z0-9_-]{43})', header
+    )
+    if match is None:
+        return None
+    token, token_id = match.groups()
+    with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM extension_tokens WHERE id = ?", (token_id,)
+        ).fetchone()
+    if row is None or not hmac.compare_digest(
+            bytes(row['token_verifier']), _credential_verifier(token)):
+        return None
+    user = db_get_user_by_id(row['user_id'])
+    if (user is None or user['suspended'] or user['password_hash'] is None
+            or user['session_version'] != row['paired_session_version']):
+        return None
+
+    now = time.time()
+    reported_version = request.headers.get('X-VDL-Companion-Version')
+    if row['last_used_at'] is None or row['last_used_at'] <= now - 300:
+        try:
+            version = _validated_extension_version(reported_version)
+        except ValueError:
+            version = row['extension_version']
+        with _db_lock, db() as conn:
+            conn.execute(
+                "UPDATE extension_tokens SET last_used_at = ?, "
+                "extension_version = ? WHERE id = ?",
+                (now, version, token_id),
+            )
+    return {'id': token_id, 'user': user}
+
+
+def _canonical_page_url(value):
+    if (not isinstance(value, str) or len(value.encode('utf-8')) > 8192
+            or any(ord(character) < 32 or ord(character) == 127
+                   for character in value)):
+        raise ValueError('Invalid page URL')
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+        hostname = parsed.hostname
+    except (ValueError, UnicodeError) as exc:
+        raise ValueError('Invalid page URL') from exc
+    if (parsed.scheme.lower() not in ('http', 'https') or not hostname
+            or parsed.username is not None or parsed.password is not None):
+        raise ValueError('Invalid page URL')
+    try:
+        ascii_host = hostname.encode('idna').decode('ascii').lower()
+    except UnicodeError as exc:
+        raise ValueError('Invalid page URL') from exc
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError('Invalid page URL')
+    if ':' in ascii_host and not ascii_host.startswith('['):
+        display_host = f'[{ascii_host}]'
+    else:
+        display_host = ascii_host
+    default_port = 443 if parsed.scheme.lower() == 'https' else 80
+    authority = display_host + (f':{port}' if port and port != default_port else '')
+    path = parsed.path or '/'
+    return f'{parsed.scheme.lower()}://{authority}{path}' + (
+        f'?{parsed.query}' if parsed.query else ''
+    )
+
+
+def _cookie_string(value, field, maximum, *, allow_empty=False, ascii_only=False):
+    if not isinstance(value, str) or (not value and not allow_empty):
+        raise ValueError(f'Invalid cookie {field}')
+    try:
+        encoded = value.encode('ascii' if ascii_only else 'utf-8')
+    except UnicodeError as exc:
+        raise ValueError(f'Invalid cookie {field}') from exc
+    if len(encoded) > maximum or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError(f'Invalid cookie {field}')
+    return value
+
+
+def _domain_matches(hostname, domain, host_only):
+    try:
+        host_ip = ipaddress.ip_address(hostname)
+    except ValueError:
+        host_ip = None
+    try:
+        domain_ip = ipaddress.ip_address(domain)
+    except ValueError:
+        domain_ip = None
+    if host_ip is not None or domain_ip is not None:
+        return host_ip is not None and domain_ip is not None and host_ip == domain_ip
+    return domain == hostname if host_only else (
+        domain == hostname or hostname.endswith('.' + domain)
+    )
+
+
+def _cookie_path_matches(request_path, cookie_path):
+    return (
+        cookie_path == request_path
+        or (
+            request_path.startswith(cookie_path)
+            and (cookie_path.endswith('/') or request_path[len(cookie_path):].startswith('/'))
+        )
+    )
+
+
+def _validated_cookies(value, canonical_url):
+    if not isinstance(value, list) or len(value) > 300:
+        raise ValueError('Invalid cookies')
+    parsed = urlsplit(canonical_url)
+    hostname = parsed.hostname
+    request_path = parsed.path or '/'
+    allowed = {
+        'name', 'value', 'domain', 'host_only', 'path', 'secure',
+        'http_only', 'expires',
+    }
+    result = []
+    seen = set()
+    now = time.time()
+    for item in value:
+        if not isinstance(item, dict) or set(item) != allowed:
+            raise ValueError('Invalid cookie fields')
+        name = _cookie_string(item['name'], 'name', 256)
+        cookie_value = _cookie_string(
+            item['value'], 'value', 16384, allow_empty=True
+        )
+        raw_domain = _cookie_string(
+            item['domain'], 'domain', 253, ascii_only=True
+        ).lower()
+        domain = raw_domain[1:] if raw_domain.startswith('.') else raw_domain
+        path = _cookie_string(item['path'], 'path', 2048)
+        if (not domain or domain.startswith('.') or not path.startswith('/')
+                or any(character in domain for character in '/\\@[]')):
+            raise ValueError('Invalid cookie scope')
+        try:
+            domain_ip = ipaddress.ip_address(domain)
+        except ValueError:
+            domain_ip = None
+        if domain_ip is None and (
+                any(not label or len(label) > 63
+                    or label.startswith('-') or label.endswith('-')
+                    or not re.fullmatch(r'[a-z0-9-]+', label)
+                    for label in domain.rstrip('.').split('.'))
+                or domain.endswith('.')):
+            raise ValueError('Invalid cookie scope')
+        for boolean in ('host_only', 'secure', 'http_only'):
+            if not isinstance(item[boolean], bool):
+                raise ValueError(f'Invalid cookie {boolean}')
+        if not _domain_matches(hostname, domain, item['host_only']):
+            raise ValueError('Cookie domain does not match page URL')
+        if not _cookie_path_matches(request_path, path):
+            raise ValueError('Cookie path does not match page URL')
+        if item['secure'] and parsed.scheme != 'https':
+            raise ValueError('Secure cookie requires HTTPS')
+        expires = item['expires']
+        if expires is not None:
+            if isinstance(expires, bool) or not isinstance(expires, int):
+                raise ValueError('Invalid cookie expiry')
+            try:
+                time.localtime(expires)
+            except (OverflowError, OSError, ValueError) as exc:
+                raise ValueError('Invalid cookie expiry') from exc
+            if expires <= now:
+                raise ValueError('Cookie has expired')
+        key = (domain, path, name)
+        if key in seen:
+            raise ValueError('Duplicate cookie')
+        seen.add(key)
+        result.append({
+            'name': name, 'value': cookie_value, 'domain': domain,
+            'host_only': item['host_only'], 'path': path,
+            'secure': item['secure'], 'http_only': item['http_only'],
+            'expires': expires,
+        })
+    return result
+
+
+class RewindingCookieBuffer(io.StringIO):
+    """Keep yt-dlp's refreshed cookie jar readable by its next context."""
+    def truncate(self, size=None):
+        result = super().truncate(0 if size is None else size)
+        if size in (None, 0):
+            self.seek(0)
+        return result
+
+
+def _cookies_to_netscape(cookies):
+    lines = ['# Netscape HTTP Cookie File']
+    for cookie in cookies:
+        domain = cookie['domain'] if cookie['host_only'] else '.' + cookie['domain']
+        if cookie['http_only']:
+            domain = '#HttpOnly_' + domain
+        lines.append('\t'.join((
+            domain,
+            'FALSE' if cookie['host_only'] else 'TRUE',
+            cookie['path'],
+            'TRUE' if cookie['secure'] else 'FALSE',
+            str(cookie['expires'] or 0),
+            cookie['name'],
+            cookie['value'],
+        )))
+    return RewindingCookieBuffer('\n'.join(lines) + '\n')
+
+
+def _redact_sensitive_text(value, secrets_to_hide=()):
+    text = str(value)
+    for secret in secrets_to_hide:
+        if secret:
+            text = text.replace(secret, '<redacted>')
+    text = re.sub(r'(https?://[^\s?#]+)\?[^\s#]*', r'\1?<redacted>', text)
+    text = re.sub(r'(https?://[^\s#]+)#[^\s]*', r'\1', text)
+    text = re.sub(r'(?i)(authorization\s*[:=]\s*)([^\s,;]+)', r'\1<redacted>', text)
+    return text
+
+
+class _RedactingYtdlpLogger:
+    def __init__(self, sensitive_values):
+        self._sensitive_values = tuple(sensitive_values)
+
+    def debug(self, message):
+        pass
+
+    def warning(self, message):
+        pass
+
+    def error(self, message):
+        # DownloadError remains the authoritative user-visible failure; this
+        # sink prevents yt-dlp from independently emitting credential text.
+        _redact_sensitive_text(message, self._sensitive_values)
+
+
+def _resolve_companion_download(user, request_id, canonical_url):
+    """Resolve idempotency, dedupe, resume, or insert under one transaction."""
+    with _db_lock, db() as conn:
+        row = conn.execute(
+            "SELECT id, url, status, visibility FROM downloads "
+            "WHERE owner_user_id = ? AND extension_request_id = ?",
+            (user['id'], request_id),
+        ).fetchone()
+        if row is not None:
+            if row['url'] != canonical_url:
+                return None, 'conflict', None
+            return dict(row), 'existing', None
+
+        row = conn.execute(
+            "SELECT id, url, status, visibility FROM downloads "
+            "WHERE owner_user_id = ? AND browser_authenticated = 1 "
+            "AND url = ? AND status IN ('starting', 'downloading', 'paused') "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            (user['id'], canonical_url),
+        ).fetchone()
+        if row is not None:
+            return dict(row), 'already_active', None
+
+        row = conn.execute(
+            "SELECT id, url, status, visibility FROM downloads "
+            "WHERE owner_user_id = ? AND browser_authenticated = 1 "
+            "AND url = ? AND status IN ('cancelled', 'interrupted') "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            (user['id'], canonical_url),
+        ).fetchone()
+        if row is not None:
+            conn.execute(
+                "UPDATE downloads SET status = 'starting', progress = '0%', "
+                "extension_request_id = ? WHERE id = ?",
+                (request_id, row['id']),
+            )
+            result = dict(row)
+            result['status'] = 'starting'
+            return result, 'resumed', 'update'
+
+        while True:
+            download_id = str(uuid.uuid4())[:8]
+            if conn.execute(
+                    "SELECT 1 FROM downloads WHERE id = ?", (download_id,)
+            ).fetchone() is None:
+                break
+        conn.execute(
+            "INSERT INTO downloads("
+            "id, url, status, progress, created_at, owner_user_id, "
+            "owner_username, visibility, browser_authenticated, "
+            "extension_request_id"
+            ") VALUES (?, ?, 'starting', '0%', ?, ?, ?, 'private', 1, ?)",
+            (
+                download_id, canonical_url, time.time(), user['id'],
+                user['username'], request_id,
+            ),
+        )
+        return {
+            'id': download_id, 'url': canonical_url, 'status': 'starting',
+            'visibility': 'private',
+        }, 'started', 'insert'
 
 
 def _validated_username(value):
@@ -1825,11 +2445,11 @@ def _validated_custom_filename(value):
     return stem
 
 
-def background_download(url, download_id):
+def background_download(url, download_id, cookie_bundle=None):
     with _worker_condition:
         _live_worker_ids.add(download_id)
     try:
-        return _background_download(url, download_id)
+        return _background_download(url, download_id, cookie_bundle)
     finally:
         # Fragment downloaders can retain their locked destination stream in a
         # progress-hook reference cycle when cancellation skips normal cleanup.
@@ -1840,7 +2460,14 @@ def background_download(url, download_id):
             _worker_condition.notify_all()
 
 
-def _background_download(url, download_id):
+def _background_download(url, download_id, cookie_bundle=None):
+    sensitive_values = tuple(
+        secret
+        for cookie in (cookie_bundle or ()) if isinstance(cookie, dict)
+        for secret in (cookie.get('name', ''), cookie.get('value', ''))
+        if secret
+    )
+    cookie_buffer = None
     prefs = db_get_preferences()
     output_dir = prefs.get("download_dir", ".")
     try:
@@ -1906,7 +2533,16 @@ def _background_download(url, download_id):
             options['postprocessors'] = [
                 {'key': 'FFmpegExtractAudio', 'preferredcodec': 'm4a'},
             ]
-        return yt_dlp_options(options)
+        return with_cookie_options(options)
+
+    def with_cookie_options(options):
+        # Add the live secret only after the deployment helper's deep copy.
+        merged = yt_dlp_options(options)
+        if cookie_buffer is not None:
+            cookie_buffer.seek(0)
+            merged['cookiefile'] = cookie_buffer
+            merged['logger'] = _RedactingYtdlpLogger(sensitive_values)
+        return merged
 
     # Persist the yt-dlp format selector that we're about to use, so the
     # History tab can show *what was asked for* whenever a download fails
@@ -1922,6 +2558,21 @@ def _background_download(url, download_id):
         clear_cancel(download_id)
         clear_pause(download_id)
         return
+
+    if cookie_bundle is not None:
+        try:
+            cookie_buffer = _cookies_to_netscape(cookie_bundle)
+            cookie_bundle = None
+        except Exception as exc:
+            db_update_download(
+                download_id, status='error',
+                progress=_redact_sensitive_text(exc, sensitive_values),
+                finished_at=time.time(),
+            )
+            clear_cancel(download_id)
+            clear_pause(download_id)
+            _release_worker_slot()
+            return
 
     # A Continue action starts a new worker, so its in-memory filter is gone.
     # The last persisted ETA is a much safer baseline than yt-dlp's first
@@ -1945,7 +2596,7 @@ def _background_download(url, download_id):
         if is_cancel_requested(download_id):
             raise DownloadCancelled()
         try:
-            probe_opts = yt_dlp_options({
+            probe_opts = with_cookie_options({
                 'quiet': True,
                 'noprogress': True,
                 'skip_download': True,
@@ -2050,10 +2701,20 @@ def _background_download(url, download_id):
         if is_cancel_requested(download_id):
             db_update_download(download_id, status='cancelled', finished_at=time.time())
         else:
-            db_update_download(download_id, status='error', progress=str(e), finished_at=time.time())
+            db_update_download(
+                download_id, status='error',
+                progress=_redact_sensitive_text(e, sensitive_values),
+                finished_at=time.time(),
+            )
     except Exception as e:
-        db_update_download(download_id, status='error', progress=str(e), finished_at=time.time())
+        db_update_download(
+            download_id, status='error',
+            progress=_redact_sensitive_text(e, sensitive_values),
+            finished_at=time.time(),
+        )
     finally:
+        if cookie_buffer is not None:
+            cookie_buffer.close()
         clear_cancel(download_id)
         clear_pause(download_id)
         _clear_progress_estimate(download_id)
@@ -2645,6 +3306,243 @@ def index():
     return response
 
 
+@app.route('/browser-extension/vdl-companion-firefox.xpi', methods=['GET'])
+def browser_extension_package():
+    package = _bundled_extension()
+    if package is None:
+        return _companion_error(
+            500, 'extension_package_unavailable',
+            'Browser extension package is unavailable',
+        )
+    response = send_file(
+        COMPANION_XPI_PATH,
+        mimetype='application/x-xpinstall',
+        as_attachment=False,
+        download_name=COMPANION_XPI_NAME,
+        conditional=False,
+    )
+    response.headers['Content-Disposition'] = (
+        f'inline; filename="{COMPANION_XPI_NAME}"'
+    )
+    response.headers['Cache-Control'] = 'no-store'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    return response
+
+
+@app.route('/api/extension/pairing-codes', methods=['POST'])
+def extension_pairing_codes():
+    code, expires_at = _new_pairing_code(g.current_user['id'])
+    response = jsonify({'code': code, 'expires_at': int(expires_at)})
+    response.headers['Cache-Control'] = 'no-store'
+    return response, 201
+
+
+@app.route('/api/extension/pairing-codes/current', methods=['DELETE'])
+def extension_current_pairing_code():
+    with _pairing_lock:
+        _pairing_codes.pop(g.current_user['id'], None)
+    return '', 204
+
+
+@app.route('/api/extension/connections', methods=['GET'])
+def extension_connections():
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT id, device_label, extension_version, protocol_version, "
+            "created_at, last_used_at FROM extension_tokens "
+            "WHERE user_id = ? AND paired_session_version = ? "
+            "ORDER BY created_at DESC",
+            (g.current_user['id'], g.current_user['session_version']),
+        ).fetchall()
+    response = jsonify({
+        'connections': [dict(row) for row in rows],
+        'bundled_extension': _bundled_extension(),
+    })
+    response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+@app.route('/api/extension/connections/<connection_id>', methods=['DELETE'])
+def extension_connection(connection_id):
+    with _db_lock, db() as conn:
+        cursor = conn.execute(
+            "DELETE FROM extension_tokens WHERE id = ? AND user_id = ?",
+            (connection_id, g.current_user['id']),
+        )
+        removed = cursor.rowcount == 1
+    if not removed:
+        return jsonify({'error': 'Unknown companion connection'}), 404
+    return '', 204
+
+
+def _companion_preflight(method):
+    origin = request.headers.get('Origin')
+    if not _is_extension_origin(origin):
+        return _companion_error(400, 'invalid_request', 'Invalid extension origin')
+    response = app.make_response(('', 204))
+    response.headers['Access-Control-Allow-Methods'] = method
+    response.headers['Access-Control-Allow-Headers'] = (
+        'Authorization, Content-Type, X-VDL-Companion-Protocol, '
+        'X-VDL-Companion-Version'
+    )
+    response.headers['Access-Control-Max-Age'] = '600'
+    if request.headers.get(
+            'Access-Control-Request-Private-Network', ''
+    ).lower() == 'true':
+        response.headers['Access-Control-Allow-Private-Network'] = 'true'
+    return response
+
+
+@app.route('/api/extension/pair', methods=['POST', 'OPTIONS'])
+def extension_pair():
+    if request.method == 'OPTIONS':
+        return _companion_preflight('POST')
+    protocol_error = _require_companion_protocol()
+    if protocol_error:
+        return protocol_error
+    if _failed_pair_rate_limited(request.remote_addr):
+        return _companion_error(429, 'rate_limited', 'Try pairing again later')
+    data, error = _read_json_body(16 * 1024)
+    if error:
+        return error
+    if set(data) != {
+        'code', 'device_label', 'extension_version', 'protocol_version',
+    }:
+        _record_failed_pair(request.remote_addr)
+        return _companion_error(400, 'invalid_request', 'Invalid pairing request')
+    if data.get('protocol_version') != COMPANION_PROTOCOL:
+        return _companion_protocol_error()
+    try:
+        label = _validated_device_label(data.get('device_label'))
+        extension_version = _validated_extension_version(
+            data.get('extension_version')
+        )
+        if extension_version != request.headers.get('X-VDL-Companion-Version'):
+            raise ValueError
+    except ValueError:
+        _record_failed_pair(request.remote_addr)
+        return _companion_error(400, 'invalid_request', 'Invalid pairing request')
+
+    user_id = _consume_pairing_code(data.get('code'))
+    user = db_get_user_by_id(user_id) if user_id is not None else None
+    if (user is None or user['suspended'] or user['password_hash'] is None):
+        _record_failed_pair(request.remote_addr)
+        return _companion_error(
+            401, 'companion_auth_failed', 'Companion authentication failed'
+        )
+    token_id, token = _new_companion_token(user, label, extension_version)
+    return jsonify({
+        'token': token,
+        'connection_id': token_id,
+        'user': {'username': user['username']},
+        'protocol_version': COMPANION_PROTOCOL,
+        'server_version': APP_VERSION,
+        'bundled_extension_version': COMPANION_PACKAGE_VERSION,
+    }), 201
+
+
+@app.route('/api/extension/status', methods=['GET', 'OPTIONS'])
+def extension_status():
+    if request.method == 'OPTIONS':
+        return _companion_preflight('GET')
+    protocol_error = _require_companion_protocol()
+    if protocol_error:
+        return protocol_error
+    auth = _companion_authenticate()
+    if auth is None:
+        return _companion_error(
+            401, 'companion_auth_failed', 'Companion authentication failed'
+        )
+    return jsonify({
+        'paired': True,
+        'user': {'username': auth['user']['username']},
+        'protocol_version': COMPANION_PROTOCOL,
+        'server_version': APP_VERSION,
+        'bundled_extension': _bundled_extension(),
+    })
+
+
+@app.route('/api/extension/downloads', methods=['POST', 'OPTIONS'])
+def extension_downloads():
+    if request.method == 'OPTIONS':
+        return _companion_preflight('POST')
+    protocol_error = _require_companion_protocol()
+    if protocol_error:
+        return protocol_error
+    auth = _companion_authenticate()
+    if auth is None:
+        return _companion_error(
+            401, 'companion_auth_failed', 'Companion authentication failed'
+        )
+    data, error = _read_json_body(256 * 1024, require_length=True)
+    if error:
+        return error
+    if set(data) != {
+        'schema', 'request_id', 'page_url', 'captured_at', 'cookies',
+    } or data.get('schema') != 1:
+        return _companion_error(400, 'invalid_request', 'Invalid download request')
+    request_id = data.get('request_id')
+    try:
+        parsed_id = uuid.UUID(request_id)
+        if (str(parsed_id) != request_id or parsed_id.version != 4):
+            raise ValueError
+        captured_at = data.get('captured_at')
+        if (isinstance(captured_at, bool) or not isinstance(captured_at, int)
+                or captured_at < 0 or abs(time.time() - captured_at) > 600):
+            raise ValueError
+        canonical_url = _canonical_page_url(data.get('page_url'))
+        cookies = _validated_cookies(data.get('cookies'), canonical_url)
+    except (TypeError, ValueError):
+        return _companion_error(400, 'invalid_request', 'Invalid download request')
+
+    if _token_rate_limited(auth['id'], request_id):
+        return _companion_error(429, 'rate_limited', 'Try downloading again later')
+    row, action, event_reason = _resolve_companion_download(
+        auth['user'], request_id, canonical_url
+    )
+    if action == 'conflict':
+        return _companion_error(
+            409, 'request_id_conflict',
+            'Request ID was already used for another URL',
+        )
+    if event_reason:
+        event_bus.publish('change', {'reason': event_reason, 'id': row['id']})
+    if action in ('started', 'resumed'):
+        with _cancel_lock:
+            _cancel_flags.pop(row['id'], None)
+            _pause_flags.pop(row['id'], None)
+        thread = threading.Thread(
+            target=background_download,
+            args=(canonical_url, row['id'], cookies),
+            daemon=True,
+        )
+        thread.start()
+    response_action = 'already_active' if action in ('existing', 'already_active') else action
+    return jsonify({
+        'id': row['id'],
+        'action': response_action,
+        'status': row['status'],
+        'visibility': row['visibility'],
+    }), (201 if action == 'started' else 200)
+
+
+@app.route('/api/extension/token', methods=['DELETE', 'OPTIONS'])
+def extension_token():
+    if request.method == 'OPTIONS':
+        return _companion_preflight('DELETE')
+    protocol_error = _require_companion_protocol()
+    if protocol_error:
+        return protocol_error
+    auth = _companion_authenticate()
+    if auth is None:
+        return _companion_error(
+            401, 'companion_auth_failed', 'Companion authentication failed'
+        )
+    with _db_lock, db() as conn:
+        conn.execute("DELETE FROM extension_tokens WHERE id = ?", (auth['id'],))
+    return '', 204
+
+
 @app.route('/api/users', methods=['GET', 'POST'])
 @admin_required
 def users():
@@ -3056,6 +3954,11 @@ def resume_download(download_id):
         return jsonify({"error": "Unknown download id"}), 404
     if entry['status'] not in ('cancelled', 'interrupted'):
         return jsonify({"error": f"Cannot resume from status '{entry['status']}'"}), 409
+    if entry.get('browser_authenticated'):
+        return jsonify({
+            "error": "Fresh browser cookies are required; re-send this page from Firefox",
+            "code": "fresh_browser_cookies_required",
+        }), 409
 
     # The conditional write is the ownership hand-off: only its winner may
     # clear stale cancellation state and touch the shared partial files.

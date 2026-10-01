@@ -1182,6 +1182,7 @@ function renameCancel(id) {
 }
 
 function renameCommit(id) {
+    const keepInfoOpen = openInfoId === String(id);
     const wrap = document.querySelector(`.rename-wrap[data-rename-id="${id}"]`);
     if (!wrap) { renameDrafts.delete(id); return; }
     const input = wrap.querySelector('.rename-input');
@@ -1210,7 +1211,14 @@ function renameCommit(id) {
             return;
         }
         renameDrafts.delete(id);
-        fetchHistory();
+        fetchHistory().then(() => {
+            // The rename response and its SSE signal can reconcile in either
+            // order. Preserve the dialog the user was actively editing.
+            if (keepInfoOpen) {
+                openInfoId = String(id);
+                positionHistoryInfo(openInfoId);
+            }
+        });
     }).catch((err) => {
         alert('Rename failed: ' + err);
         input.disabled = false;
@@ -2055,6 +2063,9 @@ function renderItem(info, inHistoryView = false) {
         primary = `<button class="stop-btn icon-only" onclick="stopDownload('${id}')" aria-label="Stop" title="Stop">${renderActionProgressIcon('i-pause', info)}</button>`;
     } else if (isPaused) {
         primary = `<button class="continue-btn" onclick="unpauseDownload('${id}')">${renderActionProgressIcon('i-play', info)}Resume</button>`;
+    } else if (!isUpload && info.browser_authenticated
+            && (isCancelled || info.status === 'interrupted')) {
+        primary = '<span class="firefox-resend" title="Open the source page while signed in, then click the VDL Companion toolbar action.">Re-send from Firefox</span>';
     } else if (!isUpload && (isCancelled || info.status === 'interrupted')) {
         primary = `<button class="continue-btn icon-only" data-url-action="continue" data-download-id="${id}" ${urlData} aria-label="Continue" title="Continue">${renderActionProgressIcon('i-play', info)}</button>`;
     }
@@ -2187,8 +2198,11 @@ function renderItem(info, inHistoryView = false) {
         const base = info.filename.split('/').pop().split('\\').pop();
         displayTitle = base.replace(/\.[^.]+$/, '');
     }
+    const authenticatedLabel = info.browser_authenticated
+        ? '<span class="firefox-session-label">Firefox session</span>'
+        : '';
     const titleRow = displayTitle
-        ? `<div class="item-title" title="${escapeAttr(displayTitle)}">${escapeHtml(displayTitle)}</div>`
+        ? `<div class="item-title" title="${escapeAttr(displayTitle)}">${escapeHtml(displayTitle)}${authenticatedLabel}</div>`
         : '';
     const tagRow = renderTagControl(info);
 
@@ -2672,6 +2686,7 @@ function openSettings() {
     settingsOpenPromise = Promise.allSettled([
         loadPreferences(),
         loadUsers(),
+        loadExtensionConnections(),
     ]).then(() => {
         document.getElementById('tab-history').hidden = true;
         page.hidden = false;
@@ -2689,6 +2704,7 @@ function closeSettings() {
     page.hidden = true;
     document.getElementById('tab-history').hidden = false;
     document.body.classList.remove('settings-open');
+    clearExtensionPairing();
     hideActionError();
     window.scrollTo({ top: 0 });
     document.getElementById('accountMenuButton').focus();
@@ -2741,6 +2757,7 @@ settingsNavButtons.forEach(button => {
         settingsSearchInput.value = '';
         applySettingsSearch();
         const name = button.dataset.settingsSection;
+        if (name !== 'browser-extension') clearExtensionPairing();
         setActiveSettingsSection(name);
         document.getElementById(`settings-${name}`).scrollIntoView({
             behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches
@@ -2757,6 +2774,150 @@ settingsSearchInput.addEventListener('keydown', event => {
     settingsSearchInput.value = '';
     applySettingsSearch();
 });
+
+let extensionPairingExpiresAt = 0;
+let extensionPairingTimer = null;
+let bundledExtension = null;
+
+function extensionStatus(message) {
+    document.getElementById('extensionStatus').textContent = message || '';
+}
+
+function clearExtensionPairing() {
+    if (extensionPairingTimer) clearInterval(extensionPairingTimer);
+    extensionPairingTimer = null;
+    extensionPairingExpiresAt = 0;
+    const field = document.getElementById('extensionPairingString');
+    if (field) field.value = '';
+    const output = document.getElementById('extensionPairingOutput');
+    if (output) output.hidden = true;
+}
+
+function pairingString(origin, code) {
+    const bytes = new TextEncoder().encode(JSON.stringify({ origin, code }));
+    let binary = '';
+    bytes.forEach(byte => { binary += String.fromCharCode(byte); });
+    return `vdl-pair-v1:${btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')}`;
+}
+
+function updatePairingExpiry() {
+    const remaining = Math.max(0, Math.ceil(extensionPairingExpiresAt - Date.now() / 1000));
+    const label = document.getElementById('extensionPairingExpiry');
+    if (!remaining) {
+        clearExtensionPairing();
+        extensionStatus('The pairing string expired. Create a new one.');
+        return;
+    }
+    label.textContent = `Expires in ${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, '0')}`;
+}
+
+function createExtensionPairing() {
+    if (window.location.protocol !== 'https:') return;
+    apiAction('/api/extension/pairing-codes', { method: 'POST' })
+        .then(response => response.json()).then(response => {
+        document.getElementById('extensionPairingString').value = pairingString(
+            window.location.origin, response.code,
+        );
+        document.getElementById('extensionPairingOutput').hidden = false;
+        extensionPairingExpiresAt = response.expires_at;
+        updatePairingExpiry();
+        extensionPairingTimer = setInterval(updatePairingExpiry, 1000);
+        extensionStatus('Pairing string created. Paste it into the extension onboarding page.');
+    }).catch(() => {});
+}
+
+async function copyExtensionPairing() {
+    const field = document.getElementById('extensionPairingString');
+    try {
+        await navigator.clipboard.writeText(field.value);
+        extensionStatus('Pairing string copied.');
+    } catch (_) {
+        field.focus();
+        field.select();
+        extensionStatus('Copy was blocked. The pairing string is selected for manual copying.');
+    }
+}
+
+function invalidateExtensionPairing() {
+    apiAction('/api/extension/pairing-codes/current', { method: 'DELETE' })
+        .then(() => {
+            clearExtensionPairing();
+            extensionStatus('Pairing string invalidated.');
+        }).catch(() => {});
+}
+
+function versionParts(value) {
+    return String(value || '').split('.').map(part => Number(part) || 0);
+}
+
+function isNewerVersion(left, right) {
+    const a = versionParts(left);
+    const b = versionParts(right);
+    for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
+        if ((a[index] || 0) !== (b[index] || 0)) return (a[index] || 0) > (b[index] || 0);
+    }
+    return false;
+}
+
+function formatConnectionTime(value) {
+    return value ? new Date(value * 1000).toLocaleString() : 'Never';
+}
+
+function renderExtensionConnection(connection) {
+    const update = bundledExtension && isNewerVersion(
+        bundledExtension.version, connection.extension_version,
+    ) ? '<span class="extension-update-label">Update available</span>' : '';
+    return `<article class="extension-connection" data-connection-id="${escapeAttr(connection.id)}">
+                <div><strong>${escapeHtml(connection.device_label)}</strong>${update}</div>
+                <dl>
+                    <dt>Extension</dt><dd>${escapeHtml(connection.extension_version)}</dd>
+                    <dt>Paired</dt><dd>${formatConnectionTime(connection.created_at)}</dd>
+                    <dt>Last used</dt><dd>${formatConnectionTime(connection.last_used_at)}</dd>
+                </dl>
+                <button type="button" class="danger" onclick="revokeExtensionConnection('${escapeAttr(connection.id)}', this)">Revoke</button>
+            </article>`;
+}
+
+function loadExtensionConnections() {
+    const https = window.location.protocol === 'https:';
+    const create = document.getElementById('extensionCreatePairing');
+    create.disabled = !https;
+    document.getElementById('extensionHttpsStatus').textContent = https
+        ? 'This trusted HTTPS origin is ready to pair.'
+        : 'Pairing is disabled here. Open VDL through a certificate-trusted HTTPS origin.';
+    return apiFetch('/api/extension/connections').then(response => response.json()).then(data => {
+        bundledExtension = data.bundled_extension;
+        const install = document.getElementById('extensionInstallLink');
+        if (bundledExtension) {
+            install.href = bundledExtension.url;
+            install.removeAttribute('aria-disabled');
+            install.classList.remove('disabled');
+        } else {
+            install.removeAttribute('href');
+            install.setAttribute('aria-disabled', 'true');
+            install.classList.add('disabled');
+            document.getElementById('extensionInstallHint').textContent = 'The bundled extension failed its integrity check. Contact the VDL operator.';
+        }
+        const connections = data.connections || [];
+        document.getElementById('extensionConnectionList').innerHTML = connections.map(renderExtensionConnection).join('');
+        document.getElementById('extensionNoConnections').hidden = connections.length > 0;
+        const needsUpdate = connections.some(connection => bundledExtension && isNewerVersion(
+            bundledExtension.version, connection.extension_version,
+        ));
+        install.textContent = needsUpdate ? 'Update Firefox extension' : 'Install Firefox extension';
+    });
+}
+
+function revokeExtensionConnection(connectionId, button) {
+    if (!window.confirm('Revoke this VDL Companion connection?')) return;
+    apiAction(`/api/extension/connections/${encodeURIComponent(connectionId)}`, {
+        method: 'DELETE',
+    }).then(() => loadExtensionConnections()).then(() => {
+        extensionStatus('Companion connection revoked.');
+        const next = document.querySelector('.extension-connection button');
+        (next || document.getElementById('extensionCreatePairing')).focus();
+    }).catch(() => { button.focus(); });
+}
 
 let managedRoles = [];
 let managedCurrentUserId = null;

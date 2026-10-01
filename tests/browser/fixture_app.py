@@ -97,6 +97,13 @@ def test_row():
         vdl.db_update_download(download_id, **updates)
     if data.get("visibility") in ("public", "private"):
         vdl.db_set_download_visibility(download_id, data["visibility"])
+    if data.get("browser_authenticated") is True:
+        with vdl._db_lock, vdl.db() as connection:
+            connection.execute(
+                "UPDATE downloads SET browser_authenticated = 1, "
+                "visibility = 'private' WHERE id = ?",
+                (download_id,),
+            )
     return jsonify(vdl.db_get_download(download_id))
 
 

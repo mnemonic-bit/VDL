@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Pair VDL Companion</title><link rel="stylesheet" href="extension.css"></head>
+<body><main>
+    <h1>Pair VDL Companion</h1>
+    <p>Paste the pairing string copied from VDL Settings. Confirm the HTTPS destination before pairing.</p>
+    <form id="pairForm">
+        <label for="pairingString">Pairing string</label>
+        <textarea id="pairingString" required spellcheck="false" autocomplete="off"></textarea>
+        <label for="deviceLabel">Device label</label>
+        <input id="deviceLabel" required maxlength="80" value="Firefox">
+        <p id="originPreview" class="origin" hidden></p>
+        <button type="submit">Pair with this VDL</button>
+    </form>
+    <p id="status" role="alert" aria-live="assertive"></p>
+    <p class="notice">The companion token is stored in Firefox storage.local, which is not encrypted. Website cookies are sent only when you click the toolbar action and are never stored by the extension.</p>
+    <a href="privacy.html">Privacy notice</a>
+</main><script src="onboarding.js"></script></body></html>

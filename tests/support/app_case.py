@@ -35,6 +35,12 @@ class AppCase(unittest.TestCase):
             vdl._worker_queue.clear()
             vdl._active_worker_count = 0
             vdl._live_worker_ids.clear()
+        with vdl._pairing_lock:
+            vdl._pairing_codes.clear()
+        with vdl._companion_rate_lock:
+            vdl._failed_pair_rates.clear()
+            vdl._failed_pair_global.clear()
+            vdl._token_download_rates.clear()
         vdl.init_db()
         vdl.db_set_preferences({"download_dir": self.download_dir})
         vdl.app.config.update(TESTING=True)
@@ -69,6 +75,12 @@ class AppCase(unittest.TestCase):
             vdl._worker_queue.clear()
             vdl._active_worker_count = 0
             vdl._live_worker_ids.clear()
+        with vdl._pairing_lock:
+            vdl._pairing_codes.clear()
+        with vdl._companion_rate_lock:
+            vdl._failed_pair_rates.clear()
+            vdl._failed_pair_global.clear()
+            vdl._token_download_rates.clear()
         vdl.event_bus = self._old_event_bus
         vdl.DB_PATH = self._old_db_path
         vdl.DEFAULT_DOWNLOAD_DIR = self._old_default_dir

@@ -39,6 +39,9 @@ RUN python -m pip install --no-cache-dir --require-hashes -r requirements-contai
 COPY vdl.py docker-entrypoint.sh VERSION ./
 COPY templates/ templates/
 COPY static/ static/
+COPY browser-extension/dist/vdl-companion-firefox.xpi browser-extension/dist/vdl-companion-firefox.xpi.sha256 ./browser-extension/dist/
+RUN cd /app/browser-extension/dist \
+    && sha256sum -c vdl-companion-firefox.xpi.sha256
 RUN chmod 0555 /app/docker-entrypoint.sh \
     && chmod -R a-w /app
 

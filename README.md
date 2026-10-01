@@ -263,6 +263,53 @@ python vdl.py
 Native development defaults to <http://127.0.0.1:5000>. ffmpeg remains an
 external system dependency.
 
+## Firefox authenticated downloads
+
+VDL Companion lets a signed-in user send the current Firefox page and the
+cookies applicable to that page to VDL with one explicit toolbar click. This
+is useful for media the site exposes only to the user's legitimate browser
+session. It does not bypass DRM, CAPTCHA, bot protection, geographic or account
+authorization, or a site's terms.
+
+Pairing requires desktop Firefox 140 or later and a browser-visible VDL origin
+using HTTPS with a certificate trusted by that Firefox installation. VDL does
+not terminate TLS; put it behind an HTTPS reverse proxy and forward requests
+to the normal VDL HTTP listener. The public URL may use a non-default port, for
+example `https://vdl.example:8443`, but it must have no path prefix. Install the
+proxy's private certificate authority in Firefox when using an internal CA.
+Plain HTTP, including loopback and LAN addresses, cannot pair in the release
+extension.
+
+For a typical reverse proxy, preserve the original request path and host, allow
+long-lived `/api/events` responses without buffering, and proxy the fixed XPI
+and `/api/extension/*` paths unchanged. No forwarded-scheme trust setting is
+needed for pairing: Settings uses the browser's authoritative
+`window.location.origin`.
+
+To use the companion:
+
+1. Open VDL Settings → Browser Extension and install the bundled XPI. Firefox
+   always displays its own Add confirmation.
+2. Create and copy the five-minute pairing string, paste it into the extension
+   onboarding page, verify the HTTPS origin, and confirm pairing.
+3. Open a signed-in video page and click **Download current page with VDL**.
+   Firefox asks for access the first time each website host is used.
+4. Install a newer bundled XPI when Settings reports an update. The stable
+   add-on identity updates the existing installation in place.
+5. Use **Revoke** in VDL Settings or **Unpair** in the extension options to end
+   a connection. Signing out of the VDL web UI alone does not revoke it.
+
+Firefox Containers are isolated by the clicked tab's cookie store. Private
+windows, partitioned/FPI cookies, related identity-provider domains,
+localStorage, custom browser headers, Android/iOS Firefox, and non-Firefox
+browsers are not supported. If an authenticated download is cancelled or VDL
+restarts, revisit the signed-in source page and click the companion again;
+ordinary Continue is intentionally unavailable because cookies are never
+persisted. VDL stores the source URL and its query in the downloads database,
+while browser cookies remain in the live worker's memory only. See
+[the companion privacy notice](browser-extension/PRIVACY.md) for the complete
+data-handling disclosure.
+
 ## Project status and support
 
 VDL is a sole-maintainer project, released under the [MIT License](LICENSE).

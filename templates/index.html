@@ -268,6 +268,7 @@
             <nav class="settings-nav" aria-label="Settings sections">
                 <button type="button" class="active" data-settings-section="general" aria-current="page">General</button>
                 <button type="button" data-settings-section="playback">Playback</button>
+                <button type="button" data-settings-section="browser-extension">Browser Extension</button>
                 {% if is_admin %}
                 <button type="button" data-settings-section="users">Users</button>
                 <button type="button" class="danger" data-settings-section="danger">Danger Zone</button>
@@ -364,6 +365,46 @@
                         </div>
                         <input type="checkbox" id="prefStartFullscreen" aria-describedby="prefStartFullscreenHint">
                     </div>
+                </section>
+
+                <section id="settings-browser-extension" class="settings-section" data-settings-name="browser-extension" tabindex="-1">
+                    <h2>Browser Extension</h2>
+                    <p class="settings-section-intro">VDL Companion sends the current page URL and that site's eligible Firefox cookies only after you click its toolbar action.</p>
+                    <div class="extension-warning" role="note">
+                        Cookies can grant the same website access as your signed-in browser session. VDL stores the page URL and query, but keeps cookies only in memory for the live download.
+                    </div>
+                    <div class="setting-item" data-setting-keywords="firefox install update extension companion addon browser">
+                        <div class="setting-copy">
+                            <strong>Install VDL Companion</strong>
+                            <span id="extensionInstallHint">Firefox will show an Add confirmation. Installation and pairing are separate steps.</span>
+                        </div>
+                        <a id="extensionInstallLink" class="settings-button-link" href="/browser-extension/vdl-companion-firefox.xpi">Install Firefox extension</a>
+                    </div>
+                    <div class="setting-item extension-pairing-item" data-setting-keywords="pair connect code string https copy invalidate">
+                        <div class="setting-copy">
+                            <strong>Pair this Firefox profile</strong>
+                            <span id="extensionHttpsStatus">Checking whether this page uses HTTPS…</span>
+                        </div>
+                        <div class="extension-pairing-controls">
+                            <button id="extensionCreatePairing" type="button" onclick="createExtensionPairing()">Create pairing string</button>
+                            <div id="extensionPairingOutput" hidden>
+                                <label for="extensionPairingString">Pairing string</label>
+                                <textarea id="extensionPairingString" readonly spellcheck="false"></textarea>
+                                <span id="extensionPairingExpiry"></span>
+                                <div class="extension-inline-actions">
+                                    <button type="button" onclick="copyExtensionPairing()"><svg class="btn-icon"><use href="#i-copy"/></svg>Copy pairing string</button>
+                                    <button type="button" class="danger" onclick="invalidateExtensionPairing()">Invalidate</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="extension-connections" data-setting-keywords="connections paired devices revoke token sign out">
+                        <h3>Active companion connections</h3>
+                        <p>Signing out of VDL does not revoke a companion. Revoke it here or use Unpair in the extension.</p>
+                        <div id="extensionConnectionList"></div>
+                        <p id="extensionNoConnections">No active companion connections.</p>
+                    </div>
+                    <p id="extensionStatus" class="extension-live-status" role="status" aria-live="polite"></p>
                 </section>
 
                 {% if is_admin %}

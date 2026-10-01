@@ -72,11 +72,13 @@ class SchemaMigrationTest(unittest.TestCase):
                     "downloaded_bytes", "total_bytes", "favorite",
                     "view_count",
                     "source_type", "owner_user_id", "owner_username",
-                    "visibility",
+                    "visibility", "browser_authenticated",
+                    "extension_request_id",
                 })
                 self.assertTrue({
                     "tags", "download_tags", "app_config", "roles", "users",
                     "user_roles", "ingest_receipts",
+                    "extension_tokens",
                 }.issubset(tables))
                 self.assertIn("name", user_columns)
                 admin = vdl.db_get_user_by_username("admin")
