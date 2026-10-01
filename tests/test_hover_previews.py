@@ -21,19 +21,24 @@ class HoverPreviewTest(AppCase):
 
         self.assertEqual(
             preview_path,
-            os.path.join(self.download_dir, ".vdl_test0001.preview.mp4"),
+            os.path.join(self.download_dir, ".vdl_test0001.preview-v3.mp4"),
         )
 
     def test_preview_segments_span_long_videos_without_repeating_short_ones(self):
         self.assertEqual(vdl._preview_segments(0), [])
-        self.assertEqual(vdl._preview_segments(20), [(0.0, 20)])
+        self.assertEqual(vdl._preview_segments(10), [])
+        self.assertEqual(vdl._preview_segments(12), [(5.0, 2.0)])
+        self.assertEqual(vdl._preview_segments(30), [(5.0, 20.0)])
 
         segments = vdl._preview_segments(63)
         self.assertEqual(len(segments), 7)
         self.assertEqual([length for _start, length in segments], [3.0] * 7)
+        starts = [start for start, _length in segments]
+        self.assertEqual(starts[0], 5.0)
+        self.assertEqual(starts[-1], 55.0)
         self.assertEqual(
-            [start for start, _length in segments],
-            [0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0],
+            [round(starts[index + 1] - starts[index], 6) for index in range(6)],
+            [round(50 / 6, 6)] * 6,
         )
 
     def test_ffprobe_duration_requires_a_finite_video_stream(self):
@@ -84,10 +89,11 @@ class HoverPreviewTest(AppCase):
         self.assertEqual(command.count("-i"), 7)
         self.assertEqual(
             [command[index + 1] for index, value in enumerate(command) if value == "-ss"],
-            ["0.000", "10.000", "20.000", "30.000", "40.000", "50.000", "60.000"],
+            ["5.000", "13.333", "21.667", "30.000", "38.333", "46.667", "55.000"],
         )
         self.assertIn("concat=n=7:v=1:a=0[outv]", command[command.index("-filter_complex") + 1])
         self.assertEqual(command[command.index("-c:v") + 1], "libx264")
+        self.assertEqual(command[command.index("-r") + 1], "12")
         self.assertEqual(command[command.index("-pix_fmt") + 1], "yuv420p")
         self.assertIn("+faststart", command)
 
@@ -113,6 +119,11 @@ class HoverPreviewTest(AppCase):
 
     def test_preview_endpoint_generates_once_caches_and_supports_ranges(self):
         self.finished_file()
+        stale_path = os.path.join(
+            self.download_dir, ".vdl_test0001.preview-v2.mp4"
+        )
+        with open(stale_path, "wb") as stale_preview:
+            stale_preview.write(b"edge-inclusive-preview")
 
         def generate(_source, destination):
             with open(destination, "wb") as preview:

@@ -310,8 +310,7 @@
 
     <div id="playerBackdrop" class="player-backdrop" onclick="closePlayer(event)">
         <div class="player-box" onclick="event.stopPropagation()">
-            <div id="playerTitle" class="player-title"></div>
-            <button class="player-close" onclick="closePlayer()" aria-label="Close player"><svg style="width:24px;height:24px"><use href="#i-x"/></svg></button>
+            <button class="player-close" type="button" onclick="closePlayer()" aria-label="Close player"><svg aria-hidden="true"><use href="#i-x"/></svg></button>
             <video id="playerVideo" controls autoplay></video>
         </div>
     </div>

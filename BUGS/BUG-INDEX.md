@@ -87,6 +87,16 @@ all exposed **Download**. The existing footer warning detects the UI/API
 version mismatch but does not keep an old client from continuing to interact
 with the newer backend or make the required refresh prominent near the active
 workflow.
+Issue 41 was reported and resolved through an interactive History-preview
+review on 2026-10-01. Video thumbnails carried a redundant play overlay and
+tooltip, lacked a delayed moving preview, sampled unhelpful opening and closing
+frames, and initially generated H.264 level-6.2 montages that some Firefox
+decoders rejected. The thumbnail is now unobscured, its seven-excerpt montage
+loads only after intentional hover, skips five seconds at both timeline edges,
+uses Firefox-compatible level-2.1 encoding, and preserves the favorite star's
+state-specific tooltip. The related full player now omits its repeated title
+and reveals an inner top-right close control only during mouse activity or
+keyboard focus.
 
 ## Bug reports
 
@@ -130,6 +140,7 @@ workflow.
 - [Bug 0038 — History info panel had inconsistent layout and no source-copy action](bug-0038-history-info-panel-had-inconsistent-layout-and-missing-source-copy.md)
 - [Bug 0039 — Header download actions occupied space without useful state](bug-0039-header-download-actions-occupied-space-without-useful-state.md)
 - [Bug 0040 — Open tabs retain stale UI code after an application upgrade](bug-0040-open-tabs-retain-stale-ui-after-upgrade.md)
+- [Bug 0041 — History video previews were redundant and Firefox-incompatible](bug-0041-history-video-previews-were-redundant-and-firefox-incompatible.md)
 
 ## Accepted UI decisions
 

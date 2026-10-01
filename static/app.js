@@ -1411,6 +1411,7 @@ function toggleMenu(id, ev) {
 }
 
 const HOVER_PREVIEW_DELAY_MS = 500;
+const HOVER_PREVIEW_CACHE_VERSION = 3;
 let hoverPreviewTimer = null;
 let pendingHoverPreview = null;
 let activeHoverPreview = null;
@@ -1462,7 +1463,8 @@ function startHoverPreview(preview) {
     video.onerror = () => {
         if (activeHoverPreview === preview) stopHoverPreview(preview);
     };
-    video.src = '/api/preview/' + encodeURIComponent(preview.dataset.downloadId);
+    video.src = '/api/preview/' + encodeURIComponent(preview.dataset.downloadId)
+        + '?v=' + HOVER_PREVIEW_CACHE_VERSION;
     video.load();
     const playback = video.play();
     if (playback) {
@@ -1724,7 +1726,7 @@ function renderHistoryCard(info) {
         const playExt = info.filename.split('.').pop().toLowerCase();
         preview = `
                 <div class="history-preview-wrap">
-                    <button class="history-preview" type="button" data-play-action data-download-id="${escapeAttr(id)}" data-play-label="${escapeAttr(playLabel)}" data-play-ext="${escapeAttr(playExt)}" aria-label="Play" title="Play">
+                    <button class="history-preview" type="button" data-play-action data-download-id="${escapeAttr(id)}" data-play-label="${escapeAttr(playLabel)}" data-play-ext="${escapeAttr(playExt)}" aria-label="Play">
                         <span class="history-preview-fallback"><svg><use href="#i-camera"/></svg><span>No video preview</span></span>
                         <img src="/api/thumbnail/${encodeURIComponent(id)}" alt="" loading="lazy" onerror="this.closest('.history-preview').classList.add('thumbnail-unavailable')">
                         <video class="history-preview-video" muted playsinline loop preload="none" aria-hidden="true"></video>
@@ -2237,6 +2239,24 @@ const _VIDEO_MIME = {
     flac: 'audio/flac', wav: 'audio/wav',
 };
 
+const PLAYER_CONTROLS_IDLE_MS = 2000;
+let playerControlsTimer = null;
+
+function hidePlayerControls() {
+    clearTimeout(playerControlsTimer);
+    playerControlsTimer = null;
+    document.querySelector('.player-box').classList.remove('player-controls-visible');
+}
+
+function showPlayerControls() {
+    const backdrop = document.getElementById('playerBackdrop');
+    if (!backdrop.classList.contains('open')) return;
+    const player = backdrop.querySelector('.player-box');
+    player.classList.add('player-controls-visible');
+    clearTimeout(playerControlsTimer);
+    playerControlsTimer = setTimeout(hidePlayerControls, PLAYER_CONTROLS_IDLE_MS);
+}
+
 function playVideo(id, label, ext) {
     const url = '/api/file/' + encodeURIComponent(id);
     if (playerMode === 'new_tab') {
@@ -2244,7 +2264,7 @@ function playVideo(id, label, ext) {
         return;
     }
     const video = document.getElementById('playerVideo');
-    document.getElementById('playerTitle').textContent = label || '';
+    hidePlayerControls();
     // Clear any previous <source> children and src attribute before reloading.
     // Setting video.src directly doesn't carry a type hint; using a <source>
     // element with an explicit type lets the browser decide playability before
@@ -2263,12 +2283,19 @@ function playVideo(id, label, ext) {
 function closePlayer(ev) {
     const backdrop = document.getElementById('playerBackdrop');
     const video = document.getElementById('playerVideo');
+    const closeButton = backdrop.querySelector('.player-close');
+    hidePlayerControls();
+    if (document.activeElement === closeButton) closeButton.blur();
     video.pause();
     video.removeAttribute('src');
     video.innerHTML = '';
     video.load();
     backdrop.classList.remove('open');
 }
+
+document.getElementById('playerBackdrop').addEventListener(
+    'mousemove', showPlayerControls,
+);
 
 document.addEventListener('keydown', (ev) => {
     // Editors use Escape to cancel their own transient state. Respect that

@@ -391,17 +391,21 @@ test('History cards show preview first and preview click starts playback', async
     await refresh(page);
 
     const card = page.locator('[data-row-id="preview01"]');
-    await expect(card.locator('.history-preview')).toBeVisible();
+    const preview = card.locator('.history-preview');
+    await expect(preview).toBeVisible();
+    await expect(preview).not.toHaveAttribute('title', /.+/);
+    await expect(card.locator('.favorite-toggle')).toHaveAttribute(
+        'title', 'Add to favorites');
     await expect(card.locator('.history-card-title')).toHaveText('Preview title');
     await expect(card.locator('.history-info-popover')).toBeHidden();
     const children = await card.locator(':scope > *').evaluateAll(elements =>
         elements.map(element => element.className));
     expect(children[0]).toContain('history-preview-wrap');
     await expect(card.locator('.history-preview-play')).toHaveCount(0);
-    await card.locator('.history-preview').focus();
-    await expect(card.locator('.history-preview')).toHaveCSS('outline-style', 'solid');
+    await preview.focus();
+    await expect(preview).toHaveCSS('outline-style', 'solid');
 
-    await card.locator('.history-preview').click();
+    await preview.click();
     await expect(page.locator('#playerBackdrop')).toHaveClass(/open/);
     await expect(page.locator('#playerVideo source')).toHaveAttribute('src', '/api/file/preview01');
 });
@@ -448,14 +452,14 @@ test('hover previews wait before loading and only play one montage at a time', a
     await expect(firstVideo).not.toHaveAttribute('src', /./);
     expect(await page.evaluate(() => window.__hoverPreviewPlays)).toBe(0);
     await expect.poll(() => page.evaluate(() => window.__hoverPreviewPlays)).toBe(1);
-    await expect(firstVideo).toHaveAttribute('src', '/api/preview/hover01');
+    await expect(firstVideo).toHaveAttribute('src', '/api/preview/hover01?v=3');
     await expect(first).toHaveClass(/preview-playing/);
 
     await second.hover();
     await expect(firstVideo).not.toHaveAttribute('src', /./);
     await expect(first).not.toHaveClass(/preview-playing/);
     await expect.poll(() => page.evaluate(() => window.__hoverPreviewPlays)).toBe(2);
-    await expect(secondVideo).toHaveAttribute('src', '/api/preview/hover02');
+    await expect(secondVideo).toHaveAttribute('src', '/api/preview/hover02?v=3');
     await expect(second).toHaveClass(/preview-playing/);
 
     await page.locator('.app-header').hover();

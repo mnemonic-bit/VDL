@@ -16,6 +16,40 @@ test('overlay playback assigns MIME, supports Range, and Escape closes it', asyn
     await expect(page.locator('#playerBackdrop')).not.toHaveClass(/open/);
 });
 
+test('overlay omits the title and reveals its inner close button on mouse activity', async ({ page }) => {
+    test.setTimeout(15_000);
+    await seed(page, { id: 'player-ui', status: 'finished', file: true, name: 'fixture.mp4' });
+    await refresh(page);
+    await page.locator('[data-row-id="player-ui"]').getByRole('button', { name: 'Play', exact: true }).click();
+
+    const player = page.locator('.player-box');
+    const video = page.locator('#playerVideo');
+    const close = page.getByRole('button', { name: 'Close player' });
+    await expect(page.locator('#playerTitle')).toHaveCount(0);
+    await expect(close).toHaveCSS('opacity', '0');
+
+    const videoBounds = await video.boundingBox();
+    const closeBounds = await close.boundingBox();
+    expect(closeBounds.x).toBeGreaterThanOrEqual(videoBounds.x);
+    expect(closeBounds.y).toBeGreaterThanOrEqual(videoBounds.y);
+    expect(closeBounds.x + closeBounds.width).toBeLessThanOrEqual(videoBounds.x + videoBounds.width);
+    expect(closeBounds.y + closeBounds.height).toBeLessThanOrEqual(videoBounds.y + videoBounds.height);
+
+    await page.mouse.move(
+        videoBounds.x + videoBounds.width / 2,
+        videoBounds.y + videoBounds.height / 2,
+    );
+    await expect(player).toHaveClass(/player-controls-visible/);
+    await expect(close).toHaveCSS('opacity', '1');
+    await page.waitForTimeout(2_100);
+    expect(await player.evaluate(element =>
+        element.classList.contains('player-controls-visible'))).toBe(false);
+    await expect(close).toHaveCSS('opacity', '0');
+
+    await close.focus();
+    await expect(close).toHaveCSS('opacity', '1');
+});
+
 test('new-tab player mode opens the stored file endpoint', async ({ page }) => {
     await page.request.post('/__test__/preferences', { data: { player_mode: 'new_tab' } });
     await seed(page, { id: 'playtab1', status: 'finished', file: true, name: 'fixture.webm' });

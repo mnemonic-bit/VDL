@@ -1594,6 +1594,10 @@ def _thumbnail_path(entry, fallback_dir=None):
     )
 
 
+_PREVIEW_CACHE_VERSION = 3
+_PREVIEW_FRAMES_PER_SECOND = 12
+
+
 def _preview_path(entry, fallback_dir=None):
     """Return the stable sidecar path for one download's hover preview."""
     directory = entry.get('output_dir')
@@ -1605,7 +1609,7 @@ def _preview_path(entry, fallback_dir=None):
         return None
     return os.path.join(
         os.path.abspath(directory),
-        f".vdl_{entry['id']}.preview.mp4",
+        f".vdl_{entry['id']}.preview-v{_PREVIEW_CACHE_VERSION}.mp4",
     )
 
 
@@ -1646,6 +1650,7 @@ def generate_video_thumbnail(media_path, thumbnail_path):
 _PREVIEW_SEGMENT_COUNT = 7
 _PREVIEW_SEGMENT_SECONDS = 3.0
 _PREVIEW_TOTAL_SECONDS = _PREVIEW_SEGMENT_COUNT * _PREVIEW_SEGMENT_SECONDS
+_PREVIEW_EDGE_MARGIN_SECONDS = 5.0
 
 
 def ffprobe_video_duration(path):
@@ -1681,14 +1686,24 @@ def ffprobe_video_duration(path):
 
 def _preview_segments(duration):
     """Return equally spaced (start, length) excerpts for a hover preview."""
-    if duration <= 0:
+    interior_duration = duration - (2 * _PREVIEW_EDGE_MARGIN_SECONDS)
+    if interior_duration <= 0:
         return []
-    if duration < _PREVIEW_TOTAL_SECONDS:
-        return [(0.0, duration)]
-    last_start = duration - _PREVIEW_SEGMENT_SECONDS
-    spacing = last_start / (_PREVIEW_SEGMENT_COUNT - 1)
+    if interior_duration < _PREVIEW_TOTAL_SECONDS:
+        return [(_PREVIEW_EDGE_MARGIN_SECONDS, interior_duration)]
+    last_start = (
+        duration
+        - _PREVIEW_EDGE_MARGIN_SECONDS
+        - _PREVIEW_SEGMENT_SECONDS
+    )
+    spacing = (
+        last_start - _PREVIEW_EDGE_MARGIN_SECONDS
+    ) / (_PREVIEW_SEGMENT_COUNT - 1)
     return [
-        (spacing * index, _PREVIEW_SEGMENT_SECONDS)
+        (
+            _PREVIEW_EDGE_MARGIN_SECONDS + spacing * index,
+            _PREVIEW_SEGMENT_SECONDS,
+        )
         for index in range(_PREVIEW_SEGMENT_COUNT)
     ]
 
@@ -1712,7 +1727,7 @@ def generate_video_preview(media_path, preview_path):
         ])
 
     filters = [
-        f'[{index}:v:0]fps=12,scale=480:-2,setsar=1,'
+        f'[{index}:v:0]fps={_PREVIEW_FRAMES_PER_SECOND},scale=480:-2,setsar=1,'
         f'setpts=PTS-STARTPTS[v{index}]'
         for index in range(len(segments))
     ]
@@ -1724,6 +1739,9 @@ def generate_video_preview(media_path, preview_path):
         '-filter_complex', ';'.join(filters),
         '-map', '[outv]',
         '-an',
+        # concat uses a microsecond time base. Pinning the output cadence keeps
+        # x264 from declaring these tiny previews as unsupported level 6.2.
+        '-r', str(_PREVIEW_FRAMES_PER_SECOND),
         '-c:v', 'libx264',
         '-preset', 'veryfast',
         '-crf', '28',

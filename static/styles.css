@@ -811,8 +811,21 @@ input[type="text"].tag-entry-input {
 .player-backdrop.open { display: flex; }
 .player-box { position: relative; max-width: 90vw; max-height: 90vh; }
 .player-box video { display: block; max-width: 90vw; max-height: 90vh; background: black; border-radius: 4px; }
-.player-close { position: absolute; top: -36px; right: 0; background: transparent; color: white; border: none; font-size: 1.6em; cursor: pointer; line-height: 1; }
-.player-title { position: absolute; top: -32px; left: 0; color: #ddd; font-size: 0.95em; max-width: calc(90vw - 40px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, Menlo, Consolas, monospace; }
+.player-close {
+    position: absolute; top: 12px; right: 12px; z-index: 2;
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 36px; height: 36px; padding: 0;
+    color: white; background: rgba(0,0,0,0.58); border: 0; border-radius: 50%;
+    cursor: pointer; opacity: 0; pointer-events: none;
+    transition: opacity 0.15s ease, background-color 0.15s ease;
+}
+.player-close svg { width: 22px; height: 22px; }
+.player-box.player-controls-visible .player-close,
+.player-close:focus { opacity: 1; pointer-events: auto; }
+.player-close:hover { background: rgba(0,0,0,0.78); }
+@media (hover: none), (pointer: coarse) {
+    .player-close { opacity: 1; pointer-events: auto; }
+}
 .history-summary { display: flex; justify-content: space-between; align-items: center; cursor: pointer; list-style: none; }
 .history-summary::-webkit-details-marker { display: none; }
 .history-summary::before { content: '▶'; display: inline-block; margin-right: 8px; font-size: 0.8em; transition: transform 0.15s; }
@@ -1017,7 +1030,8 @@ details[open] > .history-summary::before { transform: rotate(90deg); }
     .current-drawer::backdrop { animation: none; }
     .upload-drop-overlay.uploading .upload-drop-message svg { animation: none; }
     .history-preview img,
-    .history-preview-video { transition: none; }
+    .history-preview-video,
+    .player-close { transition: none; }
 }
 #downloadForm button[type="submit"] { display: inline-flex; align-items: center; gap: 6px; }
 .eta { margin-top: 4px; font-size: 0.9em; color: var(--muted); }

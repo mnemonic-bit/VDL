@@ -87,8 +87,9 @@ class RealMediaIntegrationTest(AppCase):
         self.assertEqual(len(preview_streams), 1)
         self.assertEqual(preview_streams[0]["codec_type"], "video")
         self.assertEqual(preview_streams[0]["codec_name"], "h264")
+        self.assertLessEqual(preview_streams[0]["level"], 30)
         self.assertLessEqual(preview_streams[0]["width"], 480)
-        self.assertAlmostEqual(vdl.ffprobe_video_duration(preview_path), 21, delta=0.5)
+        self.assertAlmostEqual(vdl.ffprobe_video_duration(preview_path), 14, delta=0.5)
         modified_at = os.path.getmtime(preview_path)
 
         second = self.client.get("/api/preview/preview1")
