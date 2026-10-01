@@ -22,7 +22,6 @@
     --brand:        #1f8a3b;
     --app-progress-track-active: #399748;
     --app-progress: #134d77;
-    --preview-scrim: rgba(0,0,0,0.58);
     --modal-backdrop: rgba(0,0,0,0.62);
     --modal-shadow: rgba(0,0,0,0.35);
     --danger:       #e74c3c;
@@ -60,7 +59,6 @@ html[data-theme="dark"] {
     --brand:        #1f8a3b;
     --app-progress-track-active: #399748;
     --app-progress: #134d77;
-    --preview-scrim: rgba(0,0,0,0.68);
     --modal-backdrop: rgba(0,0,0,0.72);
     --modal-shadow: rgba(0,0,0,0.6);
     --danger:       #e74c3c;
@@ -436,6 +434,10 @@ button { padding: 10px 20px; cursor: pointer; }
     color: var(--muted);
 }
 button.history-preview { cursor: pointer; }
+button.history-preview:focus-visible {
+    outline: 2px solid var(--link);
+    outline-offset: 2px;
+}
 .history-preview img {
     position: absolute;
     inset: 0;
@@ -443,8 +445,23 @@ button.history-preview { cursor: pointer; }
     width: 100%;
     height: 100%;
     object-fit: cover;
+    transition: opacity 0.15s ease;
 }
 .history-preview.thumbnail-unavailable img { display: none; }
+.history-preview-video {
+    position: absolute;
+    inset: 0;
+    z-index: 2;
+    width: 100%;
+    height: 100%;
+    background: var(--surface-2);
+    object-fit: cover;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.15s ease;
+}
+.history-preview.preview-loading { cursor: progress; }
+.history-preview.preview-playing .history-preview-video { opacity: 1; }
 .history-preview-fallback {
     position: absolute;
     inset: 0;
@@ -457,28 +474,6 @@ button.history-preview { cursor: pointer; }
     color: var(--muted-2);
 }
 .history-preview-fallback svg { width: 28px; height: 28px; }
-.history-preview-play {
-    position: absolute;
-    inset: 0;
-    z-index: 2;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    color: white;
-    background: transparent;
-}
-.history-preview-play svg {
-    width: 42px;
-    height: 42px;
-    padding: 11px;
-    border-radius: 50%;
-    background: var(--preview-scrim);
-    filter: drop-shadow(0 1px 3px var(--menu-shadow));
-}
-button.history-preview:focus-visible .history-preview-play svg {
-    outline: 2px solid var(--link);
-    outline-offset: 2px;
-}
 .favorite-toggle {
     position: absolute;
     top: 9px;
@@ -1021,6 +1016,8 @@ details[open] > .history-summary::before { transform: rotate(90deg); }
     .current-drawer[open],
     .current-drawer::backdrop { animation: none; }
     .upload-drop-overlay.uploading .upload-drop-message svg { animation: none; }
+    .history-preview img,
+    .history-preview-video { transition: none; }
 }
 #downloadForm button[type="submit"] { display: inline-flex; align-items: center; gap: 6px; }
 .eta { margin-top: 4px; font-size: 0.9em; color: var(--muted); }

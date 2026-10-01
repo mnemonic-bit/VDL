@@ -1410,12 +1410,108 @@ function toggleMenu(id, ev) {
     }
 }
 
+const HOVER_PREVIEW_DELAY_MS = 500;
+let hoverPreviewTimer = null;
+let pendingHoverPreview = null;
+let activeHoverPreview = null;
+
+function hoverPreviewsEnabled() {
+    return window.matchMedia('(hover: hover) and (pointer: fine)').matches
+        && !window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+}
+
+function stopHoverPreview(preview = activeHoverPreview || pendingHoverPreview) {
+    if (!preview) return;
+    if (pendingHoverPreview === preview) {
+        clearTimeout(hoverPreviewTimer);
+        hoverPreviewTimer = null;
+        pendingHoverPreview = null;
+    }
+
+    const video = preview.querySelector('.history-preview-video');
+    preview.classList.remove('preview-loading', 'preview-playing');
+    if (video) {
+        video.onplaying = null;
+        video.onerror = null;
+        video.pause();
+        video.removeAttribute('src');
+        video.load();
+    }
+    if (activeHoverPreview === preview) activeHoverPreview = null;
+}
+
+function startHoverPreview(preview) {
+    hoverPreviewTimer = null;
+    pendingHoverPreview = null;
+    if (!preview.isConnected || !preview.matches(':hover') || !hoverPreviewsEnabled()) return;
+
+    if (activeHoverPreview && activeHoverPreview !== preview) {
+        stopHoverPreview(activeHoverPreview);
+    }
+    const video = preview.querySelector('.history-preview-video');
+    if (!video) return;
+
+    activeHoverPreview = preview;
+    preview.classList.add('preview-loading');
+    video.muted = true;
+    video.onplaying = () => {
+        if (activeHoverPreview !== preview) return;
+        preview.classList.remove('preview-loading');
+        preview.classList.add('preview-playing');
+    };
+    video.onerror = () => {
+        if (activeHoverPreview === preview) stopHoverPreview(preview);
+    };
+    video.src = '/api/preview/' + encodeURIComponent(preview.dataset.downloadId);
+    video.load();
+    const playback = video.play();
+    if (playback) {
+        playback.catch(() => {
+            if (activeHoverPreview === preview) stopHoverPreview(preview);
+        });
+    }
+}
+
+function scheduleHoverPreview(preview) {
+    if (!hoverPreviewsEnabled() || preview.classList.contains('thumbnail-unavailable')) return;
+    if (pendingHoverPreview && pendingHoverPreview !== preview) {
+        stopHoverPreview(pendingHoverPreview);
+    }
+    if (activeHoverPreview === preview || pendingHoverPreview === preview) return;
+    pendingHoverPreview = preview;
+    hoverPreviewTimer = setTimeout(
+        () => startHoverPreview(preview),
+        HOVER_PREVIEW_DELAY_MS,
+    );
+}
+
+document.addEventListener('pointerover', (ev) => {
+    const preview = ev.target.closest
+        ? ev.target.closest('button.history-preview[data-play-action]')
+        : null;
+    if (!preview || (ev.relatedTarget && preview.contains(ev.relatedTarget))) return;
+    scheduleHoverPreview(preview);
+});
+
+document.addEventListener('pointerout', (ev) => {
+    const preview = ev.target.closest
+        ? ev.target.closest('button.history-preview[data-play-action]')
+        : null;
+    if (!preview || (ev.relatedTarget && preview.contains(ev.relatedTarget))) return;
+    stopHoverPreview(preview);
+});
+
+document.addEventListener('visibilitychange', () => {
+    if (document.hidden) stopHoverPreview();
+});
+
 document.addEventListener('click', (ev) => {
     const favoriteAction = ev.target.closest('[data-favorite-action]');
     if (favoriteAction) toggleFavorite(favoriteAction);
 
     const playAction = ev.target.closest('[data-play-action]');
     if (playAction) {
+        stopHoverPreview();
         playVideo(
             playAction.dataset.downloadId,
             playAction.dataset.playLabel,
@@ -1631,7 +1727,7 @@ function renderHistoryCard(info) {
                     <button class="history-preview" type="button" data-play-action data-download-id="${escapeAttr(id)}" data-play-label="${escapeAttr(playLabel)}" data-play-ext="${escapeAttr(playExt)}" aria-label="Play" title="Play">
                         <span class="history-preview-fallback"><svg><use href="#i-camera"/></svg><span>No video preview</span></span>
                         <img src="/api/thumbnail/${encodeURIComponent(id)}" alt="" loading="lazy" onerror="this.closest('.history-preview').classList.add('thumbnail-unavailable')">
-                        <span class="history-preview-play"><svg><use href="#i-play"/></svg></span>
+                        <video class="history-preview-video" muted playsinline loop preload="none" aria-hidden="true"></video>
                     </button>
                     ${favoriteButton}
                 </div>`;
@@ -2036,6 +2132,7 @@ function fetchHistory({ sortFavorites = false } = {}) {
             if (!newHistoryIds.has(id)) pendingHistoryAnimations.delete(id);
         });
 
+        stopHoverPreview();
         document.getElementById('activeList').innerHTML  = active.map(i => renderItem(i, false)).join('');
         document.getElementById('historyList').innerHTML = pageItems.map(i => renderItem(i, true)).join('');
 

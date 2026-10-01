@@ -10,6 +10,7 @@ import uuid
 import sqlite3
 import os
 import re
+import math
 import time
 import subprocess
 import mimetypes
@@ -238,6 +239,10 @@ TERMINAL_STATUSES = HISTORY_STATUSES + ('cancelled', 'interrupted')
 # per operation and guard writes with this lock.
 _db_lock = threading.Lock()
 _upload_lock = threading.Lock()
+# Preview generation opens the source seven times and encodes a new asset.
+# Serialising that work keeps a burst of first-time hovers from saturating the
+# host while cached previews continue to bypass the lock entirely.
+_preview_generation_lock = threading.Lock()
 _NO_UPDATE = object()
 
 # Workers wait here before entering yt-dlp. A FIFO queue keeps a burst in
@@ -605,6 +610,9 @@ def delete_download_artifacts(entry, fallback_dir=None):
     thumbnail = _thumbnail_path(entry, fallback_dir)
     if thumbnail:
         candidates.add(thumbnail)
+    preview = _preview_path(entry, fallback_dir)
+    if preview:
+        candidates.add(preview)
 
     search_dirs = {entry.get("output_dir"), fallback_dir}
     if filename:
@@ -626,13 +634,17 @@ def delete_download_artifacts(entry, fallback_dir=None):
             pass
 
     removed = 0
-    for path in candidates:
-        try:
-            os.remove(path)
-            removed += 1
-        except FileNotFoundError:
-            # A postprocessor may already have consumed a temporary file.
-            pass
+    # A first-hover request may still be encoding after the UI asks to remove
+    # its row. Waiting here prevents that request from publishing an orphaned
+    # preview after the artifact scan has already finished.
+    with _preview_generation_lock:
+        for path in candidates:
+            try:
+                os.remove(path)
+                removed += 1
+            except FileNotFoundError:
+                # A postprocessor may already have consumed a temporary file.
+                pass
     return removed
 
 
@@ -1582,6 +1594,21 @@ def _thumbnail_path(entry, fallback_dir=None):
     )
 
 
+def _preview_path(entry, fallback_dir=None):
+    """Return the stable sidecar path for one download's hover preview."""
+    directory = entry.get('output_dir')
+    if not directory and entry.get('filename'):
+        directory = os.path.dirname(os.path.abspath(entry['filename']))
+    if not directory:
+        directory = fallback_dir
+    if not directory:
+        return None
+    return os.path.join(
+        os.path.abspath(directory),
+        f".vdl_{entry['id']}.preview.mp4",
+    )
+
+
 def generate_video_thumbnail(media_path, thumbnail_path):
     """Extract a compact preview frame without making download success depend on it."""
     for seek_time in ('1', '0'):
@@ -1613,6 +1640,115 @@ def generate_video_thumbnail(media_path, thumbnail_path):
                 pass
             except OSError:
                 pass
+    return False
+
+
+_PREVIEW_SEGMENT_COUNT = 7
+_PREVIEW_SEGMENT_SECONDS = 3.0
+_PREVIEW_TOTAL_SECONDS = _PREVIEW_SEGMENT_COUNT * _PREVIEW_SEGMENT_SECONDS
+
+
+def ffprobe_video_duration(path):
+    """Return a finite duration for the first video stream, or None."""
+    try:
+        result = subprocess.run(
+            [
+                'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                '-show_entries', 'stream=duration:format=duration',
+                '-of', 'json', path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        data = json.loads(result.stdout or '{}')
+        streams = data.get('streams') or []
+        if not streams:
+            return None
+        value = (data.get('format') or {}).get('duration')
+        if value is None:
+            value = streams[0].get('duration')
+        duration = float(value)
+        if math.isfinite(duration) and duration > 0:
+            return duration
+    except (OSError, subprocess.SubprocessError, TypeError, ValueError,
+            json.JSONDecodeError):
+        pass
+    return None
+
+
+def _preview_segments(duration):
+    """Return equally spaced (start, length) excerpts for a hover preview."""
+    if duration <= 0:
+        return []
+    if duration < _PREVIEW_TOTAL_SECONDS:
+        return [(0.0, duration)]
+    last_start = duration - _PREVIEW_SEGMENT_SECONDS
+    spacing = last_start / (_PREVIEW_SEGMENT_COUNT - 1)
+    return [
+        (spacing * index, _PREVIEW_SEGMENT_SECONDS)
+        for index in range(_PREVIEW_SEGMENT_COUNT)
+    ]
+
+
+def generate_video_preview(media_path, preview_path):
+    """Create a compact silent montage from evenly spaced video excerpts."""
+    duration = ffprobe_video_duration(media_path)
+    if duration is None:
+        return False
+    segments = _preview_segments(duration)
+    if not segments:
+        return False
+
+    temporary_path = f"{preview_path}.{uuid.uuid4().hex}.tmp.mp4"
+    command = ['ffmpeg', '-v', 'error']
+    for start, length in segments:
+        command.extend([
+            '-ss', f'{start:.3f}',
+            '-t', f'{length:.3f}',
+            '-i', media_path,
+        ])
+
+    filters = [
+        f'[{index}:v:0]fps=12,scale=480:-2,setsar=1,'
+        f'setpts=PTS-STARTPTS[v{index}]'
+        for index in range(len(segments))
+    ]
+    inputs = ''.join(f'[v{index}]' for index in range(len(segments)))
+    filters.append(
+        f'{inputs}concat=n={len(segments)}:v=1:a=0[outv]'
+    )
+    command.extend([
+        '-filter_complex', ';'.join(filters),
+        '-map', '[outv]',
+        '-an',
+        '-c:v', 'libx264',
+        '-preset', 'veryfast',
+        '-crf', '28',
+        '-pix_fmt', 'yuv420p',
+        '-movflags', '+faststart',
+        '-f', 'mp4',
+        '-y', temporary_path,
+    ])
+
+    try:
+        result = subprocess.run(command, capture_output=True, timeout=180)
+        if (result.returncode == 0
+                and os.path.isfile(temporary_path)
+                and os.path.getsize(temporary_path) > 0):
+            os.replace(temporary_path, preview_path)
+            return True
+    except (OSError, subprocess.SubprocessError):
+        pass
+    finally:
+        try:
+            os.remove(temporary_path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
     return False
 
 
@@ -2281,6 +2417,36 @@ def stream_thumbnail(download_id):
     return send_file(
         thumbnail_path,
         mimetype='image/jpeg',
+        conditional=True,
+        max_age=86400,
+    )
+
+
+@app.route('/api/preview/<download_id>', methods=['GET'])
+def stream_preview(download_id):
+    """Serve a cached hover montage, generating it on first use."""
+    entry = db_get_download(download_id)
+    if entry is None or entry.get('status') != 'finished':
+        abort(404)
+    media_path = entry.get('filename')
+    if not media_path or not os.path.isfile(media_path):
+        abort(404)
+    if not _is_allowed_download_path(media_path):
+        abort(403)
+
+    fallback_dir = db_get_preferences().get('download_dir', '.')
+    preview_path = _preview_path(entry, fallback_dir)
+    if not preview_path or not _is_allowed_download_path(preview_path):
+        abort(403)
+    if not os.path.isfile(preview_path):
+        with _preview_generation_lock:
+            # Another request may have filled the cache while this one waited.
+            if (not os.path.isfile(preview_path)
+                    and not generate_video_preview(media_path, preview_path)):
+                abort(404)
+    return send_file(
+        preview_path,
+        mimetype='video/mp4',
         conditional=True,
         max_age=86400,
     )

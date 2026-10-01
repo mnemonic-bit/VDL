@@ -397,22 +397,98 @@ test('History cards show preview first and preview click starts playback', async
     const children = await card.locator(':scope > *').evaluateAll(elements =>
         elements.map(element => element.className));
     expect(children[0]).toContain('history-preview-wrap');
-    const playOverlay = card.locator('.history-preview-play');
-    const playCircle = playOverlay.locator('svg');
-    await expect(playOverlay).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)');
-    const playBackground = await playCircle
-        .evaluate(element => getComputedStyle(element).backgroundColor);
-    const playAlpha = Number(playBackground.match(/[\d.]+(?=\)$)/)[0]);
-    expect(playAlpha).toBeGreaterThan(0.5);
-    expect(playAlpha).toBeLessThan(0.7);
-    await card.locator('.history-preview').hover();
-    await page.waitForTimeout(200);
-    await expect(playOverlay).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)');
-    await expect(playCircle).toHaveCSS('background-color', playBackground);
+    await expect(card.locator('.history-preview-play')).toHaveCount(0);
+    await card.locator('.history-preview').focus();
+    await expect(card.locator('.history-preview')).toHaveCSS('outline-style', 'solid');
 
     await card.locator('.history-preview').click();
     await expect(page.locator('#playerBackdrop')).toHaveClass(/open/);
     await expect(page.locator('#playerVideo source')).toHaveAttribute('src', '/api/file/preview01');
+});
+
+test('hover previews wait before loading and only play one montage at a time', async ({ page }) => {
+    await seed(page, {
+        id: 'hover01', status: 'finished', file: true,
+        name: 'hover-one.mp4', title: 'Hover one',
+    });
+    await seed(page, {
+        id: 'hover02', status: 'finished', file: true,
+        name: 'hover-two.mp4', title: 'Hover two',
+    });
+    await refresh(page);
+    await page.evaluate(() => {
+        window.__hoverPreviewPlays = 0;
+        window.__hoverPreviewPauses = 0;
+        HTMLMediaElement.prototype.load = function () {};
+        HTMLMediaElement.prototype.play = function () {
+            window.__hoverPreviewPlays += 1;
+            this.dispatchEvent(new Event('playing'));
+            return Promise.resolve();
+        };
+        HTMLMediaElement.prototype.pause = function () {
+            window.__hoverPreviewPauses += 1;
+        };
+    });
+
+    const first = page.locator('[data-row-id="hover01"] .history-preview');
+    const second = page.locator('[data-row-id="hover02"] .history-preview');
+    const firstVideo = first.locator('.history-preview-video');
+    const secondVideo = second.locator('.history-preview-video');
+    // The browser fixture stores sentinel bytes instead of real video, so its
+    // thumbnail endpoint intentionally fails. Clear that unrelated fallback
+    // state to exercise the hover lifecycle in isolation.
+    await expect(first).toHaveClass(/thumbnail-unavailable/);
+    await expect(second).toHaveClass(/thumbnail-unavailable/);
+    await first.evaluate(element => element.classList.remove('thumbnail-unavailable'));
+    await second.evaluate(element => element.classList.remove('thumbnail-unavailable'));
+    await expect(firstVideo).not.toHaveAttribute('src', /./);
+
+    await first.hover();
+    await page.waitForTimeout(300);
+    await expect(firstVideo).not.toHaveAttribute('src', /./);
+    expect(await page.evaluate(() => window.__hoverPreviewPlays)).toBe(0);
+    await expect.poll(() => page.evaluate(() => window.__hoverPreviewPlays)).toBe(1);
+    await expect(firstVideo).toHaveAttribute('src', '/api/preview/hover01');
+    await expect(first).toHaveClass(/preview-playing/);
+
+    await second.hover();
+    await expect(firstVideo).not.toHaveAttribute('src', /./);
+    await expect(first).not.toHaveClass(/preview-playing/);
+    await expect.poll(() => page.evaluate(() => window.__hoverPreviewPlays)).toBe(2);
+    await expect(secondVideo).toHaveAttribute('src', '/api/preview/hover02');
+    await expect(second).toHaveClass(/preview-playing/);
+
+    await page.locator('.app-header').hover();
+    await expect(secondVideo).not.toHaveAttribute('src', /./);
+    await expect(second).not.toHaveClass(/preview-playing/);
+    expect(await page.evaluate(() => window.__hoverPreviewPauses)).toBeGreaterThan(0);
+});
+
+test('reduced motion keeps history previews static', async ({ page }) => {
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    await seed(page, {
+        id: 'hover-reduced', status: 'finished', file: true,
+        name: 'hover-reduced.mp4', title: 'Reduced motion',
+    });
+    await refresh(page);
+
+    const preview = page.locator('[data-row-id="hover-reduced"] .history-preview');
+    const video = preview.locator('.history-preview-video');
+    await expect(preview).toHaveClass(/thumbnail-unavailable/);
+    await preview.evaluate(element => element.classList.remove('thumbnail-unavailable'));
+    await page.evaluate(() => {
+        window.__reducedMotionPreviewPlays = 0;
+        HTMLMediaElement.prototype.load = function () {};
+        HTMLMediaElement.prototype.play = function () {
+            window.__reducedMotionPreviewPlays += 1;
+            return Promise.resolve();
+        };
+    });
+    await preview.hover();
+    await page.waitForTimeout(600);
+    await expect(video).not.toHaveAttribute('src', /./);
+    await expect(preview).not.toHaveClass(/preview-loading|preview-playing/);
+    expect(await page.evaluate(() => window.__reducedMotionPreviewPlays)).toBe(0);
 });
 
 test('favorite sorting runs on reload and filtering without moving a clicked card', async ({ page }) => {
@@ -439,14 +515,11 @@ test('favorite sorting runs on reload and filtering without moving a clicked car
     await expect(star).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)');
     await star.hover();
     await page.waitForTimeout(200);
-    const playBackground = await oldCard.locator('.history-preview-play svg')
-        .evaluate(element => getComputedStyle(element).backgroundColor);
     const starBackground = await star
         .evaluate(element => getComputedStyle(element).backgroundColor);
-    const playAlpha = Number(playBackground.match(/[\d.]+(?=\)$)/)[0]);
     const starAlpha = Number(starBackground.match(/[\d.]+(?=\)$)/)[0]);
-    expect(starAlpha).toBeLessThan(playAlpha);
-    expect(playAlpha - starAlpha).toBeLessThan(0.1);
+    expect(starAlpha).toBeGreaterThan(0.5);
+    expect(starAlpha).toBeLessThan(0.6);
     await star.click();
 
     await expect(cards.first()).toHaveAttribute('data-row-id', 'favorite-new');
