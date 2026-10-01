@@ -206,6 +206,74 @@ test('History search filters by downloader with the user qualifier', async ({ pa
     await expect(page.locator('#historyEmptyTitle')).toHaveText('No matching downloads');
 });
 
+test('History search filters by minimum quality, favorite state, and views', async ({ page }) => {
+    for (const row of [
+        {
+            id: 'filter-8k', status: 'finished', file: true,
+            name: 'filter-8k.mp4', title: 'Cinema showcase', resolution: '7680x4320',
+        },
+        {
+            id: 'filter-4k', status: 'finished', file: true,
+            name: 'filter-4k.mp4', title: 'Mountain documentary', resolution: '2160p',
+        },
+        {
+            id: 'filter-720', status: 'finished', file: true,
+            name: 'filter-720.mp4', title: 'Mountain tutorial', resolution: '1280x720',
+        },
+        {
+            id: 'filter-480', status: 'finished', file: true,
+            name: 'filter-480.mp4', title: 'Small clip', resolution: '480p',
+        },
+    ]) {
+        await seed(page, row);
+    }
+    const favorite = await page.request.post('/api/favorite/filter-4k', {
+        data: { favorite: true },
+    });
+    expect(favorite.ok()).toBeTruthy();
+    for (let count = 0; count < 10; count += 1) {
+        const response = await page.request.post('/api/view/filter-4k');
+        expect(response.ok()).toBeTruthy();
+    }
+    for (let count = 0; count < 9; count += 1) {
+        const response = await page.request.post('/api/view/filter-720');
+        expect(response.ok()).toBeTruthy();
+    }
+    await refresh(page);
+
+    const input = page.locator('#historySearchInput');
+    const cards = page.locator('#historyList [data-row-id]');
+    await page.locator('#historySearchToggle').click();
+
+    await input.fill('quality:4k');
+    await expect(cards).toHaveCount(2);
+    await expect(page.locator('[data-row-id="filter-8k"]')).toBeVisible();
+    await expect(page.locator('[data-row-id="filter-4k"]')).toBeVisible();
+
+    await input.fill('quality:720');
+    await expect(cards).toHaveCount(3);
+    await input.fill('quality:720p');
+    await expect(cards).toHaveCount(3);
+
+    await input.fill('star:yes');
+    await expect(cards).toHaveCount(1);
+    await expect(page.locator('[data-row-id="filter-4k"]')).toBeVisible();
+    await input.fill('starred:no');
+    await expect(cards).toHaveCount(3);
+
+    await input.fill('views:new');
+    await expect(cards).toHaveCount(2);
+    await expect(page.locator('[data-row-id="filter-8k"]')).toBeVisible();
+    await expect(page.locator('[data-row-id="filter-480"]')).toBeVisible();
+    await input.fill('views:10');
+    await expect(cards).toHaveCount(1);
+    await expect(page.locator('[data-row-id="filter-4k"]')).toBeVisible();
+
+    await input.fill('quality:4k star:yes views:10 mountain');
+    await expect(cards).toHaveCount(1);
+    await expect(page.locator('[data-row-id="filter-4k"]')).toBeVisible();
+});
+
 test('Header search expands from the leftmost magnifier', async ({ page }) => {
     const header = page.locator('#appHeader');
     const search = header.locator('#historySearch');
@@ -215,8 +283,9 @@ test('Header search expands from the leftmost magnifier', async ({ page }) => {
 
     await expect(toggle.locator('use')).toHaveAttribute('href', '#i-search');
     await expect(input).toHaveAttribute('type', 'text');
-    await expect(input).toHaveAttribute('placeholder', 'Search title, tag, or user:name');
-    await expect(input).toHaveAttribute('aria-label', 'Search history by title, tag, or user');
+    await expect(input).toHaveAttribute('placeholder', 'Search title, tag, or filters');
+    await expect(input).toHaveAttribute(
+        'aria-label', 'Search history by title, tag, user, quality, star, or views');
     await expect(toggle).toHaveAttribute('aria-expanded', 'false');
     await expect(input).toBeHidden();
     await expect(header.locator('select')).toHaveCount(0);

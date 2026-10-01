@@ -755,21 +755,76 @@ function parseSearchTerms(value) {
     return terms.map(term => term.trim()).filter(Boolean);
 }
 
+function searchQualityHeight(value) {
+    const key = tagSearchKey(value);
+    const aliases = {
+        '8k': 4320,
+        '4k': 2160,
+        'uhd': 2160,
+        '2k': 1440,
+        'qhd': 1440,
+    };
+    if (Object.prototype.hasOwnProperty.call(aliases, key)) return aliases[key];
+
+    const dimensions = key.match(/^(\d+)\s*[x×]\s*(\d+)$/);
+    const vertical = key.match(/^(\d+)\s*p?$/);
+    const height = dimensions
+        ? Number(dimensions[2])
+        : vertical
+            ? Number(vertical[1])
+            : 0;
+    return Number.isFinite(height) && height > 0 ? height : null;
+}
+
 function matchesSearchFilter(info) {
     if (searchTerms.length === 0) return true;
     const title = tagSearchKey(info.title);
     const tags = new Set((Array.isArray(info.tags) ? info.tags : []).map(tagSearchKey));
     const userTerms = [];
+    const qualityTerms = [];
+    const starredTerms = [];
+    const viewTerms = [];
     const contentTerms = [];
     searchTerms.forEach(term => {
         const key = tagSearchKey(term);
         if (key.startsWith('user:')) userTerms.push(key.slice('user:'.length).trim());
-        else contentTerms.push(term);
+        else if (key.startsWith('quality:')) {
+            qualityTerms.push(searchQualityHeight(key.slice('quality:'.length).trim()));
+        } else if (key.startsWith('starred:')) {
+            starredTerms.push(key.slice('starred:'.length).trim());
+        } else if (key.startsWith('star:')) {
+            starredTerms.push(key.slice('star:'.length).trim());
+        } else if (key.startsWith('views:')) {
+            viewTerms.push(key.slice('views:'.length).trim());
+        } else {
+            contentTerms.push(term);
+        }
     });
 
     if (userTerms.length) {
         const downloadedBy = tagSearchKey(info.downloaded_by);
         if (!userTerms.some(user => user && user === downloadedBy)) return false;
+    }
+    if (qualityTerms.length) {
+        const height = searchQualityHeight(info.resolution)
+            ?? searchQualityHeight(info.quality);
+        if (!qualityTerms.some(minimum => minimum !== null && height >= minimum)) return false;
+    }
+    if (starredTerms.length) {
+        const favorite = Boolean(info.favorite);
+        if (!starredTerms.some(value => (
+            (value === 'yes' && favorite) || (value === 'no' && !favorite)
+        ))) return false;
+    }
+    if (viewTerms.length) {
+        const numericViews = Number(info.view_count);
+        const viewCount = Number.isFinite(numericViews) && numericViews >= 0
+            ? numericViews
+            : 0;
+        if (!viewTerms.some(value => (
+            (value === 'new' && viewCount === 0)
+            || (/^\d+$/.test(value) && viewCount >= Number(value))
+        ))) return false;
     }
     if (contentTerms.length === 0) return true;
 

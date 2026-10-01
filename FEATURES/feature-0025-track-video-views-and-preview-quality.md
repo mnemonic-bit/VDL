@@ -3,7 +3,8 @@
 **Source:** User-requested feature  
 **Status:** Implemented  
 **Last refined:** 2026-10-01  
-**Extends:** Feature 0017, Make Download History the primary thumbnail library
+**Extends:** Feature 0002, Search and filter Download History; Feature 0017,
+Make Download History the primary thumbnail library
 
 ## Decision summary
 
@@ -24,6 +25,10 @@ range requests, direct media requests, and file downloads do not count. The
 Info dialog shows the resulting state on the same line as the downloader:
 `Downloaded by: <user> · NEW` for zero views and
 `Downloaded by: <user> · Views: <count>` otherwise.
+
+Extend History search with structured filters over the resulting metadata:
+minimum quality through `quality:`, favorite state through `star:` or
+`starred:`, and view state or minimum view count through `views:`.
 
 ## Terms
 
@@ -181,6 +186,43 @@ The same line then reads, for example,
 dialog reads the server-provided `view_count`, so it remains consistent across
 browsers and users.
 
+## History search filters
+
+Filtering remains client-side and applies only to Download History. Current
+downloads remain visible regardless of the History search input. The existing
+history response already contains the stored resolution, derived quality,
+favorite state, and view count, so these filters do not add an API endpoint or
+send the search query to the server.
+
+Support these case-insensitive qualifiers:
+
+| Qualifier | Meaning |
+| --- | --- |
+| `quality:4k` | Stored quality is 4K or better |
+| `quality:720` or `quality:720p` | Stored quality is 720p or better |
+| `star:yes` or `starred:yes` | Entry is a favorite |
+| `star:no` or `starred:no` | Entry is not a favorite |
+| `views:new` | Persisted `view_count` is exactly zero |
+| `views:10` | Persisted `view_count` is at least ten |
+
+Quality thresholds accept the same numeric, optional-`p`, dimension, and
+named-alias forms as quality classification. Compare their normalized vertical
+heights so higher tiers satisfy lower thresholds. For example, `quality:4k`
+also returns 8K entries, while `quality:720p` returns 720p, 1080p, 2K, 4K,
+and 8K entries.
+
+Within one qualifier type, multiple values are alternatives. Different
+qualifier types constrain each other, and at least one existing title or tag
+term must also match. Thus `quality:4k star:yes views:10 mountain` returns
+starred videos whose quality is at least 4K, whose count is at least ten, and
+whose title or tag matches `mountain`. Unrecognized or empty values for a
+recognized qualifier match no entries rather than falling back to title or tag
+search.
+
+Each filter execution retains the existing favorite-first ordering and applies
+before History pagination. Clearing the input restores the unfiltered History
+list and its normal ordering behavior.
+
 ## Accessibility requirements
 
 - Keep the preview a native button with the existing `Play` accessible name
@@ -231,6 +273,15 @@ browsers and users.
   same-origin protection.
 - Browser tests cover both label colors, `new` removal, and the zero/nonzero
   Info presentations.
+- `quality:4k` returns 4K and 8K entries but excludes 2K and lower entries.
+- `quality:720` and `quality:720p` return identical results and include every
+  classified entry at 720p or higher.
+- `star:yes`, `starred:yes`, `star:no`, and `starred:no` filter on persisted
+  favorite state.
+- `views:new` returns only zero-view entries, while `views:10` returns entries
+  with ten or more persisted views.
+- Quality, favorite, view, user, title, and tag criteria can be combined
+  without hiding Current downloads.
 
 ## Non-goals
 
@@ -240,7 +291,7 @@ browsers and users.
   device, or time window.
 - It does not count autoplay, hover montages, direct media URLs, API media
   requests, or file downloads.
-- It does not add sorting, filtering, or searching by view count or new state.
+- It does not add sorting by view count or a dedicated server-side search API.
 - It does not display the view count directly on the thumbnail.
 - It does not provide an endpoint to decrement or reset views.
 - It does not change the exact resolution shown in the existing Info media
