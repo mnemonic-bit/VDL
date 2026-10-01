@@ -68,18 +68,43 @@ for attempt in $(seq 1 40); do
 done
 
 "$engine" exec "$name" python - <<'PY'
+import urllib.error
 import urllib.request
 
 for path in ('/api/health', '/', '/static/app.js', '/static/styles.css'):
     with urllib.request.urlopen('http://127.0.0.1:5000' + path, timeout=3) as response:
         assert response.status == 200, (path, response.status)
+try:
+    urllib.request.urlopen('http://127.0.0.1:5000/api/history', timeout=3)
+except urllib.error.HTTPError as error:
+    assert error.code == 401, error.code
+else:
+    raise AssertionError('history was available without authentication')
 PY
 
 "$engine" exec "$name" python - <<'PY'
 import json
 import os
 import subprocess
+import http.cookiejar
+import urllib.parse
 import urllib.request
+
+base_url = 'http://127.0.0.1:5000'
+cookies = http.cookiejar.CookieJar()
+opener = urllib.request.build_opener(
+    urllib.request.HTTPCookieProcessor(cookies)
+)
+setup = urllib.request.Request(
+    base_url + '/login',
+    data=urllib.parse.urlencode({
+        'username': 'admin',
+        'password': 'container-test-password',
+        'password_confirmation': 'container-test-password',
+    }).encode(),
+    method='POST',
+)
+opener.open(setup, timeout=3).close()
 
 media_path = '/tmp/upload-smoke.mp4'
 subprocess.run(
@@ -94,7 +119,7 @@ with open(media_path, 'rb') as media:
     payload = media.read()
 
 start = urllib.request.Request(
-    'http://127.0.0.1:5000/api/upload',
+    base_url + '/api/upload',
     data=json.dumps({
         'filename': 'container-upload.mp4',
         'filesize': len(payload),
@@ -102,16 +127,16 @@ start = urllib.request.Request(
     headers={'Content-Type': 'application/json'},
     method='POST',
 )
-with urllib.request.urlopen(start, timeout=3) as response:
+with opener.open(start, timeout=3) as response:
     upload_id = json.load(response)['id']
 transfer = urllib.request.Request(
-    f'http://127.0.0.1:5000/api/upload/{upload_id}',
+    f'{base_url}/api/upload/{upload_id}',
     data=payload,
     headers={'Content-Type': 'video/mp4'},
     method='PUT',
 )
-urllib.request.urlopen(transfer, timeout=10).close()
-with urllib.request.urlopen('http://127.0.0.1:5000/api/history') as response:
+opener.open(transfer, timeout=10).close()
+with opener.open(base_url + '/api/history') as response:
     uploaded = next(row for row in json.load(response) if row['id'] == upload_id)
 assert uploaded['status'] == 'finished', uploaded
 assert uploaded['source_type'] == 'upload', uploaded
@@ -121,21 +146,38 @@ remove = urllib.request.Request(
     data=b'',
     method='POST',
 )
-urllib.request.urlopen(remove, timeout=3).close()
+opener.open(remove, timeout=3).close()
 PY
 
 "$engine" exec "$name" python - <<'PY'
 import json
+import http.cookiejar
 import sqlite3
 import time
+import urllib.parse
 import urllib.request
 
+base_url = 'http://127.0.0.1:5000'
+cookies = http.cookiejar.CookieJar()
+opener = urllib.request.build_opener(
+    urllib.request.HTTPCookieProcessor(cookies)
+)
+login = urllib.request.Request(
+    base_url + '/login',
+    data=urllib.parse.urlencode({
+        'username': 'admin',
+        'password': 'container-test-password',
+    }).encode(),
+    method='POST',
+)
+opener.open(login, timeout=3).close()
+
 request = urllib.request.Request(
-    'http://127.0.0.1:5000/api/preferences',
+    base_url + '/api/preferences',
     data=json.dumps({'theme': 'dark'}).encode(),
     headers={'Content-Type': 'application/json'},
 )
-urllib.request.urlopen(request, timeout=3).close()
+opener.open(request, timeout=3).close()
 with open('/downloads/persist.mp4', 'wb') as output:
     output.write(b'persistent media')
 with sqlite3.connect('/data/downloads.db') as connection:
@@ -159,13 +201,30 @@ for attempt in $(seq 1 40); do
 done
 "$engine" exec "$name" python - <<'PY'
 import json
+import http.cookiejar
+import urllib.parse
 import urllib.request
 
-with urllib.request.urlopen('http://127.0.0.1:5000/api/preferences') as response:
+base_url = 'http://127.0.0.1:5000'
+cookies = http.cookiejar.CookieJar()
+opener = urllib.request.build_opener(
+    urllib.request.HTTPCookieProcessor(cookies)
+)
+login = urllib.request.Request(
+    base_url + '/login',
+    data=urllib.parse.urlencode({
+        'username': 'admin',
+        'password': 'container-test-password',
+    }).encode(),
+    method='POST',
+)
+opener.open(login, timeout=3).close()
+
+with opener.open(base_url + '/api/preferences') as response:
     assert json.load(response)['theme'] == 'dark'
-with urllib.request.urlopen('http://127.0.0.1:5000/api/history') as response:
+with opener.open(base_url + '/api/history') as response:
     assert any(row['id'] == 'persist1' for row in json.load(response))
-with urllib.request.urlopen('http://127.0.0.1:5000/api/file/persist1') as response:
+with opener.open(base_url + '/api/file/persist1') as response:
     assert response.read() == b'persistent media'
 PY
 

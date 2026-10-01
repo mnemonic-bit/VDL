@@ -5,6 +5,7 @@ browser interface for choosing formats, tracking concurrent downloads, pausing
 or resuming work, importing local videos by dropping them onto the page,
 organising entries with tags, and playing completed media.
 Live progress arrives over Server-Sent Events without browser polling.
+The UI and media APIs require a signed-in user.
 
 [![Latest release](https://img.shields.io/github/v/release/mnemonic-bit/VDL?display_name=tag&sort=semver)](https://github.com/mnemonic-bit/VDL/releases/latest)
 [![Main pipeline](https://github.com/mnemonic-bit/VDL/actions/workflows/main.yml/badge.svg?branch=main&event=push)](https://github.com/mnemonic-bit/VDL/actions/workflows/main.yml?query=branch%3Amain+event%3Apush)
@@ -52,6 +53,16 @@ VDL_PORT=8080 docker compose up --build -d
 
 Stop containers with `docker compose down`. This preserves `vdl-data` and
 `vdl-downloads`; `docker compose down -v` intentionally deletes both volumes.
+
+### First sign-in and user access
+
+The first visit asks you to set a password for the built-in `admin` account;
+there is no preset password. Passwords are stored as one-way Werkzeug hashes.
+After signing in, administrators can open **Settings → Users** to add normal or
+administrator accounts, rename accounts, suspend or resume access, reset
+passwords, and remove users. VDL prevents removal, suspension, or demotion of
+the last active administrator. Renaming the bootstrap administrator does not
+recreate an `admin` account on restart.
 
 Podman can build and run the same image. A Compose provider (`podman-compose`
 or Docker Compose) is required to use `compose.yaml` through Podman.
@@ -115,8 +126,9 @@ controls and do not guarantee a successful download.
 ## Storage, backup, and upgrades
 
 List the concrete named-volume locations with `docker volume inspect`. Back up
-both volumes while VDL is stopped; `/data` contains download history and
-preferences, while `/downloads` contains completed media and resumable partials.
+both volumes while VDL is stopped; `/data` contains users, password hashes,
+session signing state, download history, and preferences, while `/downloads`
+contains completed media and resumable partials.
 
 Upgrades are immutable and reviewed: update image digests and dependency pins,
 update `requirements-container.constraints`, regenerate
@@ -124,8 +136,9 @@ update `requirements-container.constraints`, regenerate
 `manylinux_2_17_aarch64`, run `./tests/container/check-lock.sh`, rebuild with
 `--pull`, run the smoke checks, then recreate the service. Do not run
 `yt-dlp -U`, `pip install -U`, or a Deno updater inside a running container.
-Rollback starts the previous image against the same two volumes; this feature
-adds no database migration.
+Rollback starts the previous image against the same two volumes. Startup
+automatically creates the access-control tables when upgrading an older
+database.
 
 Bind mounts are supported in place of the named volumes, but both host paths
 must already be writable by UID/GID 10001:
@@ -141,10 +154,12 @@ that cannot create its database or media files.
 
 ## Network exposure
 
-The UI accepts arbitrary operator-supplied URLs and has no authentication. The
-Compose port binds to `0.0.0.0`, so anyone who can reach the host port can use
-the app. Restrict access to a trusted network or place it behind an authenticated
-reverse proxy with request limits and an SSRF policy before exposing it publicly.
+The UI accepts arbitrary operator-supplied URLs and requires a local VDL
+account. The Compose port binds to `0.0.0.0`; use strong passwords and still
+restrict access to a trusted network or place it behind a hardened reverse
+proxy with request limits and an SSRF policy before exposing it publicly. The
+login is an application access boundary, not protection against hostile URLs
+submitted by an authorized user.
 
 Only download media you are authorised to access and use. VDL does not bypass
 DRM or access controls, and operators remain responsible for applicable site
@@ -186,7 +201,8 @@ unrelated removal or restriction should be recorded rather than treated as a
 container build failure.
 
 Inspect image health with `docker inspect --format '{{json .State.Health}}'`
-or the equivalent Podman command. `/api/health` is local-only and does not call
+or the equivalent Podman command. `/api/health` intentionally remains
+unauthenticated for runtime probes, exposes no library data, and does not call
 YouTube or the optional provider.
 
 ## Native development

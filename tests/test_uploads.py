@@ -134,7 +134,7 @@ class UploadTest(AppCase):
             return "720p"
 
         def transfer():
-            with vdl.app.test_client() as client:
+            with self.authenticated_client() as client:
                 result["response"] = client.put(
                     f"/api/upload/{upload_id}",
                     data=payload,

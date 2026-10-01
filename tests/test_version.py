@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest import mock
 
 import vdl
+from tests.support.app_case import AppCase
 
 
 class VersionLoadingTest(unittest.TestCase):
@@ -52,9 +53,9 @@ class VersionLoadingTest(unittest.TestCase):
                     os.chdir(previous_cwd)
 
 
-class VersionEndpointTest(unittest.TestCase):
+class VersionEndpointTest(AppCase):
     def setUp(self):
-        self.client = vdl.app.test_client()
+        super().setUp()
 
     def test_uptime_is_elapsed_time_since_application_start(self):
         with mock.patch.object(vdl.time, 'monotonic', return_value=vdl.APP_STARTED_AT + 13.9):

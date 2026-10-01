@@ -32,6 +32,7 @@ class SchemaMigrationTest(unittest.TestCase):
 
             old_path = vdl.DB_PATH
             old_default = vdl.DEFAULT_DOWNLOAD_DIR
+            old_secret_key = vdl.app.secret_key
             try:
                 vdl.DB_PATH = database
                 vdl.DEFAULT_DOWNLOAD_DIR = os.path.join(temp_dir, "downloads")
@@ -56,7 +57,13 @@ class SchemaMigrationTest(unittest.TestCase):
                     "downloaded_bytes", "total_bytes", "favorite",
                     "source_type",
                 })
-                self.assertTrue({"tags", "download_tags"}.issubset(tables))
+                self.assertTrue({
+                    "tags", "download_tags", "app_config", "roles", "users",
+                    "user_roles",
+                }.issubset(tables))
+                admin = vdl.db_get_user_by_username("admin")
+                self.assertEqual(admin["roles"], ["admin"])
+                self.assertIsNone(admin["password_hash"])
                 self.assertEqual(
                     vdl.db_get_download("legacy1")["status"],
                     "interrupted",
@@ -77,6 +84,7 @@ class SchemaMigrationTest(unittest.TestCase):
             finally:
                 vdl.DB_PATH = old_path
                 vdl.DEFAULT_DOWNLOAD_DIR = old_default
+                vdl.app.secret_key = old_secret_key
 
 
 if __name__ == "__main__":

@@ -26,6 +26,11 @@ def inspect_uploaded_video(_path):
 
 
 vdl.inspect_uploaded_video = inspect_uploaded_video
+initial_admin = vdl.db_get_initial_admin()
+if initial_admin is not None:
+    vdl.db_set_initial_admin_password(
+        initial_admin["id"], "browser-test-password"
+    )
 
 
 @vdl.app.post("/__test__/reset")

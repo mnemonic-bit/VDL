@@ -135,6 +135,10 @@ function hideServerBanner() {
 function apiFetch(url, options) {
     return fetch(url, options).then(res => {
         hideServerBanner();
+        if (res.status === 401) {
+            window.location.assign('/login');
+            throw new Error('Your session has ended. Sign in again.');
+        }
         return res;
     }).catch(err => {
         showServerBanner();
@@ -2439,6 +2443,7 @@ function openSettings() {
     document.getElementById('settingsButton').setAttribute('aria-pressed', 'true');
     window.scrollTo({ top: 0 });
     loadPreferences();
+    if (document.getElementById('userList')) loadUsers();
 }
 
 function closeSettings() {
@@ -2474,7 +2479,7 @@ function applySettingsSearch() {
 
     settingsSections.forEach(section => {
         let sectionMatches = 0;
-        section.querySelectorAll('.setting-item').forEach(item => {
+        section.querySelectorAll('.setting-item, [data-setting-keywords]').forEach(item => {
             const searchable = `${item.textContent} ${item.dataset.settingKeywords || ''}`
                 .toLocaleLowerCase();
             const available = item.dataset.settingAvailable !== 'false';
@@ -2516,6 +2521,106 @@ settingsSearchInput.addEventListener('keydown', event => {
     settingsSearchInput.value = '';
     applySettingsSearch();
 });
+
+let managedRoles = [];
+let managedCurrentUserId = null;
+
+function userRoleOptions(selectedRole) {
+    return managedRoles.map(role => (
+        `<option value="${escapeAttr(role)}"${role === selectedRole ? ' selected' : ''}>${escapeHtml(role)}</option>`
+    )).join('');
+}
+
+function renderUsers(users) {
+    const list = document.getElementById('userList');
+    if (!list) return;
+    const roleSelect = document.getElementById('newUserRole');
+    roleSelect.innerHTML = userRoleOptions('normal');
+    list.innerHTML = users.map(user => {
+        const role = user.roles[0] || '';
+        const isCurrent = user.id === managedCurrentUserId;
+        return `<article class="user-row" data-user-id="${user.id}">
+                    <div class="user-row-heading">
+                        <strong>${escapeHtml(user.username)}${isCurrent ? ' (you)' : ''}</strong>
+                        <span class="user-role">${escapeHtml(role)}</span>
+                        ${user.suspended ? '<span class="user-suspended">Suspended</span>' : ''}
+                    </div>
+                    <div class="user-editor">
+                        <input class="user-name-input" type="text" maxlength="64" value="${escapeAttr(user.username)}" aria-label="Username for ${escapeAttr(user.username)}">
+                        <select class="user-role-input" aria-label="Role for ${escapeAttr(user.username)}">${userRoleOptions(role)}</select>
+                        <input class="user-password-input" type="password" minlength="8" placeholder="New password (optional)" autocomplete="new-password" aria-label="New password for ${escapeAttr(user.username)}">
+                    </div>
+                    <div class="user-actions">
+                        <button type="button" onclick="updateUser(${user.id})">Save changes</button>
+                        <button type="button" onclick="setUserSuspended(${user.id}, ${!user.suspended})"${isCurrent ? ' disabled title="You cannot suspend your own account"' : ''}>${user.suspended ? 'Resume' : 'Suspend'}</button>
+                        <button type="button" class="user-remove" onclick="removeUser(${user.id})"${isCurrent ? ' disabled title="You cannot remove your own account"' : ''}>Remove</button>
+                    </div>
+                </article>`;
+    }).join('') || '<p class="empty">No users.</p>';
+}
+
+function loadUsers() {
+    if (!document.getElementById('userList')) return Promise.resolve();
+    return apiAction('/api/users').then(response => response.json()).then(data => {
+        managedRoles = data.roles || [];
+        managedCurrentUserId = data.current_user_id;
+        renderUsers(data.users || []);
+    }).catch(() => {});
+}
+
+function addUser(event) {
+    event.preventDefault();
+    const body = {
+        username: document.getElementById('newUsername').value,
+        password: document.getElementById('newUserPassword').value,
+        role: document.getElementById('newUserRole').value,
+    };
+    apiAction('/api/users', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+    }).then(() => {
+        document.getElementById('addUserForm').reset();
+        return loadUsers();
+    }).catch(() => {});
+}
+
+function updateUser(userId) {
+    const row = document.querySelector(`[data-user-id="${userId}"]`);
+    const password = row.querySelector('.user-password-input').value;
+    const body = {
+        username: row.querySelector('.user-name-input').value,
+        role: row.querySelector('.user-role-input').value,
+    };
+    if (password) body.password = password;
+    apiAction(`/api/users/${userId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+    }).then(response => response.json()).then(user => {
+        if (userId === managedCurrentUserId) {
+            document.getElementById('currentUsername').textContent = user.username;
+            if (!user.roles.includes('admin')) window.location.reload();
+        }
+        return loadUsers();
+    }).catch(() => {});
+}
+
+function setUserSuspended(userId, suspended) {
+    apiAction(`/api/users/${userId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ suspended }),
+    }).then(loadUsers).catch(() => {});
+}
+
+function removeUser(userId) {
+    const row = document.querySelector(`[data-user-id="${userId}"]`);
+    const username = row.querySelector('.user-name-input').value;
+    if (!confirm(`Remove user “${username}”?`)) return;
+    apiAction(`/api/users/${userId}`, { method: 'DELETE' })
+        .then(loadUsers).catch(() => {});
+}
 
 window.addEventListener('resize', closeHistoryInfo);
 

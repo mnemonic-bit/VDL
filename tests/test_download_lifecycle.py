@@ -343,7 +343,7 @@ class DownloadLifecycleTest(AppCase):
         responses = []
 
         def resume():
-            with vdl.app.test_client() as client:
+            with self.authenticated_client() as client:
                 responses.append(client.post(f"/api/resume/{download_id}").status_code)
 
         with (
@@ -385,7 +385,7 @@ class DownloadLifecycleTest(AppCase):
         responses = {}
 
         def post(name, path):
-            with vdl.app.test_client() as client:
+            with self.authenticated_client() as client:
                 responses[name] = client.post(path).status_code
 
         with (

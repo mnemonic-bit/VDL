@@ -93,7 +93,7 @@ def wait_until_ready(process, base_url):
         if process.poll() is not None:
             raise SystemExit(f"Browser fixture exited with status {process.returncode}")
         try:
-            with urllib.request.urlopen(base_url + "/api/health", timeout=1) as response:
+            with urllib.request.urlopen(base_url + "/login", timeout=1) as response:
                 if response.status == 200:
                     return
         except OSError:

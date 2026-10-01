@@ -86,7 +86,7 @@ class CancelledDownloadCleanupTest(AppCase):
         ]
         unrelated_path = self._write("fixture_cancel02.mp4.part")
 
-        response = vdl.app.test_client().post(f"/api/remove/{download_id}")
+        response = self.authenticated_client().post(f"/api/remove/{download_id}")
 
         self.assertEqual(response.status_code, 200)
         self.assertIsNone(vdl.db_get_download(download_id))
@@ -104,7 +104,7 @@ class CancelledDownloadCleanupTest(AppCase):
         partial_path = self._write(f"fixture_{download_id}.mp4.part")
         vdl.db_set_preferences({"download_dir": self.other_dir})
 
-        response = vdl.app.test_client().post(f"/api/remove/{download_id}")
+        response = self.authenticated_client().post(f"/api/remove/{download_id}")
 
         self.assertEqual(response.status_code, 200)
         self.assertFalse(os.path.exists(partial_path))

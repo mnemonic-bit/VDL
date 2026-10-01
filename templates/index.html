@@ -183,6 +183,7 @@
             <span>Video Download Helper</span>
         </h2>
         <div class="header-actions">
+            <span id="currentUsername" class="current-username">{{ current_user.username }}</span>
             <div id="historySearch" class="header-search" role="search">
                 <button id="historySearchToggle" class="header-search-toggle" type="button"
                         aria-label="Search history" aria-expanded="false" aria-controls="historySearchInput">
@@ -212,6 +213,9 @@
                     aria-label="Settings" aria-controls="settingsPage" aria-pressed="false">
                 <svg aria-hidden="true"><use href="#i-cog"/></svg>
             </button>
+            <form method="post" action="{{ url_for('logout') }}" class="logout-form">
+                <button class="logout-button" type="submit">Sign out</button>
+            </form>
         </div>
     </header>
 
@@ -250,6 +254,7 @@
             <nav class="settings-nav" aria-label="Settings sections">
                 <button type="button" class="active" data-settings-section="general" aria-current="page">General</button>
                 <button type="button" data-settings-section="playback">Playback</button>
+                {% if is_admin %}<button type="button" data-settings-section="users">Users</button>{% endif %}
                 <button type="button" class="danger" data-settings-section="danger">Danger Zone</button>
             </nav>
             <div class="settings-content">
@@ -332,6 +337,23 @@
                         <input type="checkbox" id="prefStartFullscreen" aria-describedby="prefStartFullscreenHint">
                     </div>
                 </section>
+
+                {% if is_admin %}
+                <section id="settings-users" class="settings-section" data-settings-name="users" tabindex="-1">
+                    <h2>Users</h2>
+                    <p class="settings-section-intro">Add accounts and manage access to this application.</p>
+                    <form id="addUserForm" class="user-create-form" onsubmit="addUser(event)"
+                          data-setting-keywords="users accounts add create role password">
+                        <input id="newUsername" type="text" maxlength="64" required
+                               placeholder="Username" autocomplete="off" aria-label="New username">
+                        <input id="newUserPassword" type="password" minlength="8" required
+                               placeholder="Initial password" autocomplete="new-password" aria-label="Initial password">
+                        <select id="newUserRole" aria-label="New user role"></select>
+                        <button type="submit">Add user</button>
+                    </form>
+                    <div id="userList" class="user-list" aria-live="polite"></div>
+                </section>
+                {% endif %}
 
                 <section id="settings-danger" class="settings-section settings-danger" data-settings-name="danger" tabindex="-1">
                     <h2>Danger Zone</h2>

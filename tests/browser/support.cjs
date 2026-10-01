@@ -1,6 +1,9 @@
 const { expect } = require('@playwright/test');
 
 async function reset(page) {
+    await page.request.post('/login', {
+        form: { username: 'admin', password: 'browser-test-password' },
+    });
     await page.request.post('/__test__/reset');
     await page.goto('/');
     await expect(page.locator('#prefDir')).not.toHaveValue('');

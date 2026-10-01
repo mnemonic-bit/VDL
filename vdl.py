@@ -1,7 +1,11 @@
 import argparse
 import gc
 
-from flask import Flask, render_template, request, jsonify, send_file, abort, Response, stream_with_context
+from flask import (
+    Flask, Response, abort, g, jsonify, redirect, render_template, request,
+    send_file, session, stream_with_context, url_for,
+)
+from werkzeug.security import check_password_hash, generate_password_hash
 import yt_dlp
 import threading
 import queue
@@ -15,9 +19,11 @@ import time
 import subprocess
 import mimetypes
 import copy
+import secrets
 import tempfile
 import unicodedata
 from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -114,6 +120,10 @@ def yt_dlp_options(options):
     return merged
 
 app = Flask(__name__)
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+)
 
 
 def _normalized_http_origin(value):
@@ -142,11 +152,8 @@ def _normalized_http_origin(value):
 
 @app.before_request
 def reject_cross_origin_api_mutation():
-    """Keep browser form submissions from mutating the loopback service."""
-    if (
-        not request.path.startswith('/api/')
-        or request.method not in ('POST', 'PUT', 'PATCH', 'DELETE')
-    ):
+    """Keep browser form submissions from mutating the service."""
+    if request.method not in ('POST', 'PUT', 'PATCH', 'DELETE'):
         return None
 
     origin = request.headers.get('Origin')
@@ -162,6 +169,44 @@ def reject_cross_origin_api_mutation():
     if request.headers.get('Sec-Fetch-Site', '').lower() == 'cross-site':
         return jsonify({"error": "Cross-origin request denied"}), 403
     return None
+
+
+@app.before_request
+def require_authenticated_user():
+    """Resolve the signed session before any private UI or API is served."""
+    # Static styling is needed by the sign-in page, and the data-free health
+    # probe must remain available to container runtimes before anyone signs in.
+    if request.endpoint in ('static', 'login', 'health'):
+        return None
+
+    user_id = session.get('user_id')
+    user = db_get_user_by_id(user_id) if user_id is not None else None
+    if (user is not None
+            and not user['suspended']
+            and user['password_hash'] is not None
+            and session.get('session_version') == user['session_version']):
+        g.current_user = user
+        return None
+
+    session.clear()
+    if request.path.startswith('/api/'):
+        return jsonify({"error": "Authentication required"}), 401
+    return redirect(url_for('login'))
+
+
+def admin_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if 'admin' not in g.current_user['roles']:
+            return jsonify({"error": "Administrator access required"}), 403
+        return view(*args, **kwargs)
+    return wrapped
+
+
+def _start_user_session(user):
+    session.clear()
+    session['user_id'] = user['id']
+    session['session_version'] = user['session_version']
 
 # ---------------------------------------------------------------------------
 # Event bus (server -> browser push)
@@ -284,6 +329,28 @@ def init_db():
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS app_config (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS roles (
+                id   INTEGER PRIMARY KEY,
+                name TEXT NOT NULL COLLATE NOCASE UNIQUE
+            );
+            CREATE TABLE IF NOT EXISTS users (
+                id              INTEGER PRIMARY KEY,
+                username        TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                password_hash   TEXT,
+                suspended       INTEGER NOT NULL DEFAULT 0
+                                CHECK (suspended IN (0, 1)),
+                session_version INTEGER NOT NULL DEFAULT 0,
+                created_at      REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS user_roles (
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                role_id INTEGER NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+                PRIMARY KEY (user_id, role_id)
+            );
             CREATE TABLE IF NOT EXISTS tags (
                 id              INTEGER PRIMARY KEY,
                 name            TEXT NOT NULL,
@@ -349,6 +416,46 @@ def init_db():
         ]:
             if col not in existing_cols:
                 conn.execute(ddl)
+
+        # Roles are rows rather than a users-table enum so deployments can add
+        # role names later without another schema migration. The join table is
+        # intentionally many-to-many even though today's UI assigns one role.
+        for role_name in ('normal', 'admin'):
+            conn.execute(
+                "INSERT OR IGNORE INTO roles(name) VALUES (?)",
+                (role_name,),
+            )
+        bootstrap_created = conn.execute(
+            "SELECT 1 FROM app_config WHERE key = 'bootstrap_admin_created'"
+        ).fetchone()
+        if bootstrap_created is None:
+            conn.execute(
+                "INSERT OR IGNORE INTO users(username, password_hash, created_at) "
+                "VALUES ('admin', NULL, ?)",
+                (time.time(),),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO user_roles(user_id, role_id) "
+                "SELECT users.id, roles.id FROM users, roles "
+                "WHERE users.username = 'admin' AND roles.name = 'admin'"
+            )
+            # The marker, rather than the username, records bootstrap. An
+            # administrator may rename the account without init_db recreating
+            # a new passwordless account named "admin" on the next restart.
+            conn.execute(
+                "INSERT INTO app_config(key, value) VALUES (?, ?)",
+                ('bootstrap_admin_created', '1'),
+            )
+
+        # Persisting the signing key keeps browser sessions valid across clean
+        # restarts without asking operators to manage another required secret.
+        conn.execute(
+            "INSERT OR IGNORE INTO app_config(key, value) VALUES (?, ?)",
+            ('session_secret', secrets.token_hex(32)),
+        )
+        app.secret_key = conn.execute(
+            "SELECT value FROM app_config WHERE key = 'session_secret'"
+        ).fetchone()['value']
         # Seed defaults only if missing.
         defaults = {
             "download_dir": DEFAULT_DOWNLOAD_DIR,
@@ -745,6 +852,217 @@ def db_set_preferences(updates: dict):
     if "max_concurrent" in updates:
         with _worker_condition:
             _worker_condition.notify_all()
+
+
+def _db_user(conn, where, values):
+    row = conn.execute(
+        "SELECT id, username, password_hash, suspended, session_version, "
+        f"created_at FROM users WHERE {where}",
+        values,
+    ).fetchone()
+    if row is None:
+        return None
+    user = dict(row)
+    user['suspended'] = bool(user['suspended'])
+    user['roles'] = [
+        role['name'] for role in conn.execute(
+            "SELECT roles.name FROM roles "
+            "JOIN user_roles ON user_roles.role_id = roles.id "
+            "WHERE user_roles.user_id = ? "
+            "ORDER BY roles.name COLLATE NOCASE",
+            (user['id'],),
+        )
+    ]
+    return user
+
+
+def db_get_user_by_id(user_id):
+    with db() as conn:
+        return _db_user(conn, "id = ?", (user_id,))
+
+
+def db_get_user_by_username(username):
+    with db() as conn:
+        return _db_user(conn, "username = ? COLLATE NOCASE", (username,))
+
+
+def db_get_initial_admin():
+    """Return the passwordless bootstrap administrator, if it still exists."""
+    with db() as conn:
+        row = conn.execute(
+            "SELECT users.id FROM users "
+            "JOIN user_roles ON user_roles.user_id = users.id "
+            "JOIN roles ON roles.id = user_roles.role_id "
+            "WHERE roles.name = 'admin' AND users.password_hash IS NULL "
+            "ORDER BY users.created_at, users.id LIMIT 1"
+        ).fetchone()
+        return _db_user(conn, "id = ?", (row['id'],)) if row else None
+
+
+def db_list_roles():
+    with db() as conn:
+        return [
+            row['name'] for row in conn.execute(
+                "SELECT name FROM roles ORDER BY name COLLATE NOCASE"
+            )
+        ]
+
+
+def _public_user(user):
+    return {
+        key: value for key, value in user.items()
+        if key != 'password_hash'
+    }
+
+
+def db_list_users():
+    with db() as conn:
+        ids = [
+            row['id'] for row in conn.execute(
+                "SELECT id FROM users ORDER BY username COLLATE NOCASE"
+            )
+        ]
+        return [_public_user(_db_user(conn, "id = ?", (user_id,)))
+                for user_id in ids]
+
+
+def _validated_username(value):
+    if not isinstance(value, str):
+        raise ValueError('Username is required')
+    username = unicodedata.normalize('NFC', value).strip()
+    if (not username or len(username) > 64
+            or any(ord(character) < 32 for character in username)):
+        raise ValueError('Username must be between 1 and 64 visible characters')
+    return username
+
+
+def _validated_password(value):
+    if not isinstance(value, str) or len(value) < 8:
+        raise ValueError('Password must contain at least 8 characters')
+    if len(value) > 1024:
+        raise ValueError('Password is too long')
+    return value
+
+
+def _db_role_id(conn, role_name):
+    row = conn.execute(
+        "SELECT id FROM roles WHERE name = ? COLLATE NOCASE",
+        (role_name,),
+    ).fetchone()
+    if row is None:
+        raise ValueError('Unknown role')
+    return row['id']
+
+
+def db_set_initial_admin_password(user_id, password):
+    password_hash = generate_password_hash(_validated_password(password))
+    with _db_lock, db() as conn:
+        cursor = conn.execute(
+            "UPDATE users SET password_hash = ?, session_version = session_version + 1 "
+            "WHERE id = ? AND password_hash IS NULL",
+            (password_hash, user_id),
+        )
+        if cursor.rowcount != 1:
+            return None
+        return _db_user(conn, "id = ?", (user_id,))
+
+
+def db_create_user(username, password, role_name):
+    username = _validated_username(username)
+    password_hash = generate_password_hash(_validated_password(password))
+    with _db_lock, db() as conn:
+        role_id = _db_role_id(conn, role_name)
+        try:
+            cursor = conn.execute(
+                "INSERT INTO users(username, password_hash, created_at) "
+                "VALUES (?, ?, ?)",
+                (username, password_hash, time.time()),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError('A user with that name already exists') from exc
+        conn.execute(
+            "INSERT INTO user_roles(user_id, role_id) VALUES (?, ?)",
+            (cursor.lastrowid, role_id),
+        )
+        return _public_user(_db_user(conn, "id = ?", (cursor.lastrowid,)))
+
+
+def _db_other_active_admin_exists(conn, user_id):
+    return conn.execute(
+        "SELECT 1 FROM users "
+        "JOIN user_roles ON user_roles.user_id = users.id "
+        "JOIN roles ON roles.id = user_roles.role_id "
+        "WHERE roles.name = 'admin' AND users.suspended = 0 "
+        "AND users.id != ? LIMIT 1",
+        (user_id,),
+    ).fetchone() is not None
+
+
+def db_update_user(user_id, *, username=None, password=None,
+                   role_name=None, suspended=None):
+    with _db_lock, db() as conn:
+        user = _db_user(conn, "id = ?", (user_id,))
+        if user is None:
+            return None
+        if role_name is not None and not isinstance(role_name, str):
+            raise ValueError('Unknown role')
+
+        removes_active_admin = (
+            'admin' in user['roles']
+            and not user['suspended']
+            and (suspended is True
+                 or (role_name is not None
+                     and role_name.casefold() != 'admin'))
+        )
+        if (removes_active_admin
+                and not _db_other_active_admin_exists(conn, user_id)):
+            raise ValueError('At least one active administrator is required')
+
+        if username is not None:
+            username = _validated_username(username)
+            try:
+                conn.execute(
+                    "UPDATE users SET username = ? WHERE id = ?",
+                    (username, user_id),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError('A user with that name already exists') from exc
+        if suspended is not None:
+            if not isinstance(suspended, bool):
+                raise ValueError('Suspended must be true or false')
+            conn.execute(
+                "UPDATE users SET suspended = ? WHERE id = ?",
+                (int(suspended), user_id),
+            )
+        if password is not None:
+            password_hash = generate_password_hash(
+                _validated_password(password)
+            )
+            conn.execute(
+                "UPDATE users SET password_hash = ?, "
+                "session_version = session_version + 1 WHERE id = ?",
+                (password_hash, user_id),
+            )
+        if role_name is not None:
+            role_id = _db_role_id(conn, role_name)
+            conn.execute("DELETE FROM user_roles WHERE user_id = ?", (user_id,))
+            conn.execute(
+                "INSERT INTO user_roles(user_id, role_id) VALUES (?, ?)",
+                (user_id, role_id),
+            )
+        return _public_user(_db_user(conn, "id = ?", (user_id,)))
+
+
+def db_delete_user(user_id):
+    with _db_lock, db() as conn:
+        user = _db_user(conn, "id = ?", (user_id,))
+        if user is None:
+            return False
+        if ('admin' in user['roles']
+                and not _db_other_active_admin_exists(conn, user_id)):
+            raise ValueError('At least one active administrator is required')
+        conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -1781,14 +2099,140 @@ def generate_video_preview(media_path, preview_path):
 # Routes
 # ---------------------------------------------------------------------------
 
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    current_id = session.get('user_id')
+    current = db_get_user_by_id(current_id) if current_id is not None else None
+    if (current is not None and not current['suspended']
+            and current['password_hash'] is not None
+            and session.get('session_version') == current['session_version']):
+        return redirect(url_for('index'))
+
+    initial_admin = db_get_initial_admin()
+    error = None
+    if request.method == 'POST':
+        username = request.form.get('username', '')
+        password = request.form.get('password', '')
+        if initial_admin is not None:
+            confirmation = request.form.get('password_confirmation', '')
+            if username.casefold() != initial_admin['username'].casefold():
+                error = 'Complete the administrator setup first.'
+            elif password != confirmation:
+                error = 'Passwords do not match.'
+            else:
+                try:
+                    user = db_set_initial_admin_password(
+                        initial_admin['id'], password
+                    )
+                except ValueError as exc:
+                    error = str(exc)
+                else:
+                    if user is None:
+                        error = 'Administrator setup was already completed. Sign in.'
+                    else:
+                        _start_user_session(user)
+                        return redirect(url_for('index'))
+        else:
+            user = db_get_user_by_username(username)
+            if (user is None or user['password_hash'] is None
+                    or not check_password_hash(user['password_hash'], password)):
+                error = 'Invalid username or password.'
+            elif user['suspended']:
+                error = 'This account is suspended.'
+            else:
+                _start_user_session(user)
+                return redirect(url_for('index'))
+
+    response = app.make_response(render_template(
+        'login.html',
+        ui_version=APP_VERSION,
+        initial_admin=initial_admin,
+        error=error,
+    ))
+    response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+@app.route('/logout', methods=['POST'])
+def logout():
+    session.clear()
+    return redirect(url_for('login'))
+
+
 @app.route('/')
 def index():
     response = app.make_response(render_template(
         'index.html',
         ui_version=APP_VERSION,
+        current_user=_public_user(g.current_user),
+        is_admin='admin' in g.current_user['roles'],
     ))
     response.headers['Cache-Control'] = 'no-store'
     return response
+
+
+@app.route('/api/users', methods=['GET', 'POST'])
+@admin_required
+def users():
+    if request.method == 'GET':
+        return jsonify({
+            'users': db_list_users(),
+            'roles': db_list_roles(),
+            'current_user_id': g.current_user['id'],
+        })
+
+    data = request.get_json(silent=True) or {}
+    try:
+        user = db_create_user(
+            data.get('username'),
+            data.get('password'),
+            data.get('role', 'normal'),
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify(user), 201
+
+
+@app.route('/api/users/<int:user_id>', methods=['PATCH', 'DELETE'])
+@admin_required
+def user(user_id):
+    if request.method == 'DELETE':
+        if user_id == g.current_user['id']:
+            return jsonify({"error": "You cannot remove your own account"}), 400
+        try:
+            removed = db_delete_user(user_id)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        if not removed:
+            return jsonify({"error": "Unknown user"}), 404
+        return jsonify({"message": "User removed", "id": user_id})
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "A JSON object is required"}), 400
+    allowed = {'username', 'password', 'role', 'suspended'}
+    if not any(key in data for key in allowed):
+        return jsonify({"error": "No user changes provided"}), 400
+    if user_id == g.current_user['id'] and data.get('suspended') is True:
+        return jsonify({"error": "You cannot suspend your own account"}), 400
+
+    try:
+        updated = db_update_user(
+            user_id,
+            username=data.get('username') if 'username' in data else None,
+            password=data.get('password') if 'password' in data else None,
+            role_name=data.get('role') if 'role' in data else None,
+            suspended=data.get('suspended') if 'suspended' in data else None,
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    if updated is None:
+        return jsonify({"error": "Unknown user"}), 404
+
+    if user_id == g.current_user['id']:
+        refreshed = db_get_user_by_id(user_id)
+        session['session_version'] = refreshed['session_version']
+    return jsonify(updated)
 
 
 @app.route('/api/health', methods=['GET'])

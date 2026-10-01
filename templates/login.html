@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sign in · Video Downloader</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css', v=ui_version) }}">
+    <script>
+        (function () {
+            try {
+                const stored = localStorage.getItem('theme') || 'system';
+                const sysDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+                const effective = stored === 'system' ? (sysDark ? 'dark' : 'light') : stored;
+                document.documentElement.setAttribute('data-theme', effective);
+            } catch (e) { /* localStorage may be unavailable */ }
+        })();
+    </script>
+</head>
+<body class="auth-page">
+    <main class="auth-card">
+        <div class="auth-brand" aria-hidden="true">VDL</div>
+        {% if initial_admin %}
+            <h1>Set administrator password</h1>
+            <p>Create the initial password for the built-in administrator account.</p>
+        {% else %}
+            <h1>Sign in</h1>
+            <p>Enter your account details to open Video Download Helper.</p>
+        {% endif %}
+
+        {% if error %}
+            <div class="auth-error" role="alert">{{ error }}</div>
+        {% endif %}
+
+        <form method="post" class="auth-form">
+            <label for="username">Username</label>
+            <input id="username" name="username" type="text" required autofocus
+                   autocomplete="username"
+                   {% if initial_admin %}value="{{ initial_admin.username }}" readonly{% endif %}>
+            <label for="password">{% if initial_admin %}New password{% else %}Password{% endif %}</label>
+            <input id="password" name="password" type="password" required minlength="8"
+                   autocomplete="{% if initial_admin %}new-password{% else %}current-password{% endif %}">
+            {% if initial_admin %}
+                <label for="password_confirmation">Confirm password</label>
+                <input id="password_confirmation" name="password_confirmation" type="password"
+                       required minlength="8" autocomplete="new-password">
+            {% endif %}
+            <button type="submit">{% if initial_admin %}Set password and sign in{% else %}Sign in{% endif %}</button>
+        </form>
+    </main>
+</body>
+</html>
