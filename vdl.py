@@ -424,6 +424,13 @@ DEFAULT_DOWNLOAD_DIR = os.environ.get("DOWNLOADS_DIR", ".")
 HISTORY_STATUSES = ('finished', 'error')
 TERMINAL_STATUSES = HISTORY_STATUSES + ('cancelled', 'interrupted')
 
+PLAYBACK_SESSION_TTL_SECONDS = 30 * 60
+PLAYBACK_SESSION_MAX_PER_USER = 8
+PLAYBACK_SESSION_MAX_FILTER_LENGTH = 256
+PLAYBACK_SESSION_MAX_PAGE_SIZE = 100
+PLAYBACK_SESSION_MAX_COORDINATE = 1_000_000
+PLAYBACK_SESSION_ORDERINGS = ('newest', 'favorites_first')
+
 # A single lock serialises writes from background threads. SQLite itself is
 # safe for concurrent reads, but multiple writers across threads on the same
 # connection cause "database is locked" errors. We open a fresh connection
@@ -435,6 +442,12 @@ _upload_lock = threading.Lock()
 # host while cached previews continue to bypass the lock entirely.
 _preview_generation_lock = threading.Lock()
 _NO_UPDATE = object()
+
+# Endless playback is disposable navigation state. Keeping it outside SQLite
+# makes process restarts an explicit lease boundary and avoids leaving behind
+# playlist-shaped records for a feature that deliberately resolves live data.
+_playback_sessions = {}
+_playback_sessions_lock = threading.Lock()
 
 # Workers wait here before entering yt-dlp. A FIFO queue keeps a burst in
 # worker-arrival order while the counter lets preference changes take
@@ -1237,6 +1250,219 @@ def db_list_downloads(user_id=None, is_admin=False):
         return downloads
 
 
+def _parse_history_filter(value):
+    """Mirror the browser's quote-aware History tokenization."""
+    terms = []
+    draft = []
+    quoted = False
+    for character in value:
+        if character == '"':
+            quoted = not quoted
+        elif character.isspace() and not quoted:
+            if draft:
+                terms.append(''.join(draft))
+                draft = []
+        else:
+            draft.append(character)
+    if draft:
+        terms.append(''.join(draft))
+    return [term.strip() for term in terms if term.strip()]
+
+
+def _normalize_history_filter(value):
+    if not isinstance(value, str):
+        raise ValueError('Filter must be text')
+    value = unicodedata.normalize('NFC', value).strip()
+    if len(value) > PLAYBACK_SESSION_MAX_FILTER_LENGTH:
+        raise ValueError(
+            f'Filter must be at most {PLAYBACK_SESSION_MAX_FILTER_LENGTH} characters'
+        )
+    # Re-quoting whitespace-bearing terms preserves their token boundary when
+    # the normalized value is parsed again on each live resolution.
+    return ' '.join(
+        f'"{term}"' if any(character.isspace() for character in term) else term
+        for term in _parse_history_filter(value)
+    )
+
+
+def _history_search_key(value):
+    return str(value or '').lower()
+
+
+def _history_quality_height(value):
+    key = _history_search_key(value)
+    aliases = {
+        '8k': 4320, '4k': 2160, 'uhd': 2160,
+        '2k': 1440, 'qhd': 1440,
+    }
+    if key in aliases:
+        return aliases[key]
+    dimensions = re.fullmatch(r'(\d+)\s*[x×]\s*(\d+)', key)
+    vertical = re.fullmatch(r'(\d+)\s*p?', key)
+    height = int(dimensions.group(2)) if dimensions else (
+        int(vertical.group(1)) if vertical else 0
+    )
+    return height if height > 0 else None
+
+
+def _matches_history_filter(entry, normalized_filter):
+    terms = _parse_history_filter(normalized_filter)
+    if not terms:
+        return True
+
+    title = _history_search_key(entry.get('title'))
+    tags = {
+        _history_search_key(tag) for tag in entry.get('tags', [])
+    }
+    user_terms = []
+    quality_terms = []
+    starred_terms = []
+    view_terms = []
+    content_terms = []
+    for term in terms:
+        key = _history_search_key(term)
+        if key.startswith('user:'):
+            user_terms.append(key[len('user:'):].strip())
+        elif key.startswith('quality:'):
+            quality_terms.append(
+                _history_quality_height(key[len('quality:'):].strip())
+            )
+        elif key.startswith('starred:'):
+            starred_terms.append(key[len('starred:'):].strip())
+        elif key.startswith('star:'):
+            starred_terms.append(key[len('star:'):].strip())
+        elif key.startswith('views:'):
+            view_terms.append(key[len('views:'):].strip())
+        else:
+            content_terms.append(term)
+
+    if user_terms:
+        downloaded_by = _history_search_key(entry.get('downloaded_by'))
+        if not any(term and term == downloaded_by for term in user_terms):
+            return False
+    if quality_terms:
+        height = _history_quality_height(entry.get('resolution'))
+        if height is None:
+            height = _history_quality_height(entry.get('quality'))
+        if not any(
+                minimum is not None
+                and height is not None
+                and height >= minimum
+                for minimum in quality_terms):
+            return False
+    if starred_terms:
+        favorite = bool(entry.get('favorite'))
+        if not any(
+                (value == 'yes' and favorite)
+                or (value == 'no' and not favorite)
+                for value in starred_terms):
+            return False
+    if view_terms:
+        try:
+            view_count = max(0, int(entry.get('view_count') or 0))
+        except (TypeError, ValueError):
+            view_count = 0
+        if not any(
+                (value == 'new' and view_count == 0)
+                or (value.isdigit() and view_count >= int(value))
+                for value in view_terms):
+            return False
+    if not content_terms:
+        return True
+    return any(
+        (_history_search_key(term) in title)
+        or (_history_search_key(term) in tags)
+        for term in content_terms
+    )
+
+
+def _playable_library_entry(entry):
+    if entry.get('status') != 'finished':
+        return False
+    filename = entry.get('filename')
+    if not filename or not os.path.isfile(filename):
+        return False
+    return _is_allowed_download_path(os.path.realpath(filename))
+
+
+def resolve_library_selection(user_id, is_admin, normalized_filter, ordering):
+    """Return the current canonical, visible, browser-playable selection."""
+    entries = [
+        entry for entry in db_list_downloads(user_id, is_admin=is_admin)
+        if _playable_library_entry(entry)
+        and _matches_history_filter(entry, normalized_filter)
+    ]
+    if ordering == 'favorites_first':
+        entries.sort(
+            key=lambda entry: (
+                bool(entry.get('favorite')),
+                float(entry.get('created_at') or 0),
+                str(entry.get('id') or ''),
+            ),
+            reverse=True,
+        )
+    else:
+        entries.sort(
+            key=lambda entry: (
+                float(entry.get('created_at') or 0),
+                str(entry.get('id') or ''),
+            ),
+            reverse=True,
+        )
+    return entries
+
+
+def resolve_library_page(user_id, is_admin, normalized_filter, ordering,
+                         page_size, page):
+    """Resolve one deterministic page without retaining the result set."""
+    selection = resolve_library_selection(
+        user_id, is_admin, normalized_filter, ordering
+    )
+    start = page * page_size
+    return selection[start:start + page_size], len(selection)
+
+
+def _playback_item(entry):
+    filename = entry.get('filename') or ''
+    title = entry.get('title') or Path(filename).stem or 'Untitled download'
+    return {
+        'id': str(entry['id']),
+        'title': title,
+        'extension': Path(filename).suffix.lstrip('.').lower(),
+    }
+
+
+def _prune_playback_sessions_locked(now):
+    expired = [
+        session_id for session_id, state in _playback_sessions.items()
+        if now - state['last_activity'] >= PLAYBACK_SESSION_TTL_SECONDS
+    ]
+    for session_id in expired:
+        _playback_sessions.pop(session_id, None)
+
+
+def _release_playback_sessions_for_user(user_id):
+    if user_id is None:
+        return
+    with _playback_sessions_lock:
+        owned = [
+            session_id for session_id, state in _playback_sessions.items()
+            if state['owner_user_id'] == user_id
+        ]
+        for session_id in owned:
+            _playback_sessions.pop(session_id, None)
+
+
+def _playback_session_response(state, entry):
+    return {
+        'session_id': state['session_id'],
+        'sequence': state['sequence'],
+        'page': state['page'],
+        'position': state['position'],
+        'item': _playback_item(entry),
+    }
+
+
 def db_get_preferences():
     with db() as conn:
         rows = conn.execute("SELECT key, value FROM preferences").fetchall()
@@ -2016,7 +2242,10 @@ def db_update_user(user_id, *, username=None, name=None, password=None,
                 "INSERT INTO user_roles(user_id, role_id) VALUES (?, ?)",
                 (user_id, role_id),
             )
-        return _public_user(_db_user(conn, "id = ?", (user_id,)))
+        updated = _public_user(_db_user(conn, "id = ?", (user_id,)))
+    if suspended is True:
+        _release_playback_sessions_for_user(user_id)
+    return updated
 
 
 def db_delete_user(user_id):
@@ -2028,7 +2257,8 @@ def db_delete_user(user_id):
                 and not _db_other_active_admin_exists(conn, user_id)):
             raise ValueError('At least one active administrator is required')
         conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
-        return True
+    _release_playback_sessions_for_user(user_id)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -3379,6 +3609,7 @@ def login():
 
 @app.route('/logout', methods=['POST'])
 def logout():
+    _release_playback_sessions_for_user(session.get('user_id'))
     session.clear()
     return redirect(url_for('login'))
 
@@ -4227,6 +4458,181 @@ def get_history():
         g.current_user['id'],
         is_admin='admin' in g.current_user['roles'],
     ))
+
+
+def _playback_integer(payload, key, minimum, maximum):
+    value = payload.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f'{key} must be an integer')
+    if value < minimum or value > maximum:
+        raise ValueError(f'{key} is outside the allowed range')
+    return value
+
+
+@app.route('/api/playback-sessions', methods=['POST'])
+def create_playback_session():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({'error': 'A JSON object is required'}), 400
+    try:
+        normalized_filter = _normalize_history_filter(
+            payload.get('filter', '')
+        )
+        ordering = payload.get('ordering', 'newest')
+        if ordering not in PLAYBACK_SESSION_ORDERINGS:
+            raise ValueError('Unknown playback ordering')
+        page_size = _playback_integer(
+            payload, 'page_size', 1, PLAYBACK_SESSION_MAX_PAGE_SIZE
+        )
+        page = _playback_integer(
+            payload, 'page', 0, PLAYBACK_SESSION_MAX_COORDINATE
+        )
+        position = _playback_integer(
+            payload, 'position', 0, page_size - 1
+        )
+        start_download_id = payload.get('start_download_id')
+        if start_download_id is not None and (
+                not isinstance(start_download_id, str)
+                or not start_download_id
+                or len(start_download_id) > 128):
+            raise ValueError('start_download_id is invalid')
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+
+    user_id = g.current_user['id']
+    is_admin = 'admin' in g.current_user['roles']
+    selection = resolve_library_selection(
+        user_id, is_admin, normalized_filter, ordering
+    )
+    if start_download_id is not None:
+        start_index = next(
+            (index for index, entry in enumerate(selection)
+             if str(entry['id']) == start_download_id),
+            None,
+        )
+        if start_index is None:
+            return jsonify({
+                'error': 'The requested starting video is no longer available'
+            }), 409
+    elif selection:
+        requested_index = page * page_size + position
+        start_index = requested_index if requested_index < len(selection) else 0
+    else:
+        return '', 204
+
+    now = time.monotonic()
+    session_id = secrets.token_urlsafe(32)
+    state = {
+        'session_id': session_id,
+        'owner_user_id': user_id,
+        'filter': normalized_filter,
+        'ordering': ordering,
+        'page_size': page_size,
+        'page': start_index // page_size,
+        'position': start_index % page_size,
+        'current_download_id': str(selection[start_index]['id']),
+        'sequence': 0,
+        'last_response': None,
+        'last_expected_download_id': None,
+        'created_at': now,
+        'last_activity': now,
+    }
+    with _playback_sessions_lock:
+        _prune_playback_sessions_locked(now)
+        owned = sorted(
+            (
+                candidate for candidate in _playback_sessions.values()
+                if candidate['owner_user_id'] == user_id
+            ),
+            key=lambda candidate: candidate['last_activity'],
+        )
+        while len(owned) >= PLAYBACK_SESSION_MAX_PER_USER:
+            oldest = owned.pop(0)
+            _playback_sessions.pop(oldest['session_id'], None)
+        _playback_sessions[session_id] = state
+    return jsonify(_playback_session_response(state, selection[start_index])), 201
+
+
+@app.route('/api/playback-sessions/<session_id>/advance', methods=['POST'])
+def advance_playback_session(session_id):
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({'error': 'A JSON object is required'}), 400
+    expected_download_id = payload.get('expected_download_id')
+    if (not isinstance(expected_download_id, str)
+            or not expected_download_id
+            or len(expected_download_id) > 128):
+        return jsonify({'error': 'expected_download_id is invalid'}), 400
+    try:
+        sequence = _playback_integer(
+            payload, 'sequence', 1, PLAYBACK_SESSION_MAX_COORDINATE
+        )
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+
+    now = time.monotonic()
+    user_id = g.current_user['id']
+    is_admin = 'admin' in g.current_user['roles']
+    with _playback_sessions_lock:
+        _prune_playback_sessions_locked(now)
+        state = _playback_sessions.get(session_id)
+        if state is None or state['owner_user_id'] != user_id:
+            return jsonify({'error': 'Unknown playback session'}), 404
+        if sequence == state['sequence'] and state['last_response'] is not None:
+            if expected_download_id != state['last_expected_download_id']:
+                return jsonify({'error': 'Playback position changed'}), 409
+            state['last_activity'] = now
+            return jsonify(state['last_response'])
+        if sequence != state['sequence'] + 1:
+            return jsonify({'error': 'Playback sequence is out of order'}), 409
+        if expected_download_id != state['current_download_id']:
+            return jsonify({'error': 'Playback position changed'}), 409
+
+        selection = resolve_library_selection(
+            user_id, is_admin, state['filter'], state['ordering']
+        )
+        if not selection:
+            _playback_sessions.pop(session_id, None)
+            return '', 204
+
+        next_index = (
+            state['page'] * state['page_size'] + state['position'] + 1
+        ) % len(selection)
+        entry = selection[next_index]
+        state['page'] = next_index // state['page_size']
+        state['position'] = next_index % state['page_size']
+        state['current_download_id'] = str(entry['id'])
+        state['sequence'] = sequence
+        state['last_expected_download_id'] = expected_download_id
+        state['last_activity'] = now
+        response = _playback_session_response(state, entry)
+        state['last_response'] = response
+        return jsonify(response)
+
+
+@app.route('/api/playback-sessions/<session_id>/keepalive', methods=['POST'])
+def keepalive_playback_session(session_id):
+    now = time.monotonic()
+    with _playback_sessions_lock:
+        _prune_playback_sessions_locked(now)
+        state = _playback_sessions.get(session_id)
+        if (state is None
+                or state['owner_user_id'] != g.current_user['id']):
+            return jsonify({'error': 'Unknown playback session'}), 404
+        state['last_activity'] = now
+    return '', 204
+
+
+@app.route('/api/playback-sessions/<session_id>', methods=['DELETE'])
+def release_playback_session(session_id):
+    with _playback_sessions_lock:
+        state = _playback_sessions.get(session_id)
+        if (state is not None
+                and state['owner_user_id'] == g.current_user['id']):
+            _playback_sessions.pop(session_id, None)
+    # Releasing an already-expired lease is intentionally harmless. Returning
+    # the same response for foreign IDs also avoids exposing their existence.
+    return '', 204
 
 
 @app.route('/api/visibility/<download_id>', methods=['POST'])

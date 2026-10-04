@@ -198,6 +198,12 @@
                     <svg aria-hidden="true"><use href="#i-x"/></svg>
                 </button>
             </div>
+            <button id="endlessPlaybackButton" class="endless-playback-button" type="button"
+                    onclick="startEndlessPlaybackFromView()" aria-label="Play All"
+                    title="Play the current History selection continuously in the built-in player" disabled>
+                <svg aria-hidden="true"><use href="#i-play"/></svg>
+                <span>Play All</span>
+            </button>
             <button id="newDownloadButton" class="new-download-button" type="button"
                     onclick="openNewDownload()" aria-label="New download"
                     aria-haspopup="dialog" aria-controls="newDownloadDialog" aria-expanded="false">
@@ -599,9 +605,21 @@
     </dialog>
 
     <div id="playerBackdrop" class="player-backdrop" onclick="closePlayer(event)">
-        <div class="player-box" onclick="event.stopPropagation()">
+        <div class="player-box player-original-size" onclick="event.stopPropagation()">
             <button class="player-close" type="button" onclick="closePlayer()" aria-label="Close player"><svg aria-hidden="true"><use href="#i-x"/></svg></button>
             <video id="playerVideo" controls autoplay></video>
+            <div id="playerTransition" class="player-transition" hidden>
+                <span id="playerStatus" role="status" aria-live="polite"></span>
+                <div class="player-transition-actions">
+                    <button id="playerContinue" type="button" onclick="continueEndlessPlayback()" hidden>Continue playback</button>
+                    <button id="playerReturnFullscreen" type="button" onclick="returnEndlessFullscreen()" hidden>Return to fullscreen</button>
+                    <button id="playerRetry" type="button" onclick="retryEndlessPlayback()" hidden>Retry</button>
+                    <button id="playerRestart" type="button" onclick="restartEndlessPlayback()" hidden>Start a new session</button>
+                    <button id="playerSkip" type="button" onclick="skipEndlessPlayback()" hidden>Skip</button>
+                    <button id="playerStopEndless" type="button" onclick="stopEndlessPlayback()" hidden>Stop endless playback</button>
+                    <button id="playerTransitionClose" type="button" onclick="closePlayer()" hidden>Close</button>
+                </div>
+            </div>
         </div>
     </div>
 

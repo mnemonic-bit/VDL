@@ -269,6 +269,17 @@ body.settings-open { max-width: 1180px; }
     border: 1px solid var(--brand);
     border-radius: 50%;
 }
+.endless-playback-button {
+    display: inline-flex; align-items: center; gap: 7px;
+    min-height: 40px; padding: 0 12px;
+    color: var(--fg); background: var(--surface-2);
+    border: 1px solid var(--border-soft); border-radius: 999px;
+    font: inherit; font-weight: 600;
+}
+.endless-playback-button:hover:not(:disabled) { background: var(--surface-hover); }
+.endless-playback-button:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
+.endless-playback-button:disabled { color: var(--muted-2); cursor: default; opacity: 0.6; }
+.endless-playback-button svg { width: 16px; height: 16px; fill: currentColor; }
 .new-download-button:hover { background: var(--app-progress-track-active); }
 .new-download-button:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
 .new-download-button svg { width: 17px; height: 17px; flex: none; }
@@ -312,7 +323,8 @@ body.settings-open { max-width: 1180px; }
 .new-download-close svg { width: 20px; height: 20px; }
 body.settings-open .header-search,
 body.settings-open .new-download-button,
-body.settings-open .current-downloads-button { display: none; }
+body.settings-open .current-downloads-button,
+body.settings-open .endless-playback-button { display: none; }
 .action-error { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 20px; padding: 10px 12px; color: var(--error-text); background: var(--error-bg); border: 1px solid var(--error-border); border-radius: 4px; }
 .action-error-close { background: none; border: none; padding: 4px; cursor: pointer; color: inherit; line-height: 0; border-radius: 3px; flex-shrink: 0; }
 .action-error-close:hover { opacity: 0.7; }
@@ -956,6 +968,27 @@ input[type="text"].tag-entry-input {
 .player-backdrop.open { display: flex; }
 .player-box { position: relative; max-width: 90vw; max-height: 90vh; }
 .player-box video { display: block; max-width: 90vw; max-height: 90vh; background: black; border-radius: 4px; }
+.player-box.player-original-size video { object-fit: contain; }
+.player-box video:fullscreen,
+.player-box video:-webkit-full-screen {
+    width: 100vw !important; height: 100vh !important;
+    max-width: none; max-height: none; border-radius: 0;
+}
+.player-transition {
+    position: absolute; right: 10px; bottom: 52px; left: 10px; z-index: 3;
+    padding: 10px 12px; color: white; background: rgba(0,0,0,0.78);
+    border-radius: 6px; text-align: center;
+}
+.player-transition[hidden] { display: none; }
+.player-transition-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 7px; margin-top: 8px; }
+.player-transition-actions:empty { margin-top: 0; }
+.player-transition-actions button {
+    min-height: 34px; padding: 0 11px; color: var(--fg);
+    background: var(--surface); border: 1px solid var(--border); border-radius: 4px;
+    font: inherit;
+}
+.player-transition-actions button[hidden] { display: none; }
+.player-transition-actions button:focus-visible { outline: 2px solid white; outline-offset: 2px; }
 .player-close {
     position: absolute; top: 12px; right: 12px; z-index: 2;
     display: inline-flex; align-items: center; justify-content: center;
@@ -1314,6 +1347,8 @@ details[open] > .history-summary::before { transform: rotate(90deg); }
     .app-title { font-size: 1.1em; }
     .header-search-toggle { width: 38px; height: 38px; }
     .new-download-button { width: 38px; height: 38px; padding: 0; }
+    .endless-playback-button { width: 38px; height: 38px; padding: 0; justify-content: center; }
+    .endless-playback-button span { display: none; }
     .current-downloads-button { width: 38px; height: 38px; padding: 0; }
     .current-downloads-label { display: none; }
     .app-title span { display: none; }

@@ -45,6 +45,8 @@ def test_reset():
     with vdl._cancel_lock:
         vdl._cancel_flags.clear()
         vdl._pause_flags.clear()
+    with vdl._playback_sessions_lock:
+        vdl._playback_sessions.clear()
     vdl.init_db()
     FakeYoutubeDL.reset()
     return jsonify({"ok": True})

@@ -41,6 +41,8 @@ class AppCase(unittest.TestCase):
             vdl._failed_pair_rates.clear()
             vdl._failed_pair_global.clear()
             vdl._token_download_rates.clear()
+        with vdl._playback_sessions_lock:
+            vdl._playback_sessions.clear()
         vdl.init_db()
         vdl.db_set_preferences({"download_dir": self.download_dir})
         vdl.app.config.update(TESTING=True)
@@ -81,6 +83,8 @@ class AppCase(unittest.TestCase):
             vdl._failed_pair_rates.clear()
             vdl._failed_pair_global.clear()
             vdl._token_download_rates.clear()
+        with vdl._playback_sessions_lock:
+            vdl._playback_sessions.clear()
         vdl.event_bus = self._old_event_bus
         vdl.DB_PATH = self._old_db_path
         vdl.DEFAULT_DOWNLOAD_DIR = self._old_default_dir

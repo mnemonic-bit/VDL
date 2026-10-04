@@ -10,6 +10,7 @@ async function installFullscreenHarness(page) {
             get: () => window.__fullscreenElement || null,
         });
         HTMLVideoElement.prototype.requestFullscreen = function requestFullscreen() {
+            window.__fullscreenRequests = (window.__fullscreenRequests || 0) + 1;
             window.__fullscreenElement = this;
             document.dispatchEvent(new Event('fullscreenchange'));
             return Promise.resolve();
@@ -19,6 +20,32 @@ async function installFullscreenHarness(page) {
             document.dispatchEvent(new Event('fullscreenchange'));
         };
     });
+}
+
+async function installMediaHarness(page, { denyFirstPlay = false } = {}) {
+    await page.evaluate(({ denyFirst }) => {
+        window.__playerPlayAttempts = 0;
+        HTMLMediaElement.prototype.load = function load() {};
+        HTMLMediaElement.prototype.pause = function pause() {};
+        HTMLMediaElement.prototype.play = function play() {
+            if (this.id !== 'playerVideo') return Promise.resolve();
+            window.__playerPlayAttempts += 1;
+            if (denyFirst && window.__playerPlayAttempts === 1) {
+                return Promise.reject(new DOMException(
+                    'User activation is required', 'NotAllowedError',
+                ));
+            }
+            queueMicrotask(() => this.dispatchEvent(new Event('playing')));
+            return Promise.resolve();
+        };
+    }, { denyFirst: denyFirstPlay });
+}
+
+async function startEndlessFromCard(page, id) {
+    const card = page.locator(`[data-row-id="${id}"]`);
+    await card.locator('.kebab-btn').click();
+    await card.getByRole('button', { name: 'Play All' }).click();
+    await expect.poll(() => page.evaluate(() => endlessPlayback.sessionId)).not.toBeNull();
 }
 
 test('overlay playback assigns MIME, supports Range, and Escape closes it', async ({ page }) => {
@@ -116,6 +143,105 @@ test('new-tab player mode opens the stored file endpoint', async ({ page }) => {
     await page.locator('[data-row-id="playtab1"]').getByRole('button', { name: 'Play', exact: true }).click();
     await expect.poll(() => page.evaluate(() => window.__opened)).not.toBeNull();
     expect((await page.evaluate(() => window.__opened))[0]).toBe('/api/file/playtab1');
+});
+
+test('endless playback advances once on the same video node and does not count automatic views', async ({ page }) => {
+    await installMediaHarness(page);
+    await seed(page, {
+        id: 'endless-old', status: 'finished', file: true, name: 'old.mp4',
+        title: 'Older video',
+    });
+    await seed(page, {
+        id: 'endless-new', status: 'finished', file: true, name: 'new.mp4',
+        title: 'Newer video',
+    });
+    await refresh(page);
+    await page.evaluate(() => { window.__endlessVideoNode = document.getElementById('playerVideo'); });
+
+    await startEndlessFromCard(page, 'endless-new');
+    await expect(page.locator('#playerVideo source'))
+        .toHaveAttribute('src', '/api/file/endless-new');
+    await page.locator('#playerVideo').evaluate(video => video.dispatchEvent(new Event('ended')));
+    await expect(page.locator('#playerVideo source'))
+        .toHaveAttribute('src', '/api/file/endless-old');
+    expect(await page.evaluate(() => (
+        window.__endlessVideoNode === document.getElementById('playerVideo')
+    ))).toBe(true);
+
+    await expect.poll(async () => {
+        const rows = await (await page.request.get('/api/history')).json();
+        return Object.fromEntries(rows.map(row => [row.id, row.view_count]));
+    }).toEqual({ 'endless-new': 1, 'endless-old': 0 });
+});
+
+test('endless handoff retains standard fullscreen without requesting it again', async ({ page }) => {
+    await installFullscreenHarness(page);
+    await page.request.post('/__test__/preferences', {
+        data: { start_fullscreen: 'true' },
+    });
+    await seed(page, { id: 'full-old', status: 'finished', file: true, name: 'old.mp4' });
+    await seed(page, { id: 'full-new', status: 'finished', file: true, name: 'new.mp4' });
+    await page.reload();
+    await installMediaHarness(page);
+    await startEndlessFromCard(page, 'full-new');
+
+    await page.locator('#playerVideo').evaluate(video => video.dispatchEvent(new Event('ended')));
+    await expect(page.locator('#playerVideo source')).toHaveAttribute('src', '/api/file/full-old');
+    expect(await page.evaluate(() => document.fullscreenElement?.id)).toBe('playerVideo');
+    expect(await page.evaluate(() => window.__fullscreenRequests)).toBe(1);
+});
+
+test('autoplay denial offers one-action continuation', async ({ page }) => {
+    await installMediaHarness(page, { denyFirstPlay: true });
+    await seed(page, {
+        id: 'denied-play', status: 'finished', file: true, name: 'denied.mp4',
+    });
+    await refresh(page);
+
+    const card = page.locator('[data-row-id="denied-play"]');
+    await card.locator('.kebab-btn').click();
+    await card.getByRole('button', { name: 'Play All' }).click();
+    const continueButton = page.getByRole('button', { name: 'Continue playback' });
+    await expect(continueButton).toBeVisible();
+    await continueButton.click();
+    await expect.poll(() => page.evaluate(() => endlessPlayback.phase)).toBe('playing');
+    expect(await page.evaluate(() => window.__playerPlayAttempts)).toBe(2);
+});
+
+test('original-size policy is recalculated from each handoff item', async ({ page }) => {
+    await page.evaluate(() => {
+        HTMLMediaElement.prototype.pause = function pause() {};
+        HTMLMediaElement.prototype.load = function load() {
+            queueMicrotask(() => this.dispatchEvent(new Event('loadedmetadata')));
+        };
+        HTMLMediaElement.prototype.play = function play() {
+            queueMicrotask(() => this.dispatchEvent(new Event('playing')));
+            return Promise.resolve();
+        };
+        const currentId = video => {
+            const source = video.querySelector('source');
+            return source ? source.getAttribute('src').split('/').pop() : '';
+        };
+        Object.defineProperty(HTMLVideoElement.prototype, 'videoWidth', {
+            configurable: true,
+            get() { return currentId(this) === 'size-first' ? 320 : 640; },
+        });
+        Object.defineProperty(HTMLVideoElement.prototype, 'videoHeight', {
+            configurable: true,
+            get() { return currentId(this) === 'size-first' ? 180 : 360; },
+        });
+    });
+    await seed(page, { id: 'size-second', status: 'finished', file: true, name: 'second.mp4' });
+    await seed(page, { id: 'size-first', status: 'finished', file: true, name: 'first.mp4' });
+    await refresh(page);
+    await startEndlessFromCard(page, 'size-first');
+    await expect(page.locator('#playerVideo')).toHaveCSS('width', '320px');
+    await expect(page.locator('#playerVideo')).toHaveCSS('height', '180px');
+
+    await page.locator('#playerVideo').evaluate(video => video.dispatchEvent(new Event('ended')));
+    await expect(page.locator('#playerVideo source')).toHaveAttribute('src', '/api/file/size-second');
+    await expect(page.locator('#playerVideo')).toHaveCSS('width', '640px');
+    await expect(page.locator('#playerVideo')).toHaveCSS('height', '360px');
 });
 
 test('three-dot menu downloads the stored video to the browser', async ({ page }) => {

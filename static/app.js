@@ -1689,6 +1689,16 @@ document.addEventListener('click', (ev) => {
     const favoriteAction = ev.target.closest('[data-favorite-action]');
     if (favoriteAction) toggleFavorite(favoriteAction);
 
+    const endlessAction = ev.target.closest('[data-endless-action]');
+    if (endlessAction) {
+        closeAllMenus();
+        startEndlessPlayback(
+            endlessAction.dataset.downloadId,
+            endlessAction.dataset.playLabel,
+            endlessAction.dataset.playExt,
+        );
+    }
+
     const playAction = ev.target.closest('[data-play-action]');
     if (playAction) {
         stopHoverPreview();
@@ -1885,6 +1895,9 @@ function renderHistoryCard(info) {
         menuItems.push(`<button data-url-action="open" ${urlData}><svg class="menu-icon"><use href="#i-external"/></svg>Open URL</button>`);
     }
     if (hasPlay) {
+        const playLabel = info.filename.split('/').pop().split('\\').pop();
+        const playExt = info.filename.split('.').pop().toLowerCase();
+        menuItems.push(`<button data-endless-action data-download-id="${escapeAttr(id)}" data-play-label="${escapeAttr(playLabel)}" data-play-ext="${escapeAttr(playExt)}"><svg class="menu-icon"><use href="#i-play"/></svg>Play All</button>`);
         menuItems.push(`<button data-file-download-action data-download-id="${escapeAttr(id)}"><svg class="menu-icon"><use href="#i-download"/></svg>Download</button>`);
     }
     if (!isFinished) {
@@ -2224,6 +2237,8 @@ let historyPageSize = DEFAULT_HISTORY_PAGE_SIZE;
 let historyPage = 0;
 let historyTotal = 0;
 let historyOrderIds = [];
+let historyOrdering = 'favorites_first';
+let historyPageItems = [];
 let _renderedActiveIds  = new Set();
 let _renderedHistoryIds = new Set();
 const pendingActiveAnimations = new Set();
@@ -2304,6 +2319,7 @@ function fetchHistory({ sortFavorites = false } = {}) {
         const active = data.filter(i => CURRENT_TAB_STATUSES.has(i.status));
         let historyEntries = data.filter(i => HISTORY_TAB_STATUSES.has(i.status));
         if (sortFavorites) {
+            historyOrdering = 'favorites_first';
             // The API is newest-first, and modern stable sorting preserves
             // that date order inside each favorite group.
             historyEntries = historyEntries.slice().sort(
@@ -2328,6 +2344,10 @@ function fetchHistory({ sortFavorites = false } = {}) {
         if (historyPage > maxPage) historyPage = maxPage;
         const start = historyPage * historyPageSize;
         const pageItems = done.slice(start, start + historyPageSize);
+        historyPageItems = pageItems;
+        document.getElementById('endlessPlaybackButton').disabled = !pageItems.some(
+            info => info.status === 'finished' && info.filename,
+        );
 
         let focusRestore = null;
         const ae = document.activeElement;
@@ -2477,7 +2497,31 @@ const _VIDEO_MIME = {
 };
 
 const PLAYER_CONTROLS_IDLE_MS = 2000;
+const PLAYER_HANDOFF_TIMEOUT_MS = 20_000;
+const PLAYBACK_KEEPALIVE_MS = 5 * 60 * 1000;
+const MAX_AUTOMATIC_SKIPS = 10;
 let playerControlsTimer = null;
+let playerMediaCleanup = null;
+
+const endlessPlayback = {
+    active: false,
+    phase: 'idle',
+    presentation: 'original',
+    launchProvenance: 'original',
+    epoch: 0,
+    loadGeneration: 0,
+    sessionId: null,
+    sequence: 0,
+    currentDownloadId: null,
+    currentItem: null,
+    advancePending: false,
+    handoffInProgress: false,
+    returnFullscreenNeeded: false,
+    failureCount: 0,
+    failedGeneration: null,
+    watchdogTimer: null,
+    keepaliveTimer: null,
+};
 
 function hidePlayerControls() {
     clearTimeout(playerControlsTimer);
@@ -2494,15 +2538,162 @@ function showPlayerControls() {
     playerControlsTimer = setTimeout(hidePlayerControls, PLAYER_CONTROLS_IDLE_MS);
 }
 
-function playVideo(id, label, ext) {
-    const url = '/api/file/' + encodeURIComponent(id);
-    if (playerMode === 'new_tab') {
-        window.open(url, '_blank', 'noopener');
+function showPlayerTransition(message, actions = [], focusAction = null) {
+    const transition = document.getElementById('playerTransition');
+    const status = document.getElementById('playerStatus');
+    const actionIds = {
+        continue: 'playerContinue',
+        fullscreen: 'playerReturnFullscreen',
+        retry: 'playerRetry',
+        restart: 'playerRestart',
+        skip: 'playerSkip',
+        stop: 'playerStopEndless',
+        close: 'playerTransitionClose',
+    };
+    status.textContent = message || '';
+    Object.entries(actionIds).forEach(([name, id]) => {
+        document.getElementById(id).hidden = !actions.includes(name);
+    });
+    transition.hidden = !message && actions.length === 0;
+    if (focusAction && actionIds[focusAction]) {
+        setTimeout(() => {
+            const button = document.getElementById(actionIds[focusAction]);
+            if (!transition.hidden && !button.hidden) button.focus();
+        }, 0);
+    }
+}
+
+function clearPlaybackWatchdog() {
+    clearTimeout(endlessPlayback.watchdogTimer);
+    endlessPlayback.watchdogTimer = null;
+}
+
+function armPlaybackWatchdog(generation) {
+    clearPlaybackWatchdog();
+    if (!endlessPlayback.active || document.hidden) return;
+    endlessPlayback.watchdogTimer = setTimeout(() => {
+        if (generation !== endlessPlayback.loadGeneration) return;
+        handlePlaybackFailure(generation, 'The next video did not become ready in time.');
+    }, PLAYER_HANDOFF_TIMEOUT_MS);
+}
+
+function applyOriginalPlayerSize(generation) {
+    if (generation !== endlessPlayback.loadGeneration) return;
+    const video = document.getElementById('playerVideo');
+    if (!video.videoWidth || !video.videoHeight) return;
+    video.style.width = `${video.videoWidth}px`;
+    video.style.height = `${video.videoHeight}px`;
+}
+
+function clearPlayerMediaCallbacks() {
+    clearPlaybackWatchdog();
+    if (playerMediaCleanup) playerMediaCleanup();
+    playerMediaCleanup = null;
+}
+
+function markPlaybackStarted(generation) {
+    if (generation !== endlessPlayback.loadGeneration) return;
+    clearPlaybackWatchdog();
+    endlessPlayback.phase = 'playing';
+    endlessPlayback.handoffInProgress = false;
+    endlessPlayback.failureCount = 0;
+    endlessPlayback.failedGeneration = null;
+    if (endlessPlayback.returnFullscreenNeeded) {
+        showPlayerTransition(
+            'Playback continued in the overlay.', ['fullscreen'], 'fullscreen',
+        );
+    } else {
+        showPlayerTransition('', []);
+    }
+}
+
+function handlePlaybackFailure(generation, message) {
+    if (!endlessPlayback.active
+            || generation !== endlessPlayback.loadGeneration
+            || endlessPlayback.failedGeneration === generation) return;
+    clearPlaybackWatchdog();
+    endlessPlayback.failedGeneration = generation;
+    endlessPlayback.phase = 'failed';
+    endlessPlayback.handoffInProgress = false;
+    endlessPlayback.failureCount += 1;
+    const currentLimit = Math.max(1, Math.min(MAX_AUTOMATIC_SKIPS, historyTotal || 1));
+    if (endlessPlayback.failureCount >= currentLimit) {
+        showPlayerTransition(
+            message,
+            ['retry', 'skip', 'stop', 'close'],
+            'retry',
+        );
         return;
     }
+    showPlayerTransition(`${message} Skipping to the next video.`, []);
+    setTimeout(() => advanceEndlessPlayback(), 0);
+}
+
+function observePlaybackPromise(playback, generation) {
+    if (!playback || typeof playback.then !== 'function') return;
+    playback.then(
+        () => markPlaybackStarted(generation),
+        error => {
+            if (generation !== endlessPlayback.loadGeneration
+                    || !endlessPlayback.active) return;
+            if (error && error.name === 'NotAllowedError') {
+                clearPlaybackWatchdog();
+                endlessPlayback.phase = 'awaiting-user';
+                endlessPlayback.handoffInProgress = false;
+                showPlayerTransition(
+                    'Your browser paused automatic playback.',
+                    ['continue', 'stop', 'close'],
+                    'continue',
+                );
+                return;
+            }
+            handlePlaybackFailure(
+                generation,
+                'This video could not be played.',
+            );
+        },
+    );
+}
+
+function loadPlaybackItem(item, { automatic = false } = {}) {
     const video = document.getElementById('playerVideo');
-    playerStartedFullscreen = false;
-    hidePlayerControls();
+    clearPlayerMediaCallbacks();
+    const generation = ++endlessPlayback.loadGeneration;
+    const epoch = endlessPlayback.epoch;
+    endlessPlayback.phase = 'loading';
+    endlessPlayback.failedGeneration = null;
+    endlessPlayback.currentItem = item;
+    endlessPlayback.currentDownloadId = String(item.id);
+    video.style.removeProperty('width');
+    video.style.removeProperty('height');
+
+    const current = callback => event => {
+        if (epoch === endlessPlayback.epoch
+                && generation === endlessPlayback.loadGeneration) callback(event);
+    };
+    const onMetadata = current(() => {
+        applyOriginalPlayerSize(generation);
+        armPlaybackWatchdog(generation);
+    });
+    const onResize = current(() => applyOriginalPlayerSize(generation));
+    const onCanPlay = current(() => armPlaybackWatchdog(generation));
+    const onPlaying = current(() => markPlaybackStarted(generation));
+    const onError = current(() => handlePlaybackFailure(
+        generation, 'This video is missing or uses an unsupported format.',
+    ));
+    video.addEventListener('loadedmetadata', onMetadata);
+    video.addEventListener('resize', onResize);
+    video.addEventListener('canplay', onCanPlay);
+    video.addEventListener('playing', onPlaying);
+    video.addEventListener('error', onError);
+    playerMediaCleanup = () => {
+        video.removeEventListener('loadedmetadata', onMetadata);
+        video.removeEventListener('resize', onResize);
+        video.removeEventListener('canplay', onCanPlay);
+        video.removeEventListener('playing', onPlaying);
+        video.removeEventListener('error', onError);
+    };
+
     // Clear any previous <source> children and src attribute before reloading.
     // Setting video.src directly doesn't carry a type hint; using a <source>
     // element with an explicit type lets the browser decide playability before
@@ -2510,30 +2701,112 @@ function playVideo(id, label, ext) {
     video.removeAttribute('src');
     video.innerHTML = '';
     const source = document.createElement('source');
-    source.src = url;
-    const mime = _VIDEO_MIME[ext] || null;
+    source.src = '/api/file/' + encodeURIComponent(item.id);
+    const mime = _VIDEO_MIME[item.extension] || null;
     if (mime) source.type = mime;
     video.appendChild(source);
     video.load();
-    document.getElementById('playerBackdrop').classList.add('open');
-    if (startVideosFullscreen) {
+    if (endlessPlayback.active) {
+        showPlayerTransition(`Loading ${item.title || 'next video'}`, []);
+        armPlaybackWatchdog(generation);
+    }
+    if (automatic) {
         try {
-            if (video.requestFullscreen) {
-                playerStartedFullscreen = true;
-                const request = video.requestFullscreen();
-                if (request) request.catch(() => {
-                    playerStartedFullscreen = false;
-                });
-            } else if (video.webkitEnterFullscreen) {
-                playerStartedFullscreen = true;
-                video.webkitEnterFullscreen();
-            }
+            observePlaybackPromise(video.play(), generation);
         } catch (error) {
-            playerStartedFullscreen = false;
-            // Full screen is a browser-controlled enhancement. Playback must
-            // still open when policy or platform support rejects the request.
+            handlePlaybackFailure(generation, 'This video could not be played.');
         }
     }
+    return generation;
+}
+
+function requestPlayerFullscreen({ launch = false } = {}) {
+    const video = document.getElementById('playerVideo');
+    try {
+        if (video.requestFullscreen) {
+            if (launch) playerStartedFullscreen = true;
+            const request = video.requestFullscreen();
+            if (request) request.catch(() => {
+                if (launch) {
+                    playerStartedFullscreen = false;
+                    endlessPlayback.launchProvenance = 'original';
+                } else if (endlessPlayback.active) {
+                    endlessPlayback.returnFullscreenNeeded = true;
+                    showPlayerTransition(
+                        'Fullscreen could not be restored. Try again from this button.',
+                        ['fullscreen', 'stop', 'close'],
+                        'fullscreen',
+                    );
+                }
+            });
+            return;
+        }
+        if (video.webkitEnterFullscreen) {
+            if (launch) playerStartedFullscreen = true;
+            video.webkitEnterFullscreen();
+        }
+    } catch (error) {
+        if (launch) {
+            playerStartedFullscreen = false;
+            endlessPlayback.launchProvenance = 'original';
+        } else if (endlessPlayback.active) {
+            endlessPlayback.returnFullscreenNeeded = true;
+            showPlayerTransition(
+                'Fullscreen could not be restored. Try again from this button.',
+                ['fullscreen', 'stop', 'close'],
+                'fullscreen',
+            );
+        }
+        // Full screen is browser-controlled; the overlay remains usable.
+    }
+}
+
+function openBuiltInPlayer({ fullscreen = false, requestFullscreen = true } = {}) {
+    const backdrop = document.getElementById('playerBackdrop');
+    hidePlayerControls();
+    backdrop.classList.add('open');
+    endlessPlayback.launchProvenance = fullscreen ? 'fullscreen' : 'original';
+    endlessPlayback.presentation = 'original';
+    playerStartedFullscreen = false;
+    if (fullscreen && requestFullscreen) requestPlayerFullscreen({ launch: true });
+}
+
+function releasePlaybackLease(sessionId) {
+    if (!sessionId) return;
+    fetch('/api/playback-sessions/' + encodeURIComponent(sessionId), {
+        method: 'DELETE',
+        keepalive: true,
+    }).catch(() => {});
+}
+
+function deactivateEndlessPlayback({ release = true } = {}) {
+    const sessionId = endlessPlayback.sessionId;
+    clearInterval(endlessPlayback.keepaliveTimer);
+    endlessPlayback.keepaliveTimer = null;
+    endlessPlayback.active = false;
+    endlessPlayback.sessionId = null;
+    endlessPlayback.sequence = 0;
+    endlessPlayback.advancePending = false;
+    endlessPlayback.handoffInProgress = false;
+    endlessPlayback.returnFullscreenNeeded = false;
+    if (release) releasePlaybackLease(sessionId);
+}
+
+function playVideo(id, label, ext) {
+    const url = '/api/file/' + encodeURIComponent(id);
+    if (playerMode === 'new_tab') {
+        window.open(url, '_blank', 'noopener');
+        return;
+    }
+    endlessPlayback.epoch += 1;
+    deactivateEndlessPlayback();
+    endlessPlayback.phase = 'loading';
+    openBuiltInPlayer({
+        fullscreen: startVideosFullscreen,
+        requestFullscreen: false,
+    });
+    loadPlaybackItem({ id, title: label, extension: ext });
+    if (startVideosFullscreen) requestPlayerFullscreen({ launch: true });
 }
 
 function recordView(id) {
@@ -2543,36 +2816,299 @@ function recordView(id) {
         .catch(() => {});
 }
 
-function closePlayer(ev) {
+function closePlayer() {
     const backdrop = document.getElementById('playerBackdrop');
     const video = document.getElementById('playerVideo');
     const closeButton = backdrop.querySelector('.player-close');
+    endlessPlayback.epoch += 1;
+    endlessPlayback.loadGeneration += 1;
+    deactivateEndlessPlayback();
+    clearPlayerMediaCallbacks();
+    endlessPlayback.phase = 'idle';
+    endlessPlayback.currentDownloadId = null;
+    endlessPlayback.currentItem = null;
     playerStartedFullscreen = false;
     hidePlayerControls();
+    showPlayerTransition('', []);
     if (document.activeElement === closeButton) closeButton.blur();
     video.pause();
+    video.style.removeProperty('width');
+    video.style.removeProperty('height');
     video.removeAttribute('src');
     video.innerHTML = '';
     video.load();
     backdrop.classList.remove('open');
 }
 
-function closePlayerAfterInitialFullscreen() {
+async function playbackResponseError(response) {
+    const data = await response.json().catch(() => ({}));
+    return new Error(data.error || response.statusText || 'Playback request failed');
+}
+
+function startPlaybackKeepalive(epoch) {
+    clearInterval(endlessPlayback.keepaliveTimer);
+    endlessPlayback.keepaliveTimer = setInterval(() => {
+        if (epoch !== endlessPlayback.epoch || !endlessPlayback.sessionId) return;
+        apiFetch(
+            '/api/playback-sessions/'
+                + encodeURIComponent(endlessPlayback.sessionId)
+                + '/keepalive',
+            { method: 'POST' },
+        ).then(response => {
+            if (response.status === 404 && epoch === endlessPlayback.epoch) {
+                deactivateEndlessPlayback({ release: false });
+                showPlayerTransition(
+                    'The endless playback session expired. Start a new session to continue.',
+                    ['restart', 'close'],
+                    'restart',
+                );
+            }
+        }).catch(() => {});
+    }, PLAYBACK_KEEPALIVE_MS);
+}
+
+function historyPositionForId(id) {
+    const position = historyPageItems.findIndex(
+        item => String(item.id) === String(id),
+    );
+    return Math.max(0, position);
+}
+
+function startEndlessPlaybackFromView() {
+    const first = historyPageItems.find(
+        item => item.status === 'finished' && item.filename,
+    );
+    if (!first) return;
+    const label = first.filename.split('/').pop().split('\\').pop();
+    const extension = first.filename.split('.').pop().toLowerCase();
+    startEndlessPlayback(first.id, label, extension);
+}
+
+function startEndlessPlayback(id = null, label = '', extension = '') {
+    if (!id && historyTotal === 0) return;
+    endlessPlayback.epoch += 1;
+    const epoch = endlessPlayback.epoch;
+    deactivateEndlessPlayback();
+    endlessPlayback.active = true;
+    endlessPlayback.phase = 'opening';
+    endlessPlayback.failureCount = 0;
+    endlessPlayback.returnFullscreenNeeded = false;
+    openBuiltInPlayer({
+        fullscreen: startVideosFullscreen,
+        requestFullscreen: false,
+    });
+
+    if (id) {
+        loadPlaybackItem({ id, title: label, extension }, { automatic: true });
+        recordView(id);
+    } else {
+        showPlayerTransition('Starting endless playback…', []);
+    }
+    if (startVideosFullscreen) requestPlayerFullscreen({ launch: true });
+
+    const body = {
+        filter: historySearchInput.value,
+        ordering: historyOrdering,
+        page_size: historyPageSize,
+        page: historyPage,
+        position: id ? historyPositionForId(id) : 0,
+    };
+    if (id) body.start_download_id = String(id);
+    apiFetch('/api/playback-sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+    }).then(async response => {
+        if (response.status === 204) {
+            if (epoch !== endlessPlayback.epoch || !endlessPlayback.active) return;
+            deactivateEndlessPlayback({ release: false });
+            showPlayerTransition('No playable videos remain in this selection.', ['close']);
+            return;
+        }
+        if (!response.ok) {
+            if (epoch !== endlessPlayback.epoch || !endlessPlayback.active) return;
+            throw await playbackResponseError(response);
+        }
+        const data = await response.json();
+        if (epoch !== endlessPlayback.epoch || !endlessPlayback.active) {
+            releasePlaybackLease(data.session_id);
+            return;
+        }
+        endlessPlayback.sessionId = data.session_id;
+        endlessPlayback.sequence = data.sequence;
+        endlessPlayback.currentDownloadId = String(data.item.id);
+        startPlaybackKeepalive(epoch);
+        if (!id || String(id) !== String(data.item.id)) {
+            loadPlaybackItem(data.item, { automatic: true });
+            recordView(data.item.id);
+        } else {
+            endlessPlayback.currentItem = data.item;
+            if (endlessPlayback.phase === 'failed') advanceEndlessPlayback();
+        }
+    }).catch(error => {
+        if (epoch !== endlessPlayback.epoch || !endlessPlayback.active) return;
+        deactivateEndlessPlayback({ release: false });
+        showPlayerTransition(
+            `${error.message || 'Endless playback could not start.'} The current video can still be played.`,
+            ['close'],
+        );
+    });
+}
+
+function advanceEndlessPlayback() {
+    if (!endlessPlayback.active || !endlessPlayback.sessionId
+            || endlessPlayback.advancePending) return;
+    const epoch = endlessPlayback.epoch;
+    const sessionId = endlessPlayback.sessionId;
+    const expectedId = endlessPlayback.currentDownloadId;
+    const nextSequence = endlessPlayback.sequence + 1;
+    endlessPlayback.advancePending = true;
+    endlessPlayback.handoffInProgress = true;
+    endlessPlayback.phase = 'advancing';
+    clearPlaybackWatchdog();
+    showPlayerTransition('Loading next video', []);
+    apiFetch(
+        '/api/playback-sessions/' + encodeURIComponent(sessionId) + '/advance',
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                expected_download_id: expectedId,
+                sequence: nextSequence,
+            }),
+        },
+    ).then(async response => {
+        if (epoch !== endlessPlayback.epoch || !endlessPlayback.active) return;
+        if (response.status === 204) {
+            deactivateEndlessPlayback({ release: false });
+            showPlayerTransition('No playable videos remain in this selection.', ['close']);
+            return;
+        }
+        if (response.status === 404) {
+            deactivateEndlessPlayback({ release: false });
+            showPlayerTransition(
+                'The endless playback session expired. Start a new session to continue.',
+                ['restart', 'close'],
+                'restart',
+            );
+            return;
+        }
+        if (!response.ok) throw await playbackResponseError(response);
+        const data = await response.json();
+        if (epoch !== endlessPlayback.epoch || !endlessPlayback.active) return;
+        endlessPlayback.sequence = data.sequence;
+        endlessPlayback.currentDownloadId = String(data.item.id);
+        loadPlaybackItem(data.item, { automatic: true });
+    }).catch(error => {
+        if (epoch !== endlessPlayback.epoch || !endlessPlayback.active) return;
+        endlessPlayback.phase = 'failed';
+        // Retry must repeat the same idempotent advance request instead of
+        // attempting to replay the media item that has already ended.
+        endlessPlayback.handoffInProgress = true;
+        showPlayerTransition(
+            error.message || 'The next video could not be loaded.',
+            ['retry', 'stop', 'close'],
+            'retry',
+        );
+    }).finally(() => {
+        if (epoch === endlessPlayback.epoch) endlessPlayback.advancePending = false;
+    });
+}
+
+function continueEndlessPlayback() {
+    retryEndlessPlayback();
+}
+
+function restartEndlessPlayback() {
+    const item = endlessPlayback.currentItem;
+    if (!item) return;
+    startEndlessPlayback(item.id, item.title, item.extension);
+}
+
+function retryEndlessPlayback() {
+    if (!endlessPlayback.active) return;
+    if (endlessPlayback.phase === 'failed' && endlessPlayback.handoffInProgress) {
+        advanceEndlessPlayback();
+        return;
+    }
+    const generation = endlessPlayback.loadGeneration;
+    endlessPlayback.failedGeneration = null;
+    endlessPlayback.phase = 'loading';
+    showPlayerTransition('Resuming playback…', []);
+    try {
+        observePlaybackPromise(
+            document.getElementById('playerVideo').play(), generation,
+        );
+        armPlaybackWatchdog(generation);
+    } catch (error) {
+        handlePlaybackFailure(generation, 'This video could not be played.');
+    }
+}
+
+function skipEndlessPlayback() {
+    if (!endlessPlayback.active) return;
+    endlessPlayback.failedGeneration = endlessPlayback.loadGeneration;
+    advanceEndlessPlayback();
+}
+
+function stopEndlessPlayback() {
+    if (!endlessPlayback.active) return;
+    deactivateEndlessPlayback();
+    endlessPlayback.phase = 'playing';
+    showPlayerTransition('Endless playback stopped.', ['close']);
+}
+
+function returnEndlessFullscreen() {
+    if (!endlessPlayback.active) return;
+    endlessPlayback.returnFullscreenNeeded = false;
+    requestPlayerFullscreen();
+    if (endlessPlayback.phase === 'awaiting-user') continueEndlessPlayback();
+    else showPlayerTransition('', []);
+}
+
+function handleFullscreenExit() {
     const backdrop = document.getElementById('playerBackdrop');
-    if (!playerStartedFullscreen || !backdrop.classList.contains('open')) return;
-    closePlayer();
+    if (!backdrop.classList.contains('open')) return;
+    endlessPlayback.presentation = 'original';
+    if (endlessPlayback.active && endlessPlayback.handoffInProgress) {
+        endlessPlayback.returnFullscreenNeeded = true;
+        showPlayerTransition(
+            'Fullscreen ended while the next video was loading.',
+            ['fullscreen'],
+            'fullscreen',
+        );
+        return;
+    }
+    if (playerStartedFullscreen
+            && endlessPlayback.launchProvenance === 'fullscreen') closePlayer();
 }
 
 document.addEventListener('fullscreenchange', () => {
-    // Browser-handled Escape does not reliably reach the page as a key event.
-    // Only an initially full-screen session should close with that transition;
-    // native controls entered later must return to the original overlay.
-    if (!document.fullscreenElement) closePlayerAfterInitialFullscreen();
+    if (document.fullscreenElement === document.getElementById('playerVideo')) {
+        endlessPlayback.presentation = 'standard-fullscreen';
+        return;
+    }
+    if (!document.fullscreenElement) handleFullscreenExit();
 });
 
-document.getElementById('playerVideo').addEventListener(
-    'webkitendfullscreen', closePlayerAfterInitialFullscreen,
-);
+const playerVideo = document.getElementById('playerVideo');
+playerVideo.addEventListener('webkitbeginfullscreen', () => {
+    endlessPlayback.presentation = 'webkit-fullscreen';
+});
+playerVideo.addEventListener('webkitendfullscreen', handleFullscreenExit);
+playerVideo.addEventListener('ended', () => {
+    if (endlessPlayback.active && endlessPlayback.phase === 'playing') {
+        advanceEndlessPlayback();
+    }
+});
+
+document.addEventListener('visibilitychange', () => {
+    if (!endlessPlayback.active) return;
+    if (document.hidden) clearPlaybackWatchdog();
+    else if (endlessPlayback.phase === 'loading') {
+        armPlaybackWatchdog(endlessPlayback.loadGeneration);
+    }
+});
 
 document.getElementById('playerBackdrop').addEventListener(
     'mousemove', showPlayerControls,
