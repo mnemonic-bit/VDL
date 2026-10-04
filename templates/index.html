@@ -378,24 +378,16 @@
                             <strong>Install VDL Companion</strong>
                             <span id="extensionInstallHint">Firefox will show an Add confirmation. Installation and pairing are separate steps.</span>
                         </div>
-                        <a id="extensionInstallLink" class="settings-button-link" href="/browser-extension/vdl-companion-firefox.xpi">Install Firefox extension</a>
+                        <a id="extensionInstallLink" class="settings-button-link" href="/browser-extension/vdl-companion-firefox.xpi" onclick="extensionPackageAction()">Install Firefox extension</a>
                     </div>
                     <div class="setting-item extension-pairing-item" data-setting-keywords="pair connect code string https localhost loopback private network cidr copy invalidate">
                         <div class="setting-copy">
                             <strong>Pair this Firefox profile</strong>
-                            <span id="extensionHttpsStatus">Checking whether this origin is safe for pairing…</span>
+                            <span>Create a one-time pairing string that is valid for five minutes.</span>
+                            <span id="extensionHttpsStatus" class="extension-origin-status">Checking whether this origin is safe for pairing…</span>
                         </div>
                         <div class="extension-pairing-controls">
                             <button id="extensionCreatePairing" type="button" onclick="createExtensionPairing()">Create pairing string</button>
-                            <div id="extensionPairingOutput" hidden>
-                                <label for="extensionPairingString">Pairing string</label>
-                                <textarea id="extensionPairingString" readonly spellcheck="false"></textarea>
-                                <span id="extensionPairingExpiry"></span>
-                                <div class="extension-inline-actions">
-                                    <button type="button" onclick="copyExtensionPairing()"><svg class="btn-icon"><use href="#i-copy"/></svg>Copy pairing string</button>
-                                    <button type="button" class="danger" onclick="invalidateExtensionPairing()">Invalidate</button>
-                                </div>
-                            </div>
                         </div>
                     </div>
                     <div class="extension-connections" data-setting-keywords="connections paired devices revoke token sign out">
@@ -448,6 +440,62 @@
             </div>
         </div>
     </section>
+
+    <dialog id="extensionPairingDialog" class="user-dialog extension-pairing-dialog" aria-labelledby="extensionPairingTitle" aria-describedby="extensionPairingInstructions" aria-modal="true">
+        <div id="extensionPairingOutput" class="user-dialog-card" hidden>
+            <div class="extension-pairing-dialog-header">
+                <div>
+                    <span class="extension-pairing-eyebrow">VDL Companion</span>
+                    <h2 id="extensionPairingTitle">Pair Firefox with VDL</h2>
+                </div>
+                <button type="button" class="extension-pairing-close" aria-label="Close pairing dialog" onclick="closeExtensionPairingDialog()">
+                    <svg aria-hidden="true"><use href="#i-x"/></svg>
+                </button>
+            </div>
+            <p id="extensionPairingInstructions">The pairing string connects this Firefox profile without sharing your VDL password.</p>
+            <div class="extension-pairing-ready" role="status">
+                <svg aria-hidden="true"><use href="#i-check-circle"/></svg>
+                <div>
+                    <strong>Pairing string ready</strong>
+                    <span>It can be used once.</span>
+                </div>
+                <span id="extensionPairingExpiry"></span>
+            </div>
+            <ol class="extension-pairing-steps">
+                <li>
+                    <span class="extension-step-number" aria-hidden="true">1</span>
+                    <div class="extension-step-content">
+                        <strong>Copy the pairing string</strong>
+                        <span>You will paste it into the extension in the next step.</span>
+                        <button id="extensionCopyPairing" type="button" class="extension-copy-primary" onclick="copyExtensionPairing()">
+                            <svg class="btn-icon" aria-hidden="true"><use href="#i-copy"/></svg>
+                            <span class="extension-copy-label">Copy pairing string</span>
+                        </button>
+                        <p id="extensionPairingFeedback" class="extension-pairing-feedback" role="status" aria-live="polite"></p>
+                    </div>
+                </li>
+                <li>
+                    <span class="extension-step-number" aria-hidden="true">2</span>
+                    <div class="extension-step-content">
+                        <strong>Finish in VDL Companion</strong>
+                        <span>Open the extension from the Firefox toolbar, paste the string, then choose <em>Pair with this VDL</em>.</span>
+                    </div>
+                </li>
+            </ol>
+            <details id="extensionPairingDetails" class="extension-pairing-details">
+                <summary>
+                    <span>Show pairing string</span>
+                    <svg aria-hidden="true"><use href="#i-chevron"/></svg>
+                </summary>
+                <label for="extensionPairingString">Pairing string</label>
+                <textarea id="extensionPairingString" readonly spellcheck="false"></textarea>
+            </details>
+            <div class="user-dialog-actions extension-pairing-actions">
+                <button type="button" class="danger extension-invalidate-button" onclick="invalidateExtensionPairing()">Invalidate pairing string</button>
+                <button type="button" onclick="closeExtensionPairingDialog()">Done</button>
+            </div>
+        </div>
+    </dialog>
 
     {% if is_admin %}
     <dialog id="userRemoveDialog" class="user-dialog" aria-labelledby="userRemoveTitle" aria-modal="true">

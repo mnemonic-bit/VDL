@@ -28,6 +28,7 @@ import secrets
 import stat
 import tempfile
 import unicodedata
+import zipfile
 from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
@@ -1352,15 +1353,27 @@ def _bundled_extension():
         if (not re.fullmatch(r'[0-9a-f]{64}', expected)
                 or filename != COMPANION_XPI_NAME):
             return None
-        actual = hashlib.sha256(COMPANION_XPI_PATH.read_bytes()).hexdigest()
-    except (OSError, ValueError):
+        package_bytes = COMPANION_XPI_PATH.read_bytes()
+        actual = hashlib.sha256(package_bytes).hexdigest()
+        with zipfile.ZipFile(io.BytesIO(package_bytes)) as archive:
+            archive_names = {name.lower() for name in archive.namelist()}
+    except (OSError, ValueError, zipfile.BadZipFile):
         return None
     if not hmac.compare_digest(actual, expected):
         return None
     return {
         'version': COMPANION_PACKAGE_VERSION,
         'url': '/browser-extension/vdl-companion-firefox.xpi',
+        'download_url': '/browser-extension/vdl-companion-firefox.xpi?download=1',
         'sha256': actual,
+        # Firefox Release refuses unsigned packages. Surface the development
+        # artifact honestly instead of leaving a click to fail without useful
+        # feedback; AMO-signed XPIs contain this signature trio.
+        'signed': {
+            'meta-inf/manifest.mf',
+            'meta-inf/mozilla.sf',
+            'meta-inf/mozilla.rsa',
+        }.issubset(archive_names),
     }
 
 
@@ -3381,15 +3394,17 @@ def browser_extension_package():
             500, 'extension_package_unavailable',
             'Browser extension package is unavailable',
         )
+    download = request.args.get('download') == '1'
     response = send_file(
         COMPANION_XPI_PATH,
         mimetype='application/x-xpinstall',
-        as_attachment=False,
+        as_attachment=download,
         download_name=COMPANION_XPI_NAME,
         conditional=False,
     )
     response.headers['Content-Disposition'] = (
-        f'inline; filename="{COMPANION_XPI_NAME}"'
+        f'{"attachment" if download else "inline"}; '
+        f'filename="{COMPANION_XPI_NAME}"'
     )
     response.headers['Cache-Control'] = 'no-store'
     response.headers['X-Content-Type-Options'] = 'nosniff'

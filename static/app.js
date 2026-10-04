@@ -2562,6 +2562,9 @@ document.addEventListener('keydown', (ev) => {
     } else if (ev.key === 'Escape' && document.getElementById('newDownloadDialog').open) {
         ev.preventDefault();
         closeNewDownload();
+    } else if (ev.key === 'Escape' && document.getElementById('extensionPairingDialog').open) {
+        ev.preventDefault();
+        closeExtensionPairingDialog();
     } else if (ev.key === 'Escape' && !document.getElementById('settingsPage').hidden) {
         ev.preventDefault();
         closeSettings();
@@ -2808,6 +2811,18 @@ function extensionStatus(message) {
     document.getElementById('extensionStatus').textContent = message || '';
 }
 
+function extensionPairingFeedback(message) {
+    document.getElementById('extensionPairingFeedback').textContent = message || '';
+}
+
+function setExtensionPairingCopied(copied) {
+    const button = document.getElementById('extensionCopyPairing');
+    button.classList.toggle('copied', copied);
+    button.querySelector('use').setAttribute('href', copied ? '#i-check' : '#i-copy');
+    button.querySelector('.extension-copy-label').textContent = copied
+        ? 'Copied' : 'Copy pairing string';
+}
+
 function clearExtensionPairing() {
     if (extensionPairingTimer) clearInterval(extensionPairingTimer);
     extensionPairingTimer = null;
@@ -2816,6 +2831,17 @@ function clearExtensionPairing() {
     if (field) field.value = '';
     const output = document.getElementById('extensionPairingOutput');
     if (output) output.hidden = true;
+    const details = document.getElementById('extensionPairingDetails');
+    if (details) details.open = false;
+    setExtensionPairingCopied(false);
+    extensionPairingFeedback('');
+    const dialog = document.getElementById('extensionPairingDialog');
+    if (dialog && dialog.open) dialog.close();
+}
+
+function closeExtensionPairingDialog() {
+    const dialog = document.getElementById('extensionPairingDialog');
+    if (dialog.open) dialog.close();
 }
 
 function pairingString(origin, code) {
@@ -2833,7 +2859,7 @@ function updatePairingExpiry() {
         extensionStatus('The pairing string expired. Create a new one.');
         return;
     }
-    label.textContent = `Expires in ${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, '0')}`;
+    label.textContent = `${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, '0')} remaining`;
 }
 
 function createExtensionPairing() {
@@ -2846,8 +2872,15 @@ function createExtensionPairing() {
         document.getElementById('extensionPairingOutput').hidden = false;
         extensionPairingExpiresAt = response.expires_at;
         updatePairingExpiry();
+        if (extensionPairingTimer) clearInterval(extensionPairingTimer);
         extensionPairingTimer = setInterval(updatePairingExpiry, 1000);
-        extensionStatus('Pairing string created. Paste it into the extension onboarding page.');
+        const dialog = document.getElementById('extensionPairingDialog');
+        document.getElementById('extensionPairingDetails').open = false;
+        setExtensionPairingCopied(false);
+        extensionPairingFeedback('');
+        dialog.showModal();
+        document.getElementById('extensionCopyPairing').focus();
+        extensionStatus('Pairing string created. Copy it to continue in VDL Companion.');
     }).catch(() => {});
 }
 
@@ -2855,10 +2888,15 @@ async function copyExtensionPairing() {
     const field = document.getElementById('extensionPairingString');
     try {
         await navigator.clipboard.writeText(field.value);
+        setExtensionPairingCopied(true);
+        extensionPairingFeedback('Copied. Continue in VDL Companion.');
         extensionStatus('Pairing string copied.');
     } catch (_) {
+        document.getElementById('extensionPairingDetails').open = true;
         field.focus();
         field.select();
+        setExtensionPairingCopied(false);
+        extensionPairingFeedback('Copy was blocked. The pairing string is shown and selected below.');
         extensionStatus('Copy was blocked. The pairing string is selected for manual copying.');
     }
 }
@@ -2869,6 +2907,15 @@ function invalidateExtensionPairing() {
             clearExtensionPairing();
             extensionStatus('Pairing string invalidated.');
         }).catch(() => {});
+}
+
+function extensionPackageAction() {
+    if (!bundledExtension) return;
+    if (bundledExtension.signed) {
+        extensionStatus('Firefox should show an Add confirmation. If it does not, right-click the install button, save the XPI, then install it from about:addons.');
+    } else {
+        extensionStatus('Downloading the unsigned development XPI. Firefox Release cannot install it; use about:debugging for temporary testing or ask the operator for an AMO-signed package.');
+    }
 }
 
 function versionParts(value) {
@@ -2920,9 +2967,15 @@ function loadExtensionConnections() {
         bundledExtension = data.bundled_extension;
         const install = document.getElementById('extensionInstallLink');
         if (bundledExtension) {
-            install.href = bundledExtension.url;
+            install.href = bundledExtension.signed
+                ? bundledExtension.url : bundledExtension.download_url;
+            if (bundledExtension.signed) install.removeAttribute('download');
+            else install.setAttribute('download', 'vdl-companion-firefox.xpi');
             install.removeAttribute('aria-disabled');
             install.classList.remove('disabled');
+            document.getElementById('extensionInstallHint').textContent = bundledExtension.signed
+                ? 'Firefox will show an Add confirmation. Installation and pairing are separate steps.'
+                : 'This bundled development package is not Mozilla-signed, so Firefox Release cannot install it. Download it only for temporary testing, or ask the operator for a signed package.';
         } else {
             install.removeAttribute('href');
             install.setAttribute('aria-disabled', 'true');
@@ -2935,7 +2988,9 @@ function loadExtensionConnections() {
         const needsUpdate = connections.some(connection => bundledExtension && isNewerVersion(
             bundledExtension.version, connection.extension_version,
         ));
-        install.textContent = needsUpdate ? 'Update Firefox extension' : 'Install Firefox extension';
+        install.textContent = bundledExtension && !bundledExtension.signed
+            ? 'Download unsigned XPI'
+            : needsUpdate ? 'Update Firefox extension' : 'Install Firefox extension';
     });
 }
 
@@ -3375,12 +3430,14 @@ function scheduleFetch({ sortFavorites = false } = {}) {
     pendingFavoriteSort ||= sortFavorites;
     if (pendingFetch) return;
     pendingFetch = true;
-    requestAnimationFrame(() => {
+    // Firefox pauses animation frames in background tabs, which is exactly
+    // where VDL sits while its toolbar companion starts a download.
+    setTimeout(() => {
         pendingFetch = false;
         const applyFavoriteSort = pendingFavoriteSort;
         pendingFavoriteSort = false;
         fetchHistory({ sortFavorites: applyFavoriteSort });
-    });
+    }, 0);
 }
 
 function connectEventStream() {

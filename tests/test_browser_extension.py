@@ -353,6 +353,14 @@ class BrowserExtensionTest(AppCase):
         self.assertEqual(response.headers['Cache-Control'], 'no-store')
         self.assertEqual(response.headers['X-Content-Type-Options'], 'nosniff')
         response.close()
+        download = anonymous.get(
+            '/browser-extension/vdl-companion-firefox.xpi?download=1'
+        )
+        self.assertEqual(
+            download.headers['Content-Disposition'],
+            'attachment; filename="vdl-companion-firefox.xpi"',
+        )
+        download.close()
         self.assertEqual(anonymous.get('/browser-extension/anything.xpi').status_code, 404)
 
         with zipfile.ZipFile(vdl.COMPANION_XPI_PATH) as archive:
@@ -389,7 +397,30 @@ class BrowserExtensionTest(AppCase):
                     self.assertNotRegex(body, r'<script[^>]+src=["\']https?://')
 
         checksum = hashlib.sha256(Path(vdl.COMPANION_XPI_PATH).read_bytes()).hexdigest()
-        self.assertEqual(checksum, vdl._bundled_extension()['sha256'])
+        package = vdl._bundled_extension()
+        self.assertEqual(checksum, package['sha256'])
+        self.assertFalse(package['signed'])
+        self.assertEqual(
+            package['download_url'],
+            '/browser-extension/vdl-companion-firefox.xpi?download=1',
+        )
+
+        signed_path = Path(self.temp_dir.name) / vdl.COMPANION_XPI_NAME
+        with zipfile.ZipFile(signed_path, 'w') as signed_archive:
+            signed_archive.writestr('manifest.json', '{}')
+            signed_archive.writestr('META-INF/manifest.mf', 'fixture')
+            signed_archive.writestr('META-INF/mozilla.sf', 'fixture')
+            signed_archive.writestr('META-INF/mozilla.rsa', 'fixture')
+        signed_checksum = hashlib.sha256(signed_path.read_bytes()).hexdigest()
+        checksum_path = signed_path.with_suffix('.xpi.sha256')
+        checksum_path.write_text(
+            f'{signed_checksum}  {vdl.COMPANION_XPI_NAME}\n', encoding='ascii'
+        )
+        with (
+            mock.patch.object(vdl, 'COMPANION_XPI_PATH', signed_path),
+            mock.patch.object(vdl, 'COMPANION_XPI_CHECKSUM_PATH', checksum_path),
+        ):
+            self.assertTrue(vdl._bundled_extension()['signed'])
 
 
 if __name__ == '__main__':

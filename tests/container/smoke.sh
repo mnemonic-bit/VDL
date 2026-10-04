@@ -107,6 +107,13 @@ with urllib.request.urlopen(
     )
     assert response.headers['Cache-Control'] == 'no-store'
     assert response.headers['X-Content-Type-Options'] == 'nosniff'
+with urllib.request.urlopen(
+    'http://127.0.0.1:5000/browser-extension/vdl-companion-firefox.xpi?download=1',
+    timeout=3,
+) as response:
+    assert response.headers['Content-Disposition'] == (
+        'attachment; filename="vdl-companion-firefox.xpi"'
+    )
 with open(package_path, 'rb') as bundled:
     assert package == bundled.read(), 'served XPI differs from the image artifact'
 with open(checksum_path, encoding='ascii') as checksum_file:

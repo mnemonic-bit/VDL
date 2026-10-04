@@ -62,6 +62,19 @@ def test_release_uploads():
     return jsonify({"ok": True})
 
 
+@vdl.app.post("/__test__/hold-downloads")
+def test_hold_downloads():
+    FakeYoutubeDL.block_downloads = True
+    FakeYoutubeDL.release.clear()
+    return jsonify({"ok": True})
+
+
+@vdl.app.post("/__test__/release-downloads")
+def test_release_downloads():
+    FakeYoutubeDL.release.set()
+    return jsonify({"ok": True})
+
+
 @vdl.app.post("/__test__/row")
 def test_row():
     data = request.get_json() or {}

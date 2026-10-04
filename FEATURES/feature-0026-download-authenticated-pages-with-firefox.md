@@ -232,6 +232,10 @@ Playback and before Users or Danger Zone. It contains:
   server's configured private-HTTP CIDRs;
 - **Install Firefox extension** or **Update Firefox extension**, linked
   directly to the bundled signed XPI;
+- when a development build contains an unsigned XPI, label it explicitly,
+  offer a forced download for temporary testing, and explain that Firefox
+  Release requires an AMO-signed package instead of leaving the install click
+  to fail without feedback;
 - **Create pairing string**, **Copy pairing string**, its five-minute expiry,
   and **Invalidate**;
 - a list of this user's active companion connections showing device label,
@@ -260,6 +264,11 @@ no user or server secret. Return:
 - `Content-Disposition: inline; filename="vdl-companion-firefox.xpi"`;
 - `Cache-Control: no-store`; and
 - `X-Content-Type-Options: nosniff`.
+
+Development builds may request `?download=1` on the same fixed route to return
+`Content-Disposition: attachment`. This does not make an unsigned XPI
+installable in Firefox Release; it only makes the development artifact and
+the required next step visible.
 
 The route serves only the build-time artifact after verifying its configured
 SHA-256. It accepts no filename component and must not become a general file
