@@ -3,6 +3,24 @@ const { reset, seed, refresh } = require('./support.cjs');
 
 test.beforeEach(async ({ page }) => reset(page));
 
+async function installFullscreenHarness(page) {
+    await page.addInitScript(() => {
+        Object.defineProperty(document, 'fullscreenElement', {
+            configurable: true,
+            get: () => window.__fullscreenElement || null,
+        });
+        HTMLVideoElement.prototype.requestFullscreen = function requestFullscreen() {
+            window.__fullscreenElement = this;
+            document.dispatchEvent(new Event('fullscreenchange'));
+            return Promise.resolve();
+        };
+        window.__browserEscapeFullscreen = () => {
+            window.__fullscreenElement = null;
+            document.dispatchEvent(new Event('fullscreenchange'));
+        };
+    });
+}
+
 test('overlay playback assigns MIME, supports Range, and Escape closes it', async ({ page }) => {
     await seed(page, { id: 'play0001', status: 'finished', file: true, name: 'fixture.mp4' });
     await refresh(page);
@@ -14,6 +32,43 @@ test('overlay playback assigns MIME, supports Range, and Escape closes it', asyn
     expect((await range.body()).length).toBe(10);
     await page.keyboard.press('Escape');
     await expect(page.locator('#playerBackdrop')).not.toHaveClass(/open/);
+});
+
+test('Escape closes playback that started in full screen', async ({ page }) => {
+    await installFullscreenHarness(page);
+    await page.request.post('/__test__/preferences', {
+        data: { start_fullscreen: 'true' },
+    });
+    await seed(page, {
+        id: 'play-fullscreen', status: 'finished', file: true, name: 'fixture.mp4',
+    });
+    await page.reload();
+    await page.locator('[data-row-id="play-fullscreen"]')
+        .getByRole('button', { name: 'Play', exact: true }).click();
+
+    await expect.poll(() => page.evaluate(() => document.fullscreenElement?.id || null))
+        .toBe('playerVideo');
+    await page.evaluate(() => window.__browserEscapeFullscreen());
+
+    await expect.poll(() => page.evaluate(() => document.fullscreenElement)).toBeNull();
+    await expect(page.locator('#playerBackdrop')).not.toHaveClass(/open/);
+    await expect(page.locator('#playerVideo source')).toHaveCount(0);
+    expect(await page.locator('#playerVideo').evaluate(video => video.paused)).toBe(true);
+});
+
+test('Escape returns manually entered full screen to overlay playback', async ({ page }) => {
+    await installFullscreenHarness(page);
+    await seed(page, {
+        id: 'play-overlay', status: 'finished', file: true, name: 'fixture.mp4',
+    });
+    await page.reload();
+    await page.locator('[data-row-id="play-overlay"]')
+        .getByRole('button', { name: 'Play', exact: true }).click();
+    await page.locator('#playerVideo').evaluate(video => video.requestFullscreen());
+    await page.evaluate(() => window.__browserEscapeFullscreen());
+
+    await expect(page.locator('#playerBackdrop')).toHaveClass(/open/);
+    await expect(page.locator('#playerVideo source')).toHaveCount(1);
 });
 
 test('overlay omits the title and reveals its inner close button on mouse activity', async ({ page }) => {

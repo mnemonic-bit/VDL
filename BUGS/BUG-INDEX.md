@@ -119,6 +119,12 @@ Buildx's output pipe and make `pipefail` report status 255. Settings now waits
 for its data and rejects stale preference responses. Image publication now
 resolves every digest from structured manifest JSON and retries brief registry
 propagation delays.
+Issue 45 was reported and resolved on 2026-10-04. Leaving a video that had
+started in full screen returned to the original-size overlay because the
+browser consumed Escape without sending the page's close-player key event.
+Playback now remembers how full screen was entered: leaving an initially
+full-screen session closes playback, while leaving full screen entered later
+through the video controls returns to the overlay.
 
 ## Bug reports
 
@@ -166,6 +172,7 @@ propagation delays.
 - [Bug 0042 — UI cleanup left navigation, preview, pagination, and authorization gaps](bug-0042-ui-cleanup-left-navigation-preview-pagination-and-authorization-gaps.md)
 - [Bug 0043 — User administration was fragmented and lacked safe edit guards](bug-0043-user-administration-was-fragmented-and-lacked-safe-edit-guards.md)
 - [Bug 0044 — GitHub Actions had intermittent theme and image-digest failures](bug-0044-github-actions-had-intermittent-theme-and-image-digest-failures.md)
+- [Bug 0045 — Fullscreen Escape ignored the playback launch mode](bug-0045-fullscreen-escape-ignored-playback-launch-mode.md)
 
 ## Accepted UI decisions
 

@@ -59,7 +59,7 @@ Flask + `yt-dlp` video-downloader UI. **Single-process, single-file backend** ([
 - **CSS theming** via `:root` and `html[data-theme="dark"]` custom properties. No hard-coded hex outside the var blocks (a few action-button colours excepted).
 - **Indentation**: 4 spaces (Python and JS).
 - **Commit style**: `fix:`, `feature:`, `refactor:` prefixes; lowercase imperative.
-- **Podman port binding**: when starting containers with Podman, publish host ports on all interfaces (for example, `--publish 0.0.0.0:5000:5000`).
+- **Podman deployment:** follow [`PODMAN.md`](PODMAN.md) when building or running the app with Podman.
 - **Code changes require their own version bump**: increment root `VERSION` before completing each distinct requested change that modifies code. Documentation-only changes, including bug specs and agent-instruction updates, leave `VERSION` unchanged. An existing uncommitted version change belongs to earlier work and must not be reused; increment `VERSION` again for a new code change. Features increment `MINOR` and reset `PATCH`; bug fixes and code changes without greater SemVer impact increment `PATCH`; breaking or incompatible API changes increment `MAJOR` and reset `MINOR` and `PATCH` (including while major is zero). For a mixed code-and-documentation change, apply one bump at the highest code impact: `MAJOR` before `MINOR`, then `PATCH`.
 
 ## ANTI-PATTERNS (THIS PROJECT)

@@ -2461,6 +2461,7 @@ function fetchHistory({ sortFavorites = false } = {}) {
 
 let playerMode = 'overlay';
 let startVideosFullscreen = false;
+let playerStartedFullscreen = false;
 
 // MIME types for <source type="..."> — tells the browser the codec upfront so
 // it doesn't have to sniff, which is required for WEBM on some browsers.
@@ -2500,6 +2501,7 @@ function playVideo(id, label, ext) {
         return;
     }
     const video = document.getElementById('playerVideo');
+    playerStartedFullscreen = false;
     hidePlayerControls();
     // Clear any previous <source> children and src attribute before reloading.
     // Setting video.src directly doesn't carry a type hint; using a <source>
@@ -2517,12 +2519,17 @@ function playVideo(id, label, ext) {
     if (startVideosFullscreen) {
         try {
             if (video.requestFullscreen) {
+                playerStartedFullscreen = true;
                 const request = video.requestFullscreen();
-                if (request) request.catch(() => {});
+                if (request) request.catch(() => {
+                    playerStartedFullscreen = false;
+                });
             } else if (video.webkitEnterFullscreen) {
+                playerStartedFullscreen = true;
                 video.webkitEnterFullscreen();
             }
         } catch (error) {
+            playerStartedFullscreen = false;
             // Full screen is a browser-controlled enhancement. Playback must
             // still open when policy or platform support rejects the request.
         }
@@ -2540,6 +2547,7 @@ function closePlayer(ev) {
     const backdrop = document.getElementById('playerBackdrop');
     const video = document.getElementById('playerVideo');
     const closeButton = backdrop.querySelector('.player-close');
+    playerStartedFullscreen = false;
     hidePlayerControls();
     if (document.activeElement === closeButton) closeButton.blur();
     video.pause();
@@ -2548,6 +2556,23 @@ function closePlayer(ev) {
     video.load();
     backdrop.classList.remove('open');
 }
+
+function closePlayerAfterInitialFullscreen() {
+    const backdrop = document.getElementById('playerBackdrop');
+    if (!playerStartedFullscreen || !backdrop.classList.contains('open')) return;
+    closePlayer();
+}
+
+document.addEventListener('fullscreenchange', () => {
+    // Browser-handled Escape does not reliably reach the page as a key event.
+    // Only an initially full-screen session should close with that transition;
+    // native controls entered later must return to the original overlay.
+    if (!document.fullscreenElement) closePlayerAfterInitialFullscreen();
+});
+
+document.getElementById('playerVideo').addEventListener(
+    'webkitendfullscreen', closePlayerAfterInitialFullscreen,
+);
 
 document.getElementById('playerBackdrop').addEventListener(
     'mousemove', showPlayerControls,
