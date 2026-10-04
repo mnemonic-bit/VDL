@@ -69,7 +69,7 @@ APP_VERSION = _load_app_version()
 APP_STARTED_AT = time.monotonic()
 COMPANION_PROTOCOL = 1
 COMPANION_PROTOCOLS = (COMPANION_PROTOCOL,)
-COMPANION_PACKAGE_VERSION = '1.0.0'
+COMPANION_PACKAGE_VERSION = '1.0.2'
 COMPANION_XPI_NAME = 'vdl-companion-firefox.xpi'
 COMPANION_XPI_PATH = (
     Path(__file__).resolve().parent / 'browser-extension' / 'dist'
@@ -93,6 +93,55 @@ _companion_rate_lock = threading.Lock()
 _failed_pair_rates = {}
 _failed_pair_global = []
 _token_download_rates = {}
+
+
+def _validated_companion_http_networks(value):
+    """Return explicit local IPv4 networks allowed to pair over HTTP."""
+    networks = [ipaddress.ip_network('127.0.0.0/8')]
+    local_ranges = tuple(ipaddress.ip_network(item) for item in (
+        '10.0.0.0/8', '100.64.0.0/10', '172.16.0.0/12',
+        '192.168.0.0/16',
+    ))
+    for raw in (value or '').split(','):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            network = ipaddress.ip_network(raw, strict=True)
+        except ValueError as exc:
+            raise RuntimeError(
+                'VDL_COMPANION_HTTP_CIDRS must contain comma-separated '
+                'canonical IPv4 CIDRs'
+            ) from exc
+        if network.version != 4 or not any(
+                network.subnet_of(parent) for parent in local_ranges):
+            raise RuntimeError(
+                'VDL_COMPANION_HTTP_CIDRS permits only private or shared '
+                'local IPv4 networks'
+            )
+        if network not in networks:
+            networks.append(network)
+    return tuple(networks)
+
+
+COMPANION_HTTP_NETWORKS = _validated_companion_http_networks(
+    os.environ.get('VDL_COMPANION_HTTP_CIDRS')
+)
+
+
+def _companion_http_host_allowed(hostname):
+    hostname = (hostname or '').rstrip('.').lower()
+    if hostname == 'localhost' or hostname.endswith('.localhost'):
+        return True
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        return False
+    return address.is_loopback or (
+        address.version == 4 and any(
+            address in network for network in COMPANION_HTTP_NETWORKS
+        )
+    )
 
 
 def _get_uptime_seconds():
@@ -180,6 +229,22 @@ def _normalized_http_origin(value):
     if port is None:
         port = 443 if parsed.scheme.lower() == 'https' else 80
     return parsed.scheme.lower(), parsed.hostname.lower(), port
+
+
+def _companion_management_origin():
+    origin = _normalized_http_origin(
+        request.headers.get('Origin') or request.host_url
+    )
+    if origin is None or not (
+            origin[0] == 'https'
+            or (origin[0] == 'http' and _companion_http_host_allowed(origin[1]))):
+        return None
+    scheme, hostname, port = origin
+    display_host = f'[{hostname}]' if ':' in hostname else hostname
+    default_port = 443 if scheme == 'https' else 80
+    return f'{scheme}://{display_host}' + (
+        f':{port}' if port != default_port else ''
+    )
 
 
 def _is_extension_origin(value):
@@ -1429,12 +1494,13 @@ def _token_rate_limited(token_id, request_id):
         return False
 
 
-def _new_pairing_code(user_id):
+def _new_pairing_code(user_id, origin):
     raw = 'VDL1-' + _b64url(secrets.token_bytes(16))
     now = time.time()
     record = {
         'verifier': _credential_verifier(raw),
         'user_id': user_id,
+        'origin': origin,
         'created_at': now,
         'expires_at': now + 300,
     }
@@ -1443,7 +1509,7 @@ def _new_pairing_code(user_id):
     return raw, record['expires_at']
 
 
-def _consume_pairing_code(code):
+def _consume_pairing_code(code, origin):
     if (not isinstance(code, str)
             or not re.fullmatch(r'VDL1-[A-Za-z0-9_-]{22}', code)):
         return None
@@ -1455,7 +1521,8 @@ def _consume_pairing_code(code):
             if record['expires_at'] <= now:
                 _pairing_codes.pop(user_id, None)
                 continue
-            if hmac.compare_digest(record['verifier'], verifier):
+            if (record['origin'] == origin
+                    and hmac.compare_digest(record['verifier'], verifier)):
                 matched_user_id = user_id
         if matched_user_id is None:
             return None
@@ -3331,7 +3398,13 @@ def browser_extension_package():
 
 @app.route('/api/extension/pairing-codes', methods=['POST'])
 def extension_pairing_codes():
-    code, expires_at = _new_pairing_code(g.current_user['id'])
+    origin = _companion_management_origin()
+    if origin is None:
+        return jsonify({
+            'error': 'Pairing requires HTTPS or an allowed private HTTP network',
+            'code': 'pairing_transport_not_allowed',
+        }), 403
+    code, expires_at = _new_pairing_code(g.current_user['id'], origin)
     response = jsonify({'code': code, 'expires_at': int(expires_at)})
     response.headers['Cache-Control'] = 'no-store'
     return response, 201
@@ -3357,6 +3430,9 @@ def extension_connections():
     response = jsonify({
         'connections': [dict(row) for row in rows],
         'bundled_extension': _bundled_extension(),
+        'http_pairing_allowed': _companion_http_host_allowed(
+            urlsplit(request.host_url).hostname
+        ),
     })
     response.headers['Cache-Control'] = 'no-store'
     return response
@@ -3406,13 +3482,17 @@ def extension_pair():
     if error:
         return error
     if set(data) != {
-        'code', 'device_label', 'extension_version', 'protocol_version',
+        'code', 'origin', 'device_label', 'extension_version', 'protocol_version',
     }:
         _record_failed_pair(request.remote_addr)
         return _companion_error(400, 'invalid_request', 'Invalid pairing request')
     if data.get('protocol_version') != COMPANION_PROTOCOL:
         return _companion_protocol_error()
     try:
+        origin = data.get('origin')
+        parsed_origin = _normalized_http_origin(origin)
+        if parsed_origin is None or _canonical_page_url(origin) != origin + '/':
+            raise ValueError
         label = _validated_device_label(data.get('device_label'))
         extension_version = _validated_extension_version(
             data.get('extension_version')
@@ -3423,7 +3503,7 @@ def extension_pair():
         _record_failed_pair(request.remote_addr)
         return _companion_error(400, 'invalid_request', 'Invalid pairing request')
 
-    user_id = _consume_pairing_code(data.get('code'))
+    user_id = _consume_pairing_code(data.get('code'), origin)
     user = db_get_user_by_id(user_id) if user_id is not None else None
     if (user is None or user['suspended'] or user['password_hash'] is None):
         _record_failed_pair(request.remote_addr)

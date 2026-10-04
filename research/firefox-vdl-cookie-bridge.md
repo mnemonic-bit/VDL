@@ -218,9 +218,11 @@ The companion routes must authenticate only their pairing code or bearer token. 
 
 **Verified:** Mozilla policy requires sensitive data transmission to be encrypted and purpose-limited. Cookies are personal website content. [Mozilla Add-on Policies](https://extensionworkshop.com/documentation/publish/add-on-policies/)
 
-**Recommendation:** Require trusted HTTPS for remote and LAN VDL instances. Plain HTTP would expose both the VDL bearer token and website bearer cookies to the network. A loopback-only HTTP exception may be technically useful for a browser and container on the same machine, but Mozilla's published policy does not state a clear exception.
+**Recommendation:** Require trusted HTTPS for remote and LAN VDL instances. Plain HTTP exposes both the VDL bearer token and website bearer cookies to the network. Firefox treats loopback and `localhost` HTTP as potentially trustworthy secure contexts, but that browser classification does not extend to ordinary RFC1918 LAN addresses. [MDN Secure contexts](https://developer.mozilla.org/en-US/docs/Web/Security/Secure_Contexts) · [MDN Mixed content](https://developer.mozilla.org/en-US/docs/Web/Security/Defenses/Mixed_content)
 
 **Unresolved:** Ask AMO reviewers whether an explicitly loopback-only (`localhost`, `127.0.0.0/8`, `::1`) HTTP mode is acceptable. Until confirmed, the release behavior should default-deny it rather than silently weakening transport.
+
+**Product decision (2026-10-01):** Local usability takes precedence for explicitly configured deployments. VDL permits loopback HTTP by default and lets the operator allow literal RFC1918 private or RFC6598 shared IPv4 CIDRs with `VDL_COMPANION_HTTP_CIDRS`. The exception is never inferred from the browser's network interfaces, never accepts public ranges or arbitrary hostnames, and is disclosed as unencrypted in Settings and the privacy notice. Mozilla review acceptance remains a release gate for a signed package.
 
 ### Pairing token design
 
@@ -330,7 +332,7 @@ Persisting cookies would enable automatic crash recovery but changes the securit
 ## Unresolved decisions summary
 
 - Whether v1 rejects all partitioned/FPI cookies or implements precise top-level-site selection using the Public Suffix List.
-- Whether AMO accepts cleartext loopback transport; no official exception was found. LAN/remote HTTP must remain prohibited.
+- Whether AMO accepts the disclosed cleartext loopback/private/shared IPv4 transport mode; Mozilla's secure-context exception covers loopback, not ordinary LAN addresses.
 - Final AMO data category for authentication cookies (`websiteContent` alone versus also `authenticationInfo`).
 - Manual versus stable central HTTPS automatic updates.
 - Whether failed sites get an explicit additional-domain permission UI in v1 or only a documented limitation.

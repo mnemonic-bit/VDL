@@ -7,6 +7,7 @@ services:
         ports:
             - "0.0.0.0:${VDL_PORT:-5000}:5000"
         environment:
+            VDL_COMPANION_HTTP_CIDRS: ${VDL_COMPANION_HTTP_CIDRS:-}
             VDL_POT_PROVIDER_URL: ${VDL_POT_PROVIDER_URL:-}
             VDL_INGEST_DIR: /ingest
             VDL_INGEST_SCAN_SECONDS: ${VDL_INGEST_SCAN_SECONDS:-10}

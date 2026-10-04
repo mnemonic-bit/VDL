@@ -2778,6 +2778,31 @@ settingsSearchInput.addEventListener('keydown', event => {
 let extensionPairingExpiresAt = 0;
 let extensionPairingTimer = null;
 let bundledExtension = null;
+let extensionPairingAllowed = false;
+
+function isLocalHttpHostname(value) {
+    const hostname = String(value || '').toLowerCase().replace(/\.$/, '');
+    if (hostname === 'localhost' || hostname.endsWith('.localhost') ||
+            hostname === '[::1]' || hostname === '::1') {
+        return true;
+    }
+    const octets = hostname.split('.');
+    if (octets.length !== 4 || !octets.every(
+        octet => /^\d+$/.test(octet) && Number(octet) <= 255
+    )) return false;
+    const first = Number(octets[0]);
+    const second = Number(octets[1]);
+    return first === 127 || first === 10 ||
+        (first === 100 && second >= 64 && second <= 127) ||
+        (first === 172 && second >= 16 && second <= 31) ||
+        (first === 192 && second === 168);
+}
+
+function isPairableVdlLocation(value, privateHttpAllowed = false) {
+    return value.protocol === 'https:' ||
+        (value.protocol === 'http:' && privateHttpAllowed &&
+            isLocalHttpHostname(value.hostname));
+}
 
 function extensionStatus(message) {
     document.getElementById('extensionStatus').textContent = message || '';
@@ -2812,7 +2837,7 @@ function updatePairingExpiry() {
 }
 
 function createExtensionPairing() {
-    if (window.location.protocol !== 'https:') return;
+    if (!extensionPairingAllowed) return;
     apiAction('/api/extension/pairing-codes', { method: 'POST' })
         .then(response => response.json()).then(response => {
         document.getElementById('extensionPairingString').value = pairingString(
@@ -2879,13 +2904,19 @@ function renderExtensionConnection(connection) {
 }
 
 function loadExtensionConnections() {
-    const https = window.location.protocol === 'https:';
     const create = document.getElementById('extensionCreatePairing');
-    create.disabled = !https;
-    document.getElementById('extensionHttpsStatus').textContent = https
-        ? 'This trusted HTTPS origin is ready to pair.'
-        : 'Pairing is disabled here. Open VDL through a certificate-trusted HTTPS origin.';
+    create.disabled = true;
     return apiFetch('/api/extension/connections').then(response => response.json()).then(data => {
+        extensionPairingAllowed = isPairableVdlLocation(
+            window.location, Boolean(data.http_pairing_allowed),
+        );
+        const localHttp = window.location.protocol === 'http:' && extensionPairingAllowed;
+        create.disabled = !extensionPairingAllowed;
+        document.getElementById('extensionHttpsStatus').textContent = localHttp
+            ? 'This private HTTP origin is enabled by the VDL operator. Traffic is not encrypted.'
+            : extensionPairingAllowed
+                ? 'This trusted HTTPS origin is ready to pair.'
+                : 'Pairing is disabled here. Use HTTPS or ask the operator to allow this local IPv4 CIDR.';
         bundledExtension = data.bundled_extension;
         const install = document.getElementById('extensionInstallLink');
         if (bundledExtension) {

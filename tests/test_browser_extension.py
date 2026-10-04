@@ -1,5 +1,6 @@
 import json
 import hashlib
+import ipaddress
 from pathlib import Path
 import time
 import uuid
@@ -27,6 +28,7 @@ class BrowserExtensionTest(AppCase):
             headers=self.companion_headers,
             json={
                 'code': code,
+                'origin': 'http://localhost',
                 'device_label': label,
                 'extension_version': '1.0.0',
                 'protocol_version': 1,
@@ -69,21 +71,29 @@ class BrowserExtensionTest(AppCase):
         for code in (first,):
             failed = vdl.app.test_client().post(
                 '/api/extension/pair', headers=self.companion_headers,
-                json={'code': code, 'device_label': 'Firefox',
+                json={'code': code, 'origin': 'http://localhost', 'device_label': 'Firefox',
                       'extension_version': '1.0.0', 'protocol_version': 1},
             )
             self.assertEqual(failed.status_code, 401)
             self.assertEqual(failed.get_json()['code'], 'companion_auth_failed')
 
+        wrong_origin = vdl.app.test_client().post(
+            '/api/extension/pair', headers=self.companion_headers,
+            json={'code': second, 'origin': 'http://127.0.0.1',
+                  'device_label': 'Firefox', 'extension_version': '1.0.0',
+                  'protocol_version': 1},
+        )
+        self.assertEqual(wrong_origin.status_code, 401)
+
         success = vdl.app.test_client().post(
             '/api/extension/pair', headers=self.companion_headers,
-            json={'code': second, 'device_label': 'Firefox',
+            json={'code': second, 'origin': 'http://localhost', 'device_label': 'Firefox',
                   'extension_version': '1.0.0', 'protocol_version': 1},
         )
         self.assertEqual(success.status_code, 201)
         replay = vdl.app.test_client().post(
             '/api/extension/pair', headers=self.companion_headers,
-            json={'code': second, 'device_label': 'Firefox',
+            json={'code': second, 'origin': 'http://localhost', 'device_label': 'Firefox',
                   'extension_version': '1.0.0', 'protocol_version': 1},
         )
         self.assertEqual(replay.status_code, 401)
@@ -96,6 +106,49 @@ class BrowserExtensionTest(AppCase):
             persisted = database.read()
         self.assertNotIn(second.encode(), persisted)
         self.assertNotIn(token.encode(), persisted)
+
+    def test_local_http_pairing_requires_an_explicit_private_or_shared_cidr(self):
+        self.assertEqual(
+            vdl._validated_companion_http_networks('192.168.40.0/24'),
+            (
+                ipaddress.ip_network('127.0.0.0/8'),
+                ipaddress.ip_network('192.168.40.0/24'),
+            ),
+        )
+        with self.assertRaises(RuntimeError):
+            vdl._validated_companion_http_networks('8.8.8.0/24')
+        self.assertIn(
+            ipaddress.ip_network('100.96.0.0/24'),
+            vdl._validated_companion_http_networks('100.96.0.0/24'),
+        )
+
+        denied = vdl.app.test_client()
+        login = denied.post(
+            '/login', base_url='http://192.168.40.8:5000',
+            data={'username': 'admin', 'password': 'test-password'},
+        )
+        self.assertEqual(login.status_code, 302)
+        response = denied.post(
+            '/api/extension/pairing-codes',
+            base_url='http://192.168.40.8:5000',
+            headers={'Origin': 'http://192.168.40.8:5000'},
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.get_json()['code'], 'pairing_transport_not_allowed')
+
+        networks = vdl._validated_companion_http_networks('192.168.40.0/24')
+        with mock.patch.object(vdl, 'COMPANION_HTTP_NETWORKS', networks):
+            allowed = denied.post(
+                '/api/extension/pairing-codes',
+                base_url='http://192.168.40.8:5000',
+                headers={'Origin': 'http://192.168.40.8:5000'},
+            )
+            self.assertEqual(allowed.status_code, 201)
+            connections = denied.get(
+                '/api/extension/connections',
+                base_url='http://192.168.40.8:5000',
+            )
+            self.assertTrue(connections.get_json()['http_pairing_allowed'])
 
     def test_token_status_listing_revocation_and_session_invalidation(self):
         token = self.pair('Firefox on laptop')
@@ -315,11 +368,16 @@ class BrowserExtensionTest(AppCase):
             }
             self.assertEqual(payload, source)
             self.assertEqual(manifest['manifest_version'], 3)
+            self.assertEqual(manifest['version'], '1.0.2')
             self.assertEqual(manifest['browser_specific_settings']['gecko']['id'],
                              '{9f743f7e-c0b3-4b99-9e58-6434d3c883d4}')
             self.assertEqual(manifest['browser_specific_settings']['gecko']['strict_min_version'], '140.0')
             self.assertEqual(manifest['incognito'], 'not_allowed')
             self.assertEqual(set(manifest['permissions']), {'activeTab', 'cookies', 'storage'})
+            self.assertNotIn(
+                'upgrade-insecure-requests',
+                manifest['content_security_policy']['extension_pages'],
+            )
             forbidden = {'tabs', 'scripting', 'webRequest', 'history', 'downloads',
                          'contextualIdentities', 'nativeMessaging'}
             self.assertTrue(forbidden.isdisjoint(manifest['permissions']))

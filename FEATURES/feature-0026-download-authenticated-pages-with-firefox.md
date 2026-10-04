@@ -27,10 +27,10 @@ profiles and Firefox Containers, but not private windows, Firefox for Android
 or iOS, partitioned cookies, or First-Party Isolation cookies in v1.
 
 Treat both the browser cookies and the companion bearer token as credentials.
-Production pairing and downloads require a VDL origin with a certificate
-trusted by Firefox over HTTPS. Do not allow plain HTTP, including loopback, in
-the signed production extension unless Mozilla later publishes or confirms a
-policy exception and a separate feature changes this contract.
+Trusted HTTPS remains the production default. Also allow loopback HTTP and
+operator-configured RFC1918 private or RFC6598 shared IPv4 CIDRs for local deployments. This exception
+is explicit, unencrypted, limited to literal private addresses, and disabled
+for LAN ranges unless the operator configures `VDL_COMPANION_HTTP_CIDRS`.
 
 Website cookies are ephemeral. VDL validates the structured cookie bundle,
 converts it into a seekable in-memory Netscape-format stream, and reuses that
@@ -64,7 +64,7 @@ item's visibility through the existing VDL controls.
 
 - A **companion connection** is a revocable association between one Firefox
   profile and one VDL user account.
-- A **pairing string** contains the browser-visible HTTPS origin of VDL and a
+- A **pairing string** contains the browser-visible allowed origin of VDL and a
   short-lived, single-use pairing code. It is a credential until it expires or
   is used.
 - A **companion token** is the persistent, narrowly scoped bearer credential
@@ -92,8 +92,9 @@ item's visibility through the existing VDL controls.
 
 ### VDL transport
 
-- Accept only a normalized origin of the form `https://host[:port]` with no
-  username, password, path other than `/`, query, or fragment.
+- Accept only a normalized trusted `https://host[:port]` origin or an allowed
+  `http://private-ip[:port]` origin with no username, password, path other than
+  `/`, query, or fragment.
 - Firefox must trust the origin's certificate. The extension must not provide
   certificate overrides or an insecure mode.
 - VDL itself does not terminate TLS. Operators may put it behind a trusted
@@ -101,10 +102,11 @@ item's visibility through the existing VDL controls.
   `window.location.origin`, is authoritative during pairing, so TLS
   termination at a reverse proxy does not require Flask to infer the public
   scheme.
-- Plain HTTP LAN, public, `.local`, `localhost`, `127.0.0.0/8`, and `::1`
-  origins are rejected by the signed production extension. Development may
-  use a separately loaded, clearly non-release build, but that behavior must
-  not be present in the signed artifact.
+- Loopback HTTP is enabled by default. RFC1918 private or RFC6598 shared IPv4 HTTP is accepted only when
+  the destination address belongs to a CIDR explicitly configured by the VDL
+  operator. Public HTTP, `.local`/arbitrary hostnames, and non-allowlisted
+  private HTTP remain rejected. The UI and privacy notice disclose that the
+  exception has no transport encryption.
 
 ### yt-dlp floor
 
@@ -226,7 +228,8 @@ Playback and before Users or Danger Zone. It contains:
   site's cookies only after a toolbar click;
 - a warning that cookies can grant the same website access as the signed-in
   browser session;
-- an HTTPS readiness check based on `window.location.origin`;
+- a transport-readiness check based on `window.location.origin` and the
+  server's configured private-HTTP CIDRs;
 - **Install Firefox extension** or **Update Firefox extension**, linked
   directly to the bundled signed XPI;
 - **Create pairing string**, **Copy pairing string**, its five-minute expiry,
@@ -235,8 +238,9 @@ Playback and before Users or Danger Zone. It contains:
   extension version, paired time, and last-used time; and
 - a **Revoke** action for each connection.
 
-When the page is not on HTTPS, keep installation available but disable pairing
-generation and explain that the user must access VDL through trusted HTTPS.
+When the page is neither HTTPS nor an allowed private HTTP origin, keep
+installation available but disable pairing generation and explain how the
+operator can configure a private or shared IPv4 CIDR.
 Do not claim that clicking Install silently installs or pairs the extension.
 The UI must state that Firefox will show an Add confirmation and that the
 extension onboarding page will request the pairing string once.
@@ -293,9 +297,9 @@ The JSON is exactly:
 
 The extension onboarding page accepts that single pasted value, decodes and
 validates it locally, displays the normalized origin prominently, and requires
-the user to click **Pair with this VDL**. It must reject extra fields, HTTP,
-credentials, paths, queries, fragments, invalid base64url, and an invalid code
-shape before making a network request.
+the user to click **Pair with this VDL**. It must reject extra fields, public
+or non-private HTTP, credentials, paths, queries, fragments, invalid
+base64url, and an invalid code shape before making a network request.
 
 Firefox does not implement web-page-to-extension external messaging, so the
 VDL page must not attempt silent post-install configuration, a content-script
@@ -305,7 +309,7 @@ workaround, or automatic extraction of the pairing string.
 
 On the Pair click, the extension:
 
-1. requests the optional host permission for the normalized HTTPS VDL host;
+1. requests the optional host permission for the normalized allowed VDL host;
 2. stops without sending anything if permission is denied;
 3. sends `POST /api/extension/pair` from the background page with
    `credentials: "omit"`, `cache: "no-store"`, and `redirect: "error"`;
@@ -422,13 +426,17 @@ The connection-list response is:
     "version": "1.0.0",
     "url": "/browser-extension/vdl-companion-firefox.xpi",
     "sha256": "…"
-  }
+  },
+  "http_pairing_allowed": false
 }
 ```
 
 `last_used_at` is null until the token's first post-pair authenticated request.
 No management response contains a token, verifier, paired session version, or
 another user's connection.
+`http_pairing_allowed` reports whether the current literal request host is in
+the operator's private-HTTP CIDR policy; HTTPS readiness remains authoritative
+in the browser through `window.location.origin`.
 
 ### Cross-origin companion API
 
@@ -484,6 +492,7 @@ Request:
 ```json
 {
   "code": "VDL1-…",
+  "origin": "https://vdl.example:8443",
   "device_label": "Firefox on Alice's laptop",
   "extension_version": "1.0.0",
   "protocol_version": 1
@@ -508,6 +517,9 @@ Invalid, expired, replaced, or already-used codes all return the same HTTP
 `request.remote_addr` and 60 per minute process-wide with bounded,
 lock-protected in-memory counters. Do not trust `X-Forwarded-For` unless a
 separate deployment feature adds an explicit trusted-proxy configuration.
+Bind each code to the exact normalized origin that created it and require the
+pair request to repeat that origin, so editing a pairing string cannot bypass
+the operator's private-HTTP CIDR policy.
 
 ### Download request
 
@@ -624,7 +636,8 @@ own one-time code or bearer token before performing work.
 Capture actual Origin, Fetch Metadata, preflight, and Private/Local Network
 Access behavior with a signed XPI on the minimum supported Firefox before
 release. Compatibility findings may narrow accepted headers but must not
-weaken code/token authentication, HTTPS, or exact-origin pinning.
+weaken code/token authentication, the configured transport policy, or
+exact-origin pinning.
 
 ## Active-page and cookie selection
 
@@ -897,7 +910,7 @@ later feature and a new privacy review.
 | `Dockerfile` | Copy and integrity-check the signed XPI; no browser, AMO credential, or signing tool at runtime |
 | dependency locks | Require yt-dlp `>=2026.06.09` natively and retain a safe container pin |
 | tests | Backend, extension-unit, browser, container, signed-Firefox integration, and leak coverage described below |
-| documentation | Installation, HTTPS proxying, pairing, use, update, revoke, privacy, troubleshooting, and security-reporting guidance |
+| documentation | Installation, HTTPS proxying, private-HTTP CIDRs, pairing, use, update, revoke, privacy, troubleshooting, and security-reporting guidance |
 
 ## Acceptance criteria
 
@@ -906,9 +919,10 @@ later feature and a new privacy review.
 - The same XPI installs and operates on supported Firefox versions on Linux,
   macOS, and Windows.
 - The VDL page cannot silently configure the extension. Copying one pairing
-  string and confirming the displayed HTTPS origin pairs it once.
-- HTTP VDL origins cannot pair or receive cookies in the signed production
-  extension, including loopback and LAN HTTP.
+  string and confirming the displayed exact origin pairs it once.
+- Loopback HTTP pairs by default. Private or shared IPv4 HTTP pairs only for an
+  operator-configured CIDR; public and non-allowlisted HTTP cannot pair or
+  receive cookies.
 - The extension has no permanent all-sites grant. The first action on a host
   triggers Firefox's host-permission prompt; later actions on that host are
   one click.
@@ -999,8 +1013,8 @@ Use mocked Firefox WebExtension APIs to cover:
 
 - top-level listener registration for a non-persistent background page;
 - pairing-string decode/validation, visible-origin confirmation, VDL host grant
-  acceptance/denial, exact port pinning, redirect refusal, and HTTPS-only
-  enforcement;
+  acceptance/denial, exact port pinning, redirect refusal, and enforcement of
+  HTTPS/loopback/operator-allowlisted private/shared IPv4 transport policy;
 - one-pairing storage, `storage.local` rather than sync, self-unpair cleanup,
   and absence of page/cookie data after every outcome;
 - active-tab scheme checks, VDL-origin rejection, fragment stripping, exact
@@ -1044,7 +1058,8 @@ extension lint/unit and signed-Firefox integration commands documented in
 ## Documentation requirements
 
 - Add an operator guide for trusted HTTPS through a reverse proxy, including
-  certificate trust on the Firefox machine and non-default ports.
+  certificate trust on the Firefox machine and non-default ports, plus the
+  explicit CIDR configuration and plaintext warning for private HTTP.
 - Add a user guide for install, Firefox confirmation, copy/paste pairing,
   first-site permission, one-click use, update, revoke, session-expiry retry,
   Container behavior, and unsupported sites.
@@ -1098,5 +1113,6 @@ The following are validation gates, not undecided product behavior:
    a declaration merely to reduce install friction.
 3. Obtain an unlisted Mozilla signature and verify the signed bytes against
    the reviewed source before bundling them.
-4. Do not introduce a production loopback-HTTP exception without Mozilla
-   policy confirmation and a new specification/security review.
+4. Validate Mozilla review acceptance of the documented local/private HTTP
+   exception before publishing a signed production package; keep public HTTP
+   prohibited regardless of that outcome.

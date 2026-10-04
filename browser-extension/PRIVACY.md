@@ -2,8 +2,10 @@
 
 VDL Companion captures data only when the user clicks its Firefox toolbar
 action. It sends the current page URL and eligible cookies for that page and
-Firefox Container to the exact HTTPS VDL origin the user paired. The extension
-developer receives nothing.
+Firefox Container to the exact VDL origin the user paired. That origin is
+either trusted HTTPS, loopback HTTP, or an operator-enabled private/shared IPv4
+address. Local HTTP is not encrypted. The extension developer receives
+nothing.
 
 The extension never stores website cookies, page URLs, request bodies,
 download IDs, or browsing history. It stores the VDL origin, a narrowly scoped

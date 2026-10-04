@@ -47,11 +47,15 @@ checksum is regenerated.
 
 ## Pairing and troubleshooting
 
-VDL must be opened through an HTTPS origin whose certificate Firefox trusts.
-Install the XPI from Settings, accept Firefox's Add prompt, create a five-minute
-pairing string in VDL, and paste it into the onboarding page. On the first use
-for a website host, Firefox asks for access to that host. Firefox Containers
-remain isolated because each action reads the clicked tab's cookie store.
+VDL should be opened through an HTTPS origin whose certificate Firefox trusts.
+Loopback HTTP is accepted for local development, and an operator may explicitly
+enable an RFC1918 private or RFC6598 shared IPv4 CIDR with
+`VDL_COMPANION_HTTP_CIDRS`. Local HTTP is unencrypted and must be limited to a
+trusted network; public HTTP and HTTP hostnames remain rejected. Install the XPI from Settings, accept Firefox's Add
+prompt, create a five-minute pairing string in VDL, and paste it into the
+onboarding page. On the first use for a website host, Firefox asks for access
+to that host. Firefox Containers remain isolated because each action reads the
+clicked tab's cookie store.
 
 If a site reports an expired session, revisit the source page while signed in
 and click the toolbar action again. Partitioned/FPI cookies, related login

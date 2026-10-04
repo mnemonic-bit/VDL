@@ -271,14 +271,30 @@ is useful for media the site exposes only to the user's legitimate browser
 session. It does not bypass DRM, CAPTCHA, bot protection, geographic or account
 authorization, or a site's terms.
 
-Pairing requires desktop Firefox 140 or later and a browser-visible VDL origin
-using HTTPS with a certificate trusted by that Firefox installation. VDL does
-not terminate TLS; put it behind an HTTPS reverse proxy and forward requests
-to the normal VDL HTTP listener. The public URL may use a non-default port, for
-example `https://vdl.example:8443`, but it must have no path prefix. Install the
-proxy's private certificate authority in Firefox when using an internal CA.
-Plain HTTP, including loopback and LAN addresses, cannot pair in the release
-extension.
+Pairing requires desktop Firefox 140 or later. Trusted HTTPS remains the
+recommended transport and is required for public addresses. For local use,
+plain HTTP is enabled on loopback by default. An operator may explicitly allow
+RFC1918 private or RFC6598 shared IPv4 networks with a comma-separated CIDR
+list, for example:
+
+```bash
+VDL_COMPANION_HTTP_CIDRS=192.168.1.0/24 docker compose up --build -d
+```
+
+For this workspace's shared-address subnet, the equivalent is
+`VDL_COMPANION_HTTP_CIDRS=100.96.0.0/24`.
+
+Then open the exact private address, such as `http://192.168.1.20:5000`.
+Private HTTP sends page URLs, cookies, and the companion token without
+transport encryption, so enable it only on a network whose users and traffic
+you trust. Hostnames and public IP ranges are intentionally not accepted for
+this exception.
+
+For other deployments, put VDL behind an HTTPS reverse proxy and forward
+requests to the normal VDL HTTP listener. The public URL may use a non-default port,
+for example `https://vdl.example:8443`, but it must have no path prefix.
+Install the proxy's private certificate authority in Firefox when using an
+internal CA.
 
 For a typical reverse proxy, preserve the original request path and host, allow
 long-lived `/api/events` responses without buffering, and proxy the fixed XPI
@@ -291,7 +307,7 @@ To use the companion:
 1. Open VDL Settings → Browser Extension and install the bundled XPI. Firefox
    always displays its own Add confirmation.
 2. Create and copy the five-minute pairing string, paste it into the extension
-   onboarding page, verify the HTTPS origin, and confirm pairing.
+   onboarding page, verify the exact destination origin, and confirm pairing.
 3. Open a signed-in video page and click **Download current page with VDL**.
    Firefox asks for access the first time each website host is used.
 4. Install a newer bundled XPI when Settings reports an update. The stable

@@ -3,11 +3,34 @@ const VERSION = browser.runtime.getManifest().version;
 const REQUEST_TIMEOUT_MS = 30000;
 const MAX_RESPONSE_BYTES = 65536;
 
+function isLocalHttpHostname(value) {
+    const hostname = value.toLowerCase().replace(/\.$/, '');
+    if (hostname === 'localhost' || hostname.endsWith('.localhost') ||
+            hostname === '[::1]' || hostname === '::1') {
+        return true;
+    }
+    const octets = hostname.split('.');
+    if (octets.length !== 4 || !octets.every(
+        octet => /^\d+$/.test(octet) && Number(octet) <= 255
+    )) return false;
+    const first = Number(octets[0]);
+    const second = Number(octets[1]);
+    return first === 127 || first === 10 ||
+        (first === 100 && second >= 64 && second <= 127) ||
+        (first === 172 && second >= 16 && second <= 31) ||
+        (first === 192 && second === 168);
+}
+
+function isAllowedVdlTransport(url) {
+    return url.protocol === 'https:' ||
+        (url.protocol === 'http:' && isLocalHttpHostname(url.hostname));
+}
+
 function normalizeVdlOrigin(value) {
     const url = new URL(value);
-    if (url.protocol !== 'https:' || url.username || url.password ||
+    if (!isAllowedVdlTransport(url) || url.username || url.password ||
             (url.pathname !== '/' && url.pathname !== '') || url.search || url.hash) {
-        throw new Error('VDL must use a trusted HTTPS origin without a path.');
+        throw new Error('VDL must use trusted HTTPS or operator-enabled local IPv4 HTTP without a path.');
     }
     return url.origin;
 }
@@ -144,24 +167,15 @@ function projectCookie(cookie) {
     };
 }
 
-async function submitCurrentTab(tab) {
+async function submitCurrentTab(tab, page) {
     const paired = await connection();
     if (!paired) {
         await browser.tabs.create({url: browser.runtime.getURL('onboarding.html')});
         return;
     }
     await setBadge('…', 'Checking this page for VDL', '#667085');
-    if (!tab || tab.incognito) {
-        throw new Error('Private tabs are not supported.');
-    }
-    const page = canonicalPageUrl(tab.url);
     if (page.origin === paired.origin) {
         throw new Error('Open the signed-in video page, not VDL itself.');
-    }
-    const pattern = permissionPattern(page);
-    if (!await browser.permissions.contains({origins: [pattern]}) &&
-            !await browser.permissions.request({origins: [pattern]})) {
-        throw new Error('Firefox site access was not granted.');
     }
     await setBadge('…', 'Sending this page to VDL', '#667085');
     let cookies = [];
@@ -218,14 +232,15 @@ async function pair(message) {
         throw new Error('Unpair the current VDL before pairing another one.');
     }
     const pattern = permissionPattern(new URL(origin));
-    if (!await browser.permissions.request({origins: [pattern]})) {
-        throw new Error('Firefox access to this VDL was not granted.');
+    if (!await browser.permissions.contains({origins: [pattern]})) {
+        throw new Error('Firefox access to this VDL is missing. Pair again to grant it.');
     }
     const result = await fetchJson(origin, '/api/extension/pair', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
             code: message.code,
+            origin,
             device_label: message.deviceLabel,
             extension_version: VERSION,
             protocol_version: PROTOCOL,
@@ -289,16 +304,32 @@ browser.runtime.onMessage.addListener(message => {
     return undefined;
 });
 
+async function recordActionError(error) {
+    const paired = await connection();
+    if (error.status === 401 && paired) {
+        await browser.storage.local.set({connection: {...paired, unusable: true}});
+        await recordError(error.message, 'Re-pair this Firefox profile with VDL.');
+    } else if (error.status === 426) {
+        await recordError(error.message, 'Install the newer companion from VDL Settings.');
+    } else {
+        await recordError(error.message, 'Open VDL Companion options for help.');
+    }
+}
+
 browser.action.onClicked.addListener(tab => {
-    submitCurrentTab(tab).catch(async error => {
-        const paired = await connection();
-        if (error.status === 401 && paired) {
-            await browser.storage.local.set({connection: {...paired, unusable: true}});
-            await recordError(error.message, 'Re-pair this Firefox profile with VDL.');
-        } else if (error.status === 426) {
-            await recordError(error.message, 'Install the newer companion from VDL Settings.');
-        } else {
-            await recordError(error.message, 'Open VDL Companion options for help.');
+    try {
+        if (!tab || tab.incognito) {
+            throw new Error('Private tabs are not supported.');
         }
-    });
+        const page = canonicalPageUrl(tab.url);
+        const permission = browser.permissions.request({
+            origins: [permissionPattern(page)],
+        });
+        permission.then(granted => {
+            if (!granted) throw new Error('Firefox site access was not granted.');
+            return submitCurrentTab(tab, page);
+        }).catch(recordActionError);
+    } catch (error) {
+        recordActionError(error);
+    }
 });
