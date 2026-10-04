@@ -98,6 +98,59 @@ test('Escape returns manually entered full screen to overlay playback', async ({
     await expect(page.locator('#playerVideo source')).toHaveCount(1);
 });
 
+test('player keyboard shortcuts toggle playback and enter full screen', async ({ page }) => {
+    await installFullscreenHarness(page);
+    await seed(page, {
+        id: 'player-shortcuts', status: 'finished', file: true, name: 'fixture.mp4',
+    });
+    await page.reload();
+    await page.evaluate(() => {
+        window.__shortcutPaused = true;
+        window.__shortcutPlayCalls = 0;
+        window.__shortcutPauseCalls = 0;
+        Object.defineProperty(HTMLMediaElement.prototype, 'paused', {
+            configurable: true,
+            get() { return window.__shortcutPaused; },
+        });
+        HTMLMediaElement.prototype.play = function play() {
+            window.__shortcutPaused = false;
+            window.__shortcutPlayCalls += 1;
+            return Promise.resolve();
+        };
+        HTMLMediaElement.prototype.pause = function pause() {
+            window.__shortcutPaused = true;
+            window.__shortcutPauseCalls += 1;
+        };
+    });
+    await page.locator('[data-row-id="player-shortcuts"]')
+        .getByRole('button', { name: 'Play', exact: true }).click();
+    await page.evaluate(() => {
+        window.__shortcutPaused = true;
+        window.__shortcutPlayCalls = 0;
+        window.__shortcutPauseCalls = 0;
+    });
+
+    await page.keyboard.press('Space');
+    expect(await page.evaluate(() => window.__shortcutPaused)).toBe(false);
+    expect(await page.evaluate(() => window.__shortcutPlayCalls)).toBe(1);
+
+    await page.keyboard.press('Space');
+    expect(await page.evaluate(() => window.__shortcutPaused)).toBe(true);
+    expect(await page.evaluate(() => window.__shortcutPauseCalls)).toBe(1);
+
+    await page.keyboard.press('f');
+    await expect.poll(() => page.evaluate(() => document.fullscreenElement?.id || null))
+        .toBe('playerVideo');
+    expect(await page.evaluate(() => window.__fullscreenRequests)).toBe(1);
+
+    await page.keyboard.press('Space');
+    expect(await page.evaluate(() => window.__shortcutPaused)).toBe(false);
+    expect(await page.evaluate(() => window.__shortcutPlayCalls)).toBe(2);
+
+    await page.keyboard.press('f');
+    expect(await page.evaluate(() => window.__fullscreenRequests)).toBe(1);
+});
+
 test('overlay omits the title and reveals its inner close button on mouse activity', async ({ page }) => {
     test.setTimeout(15_000);
     await seed(page, { id: 'player-ui', status: 'finished', file: true, name: 'fixture.mp4' });

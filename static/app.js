@@ -3114,7 +3114,57 @@ document.getElementById('playerBackdrop').addEventListener(
     'mousemove', showPlayerControls,
 );
 
+function togglePlayerPlayback() {
+    const video = document.getElementById('playerVideo');
+    if (!video.paused && !video.ended) {
+        video.pause();
+        return;
+    }
+    try {
+        const playback = video.play();
+        if (endlessPlayback.active) {
+            observePlaybackPromise(playback, endlessPlayback.loadGeneration);
+        } else if (playback && typeof playback.catch === 'function') {
+            // Keyboard playback should not leak a rejected autoplay promise.
+            playback.catch(() => {});
+        }
+    } catch (error) {
+        if (endlessPlayback.active) {
+            handlePlaybackFailure(
+                endlessPlayback.loadGeneration,
+                'This video could not be played.',
+            );
+        }
+    }
+}
+
+function handlePlayerShortcut(ev) {
+    const backdrop = document.getElementById('playerBackdrop');
+    if (!backdrop.classList.contains('open')
+            || ev.defaultPrevented || ev.ctrlKey || ev.metaKey || ev.altKey) return false;
+
+    const fullscreenShortcut = (ev.key === 'f' || ev.key === 'F')
+        && endlessPlayback.presentation === 'original';
+    const playbackShortcut = ev.key === ' ' && !ev.shiftKey;
+    if (!fullscreenShortcut && !playbackShortcut) return false;
+
+    // Space must retain its native activation when a visible player action has focus.
+    if (playbackShortcut && ev.target instanceof Element
+            && backdrop.contains(ev.target)
+            && ev.target.closest('button, input, textarea, select, [contenteditable="true"]')) {
+        return false;
+    }
+
+    ev.preventDefault();
+    if (ev.repeat) return true;
+    if (fullscreenShortcut) requestPlayerFullscreen();
+    else togglePlayerPlayback();
+    return true;
+}
+
 document.addEventListener('keydown', (ev) => {
+    if (handlePlayerShortcut(ev)) return;
+
     // Editors use Escape to cancel their own transient state. Respect that
     // before treating the same key as a request to close an enclosing layer.
     if (ev.defaultPrevented) return;
