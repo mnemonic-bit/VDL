@@ -124,6 +124,60 @@ class PlaybackSessionTest(AppCase):
         )
         self.assertEqual([entry["id"] for entry in unfiltered], ["target", "other"])
 
+    def test_filter_aliases_favorite_ordering_and_page_resolution(self):
+        entry = {
+            "title": "Mountain Light",
+            "tags": [],
+            "downloaded_by": "admin",
+            "resolution": None,
+            "quality": "uhd",
+            "favorite": True,
+            "view_count": "not-a-number",
+        }
+        self.assertTrue(vdl._matches_history_filter(
+            entry,
+            vdl._normalize_history_filter(
+                "quality:4k starred:yes views:new"
+            ),
+        ))
+        self.assertFalse(vdl._matches_history_filter(
+            entry,
+            vdl._normalize_history_filter("quality:8k"),
+        ))
+        self.assertFalse(vdl._matches_history_filter(
+            entry,
+            vdl._normalize_history_filter("starred:no"),
+        ))
+        self.assertTrue(vdl._matches_history_filter(
+            {**entry, "favorite": False},
+            vdl._normalize_history_filter("starred:no"),
+        ))
+        self.assertFalse(vdl._matches_history_filter(
+            {**entry, "view_count": 1},
+            vdl._normalize_history_filter("views:2"),
+        ))
+
+        admin = vdl.db_get_user_by_username("admin")
+        self.finished_file("favorite-old", "favorite-old.mp4")
+        self.finished_file("plain-new", "plain-new.mp4")
+        self.insert("unfinished")
+        self.set_created_at("favorite-old", 1)
+        self.set_created_at("plain-new", 2)
+        vdl.db_set_download_favorite("favorite-old", True)
+
+        selection = vdl.resolve_library_selection(
+            admin["id"], True, "", "favorites_first"
+        )
+        self.assertEqual(
+            [entry["id"] for entry in selection],
+            ["favorite-old", "plain-new"],
+        )
+        page, total = vdl.resolve_library_page(
+            admin["id"], True, "", "favorites_first", 1, 1
+        )
+        self.assertEqual(total, 2)
+        self.assertEqual([entry["id"] for entry in page], ["plain-new"])
+
     def test_stale_private_missing_and_unsafe_start_items_are_rejected(self):
         self.finished_file("missing", "missing.mp4")
         os.remove(vdl.db_get_download("missing")["filename"])
@@ -249,6 +303,60 @@ class PlaybackSessionTest(AppCase):
                     self.create_session(**changes).status_code,
                     400,
                 )
+
+    def test_payload_validation_coordinate_fallback_and_stale_retry(self):
+        malformed_create = self.client.post(
+            "/api/playback-sessions", json=[]
+        )
+        self.assertEqual(malformed_create.status_code, 400)
+        self.assertEqual(
+            malformed_create.get_json()["error"],
+            "A JSON object is required",
+        )
+        self.assertEqual(self.create_session(filter=3).status_code, 400)
+        self.assertEqual(
+            self.create_session(start_download_id=3).status_code,
+            400,
+        )
+
+        self.finished_file("fallback", "fallback.mp4")
+        created = self.create_session(
+            page_size=1, page=10, position=0
+        )
+        self.assertEqual(created.status_code, 201)
+        state = created.get_json()
+        self.assertEqual(state["item"]["id"], "fallback")
+        advance_url = (
+            f"/api/playback-sessions/{state['session_id']}/advance"
+        )
+
+        self.assertEqual(
+            self.client.post(advance_url, json=[]).status_code,
+            400,
+        )
+        self.assertEqual(self.client.post(advance_url, json={
+            "expected_download_id": 3,
+            "sequence": 1,
+        }).status_code, 400)
+        self.assertEqual(self.client.post(advance_url, json={
+            "expected_download_id": "fallback",
+            "sequence": 0,
+        }).status_code, 400)
+
+        advanced = self.client.post(advance_url, json={
+            "expected_download_id": "fallback",
+            "sequence": 1,
+        })
+        self.assertEqual(advanced.status_code, 200)
+        stale_retry = self.client.post(advance_url, json={
+            "expected_download_id": "another-video",
+            "sequence": 1,
+        })
+        self.assertEqual(stale_retry.status_code, 409)
+        self.assertEqual(
+            stale_retry.get_json()["error"],
+            "Playback position changed",
+        )
 
     def test_suspending_or_removing_an_owner_releases_sessions(self):
         admin = vdl.db_get_user_by_username("admin")

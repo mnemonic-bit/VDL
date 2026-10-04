@@ -60,6 +60,7 @@ Flask + `yt-dlp` video-downloader UI. **Single-process, single-file backend** ([
 - **Indentation**: 4 spaces (Python and JS).
 - **Commit style**: `fix:`, `feature:`, `refactor:` prefixes; lowercase imperative.
 - **Podman deployment:** follow [`PODMAN.md`](PODMAN.md) when building or running the app with Podman.
+- **Coverage gates completion:** before claiming any feature or bug fix is done, run `./tests/run-all.sh --unit` and verify that `vdl.py` line coverage meets the enforced 90% minimum. A passing test suite without the coverage result is insufficient; use Python 3.12 to match GitHub Actions when the result is close to the threshold.
 - **Code changes require their own version bump**: increment root `VERSION` before completing each distinct requested change that modifies code. Documentation-only changes, including bug specs and agent-instruction updates, leave `VERSION` unchanged. An existing uncommitted version change belongs to earlier work and must not be reused; increment `VERSION` again for a new code change. Features increment `MINOR` and reset `PATCH`; bug fixes and code changes without greater SemVer impact increment `PATCH`; breaking or incompatible API changes increment `MAJOR` and reset `MINOR` and `PATCH` (including while major is zero). For a mixed code-and-documentation change, apply one bump at the highest code impact: `MAJOR` before `MINOR`, then `PATCH`.
 
 ## ANTI-PATTERNS (THIS PROJECT)
@@ -77,7 +78,6 @@ Flask + `yt-dlp` video-downloader UI. **Single-process, single-file backend** ([
 - **Container dependencies are separately locked.** Native development uses `requirements.txt`; the image installs the hashed `requirements-container.txt` and keeps the optional BgUtils plugin dormant unless `VDL_POT_PROVIDER_URL` is set.
 - **`/api/resume` ≠ `/api/unpause`**: `resume` spawns a NEW worker thread for `cancelled`/`interrupted` rows (relies on yt-dlp's `continuedl=True` to find the `.part` file). `unpause` clears the flag for an ALIVE paused worker.
 - **Cancel beats pause**: [`request_cancel` drops the pause flag](file:///workspace/vdl.py#L290-L295) so a paused worker wakes up and aborts. Don't re-arm pause during cancel.
-- **No CI or linter.** Run `python -m unittest discover -s tests -v`; UI lifecycle and external-site verification remain manual.
 - **`media/` and `downloads.db` are tracked-in-tree but gitignored.** A fresh clone has neither; both are created on first run.
 
 ## COMMANDS
