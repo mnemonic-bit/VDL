@@ -1051,6 +1051,9 @@ details[open] > .history-summary::before { transform: rotate(90deg); }
 .extension-pairing-controls { display: grid; gap: 10px; min-width: 0; }
 .extension-pairing-controls button.danger,
 .extension-connection button.danger { color: var(--error-fg); border-color: var(--error-border); }
+.extension-connection .extension-revoke-button { width: 38px; padding: 0; color: var(--error-fg); background: transparent; }
+.extension-connection .extension-revoke-button:hover { color: var(--on-brand); background: var(--danger-2); border-color: var(--danger-2); }
+.extension-revoke-button svg { width: 17px; height: 17px; }
 .extension-connections { padding-top: 18px; }
 .extension-connections h3 { margin: 0 0 5px; font-size: 1em; }
 .extension-connections > p { margin: 0 0 12px; color: var(--muted); font-size: 0.9em; }

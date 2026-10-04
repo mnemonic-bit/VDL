@@ -2856,7 +2856,7 @@ function updatePairingExpiry() {
     const label = document.getElementById('extensionPairingExpiry');
     if (!remaining) {
         clearExtensionPairing();
-        extensionStatus('The pairing string expired. Create a new one.');
+        extensionStatus('');
         return;
     }
     label.textContent = `${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, '0')} remaining`;
@@ -2946,7 +2946,12 @@ function renderExtensionConnection(connection) {
                     <dt>Paired</dt><dd>${formatConnectionTime(connection.created_at)}</dd>
                     <dt>Last used</dt><dd>${formatConnectionTime(connection.last_used_at)}</dd>
                 </dl>
-                <button type="button" class="danger" onclick="revokeExtensionConnection('${escapeAttr(connection.id)}', this)">Revoke</button>
+                <button type="button" class="danger extension-revoke-button"
+                        aria-label="Revoke ${escapeAttr(connection.device_label)}"
+                        title="Revoke connection"
+                        onclick="revokeExtensionConnection('${escapeAttr(connection.id)}', this)">
+                    <svg aria-hidden="true"><use href="#i-trash"/></svg>
+                </button>
             </article>`;
 }
 

@@ -70,7 +70,8 @@ APP_VERSION = _load_app_version()
 APP_STARTED_AT = time.monotonic()
 COMPANION_PROTOCOL = 1
 COMPANION_PROTOCOLS = (COMPANION_PROTOCOL,)
-COMPANION_PACKAGE_VERSION = '1.0.2'
+COMPANION_PACKAGE_VERSION = '1.0.3'
+COMPANION_PAIRING_CODE_FORMAT = 2
 COMPANION_XPI_NAME = 'vdl-companion-firefox.xpi'
 COMPANION_XPI_PATH = (
     Path(__file__).resolve().parent / 'browser-extension' / 'dist'
@@ -1508,8 +1509,16 @@ def _token_rate_limited(token_id, request_id):
 
 
 def _new_pairing_code(user_id, origin):
-    raw = 'VDL1-' + _b64url(secrets.token_bytes(16))
     now = time.time()
+    # Keep the established 16-byte code shape so older companions can still
+    # pair. New companions recognize the format byte and creation time, while
+    # 88 unpredictable bits remain ample for a five-minute rate-limited code.
+    payload = (
+        bytes((COMPANION_PAIRING_CODE_FORMAT,))
+        + int(now).to_bytes(4, 'big')
+        + secrets.token_bytes(11)
+    )
+    raw = 'VDL1-' + _b64url(payload)
     record = {
         'verifier': _credential_verifier(raw),
         'user_id': user_id,

@@ -1,3 +1,4 @@
+import base64
 import json
 import hashlib
 import ipaddress
@@ -65,6 +66,11 @@ class BrowserExtensionTest(AppCase):
         second_response = self.client.post('/api/extension/pairing-codes')
         second = second_response.get_json()['code']
         self.assertRegex(second, r'^VDL1-[A-Za-z0-9_-]{22}$')
+        encoded = second.removeprefix('VDL1-')
+        payload = base64.urlsafe_b64decode(encoded + '==')
+        self.assertEqual(len(payload), 16)
+        self.assertEqual(payload[0], vdl.COMPANION_PAIRING_CODE_FORMAT)
+        self.assertLessEqual(abs(int.from_bytes(payload[1:5], 'big') - time.time()), 2)
         self.assertNotEqual(first, second)
         self.assertEqual(second_response.headers['Cache-Control'], 'no-store')
 
@@ -376,7 +382,7 @@ class BrowserExtensionTest(AppCase):
             }
             self.assertEqual(payload, source)
             self.assertEqual(manifest['manifest_version'], 3)
-            self.assertEqual(manifest['version'], '1.0.2')
+            self.assertEqual(manifest['version'], '1.0.3')
             self.assertEqual(manifest['browser_specific_settings']['gecko']['id'],
                              '{9f743f7e-c0b3-4b99-9e58-6434d3c883d4}')
             self.assertEqual(manifest['browser_specific_settings']['gecko']['strict_min_version'], '140.0')

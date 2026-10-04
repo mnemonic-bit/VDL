@@ -26,7 +26,7 @@ test('pairing requests VDL access directly from the submit gesture', async ({ pa
         });
         window.browser = {
             runtime: {
-                getManifest: () => ({version: '1.0.2'}),
+                getManifest: () => ({version: '1.0.3'}),
                 onInstalled: {addListener: () => {}},
                 onMessage: {addListener: listener => { window.__messageListener = listener; }},
                 sendMessage: message => {
@@ -98,6 +98,34 @@ test('pairing requests VDL access directly from the submit gesture', async ({ pa
         .toBe('http://100.96.0.2:5000');
 });
 
+test('expired pairing strings explain where to create a replacement', async ({ page }) => {
+    await page.setContent(`
+        <form id="pairForm">
+            <textarea id="pairingString"></textarea>
+            <input id="deviceLabel" value="Firefox">
+            <p id="originPreview" hidden></p>
+            <button type="submit">Pair</button>
+        </form>
+        <p id="status"></p>
+    `);
+    await page.addScriptTag({content: extensionSource('onboarding.js')});
+
+    const code = Buffer.alloc(16);
+    code[0] = 2;
+    code.writeUInt32BE(Math.floor(Date.now() / 1000) - 11 * 60, 1);
+    code.fill(7, 5);
+    const encoded = Buffer.from(JSON.stringify({
+        code: `VDL1-${code.toString('base64url')}`,
+        origin: 'http://100.96.0.2:5000',
+    })).toString('base64url');
+    await page.locator('#pairingString').fill(`vdl-pair-v1:${encoded}`);
+
+    await expect(page.locator('#status')).toHaveText(
+        'This pairing string expired 6 minutes ago. In VDL, open Settings → Browser Extension, choose Create pairing string, and paste the new string here.',
+    );
+    await expect(page.locator('#originPreview')).toContainText('http://100.96.0.2:5000');
+});
+
 test('toolbar requests page access directly from the toolbar gesture', async ({ page }) => {
     await page.setContent('<p>extension background harness</p>');
     await page.evaluate(() => {
@@ -113,7 +141,7 @@ test('toolbar requests page access directly from the toolbar gesture', async ({ 
         });
         window.browser = {
             runtime: {
-                getManifest: () => ({version: '1.0.2'}),
+                getManifest: () => ({version: '1.0.3'}),
                 onInstalled: {addListener: () => {}},
                 onMessage: {addListener: () => {}},
                 getURL: value => value,

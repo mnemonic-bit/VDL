@@ -165,7 +165,7 @@ companion_headers = {
     'Content-Type': 'application/json',
     'Origin': 'moz-extension://01234567-89ab-cdef-0123-456789abcdef',
     'X-VDL-Companion-Protocol': '1',
-    'X-VDL-Companion-Version': '1.0.2',
+    'X-VDL-Companion-Version': '1.0.3',
 }
 pair_request = urllib.request.Request(
     base_url + '/api/extension/pair',
@@ -173,7 +173,7 @@ pair_request = urllib.request.Request(
         'code': pairing_code,
         'origin': base_url,
         'device_label': 'Container smoke',
-        'extension_version': '1.0.2',
+        'extension_version': '1.0.3',
         'protocol_version': 1,
     }).encode(),
     headers=companion_headers,

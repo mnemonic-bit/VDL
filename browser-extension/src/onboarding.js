@@ -25,14 +25,42 @@ function permissionPattern(url) {
     return `${url.protocol}//${url.hostname}/*`;
 }
 
+const PAIRING_CODE_FORMAT = 2;
+const PAIRING_CODE_LIFETIME_MS = 5 * 60 * 1000;
+
+function decodeBase64Url(value) {
+    if (!/^[A-Za-z0-9_-]+$/.test(value)) throw new Error('Invalid pairing string.');
+    const padded = value.replace(/-/g, '+').replace(/_/g, '/') +
+        '='.repeat((4 - value.length % 4) % 4);
+    return Uint8Array.from(atob(padded), character => character.charCodeAt(0));
+}
+
+function pairingCodeExpiresAt(code) {
+    const bytes = decodeBase64Url(code.slice('VDL1-'.length));
+    if (bytes.length !== 16 || bytes[0] !== PAIRING_CODE_FORMAT) return null;
+    const createdAt = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+        .getUint32(1) * 1000;
+    // A matching marker in an older fully-random code must not invent expiry
+    // information unless its timestamp is also plausible.
+    if (createdAt < Date.UTC(2025, 0, 1) || createdAt > Date.now() + 60_000) return null;
+    return createdAt + PAIRING_CODE_LIFETIME_MS;
+}
+
+function expiredPairingMessage(expiresAt) {
+    if (!expiresAt || expiresAt > Date.now()) return '';
+    const elapsed = Date.now() - expiresAt;
+    const age = elapsed < 60_000
+        ? 'less than a minute'
+        : `${Math.floor(elapsed / 60_000)} minute${elapsed < 120_000 ? '' : 's'}`;
+    return `This pairing string expired ${age} ago. In VDL, open Settings → Browser Extension, choose Create pairing string, and paste the new string here.`;
+}
+
 function decodePairingString(value) {
     if (!value.startsWith('vdl-pair-v1:')) throw new Error('Invalid pairing string.');
     const encoded = value.slice('vdl-pair-v1:'.length);
-    if (!/^[A-Za-z0-9_-]+$/.test(encoded)) throw new Error('Invalid pairing string.');
     let decoded;
     try {
-        const padded = encoded.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - encoded.length % 4) % 4);
-        const bytes = Uint8Array.from(atob(padded), character => character.charCodeAt(0));
+        const bytes = decodeBase64Url(encoded);
         decoded = JSON.parse(new TextDecoder('utf-8', {fatal: true}).decode(bytes));
     } catch (_) { throw new Error('Invalid pairing string.'); }
     if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded) ||
@@ -46,7 +74,11 @@ function decodePairingString(value) {
         throw new Error('Pairing requires trusted HTTPS or operator-enabled local IPv4 HTTP.');
     }
     if (url.origin !== decoded.origin) throw new Error('The VDL origin is not normalized.');
-    return {origin: url.origin, code: decoded.code};
+    return {
+        origin: url.origin,
+        code: decoded.code,
+        expiresAt: pairingCodeExpiresAt(decoded.code),
+    };
 }
 
 const form = document.getElementById('pairForm');
@@ -66,14 +98,19 @@ pairing.addEventListener('input', () => {
         const data = decodePairingString(pairing.value.trim());
         preview.textContent = destinationLabel(data);
         preview.hidden = false;
+        status.textContent = expiredPairingMessage(data.expiresAt);
+    } catch (_) {
+        preview.hidden = true;
         status.textContent = '';
-    } catch (_) { preview.hidden = true; }
+    }
 });
 
 form.addEventListener('submit', async event => {
     event.preventDefault();
     try {
         const data = decodePairingString(pairing.value.trim());
+        const expiryMessage = expiredPairingMessage(data.expiresAt);
+        if (expiryMessage) throw new Error(expiryMessage);
         preview.textContent = destinationLabel(data, true);
         preview.hidden = false;
         if (!await browser.permissions.request({

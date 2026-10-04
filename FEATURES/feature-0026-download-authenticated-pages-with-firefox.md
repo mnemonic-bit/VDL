@@ -282,8 +282,11 @@ user. It is an ordinary session-authenticated, same-origin mutation. It
 returns the raw code once and replaces any earlier unconsumed code for that
 user.
 
-- Generate 16 random bytes with `secrets.token_bytes`, encode them as unpadded
-  base64url, and prefix the display value with `VDL1-`.
+- Generate a 16-byte payload containing one format byte, a four-byte creation
+  timestamp, and 11 random bytes from `secrets.token_bytes`; encode it as
+  unpadded base64url and prefix the display value with `VDL1-`. The timestamp
+  lets the extension explain an expired string locally without weakening the
+  server's generic invalid-code response or changing the established shape.
 - Keep only an HMAC-SHA-256 verifier, user ID, creation time, and expiry in a
   lock-protected in-process map. Use the application's persistent signing
   secret as the HMAC key.
@@ -306,7 +309,10 @@ The JSON is exactly:
 
 The extension onboarding page accepts that single pasted value, decodes and
 validates it locally, displays the normalized origin prominently, and requires
-the user to click **Pair with this VDL**. It must reject extra fields, public
+the user to click **Pair with this VDL**. When the recognized code timestamp is
+older than five minutes, it reports how long ago the string expired and directs
+the user to **Settings → Browser Extension → Create pairing string** before
+making a network request. It must reject extra fields, public
 or non-private HTTP, credentials, paths, queries, fragments, invalid
 base64url, and an invalid code shape before making a network request.
 

@@ -6,7 +6,7 @@ test.beforeEach(async ({ page }) => reset(page));
 const companionHeaders = {
     Origin: 'moz-extension://01234567-89ab-cdef-0123-456789abcdef',
     'X-VDL-Companion-Protocol': '1',
-    'X-VDL-Companion-Version': '1.0.2',
+    'X-VDL-Companion-Version': '1.0.3',
 };
 
 async function pairCompanion(page) {
@@ -20,7 +20,7 @@ async function pairCompanion(page) {
             code,
             origin,
             device_label: 'Firefox browser test',
-            extension_version: '1.0.2',
+            extension_version: '1.0.3',
             protocol_version: 1,
         },
     });
@@ -82,6 +82,22 @@ test('Browser Extension settings allow operator-approved private HTTP pairing', 
     await pairingDialog.getByRole('button', { name: 'Invalidate pairing string' }).click();
     await expect(pairingDialog).toBeHidden();
     await expect(page.locator('#extensionStatus')).toHaveText('Pairing string invalidated.');
+    await page.locator('#extensionCreatePairing').click();
+    await expect(pairingDialog).toBeVisible();
+    await page.evaluate(() => {
+        extensionPairingExpiresAt = Date.now() / 1000 - 1;
+        updatePairingExpiry();
+    });
+    await expect(pairingDialog).toBeHidden();
+    await expect(page.locator('#extensionStatus')).toBeEmpty();
+
+    await pairCompanion(page);
+    await page.evaluate(() => loadExtensionConnections());
+    const connection = page.locator('.extension-connection');
+    const revoke = connection.getByRole('button', { name: 'Revoke Firefox browser test' });
+    await expect(revoke).toBeVisible();
+    await expect(revoke).toHaveText('');
+    await expect(revoke.locator('use')).toHaveAttribute('href', '#i-trash');
 });
 
 test('authenticated stopped rows require a fresh Firefox handoff', async ({ page }) => {
