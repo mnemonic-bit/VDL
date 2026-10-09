@@ -1159,7 +1159,12 @@ function bindTagSuggestionButtons(shell) {
     const id = shell.dataset.tagId;
     shell.querySelectorAll('[data-suggest-tag]').forEach(button => {
         button.addEventListener('mousedown', event => event.preventDefault());
-        button.addEventListener('click', () => tagCommit(id, button.dataset.suggestTag));
+        button.addEventListener('click', event => {
+            // Committing rebuilds the suggestions synchronously, detaching the
+            // button before its click can reach the outside-popover handler.
+            event.stopPropagation();
+            tagCommit(id, button.dataset.suggestTag);
+        });
     });
 }
 
@@ -3329,6 +3334,7 @@ document.addEventListener('keydown', (ev) => {
         ev.preventDefault();
         closeAccountMenu(true);
     } else if (ev.key === 'Escape' && openInfoId !== null) {
+        ev.preventDefault();
         closeHistoryInfo();
     }
 

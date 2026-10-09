@@ -125,6 +125,15 @@ browser consumed Escape without sending the page's close-player key event.
 Playback now remembers how full screen was entered: leaving an initially
 full-screen session closes playback, while leaving full screen entered later
 through the video controls returns to the overlay.
+Issue 46 was reported on 2026-10-09 and resolved and deployed in version
+`0.32.1` on 2026-10-10. Choosing a known tag rebuilt the suggestion list while
+its click was still bubbling, so the detached target looked like an outside
+click and closed the History Info popover. The Info Escape branch also failed
+to cancel the handled key event, allowing Firefox to leave macOS application
+fullscreen. Suggestion clicks now stop before the rebuild reaches the outside
+handler, and Info Escape prevents the browser default before closing. Browser
+regressions cover both event boundaries, and the reporter confirmed the fix in
+Firefox on macOS after deployment.
 
 ## Bug reports
 
@@ -173,6 +182,7 @@ through the video controls returns to the overlay.
 - [Bug 0043 — User administration was fragmented and lacked safe edit guards](bug-0043-user-administration-was-fragmented-and-lacked-safe-edit-guards.md)
 - [Bug 0044 — GitHub Actions had intermittent theme and image-digest failures](bug-0044-github-actions-had-intermittent-theme-and-image-digest-failures.md)
 - [Bug 0045 — Fullscreen Escape ignored the playback launch mode](bug-0045-fullscreen-escape-ignored-playback-launch-mode.md)
+- [Bug 0046 — History Info tag selection closed the popover and Escape exited macOS fullscreen](bug-0046-info-tag-selection-closed-popover-and-escape-exited-fullscreen.md)
 
 ## Accepted UI decisions
 

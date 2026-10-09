@@ -51,6 +51,49 @@ test('failed tag commits restore the draft for correction', async ({ page }) => 
     await expect(row.locator('.tag-entry-input')).toHaveValue('Keep this draft');
 });
 
+test('choosing a known tag keeps the Info dialog open', async ({ page }) => {
+    await seed(page, { id: 'known-tag-source', status: 'finished' });
+    await seed(page, { id: 'known-tag-target', status: 'finished' });
+    await attachTag(page, 'known-tag-source', 'Music Videos');
+    await refresh(page);
+
+    const row = page.locator('[data-row-id="known-tag-target"]');
+    await row.locator('.kebab-btn').click();
+    await row.getByRole('button', { name: 'Info', exact: true }).click();
+    const info = row.locator('.history-info-popover');
+    await expect(info).toBeVisible();
+
+    await info.getByText('Add tags', { exact: true }).click();
+    await info.getByRole('option', { name: 'Music Videos', exact: true }).click();
+
+    await expect(info).toBeVisible();
+    await expect(info.locator('.tag-chip')).toContainText('Music Videos');
+});
+
+test('Escape closes Info without reaching the browser default action', async ({ page }) => {
+    await seed(page, { id: 'info-escape', status: 'finished' });
+    await refresh(page);
+
+    const row = page.locator('[data-row-id="info-escape"]');
+    await row.locator('.kebab-btn').click();
+    await row.getByRole('button', { name: 'Info', exact: true }).click();
+    const info = row.locator('.history-info-popover');
+    await expect(info).toBeVisible();
+    await page.evaluate(() => {
+        window.infoEscapeDefaultPrevented = null;
+        window.addEventListener('keydown', event => {
+            if (event.key === 'Escape') {
+                window.infoEscapeDefaultPrevented = event.defaultPrevented;
+            }
+        }, { once: true });
+    });
+
+    await page.keyboard.press('Escape');
+
+    await expect(info).toBeHidden();
+    expect(await page.evaluate(() => window.infoEscapeDefaultPrevented)).toBe(true);
+});
+
 test('tag affordance fills its row and disappears when editing starts', async ({ page }) => {
     await seed(page, { id: 'tag-layout', status: 'cancelled', progress: 'Stopped' });
     await refresh(page);
