@@ -1,6 +1,7 @@
 import os
 import time
 import unittest
+from unittest import mock
 
 import vdl
 from tests.support.app_case import AppCase
@@ -24,6 +25,16 @@ class PlaybackSessionTest(AppCase):
                 "UPDATE downloads SET created_at = ? WHERE id = ?",
                 (created_at, download_id),
             )
+
+    def shuffle_video(self, download_id, *, height=720, duration=120,
+                      probed=True, name=None):
+        self.finished_file(download_id, name or f'{download_id}.mp4')
+        vdl.db_update_download(
+            download_id,
+            resolution=f'{height}p' if height else None,
+            duration_seconds=duration,
+            media_metadata_probed=probed,
+        )
 
     def test_create_advance_retry_page_boundary_and_wrap(self):
         for index, download_id in enumerate(("old", "middle", "new"), 1):
@@ -87,6 +98,114 @@ class PlaybackSessionTest(AppCase):
                          ("old", 1, 0))
         self.assertEqual((wrapped["item"]["id"], wrapped["page"], wrapped["position"]),
                          ("new", 0, 0))
+
+    def test_shuffle_is_random_live_non_repeating_and_retry_is_idempotent(self):
+        for download_id in ('one', 'two', 'three'):
+            self.shuffle_video(download_id)
+
+        with mock.patch.object(vdl.secrets, 'randbelow', return_value=0) as draw:
+            created = self.client.post(
+                '/api/playback-sessions', json={'mode': 'shuffle'}
+            )
+            self.assertEqual(created.status_code, 201)
+            initial = created.get_json()
+            self.assertEqual(initial['mode'], 'shuffle')
+            self.assertIsNone(initial['page'])
+            self.assertIsNone(initial['position'])
+            session_id = initial['session_id']
+            first_id = initial['item']['id']
+
+            request = {
+                'expected_download_id': first_id,
+                'sequence': 1,
+            }
+            advanced = self.client.post(
+                f'/api/playback-sessions/{session_id}/advance', json=request
+            )
+            repeated = self.client.post(
+                f'/api/playback-sessions/{session_id}/advance', json=request
+            )
+
+        self.assertEqual(advanced.get_json(), repeated.get_json())
+        self.assertNotEqual(advanced.get_json()['item']['id'], first_id)
+        self.assertEqual(draw.call_count, 2)
+        with vdl._playback_sessions_lock:
+            stored = vdl._playback_sessions[session_id]
+            self.assertEqual(stored['mode'], 'shuffle')
+            self.assertFalse(any(isinstance(value, list) for value in stored.values()))
+            self.assertNotIn('filter', stored)
+
+    def test_shuffle_snapshots_thresholds_and_resolves_live_pool(self):
+        self.shuffle_video('boundary', height=720, duration=600)
+        self.shuffle_video('short', height=1080, duration=599)
+        self.shuffle_video('low', height=480, duration=900)
+        vdl.db_set_preferences({
+            'shuffle_min_height': '720',
+            'shuffle_min_duration_minutes': '10',
+        })
+
+        created = self.client.post(
+            '/api/playback-sessions', json={'mode': 'shuffle'}
+        )
+        self.assertEqual(created.status_code, 201)
+        state = created.get_json()
+        self.assertEqual(state['item']['id'], 'boundary')
+        vdl.db_set_preferences({
+            'shuffle_min_height': '0',
+            'shuffle_min_duration_minutes': '0',
+        })
+        self.shuffle_video('new-eligible', height=1440, duration=1200)
+        os.remove(vdl.db_get_download('boundary')['filename'])
+
+        advanced = self.client.post(
+            f"/api/playback-sessions/{state['session_id']}/advance",
+            json={
+                'expected_download_id': 'boundary',
+                'sequence': 1,
+            },
+        )
+        self.assertEqual(advanced.status_code, 200)
+        self.assertEqual(advanced.get_json()['item']['id'], 'new-eligible')
+
+    def test_shuffle_distinguishes_pending_metadata_from_empty_pool(self):
+        self.finished_file('legacy', 'legacy.mp4')
+        vdl.db_set_preferences({'shuffle_min_height': '720'})
+        pending = self.client.post(
+            '/api/playback-sessions', json={'mode': 'shuffle'}
+        )
+        self.assertEqual(pending.status_code, 409)
+        self.assertEqual(pending.get_json()['code'], 'shuffle_metadata_pending')
+
+        vdl.db_update_download('legacy', media_metadata_probed=True)
+        empty = self.client.post(
+            '/api/playback-sessions', json={'mode': 'shuffle'}
+        )
+        self.assertEqual(empty.status_code, 409)
+        self.assertEqual(empty.get_json()['code'], 'no_shuffle_candidates')
+
+    def test_shuffle_one_item_repeats_and_invalid_modes_fail_closed(self):
+        self.shuffle_video('only')
+        created = self.client.post(
+            '/api/playback-sessions', json={'mode': 'shuffle'}
+        ).get_json()
+        advanced = self.client.post(
+            f"/api/playback-sessions/{created['session_id']}/advance",
+            json={'expected_download_id': 'only', 'sequence': 1},
+        )
+        self.assertEqual(advanced.get_json()['item']['id'], 'only')
+        self.assertEqual(
+            self.client.post(
+                '/api/playback-sessions', json={'mode': 'random'}
+            ).status_code,
+            400,
+        )
+        vdl.db_set_preferences({'shuffle_min_height': '999'})
+        self.assertEqual(
+            self.client.post(
+                '/api/playback-sessions', json={'mode': 'shuffle'}
+            ).status_code,
+            400,
+        )
 
     def test_filter_contract_and_tie_breaking_match_history(self):
         admin = vdl.db_get_user_by_username("admin")

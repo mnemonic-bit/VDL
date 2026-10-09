@@ -227,6 +227,65 @@ test('endless playback advances once on the same video node and does not count a
     }).toEqual({ 'endless-new': 1, 'endless-old': 0 });
 });
 
+test('Play All split button keeps its direct action and exposes an accessible menu', async ({ page }) => {
+    await installMediaHarness(page);
+    await seed(page, {
+        id: 'split-play', status: 'finished', file: true, name: 'split.mp4',
+    });
+    await refresh(page);
+
+    const toggle = page.getByRole('button', { name: 'Choose playback mode' });
+    await toggle.click();
+    await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    const menu = page.locator('#playbackModeMenu');
+    await expect(menu.getByRole('menuitem')).toHaveCount(2);
+    await page.keyboard.press('ArrowDown');
+    await page.keyboard.press('End');
+    await expect(menu.getByRole('menuitem', { name: 'Shuffle' })).toBeFocused();
+    await page.keyboard.press('Escape');
+    await expect(toggle).toBeFocused();
+    await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+
+    await page.locator('#endlessPlaybackButton').click();
+    await expect.poll(() => page.evaluate(() => endlessPlayback.sessionId)).not.toBeNull();
+    expect(await page.evaluate(() => endlessPlayback.mode)).toBe('sequential');
+});
+
+test('Shuffle ignores History search and hands off randomly in the same player', async ({ page }) => {
+    await installMediaHarness(page);
+    for (const [id, title] of [['shuffle-one', 'First'], ['shuffle-two', 'Second']]) {
+        await seed(page, {
+            id, title, status: 'finished', file: true, name: `${id}.mp4`,
+            resolution: '1080p', duration_seconds: 600,
+            media_metadata_probed: true,
+        });
+    }
+    await refresh(page);
+    await page.locator('#historySearchToggle').click();
+    await page.locator('#historySearchInput').fill('no title matches this');
+    await expect(page.locator('#historyList [data-row-id]')).toHaveCount(0);
+
+    let createBody = null;
+    page.on('request', request => {
+        if (request.url().endsWith('/api/playback-sessions')
+                && request.method() === 'POST') createBody = request.postDataJSON();
+    });
+    await page.getByRole('button', { name: 'Choose playback mode' }).click();
+    await page.locator('#playbackModeMenu')
+        .getByRole('menuitem', { name: 'Shuffle' }).click();
+    await expect.poll(() => page.evaluate(() => endlessPlayback.sessionId)).not.toBeNull();
+    expect(createBody).toEqual({ mode: 'shuffle' });
+    expect(await page.evaluate(() => endlessPlayback.mode)).toBe('shuffle');
+    const firstSource = await page.locator('#playerVideo source').getAttribute('src');
+
+    await page.locator('#playerVideo').evaluate(video => {
+        video.dispatchEvent(new Event('ended'));
+    });
+    await expect.poll(async () => page.locator('#playerVideo source').getAttribute('src'))
+        .not.toBe(firstSource);
+    expect(await page.evaluate(() => document.querySelectorAll('#playerVideo').length)).toBe(1);
+});
+
 test('endless handoff retains standard fullscreen without requesting it again', async ({ page }) => {
     await installFullscreenHarness(page);
     await page.request.post('/__test__/preferences', {

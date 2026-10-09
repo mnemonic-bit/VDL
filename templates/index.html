@@ -107,6 +107,18 @@
                     <path d="M5 3.5v9l8-4.5z"/>
                 </g>
             </symbol>
+            <symbol id="i-caret-down" viewBox="0 0 16 16">
+                <path fill="currentColor" d="M3.2 5.8h9.6L8 10.6z"/>
+            </symbol>
+            <symbol id="i-shuffle" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M2 4h2.2c3.8 0 3.8 8 7.6 8H14"/>
+                    <path d="M11.5 9.5L14 12l-2.5 2.5"/>
+                    <path d="M2 12h2.2c1.2 0 2.1-.8 2.9-1.9"/>
+                    <path d="M8.9 5.9C9.7 4.8 10.6 4 11.8 4H14"/>
+                    <path d="M11.5 1.5L14 4l-2.5 2.5"/>
+                </g>
+            </symbol>
             <symbol id="i-sync" viewBox="0 0 16 16">
                 <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9"/>
@@ -198,12 +210,27 @@
                     <svg aria-hidden="true"><use href="#i-x"/></svg>
                 </button>
             </div>
-            <button id="endlessPlaybackButton" class="endless-playback-button" type="button"
-                    onclick="startEndlessPlaybackFromView()" aria-label="Play All"
-                    title="Play the current History selection continuously in the built-in player" disabled>
-                <svg aria-hidden="true"><use href="#i-play"/></svg>
-                <span>Play All</span>
-            </button>
+            <div id="playbackModeControl" class="playback-mode-control">
+                <button id="endlessPlaybackButton" class="endless-playback-button" type="button"
+                        aria-label="Play All"
+                        title="Play the current History selection continuously in the built-in player" disabled>
+                    <svg aria-hidden="true"><use href="#i-play"/></svg>
+                    <span>Play All</span>
+                </button>
+                <button id="playbackModeToggle" class="playback-mode-toggle" type="button"
+                        aria-label="Choose playback mode" aria-haspopup="menu"
+                        aria-expanded="false" aria-controls="playbackModeMenu" disabled>
+                    <svg aria-hidden="true"><use href="#i-caret-down"/></svg>
+                </button>
+                <div id="playbackModeMenu" class="playback-mode-menu" role="menu" hidden>
+                    <button id="playbackMenuPlayAll" type="button" role="menuitem" disabled>
+                        <svg aria-hidden="true"><use href="#i-play"/></svg><span>Play All</span>
+                    </button>
+                    <button id="playbackMenuShuffle" type="button" role="menuitem" disabled>
+                        <svg aria-hidden="true"><use href="#i-shuffle"/></svg><span>Shuffle</span>
+                    </button>
+                </div>
+            </div>
             <button id="newDownloadButton" class="new-download-button" type="button"
                     onclick="openNewDownload()" aria-label="New download"
                     aria-haspopup="dialog" aria-controls="newDownloadDialog" aria-expanded="false">
@@ -370,6 +397,30 @@
                             <span id="prefStartFullscreenHint">Automatically enter full screen when the built-in player opens.</span>
                         </div>
                         <input type="checkbox" id="prefStartFullscreen" aria-describedby="prefStartFullscreenHint">
+                    </div>
+                    <h3 class="settings-subheading">Shuffle</h3>
+                    <div class="setting-item" data-setting-keywords="shuffle random quality resolution">
+                        <div class="setting-copy">
+                            <label for="prefShuffleMinHeight">Minimum video quality</label>
+                            <span>Include videos at or above this resolution.</span>
+                        </div>
+                        <select id="prefShuffleMinHeight">
+                            <option value="0">Any quality</option>
+                            <option value="360">360p</option>
+                            <option value="480">480p</option>
+                            <option value="720">720p</option>
+                            <option value="1080">1080p</option>
+                            <option value="1440">1440p</option>
+                            <option value="2160">2160p (4K)</option>
+                            <option value="4320">4320p (8K)</option>
+                        </select>
+                    </div>
+                    <div class="setting-item" data-setting-keywords="shuffle random length duration minutes">
+                        <div class="setting-copy">
+                            <label for="prefShuffleMinDuration">Minimum video length (minutes)</label>
+                            <span id="prefShuffleMinDurationHint">0 includes videos of any known length. Both Shuffle filters apply together.</span>
+                        </div>
+                        <input id="prefShuffleMinDuration" type="number" min="0" max="1440" step="1" value="0" aria-describedby="prefShuffleMinDurationHint">
                     </div>
                 </section>
 
@@ -617,6 +668,7 @@
                     <button id="playerRestart" type="button" onclick="restartEndlessPlayback()" hidden>Start a new session</button>
                     <button id="playerSkip" type="button" onclick="skipEndlessPlayback()" hidden>Skip</button>
                     <button id="playerStopEndless" type="button" onclick="stopEndlessPlayback()" hidden>Stop endless playback</button>
+                    <button id="playerPlaybackSettings" type="button" onclick="openPlaybackSettingsFromPlayer()" hidden>Open Playback settings</button>
                     <button id="playerTransitionClose" type="button" onclick="closePlayer()" hidden>Close</button>
                 </div>
             </div>

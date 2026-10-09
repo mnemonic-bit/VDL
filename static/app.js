@@ -876,6 +876,68 @@ function openAccountMenu({ focusFirst = false } = {}) {
 
 const accountMenuButton = document.getElementById('accountMenuButton');
 const accountMenu = document.getElementById('accountMenu');
+
+const playbackModeToggle = document.getElementById('playbackModeToggle');
+const playbackModeMenu = document.getElementById('playbackModeMenu');
+
+function closePlaybackModeMenu(restoreFocus = false) {
+    if (playbackModeMenu.hidden) return;
+    playbackModeMenu.hidden = true;
+    playbackModeToggle.setAttribute('aria-expanded', 'false');
+    if (restoreFocus) playbackModeToggle.focus();
+}
+
+function playbackModeItems() {
+    return Array.from(playbackModeMenu.querySelectorAll('[role="menuitem"]'))
+        .filter(item => !item.disabled);
+}
+
+function openPlaybackModeMenu(focus = null) {
+    closeHistoryInfo();
+    closeAllMenus();
+    playbackModeMenu.hidden = false;
+    playbackModeToggle.setAttribute('aria-expanded', 'true');
+    const items = playbackModeItems();
+    if (focus === 'first' && items.length) items[0].focus();
+    if (focus === 'last' && items.length) items[items.length - 1].focus();
+}
+
+playbackModeToggle.addEventListener('click', event => {
+    event.stopPropagation();
+    if (playbackModeMenu.hidden) openPlaybackModeMenu();
+    else closePlaybackModeMenu();
+});
+playbackModeToggle.addEventListener('keydown', event => {
+    if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+    event.preventDefault();
+    openPlaybackModeMenu(event.key === 'ArrowDown' ? 'first' : 'last');
+});
+playbackModeMenu.addEventListener('keydown', event => {
+    const items = playbackModeItems();
+    const current = items.indexOf(document.activeElement);
+    let next = null;
+    if (event.key === 'ArrowDown') next = (current + 1) % items.length;
+    else if (event.key === 'ArrowUp') next = (current - 1 + items.length) % items.length;
+    else if (event.key === 'Home') next = 0;
+    else if (event.key === 'End') next = items.length - 1;
+    else if (event.key === 'Escape') {
+        event.preventDefault();
+        closePlaybackModeMenu(true);
+        return;
+    }
+    if (next === null || !items.length) return;
+    event.preventDefault();
+    items[next].focus();
+});
+document.getElementById('endlessPlaybackButton').addEventListener(
+    'click', startSequentialPlayback,
+);
+document.getElementById('playbackMenuPlayAll').addEventListener(
+    'click', startSequentialPlayback,
+);
+document.getElementById('playbackMenuShuffle').addEventListener(
+    'click', startShufflePlayback,
+);
 accountMenuButton.addEventListener('click', event => {
     event.stopPropagation();
     if (accountMenu.hidden) openAccountMenu();
@@ -1483,6 +1545,7 @@ function closeAllMenus() {
     document.querySelectorAll('.kebab-menu.open').forEach(m => m.classList.remove('open'));
     openMenuId = null;
     closeAccountMenu();
+    closePlaybackModeMenu();
     if (hadOpenMenu) {
         // Schedule after the click finishes so switching directly to another
         // menu keeps its actions stable and defers the refresh again.
@@ -2345,9 +2408,20 @@ function fetchHistory({ sortFavorites = false } = {}) {
         const start = historyPage * historyPageSize;
         const pageItems = done.slice(start, start + historyPageSize);
         historyPageItems = pageItems;
-        document.getElementById('endlessPlaybackButton').disabled = !pageItems.some(
+        const sequentialAvailable = pageItems.some(
             info => info.status === 'finished' && info.filename,
         );
+        const shuffleAvailable = historyEntries.some(
+            info => info.status === 'finished' && info.filename,
+        );
+        document.getElementById('endlessPlaybackButton').disabled = !sequentialAvailable;
+        document.getElementById('playbackMenuPlayAll').disabled = !sequentialAvailable;
+        document.getElementById('playbackMenuShuffle').disabled = !shuffleAvailable;
+        document.getElementById('playbackModeToggle').disabled =
+            !sequentialAvailable && !shuffleAvailable;
+        if (document.getElementById('playbackModeToggle').disabled) {
+            closePlaybackModeMenu();
+        }
 
         let focusRestore = null;
         const ae = document.activeElement;
@@ -2505,6 +2579,7 @@ let playerMediaCleanup = null;
 
 const endlessPlayback = {
     active: false,
+    mode: 'sequential',
     phase: 'idle',
     presentation: 'original',
     launchProvenance: 'original',
@@ -2548,6 +2623,7 @@ function showPlayerTransition(message, actions = [], focusAction = null) {
         restart: 'playerRestart',
         skip: 'playerSkip',
         stop: 'playerStopEndless',
+        settings: 'playerPlaybackSettings',
         close: 'playerTransitionClose',
     };
     status.textContent = message || '';
@@ -2842,7 +2918,9 @@ function closePlayer() {
 
 async function playbackResponseError(response) {
     const data = await response.json().catch(() => ({}));
-    return new Error(data.error || response.statusText || 'Playback request failed');
+    const error = new Error(data.error || response.statusText || 'Playback request failed');
+    error.code = data.code || null;
+    return error;
 }
 
 function startPlaybackKeepalive(epoch) {
@@ -2881,15 +2959,26 @@ function startEndlessPlaybackFromView() {
     if (!first) return;
     const label = first.filename.split('/').pop().split('\\').pop();
     const extension = first.filename.split('.').pop().toLowerCase();
-    startEndlessPlayback(first.id, label, extension);
+    startEndlessPlayback(first.id, label, extension, 'sequential');
 }
 
-function startEndlessPlayback(id = null, label = '', extension = '') {
-    if (!id && historyTotal === 0) return;
+function startSequentialPlayback() {
+    closePlaybackModeMenu();
+    startEndlessPlaybackFromView();
+}
+
+function startShufflePlayback() {
+    closePlaybackModeMenu();
+    startEndlessPlayback(null, '', '', 'shuffle');
+}
+
+function startEndlessPlayback(id = null, label = '', extension = '', mode = 'sequential') {
+    if (mode === 'sequential' && !id && historyTotal === 0) return;
     endlessPlayback.epoch += 1;
     const epoch = endlessPlayback.epoch;
     deactivateEndlessPlayback();
     endlessPlayback.active = true;
+    endlessPlayback.mode = mode;
     endlessPlayback.phase = 'opening';
     endlessPlayback.failureCount = 0;
     endlessPlayback.returnFullscreenNeeded = false;
@@ -2898,22 +2987,26 @@ function startEndlessPlayback(id = null, label = '', extension = '') {
         requestFullscreen: false,
     });
 
-    if (id) {
+    if (id && mode === 'sequential') {
         loadPlaybackItem({ id, title: label, extension }, { automatic: true });
         recordView(id);
     } else {
-        showPlayerTransition('Starting endless playback…', []);
+        showPlayerTransition(
+            mode === 'shuffle' ? 'Starting shuffle…' : 'Starting endless playback…',
+            [],
+        );
     }
     if (startVideosFullscreen) requestPlayerFullscreen({ launch: true });
 
-    const body = {
+    const body = mode === 'shuffle' ? { mode: 'shuffle' } : {
+        mode: 'sequential',
         filter: historySearchInput.value,
         ordering: historyOrdering,
         page_size: historyPageSize,
         page: historyPage,
         position: id ? historyPositionForId(id) : 0,
     };
-    if (id) body.start_download_id = String(id);
+    if (id && mode === 'sequential') body.start_download_id = String(id);
     apiFetch('/api/playback-sessions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -2927,7 +3020,22 @@ function startEndlessPlayback(id = null, label = '', extension = '') {
         }
         if (!response.ok) {
             if (epoch !== endlessPlayback.epoch || !endlessPlayback.active) return;
-            throw await playbackResponseError(response);
+            const error = await playbackResponseError(response);
+            if (error.code === 'no_shuffle_candidates') {
+                endlessPlayback.phase = 'create-failed';
+                showPlayerTransition(error.message, ['settings', 'close'], 'settings');
+                return;
+            }
+            if (error.code === 'shuffle_metadata_pending') {
+                endlessPlayback.phase = 'create-failed';
+                showPlayerTransition(
+                    'Older videos are still being prepared for Shuffle.',
+                    ['retry', 'close'],
+                    'retry',
+                );
+                return;
+            }
+            throw error;
         }
         const data = await response.json();
         if (epoch !== endlessPlayback.epoch || !endlessPlayback.active) {
@@ -2935,6 +3043,7 @@ function startEndlessPlayback(id = null, label = '', extension = '') {
             return;
         }
         endlessPlayback.sessionId = data.session_id;
+        endlessPlayback.mode = data.mode || mode;
         endlessPlayback.sequence = data.sequence;
         endlessPlayback.currentDownloadId = String(data.item.id);
         startPlaybackKeepalive(epoch);
@@ -2966,7 +3075,12 @@ function advanceEndlessPlayback() {
     endlessPlayback.handoffInProgress = true;
     endlessPlayback.phase = 'advancing';
     clearPlaybackWatchdog();
-    showPlayerTransition('Loading next video', []);
+    showPlayerTransition(
+        endlessPlayback.mode === 'shuffle'
+            ? 'Loading a random video'
+            : 'Loading next video',
+        [],
+    );
     apiFetch(
         '/api/playback-sessions/' + encodeURIComponent(sessionId) + '/advance',
         {
@@ -2980,8 +3094,14 @@ function advanceEndlessPlayback() {
     ).then(async response => {
         if (epoch !== endlessPlayback.epoch || !endlessPlayback.active) return;
         if (response.status === 204) {
+            const mode = endlessPlayback.mode;
             deactivateEndlessPlayback({ release: false });
-            showPlayerTransition('No playable videos remain in this selection.', ['close']);
+            showPlayerTransition(
+                mode === 'shuffle'
+                    ? 'No eligible videos remain.'
+                    : 'No playable videos remain in this selection.',
+                ['close'],
+            );
             return;
         }
         if (response.status === 404) {
@@ -3020,6 +3140,10 @@ function continueEndlessPlayback() {
 }
 
 function restartEndlessPlayback() {
+    if (endlessPlayback.mode === 'shuffle') {
+        startShufflePlayback();
+        return;
+    }
     const item = endlessPlayback.currentItem;
     if (!item) return;
     startEndlessPlayback(item.id, item.title, item.extension);
@@ -3027,6 +3151,11 @@ function restartEndlessPlayback() {
 
 function retryEndlessPlayback() {
     if (!endlessPlayback.active) return;
+    if (endlessPlayback.phase === 'create-failed'
+            && endlessPlayback.mode === 'shuffle') {
+        startShufflePlayback();
+        return;
+    }
     if (endlessPlayback.phase === 'failed' && endlessPlayback.handoffInProgress) {
         advanceEndlessPlayback();
         return;
@@ -3056,6 +3185,20 @@ function stopEndlessPlayback() {
     deactivateEndlessPlayback();
     endlessPlayback.phase = 'playing';
     showPlayerTransition('Endless playback stopped.', ['close']);
+}
+
+function openPlaybackSettingsFromPlayer() {
+    closePlayer();
+    openSettings().then(() => {
+        settingsSearchInput.value = '';
+        applySettingsSearch();
+        setActiveSettingsSection('playback');
+        document.getElementById('settings-playback').scrollIntoView({
+            behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches
+                ? 'auto' : 'smooth',
+            block: 'start',
+        });
+    });
 }
 
 function returnEndlessFullscreen() {
@@ -3974,6 +4117,16 @@ function loadPreferences() {
         startVideosFullscreen = p.start_fullscreen === 'true';
         document.getElementById('prefStartFullscreen').checked = startVideosFullscreen;
         refreshFullscreenAvailability();
+        const shuffleHeights = new Set([
+            '0', '360', '480', '720', '1080', '1440', '2160', '4320',
+        ]);
+        const shuffleHeight = String(p.shuffle_min_height ?? '0');
+        document.getElementById('prefShuffleMinHeight').value =
+            shuffleHeights.has(shuffleHeight) ? shuffleHeight : '0';
+        const shuffleMinutes = String(p.shuffle_min_duration_minutes ?? '0');
+        document.getElementById('prefShuffleMinDuration').value =
+            /^\d+$/.test(shuffleMinutes)
+                && Number(shuffleMinutes) <= 1440 ? shuffleMinutes : '0';
 
         const theme = ['light', 'dark', 'system'].includes(p.theme) ? p.theme : 'system';
         document.getElementById('prefTheme').value = theme;
@@ -4012,6 +4165,9 @@ function savePreferences() {
         player_mode: document.getElementById('prefPlayer').value,
         start_fullscreen: document.getElementById('prefStartFullscreen').checked
             ? 'true' : 'false',
+        shuffle_min_height: document.getElementById('prefShuffleMinHeight').value,
+        shuffle_min_duration_minutes:
+            document.getElementById('prefShuffleMinDuration').value,
         theme: document.getElementById('prefTheme').value,
     };
     apiAction('/api/preferences', {

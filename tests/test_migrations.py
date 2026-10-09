@@ -74,6 +74,7 @@ class SchemaMigrationTest(unittest.TestCase):
                     "source_type", "owner_user_id", "owner_username",
                     "visibility", "browser_authenticated",
                     "extension_request_id",
+                    "duration_seconds", "media_metadata_probed",
                 })
                 self.assertTrue({
                     "tags", "download_tags", "app_config", "roles", "users",
@@ -110,6 +111,8 @@ class SchemaMigrationTest(unittest.TestCase):
                     "max_concurrent": "3",
                     "player_mode": "overlay",
                     "start_fullscreen": "false",
+                    "shuffle_min_height": "0",
+                    "shuffle_min_duration_minutes": "0",
                     "theme": "dark",
                 })
             finally:

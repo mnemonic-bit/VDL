@@ -102,6 +102,7 @@ def test_row():
             "status", "progress", "resolution", "filesize", "speed", "eta",
             "title", "finished_at", "formats", "requested_format",
             "downloaded_bytes", "total_bytes",
+            "duration_seconds", "media_metadata_probed",
         }
     }
     if filename:

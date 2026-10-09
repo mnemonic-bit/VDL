@@ -430,6 +430,10 @@ PLAYBACK_SESSION_MAX_FILTER_LENGTH = 256
 PLAYBACK_SESSION_MAX_PAGE_SIZE = 100
 PLAYBACK_SESSION_MAX_COORDINATE = 1_000_000
 PLAYBACK_SESSION_ORDERINGS = ('newest', 'favorites_first')
+SHUFFLE_MIN_HEIGHTS = (0, 360, 480, 720, 1080, 1440, 2160, 4320)
+BROWSER_VIDEO_EXTENSIONS = {
+    '.mp4', '.m4v', '.webm', '.mkv', '.ogg', '.ogv', '.mov', '.avi',
+}
 
 # A single lock serialises writes from background threads. SQLite itself is
 # safe for concurrent reads, but multiple writers across threads on the same
@@ -448,6 +452,13 @@ _NO_UPDATE = object()
 # playlist-shaped records for a feature that deliberately resolves live data.
 _playback_sessions = {}
 _playback_sessions_lock = threading.Lock()
+
+# Upload and download completion keep their long-standing inspection helpers
+# patchable for callers while sharing one ffprobe invocation in production.
+# Results are consumed immediately by the publishing worker and keyed by the
+# unique temporary/final path so concurrent completions cannot cross wires.
+_media_probe_cache = {}
+_media_probe_cache_lock = threading.Lock()
 
 # Workers wait here before entering yt-dlp. A FIFO queue keeps a burst in
 # worker-arrival order while the counter lets preference changes take
@@ -611,6 +622,10 @@ def init_db():
             # the download's resume policy and idempotency key.
             ("browser_authenticated", "ALTER TABLE downloads ADD COLUMN browser_authenticated INTEGER NOT NULL DEFAULT 0"),
             ("extension_request_id", "ALTER TABLE downloads ADD COLUMN extension_request_id TEXT"),
+            # Final-container metadata is probed after publishing decisions,
+            # never inferred from a source stream that may later be remuxed.
+            ("duration_seconds", "ALTER TABLE downloads ADD COLUMN duration_seconds REAL"),
+            ("media_metadata_probed", "ALTER TABLE downloads ADD COLUMN media_metadata_probed INTEGER NOT NULL DEFAULT 0"),
         ]:
             if col not in existing_cols:
                 conn.execute(ddl)
@@ -681,6 +696,8 @@ def init_db():
             "max_concurrent": "3",
             "player_mode": "overlay",
             "start_fullscreen": "false",
+            "shuffle_min_height": "0",
+            "shuffle_min_duration_minutes": "0",
             "theme": "system",
         }
         for k, v in defaults.items():
@@ -741,7 +758,7 @@ def db_insert_upload(download_id, upload_name, title, filesize, output_dir,
 
 def db_insert_ingested_video(download_id, source_path, source_signature,
                              upload_name, title, filesize, output_dir,
-                             filename, resolution):
+                             filename, resolution, duration_seconds=None):
     """Atomically register a watched-folder video and its source receipt."""
     now = time.time()
     device, inode, _signature_size, mtime_ns = source_signature
@@ -749,12 +766,14 @@ def db_insert_ingested_video(download_id, source_path, source_signature,
         conn.execute(
             "INSERT INTO downloads("
             "id, url, status, progress, created_at, filename, resolution, "
+            "duration_seconds, media_metadata_probed, "
             "filesize, speed, eta, title, finished_at, output_dir, "
             "requested_filename, downloaded_bytes, total_bytes, source_type"
-            ") VALUES (?, '', 'finished', '100%', ?, ?, ?, ?, 0, 0, ?, ?, "
+            ") VALUES (?, '', 'finished', '100%', ?, ?, ?, ?, 1, ?, 0, 0, ?, ?, "
             "?, ?, ?, ?, 'upload')",
             (
-                download_id, now, filename, resolution, filesize, title, now,
+                download_id, now, filename, resolution, duration_seconds,
+                filesize, title, now,
                 output_dir, upload_name, filesize, filesize,
             ),
         )
@@ -810,7 +829,8 @@ def db_update_download(download_id, *, status=None, progress=None,
                        speed=None, eta=None, title=None, finished_at=None,
                        formats=None, requested_format=None, output_dir=None,
                        requested_filename=None, downloaded_bytes=None,
-                       total_bytes=_NO_UPDATE):
+                       total_bytes=_NO_UPDATE, duration_seconds=_NO_UPDATE,
+                       media_metadata_probed=None):
     fields, values = [], []
     if status is not None:
         fields.append("status = ?"); values.append(status)
@@ -842,6 +862,11 @@ def db_update_download(download_id, *, status=None, progress=None,
         fields.append("downloaded_bytes = ?"); values.append(downloaded_bytes)
     if total_bytes is not _NO_UPDATE:
         fields.append("total_bytes = ?"); values.append(total_bytes)
+    if duration_seconds is not _NO_UPDATE:
+        fields.append("duration_seconds = ?"); values.append(duration_seconds)
+    if media_metadata_probed is not None:
+        fields.append("media_metadata_probed = ?")
+        values.append(1 if media_metadata_probed else 0)
     if not fields:
         return
     values.append(download_id)
@@ -1210,6 +1235,7 @@ def db_list_downloads(user_id=None, is_admin=False):
             "SELECT downloads.id, url, status, progress, "
             "downloads.created_at, "
             "filename, resolution, filesize, speed, eta, title, finished_at, "
+            "duration_seconds, media_metadata_probed, "
             "formats, requested_format, downloaded_bytes, total_bytes, favorite, "
             "view_count, "
             "source_type, owner_user_id, visibility, browser_authenticated, "
@@ -1236,6 +1262,9 @@ def db_list_downloads(user_id=None, is_admin=False):
             download["favorite"] = bool(download["favorite"])
             download["browser_authenticated"] = bool(
                 download["browser_authenticated"]
+            )
+            download["media_metadata_probed"] = bool(
+                download["media_metadata_probed"]
             )
             download["quality"] = classify_video_quality(
                 download["resolution"]
@@ -1422,6 +1451,66 @@ def resolve_library_page(user_id, is_admin, normalized_filter, ordering,
     return selection[start:start + page_size], len(selection)
 
 
+def _shuffle_preferences(preferences):
+    """Validate persisted shuffle thresholds without silently repairing them."""
+    raw_height = preferences.get('shuffle_min_height', '0')
+    raw_minutes = preferences.get('shuffle_min_duration_minutes', '0')
+    if (not isinstance(raw_height, str) or not raw_height.isascii()
+            or not raw_height.isdigit()):
+        raise ValueError('Stored Shuffle minimum quality is invalid')
+    if (not isinstance(raw_minutes, str) or not raw_minutes.isascii()
+            or not raw_minutes.isdigit()):
+        raise ValueError('Stored Shuffle minimum length is invalid')
+    height = int(raw_height, 10)
+    minutes = int(raw_minutes, 10)
+    if height not in SHUFFLE_MIN_HEIGHTS:
+        raise ValueError('Stored Shuffle minimum quality is invalid')
+    if not 0 <= minutes <= 1440:
+        raise ValueError('Stored Shuffle minimum length is invalid')
+    return height, minutes * 60
+
+
+def resolve_shuffle_pool(user_id, is_admin, minimum_height,
+                         minimum_duration_seconds):
+    """Resolve the live authorized pool and whether legacy metadata blocks it."""
+    candidates = []
+    metadata_pending = False
+    for entry in db_list_downloads(user_id, is_admin=is_admin):
+        if entry.get('status') != 'finished':
+            continue
+        filename = entry.get('filename')
+        if not filename or not os.path.isfile(filename):
+            continue
+        if Path(filename).suffix.lower() not in BROWSER_VIDEO_EXTENSIONS:
+            continue
+        real_path = os.path.realpath(filename)
+        if not _is_allowed_download_path(real_path):
+            continue
+
+        height = _history_quality_height(entry.get('resolution'))
+        probed = bool(entry.get('media_metadata_probed'))
+        if height is None:
+            if not probed:
+                metadata_pending = True
+            continue
+        if minimum_height and height < minimum_height:
+            continue
+
+        duration = _finite_positive_number(entry.get('duration_seconds'))
+        if minimum_duration_seconds and (
+                duration is None or duration < minimum_duration_seconds):
+            if duration is None and not probed:
+                metadata_pending = True
+            continue
+        candidates.append(entry)
+    return candidates, metadata_pending
+
+
+def _shuffle_choice(candidates):
+    """Choose uniformly without making a seeded sequence part of the API."""
+    return candidates[secrets.randbelow(len(candidates))]
+
+
 def _playback_item(entry):
     filename = entry.get('filename') or ''
     title = entry.get('title') or Path(filename).stem or 'Untitled download'
@@ -1456,9 +1545,10 @@ def _release_playback_sessions_for_user(user_id):
 def _playback_session_response(state, entry):
     return {
         'session_id': state['session_id'],
+        'mode': state['mode'],
         'sequence': state['sequence'],
-        'page': state['page'],
-        'position': state['position'],
+        'page': state.get('page'),
+        'position': state.get('position'),
         'item': _playback_item(entry),
     }
 
@@ -2996,6 +3086,7 @@ def _background_download(url, download_id, cookie_bundle=None):
                 # download — leaving the resolution column unset for some
                 # extractors. ffprobe always reflects the final container.
                 final_res = ffprobe_resolution(final_path)
+                final_duration = _consume_media_probe(final_path, final_res)
                 thumbnail_path = _thumbnail_path(entry, output_dir)
                 if thumbnail_path:
                     generate_video_thumbnail(final_path, thumbnail_path)
@@ -3006,6 +3097,8 @@ def _background_download(url, download_id, cookie_bundle=None):
                     filename=final_path,
                     filesize=os.path.getsize(final_path),
                     resolution=final_res,
+                    duration_seconds=final_duration,
+                    media_metadata_probed=True,
                     speed=0.0,
                     eta=0,
                     finished_at=time.time(),
@@ -3041,58 +3134,90 @@ def _background_download(url, download_id, cookie_bundle=None):
         _release_worker_slot()
 
 
-def ffprobe_resolution(path):
-    """Return e.g. '1080p' for the first video stream in `path`, or None."""
+def _finite_positive_number(value):
     try:
-        out = subprocess.run(
-            ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
-             '-show_entries', 'stream=height', '-of', 'csv=p=0', path],
-            capture_output=True, text=True, timeout=10,
-        )
-        h = out.stdout.strip()
-        if h.isdigit() and int(h) > 0:
-            return f"{int(h)}p"
-    except Exception:
-        pass
-    return None
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number > 0 else None
 
 
-def inspect_uploaded_video(path):
-    """Validate an upload with ffprobe and return its optional resolution."""
+def ffprobe_media_metadata(path, *, timeout=10, require_video=False):
+    """Return final-container resolution and duration from one ffprobe run."""
     try:
         result = subprocess.run(
             [
                 'ffprobe', '-v', 'error', '-select_streams', 'v:0',
-                '-show_entries', 'stream=height', '-of', 'json', path,
+                '-show_entries', 'stream=height,duration:format=duration',
+                '-of', 'json', path,
             ],
-            capture_output=True,
-            text=True,
-            timeout=30,
+            capture_output=True, text=True, timeout=timeout,
         )
     except FileNotFoundError as exc:
-        raise RuntimeError(
-            'ffprobe is required to validate uploaded videos'
-        ) from exc
+        if require_video:
+            raise RuntimeError(
+                'ffprobe is required to validate uploaded videos'
+            ) from exc
+        return None, None
     except subprocess.TimeoutExpired as exc:
-        raise ValueError('The uploaded video could not be inspected') from exc
+        if require_video:
+            raise ValueError('The uploaded video could not be inspected') from exc
+        return None, None
     except OSError as exc:
-        raise RuntimeError(
-            f'Unable to inspect the uploaded video: {exc}'
-        ) from exc
+        if require_video:
+            raise RuntimeError(
+                f'Unable to inspect the uploaded video: {exc}'
+            ) from exc
+        return None, None
 
     try:
-        streams = json.loads(result.stdout or '{}').get('streams') or []
+        payload = json.loads(result.stdout or '{}')
+        streams = payload.get('streams') or []
+        container = payload.get('format') or {}
     except (AttributeError, json.JSONDecodeError) as exc:
-        raise ValueError('The uploaded file is not a supported video') from exc
+        if require_video:
+            raise ValueError('The uploaded file is not a supported video') from exc
+        return None, None
     if result.returncode != 0 or not streams:
-        raise ValueError('The uploaded file does not contain a video stream')
+        if require_video:
+            raise ValueError('The uploaded file does not contain a video stream')
+        return None, None
 
-    height = streams[0].get('height')
-    try:
-        height = int(height)
-    except (TypeError, ValueError):
-        height = 0
-    return f'{height}p' if height > 0 else None
+    height = _finite_positive_number(streams[0].get('height'))
+    duration = _finite_positive_number(container.get('duration'))
+    if duration is None:
+        duration = _finite_positive_number(streams[0].get('duration'))
+    resolution = f'{int(height)}p' if height is not None else None
+    return resolution, duration
+
+
+def _cache_media_probe(path, resolution, duration):
+    with _media_probe_cache_lock:
+        _media_probe_cache[os.path.realpath(path)] = (resolution, duration)
+
+
+def _consume_media_probe(path, resolution):
+    with _media_probe_cache_lock:
+        cached = _media_probe_cache.pop(os.path.realpath(path), None)
+    if cached is None or cached[0] != resolution:
+        return None
+    return cached[1]
+
+
+def ffprobe_resolution(path):
+    """Return e.g. '1080p' for the first video stream in `path`, or None."""
+    resolution, duration = ffprobe_media_metadata(path)
+    _cache_media_probe(path, resolution, duration)
+    return resolution
+
+
+def inspect_uploaded_video(path):
+    """Validate an upload with ffprobe and return its optional resolution."""
+    resolution, duration = ffprobe_media_metadata(
+        path, timeout=30, require_video=True
+    )
+    _cache_media_probe(path, resolution, duration)
+    return resolution
 
 
 def _validated_upload_filename(value):
@@ -3206,6 +3331,7 @@ def _ingest_watched_file(source_path, expected_signature):
         if _source_signature(source_path) != expected_signature:
             raise IngestSourceChanged()
         resolution = inspect_uploaded_video(temporary_path)
+        duration_seconds = _consume_media_probe(temporary_path, resolution)
         # ffprobe is bounded, but a host writer can still resume while it runs.
         # A final comparison prevents that changed source from being published.
         if _source_signature(source_path) != expected_signature:
@@ -3226,6 +3352,7 @@ def _ingest_watched_file(source_path, expected_signature):
             output_dir,
             final_path,
             resolution,
+            duration_seconds,
         )
         registered = True
         print(
@@ -4115,6 +4242,9 @@ def receive_video_upload(download_id):
             raise ValueError('Uploaded video ended before all bytes arrived')
         try:
             resolution = inspect_uploaded_video(temporary_path)
+            duration_seconds = _consume_media_probe(
+                temporary_path, resolution
+            )
         except ValueError as exc:
             db_update_download(
                 download_id, status='error', progress=str(exc),
@@ -4145,6 +4275,8 @@ def receive_video_upload(download_id):
             filename=final_path,
             filesize=received,
             resolution=resolution,
+            duration_seconds=duration_seconds,
+            media_metadata_probed=True,
             speed=0.0,
             eta=0,
             finished_at=time.time(),
@@ -4474,63 +4606,105 @@ def create_playback_session():
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
         return jsonify({'error': 'A JSON object is required'}), 400
-    try:
-        normalized_filter = _normalize_history_filter(
-            payload.get('filter', '')
-        )
-        ordering = payload.get('ordering', 'newest')
-        if ordering not in PLAYBACK_SESSION_ORDERINGS:
-            raise ValueError('Unknown playback ordering')
-        page_size = _playback_integer(
-            payload, 'page_size', 1, PLAYBACK_SESSION_MAX_PAGE_SIZE
-        )
-        page = _playback_integer(
-            payload, 'page', 0, PLAYBACK_SESSION_MAX_COORDINATE
-        )
-        position = _playback_integer(
-            payload, 'position', 0, page_size - 1
-        )
-        start_download_id = payload.get('start_download_id')
-        if start_download_id is not None and (
-                not isinstance(start_download_id, str)
-                or not start_download_id
-                or len(start_download_id) > 128):
-            raise ValueError('start_download_id is invalid')
-    except ValueError as exc:
-        return jsonify({'error': str(exc)}), 400
-
+    mode = payload.get('mode', 'sequential')
+    if mode not in ('sequential', 'shuffle'):
+        return jsonify({'error': 'Unknown playback mode'}), 400
     user_id = g.current_user['id']
     is_admin = 'admin' in g.current_user['roles']
-    selection = resolve_library_selection(
-        user_id, is_admin, normalized_filter, ordering
-    )
-    if start_download_id is not None:
-        start_index = next(
-            (index for index, entry in enumerate(selection)
-             if str(entry['id']) == start_download_id),
-            None,
+    if mode == 'shuffle':
+        try:
+            minimum_height, minimum_duration = _shuffle_preferences(
+                db_get_preferences()
+            )
+        except ValueError as exc:
+            return jsonify({'error': str(exc)}), 400
+        selection, metadata_pending = resolve_shuffle_pool(
+            user_id, is_admin, minimum_height, minimum_duration
         )
-        if start_index is None:
+        if not selection:
+            if metadata_pending:
+                return jsonify({
+                    'code': 'shuffle_metadata_pending',
+                    'error': 'Older videos are still being prepared for Shuffle.',
+                }), 409
             return jsonify({
-                'error': 'The requested starting video is no longer available'
+                'code': 'no_shuffle_candidates',
+                'error': (
+                    'No videos match your Shuffle preferences. Change the '
+                    'minimum quality or length in Playback settings.'
+                ),
+                'minimum_height': minimum_height,
+                'minimum_duration_minutes': minimum_duration // 60,
             }), 409
-    elif selection:
-        requested_index = page * page_size + position
-        start_index = requested_index if requested_index < len(selection) else 0
+        entry = _shuffle_choice(selection)
+        state_fields = {
+            'mode': mode,
+            'minimum_height': minimum_height,
+            'minimum_duration_seconds': minimum_duration,
+            'page': None,
+            'position': None,
+        }
     else:
-        return '', 204
+        try:
+            normalized_filter = _normalize_history_filter(
+                payload.get('filter', '')
+            )
+            ordering = payload.get('ordering', 'newest')
+            if ordering not in PLAYBACK_SESSION_ORDERINGS:
+                raise ValueError('Unknown playback ordering')
+            page_size = _playback_integer(
+                payload, 'page_size', 1, PLAYBACK_SESSION_MAX_PAGE_SIZE
+            )
+            page = _playback_integer(
+                payload, 'page', 0, PLAYBACK_SESSION_MAX_COORDINATE
+            )
+            position = _playback_integer(
+                payload, 'position', 0, page_size - 1
+            )
+            start_download_id = payload.get('start_download_id')
+            if start_download_id is not None and (
+                    not isinstance(start_download_id, str)
+                    or not start_download_id
+                    or len(start_download_id) > 128):
+                raise ValueError('start_download_id is invalid')
+        except ValueError as exc:
+            return jsonify({'error': str(exc)}), 400
+
+        selection = resolve_library_selection(
+            user_id, is_admin, normalized_filter, ordering
+        )
+        if start_download_id is not None:
+            start_index = next(
+                (index for index, candidate in enumerate(selection)
+                 if str(candidate['id']) == start_download_id),
+                None,
+            )
+            if start_index is None:
+                return jsonify({
+                    'error': 'The requested starting video is no longer available'
+                }), 409
+        elif selection:
+            requested_index = page * page_size + position
+            start_index = requested_index if requested_index < len(selection) else 0
+        else:
+            return '', 204
+        entry = selection[start_index]
+        state_fields = {
+            'mode': mode,
+            'filter': normalized_filter,
+            'ordering': ordering,
+            'page_size': page_size,
+            'page': start_index // page_size,
+            'position': start_index % page_size,
+        }
 
     now = time.monotonic()
     session_id = secrets.token_urlsafe(32)
     state = {
         'session_id': session_id,
         'owner_user_id': user_id,
-        'filter': normalized_filter,
-        'ordering': ordering,
-        'page_size': page_size,
-        'page': start_index // page_size,
-        'position': start_index % page_size,
-        'current_download_id': str(selection[start_index]['id']),
+        **state_fields,
+        'current_download_id': str(entry['id']),
         'sequence': 0,
         'last_response': None,
         'last_expected_download_id': None,
@@ -4550,7 +4724,7 @@ def create_playback_session():
             oldest = owned.pop(0)
             _playback_sessions.pop(oldest['session_id'], None)
         _playback_sessions[session_id] = state
-    return jsonify(_playback_session_response(state, selection[start_index])), 201
+    return jsonify(_playback_session_response(state, entry)), 201
 
 
 @app.route('/api/playback-sessions/<session_id>/advance', methods=['POST'])
@@ -4588,19 +4762,42 @@ def advance_playback_session(session_id):
         if expected_download_id != state['current_download_id']:
             return jsonify({'error': 'Playback position changed'}), 409
 
-        selection = resolve_library_selection(
-            user_id, is_admin, state['filter'], state['ordering']
-        )
+        if state['mode'] == 'shuffle':
+            selection, metadata_pending = resolve_shuffle_pool(
+                user_id,
+                is_admin,
+                state['minimum_height'],
+                state['minimum_duration_seconds'],
+            )
+            if len(selection) > 1:
+                selection = [
+                    entry for entry in selection
+                    if str(entry['id']) != state['current_download_id']
+                ]
+            if not selection and metadata_pending:
+                state['last_activity'] = now
+                return jsonify({
+                    'code': 'shuffle_metadata_pending',
+                    'error': 'Older videos are still being prepared for Shuffle.',
+                }), 409
+            if not selection:
+                _playback_sessions.pop(session_id, None)
+                return '', 204
+            entry = _shuffle_choice(selection)
+        else:
+            selection = resolve_library_selection(
+                user_id, is_admin, state['filter'], state['ordering']
+            )
         if not selection:
             _playback_sessions.pop(session_id, None)
             return '', 204
-
-        next_index = (
-            state['page'] * state['page_size'] + state['position'] + 1
-        ) % len(selection)
-        entry = selection[next_index]
-        state['page'] = next_index // state['page_size']
-        state['position'] = next_index % state['page_size']
+        if state['mode'] == 'sequential':
+            next_index = (
+                state['page'] * state['page_size'] + state['position'] + 1
+            ) % len(selection)
+            entry = selection[next_index]
+            state['page'] = next_index // state['page_size']
+            state['position'] = next_index % state['page_size']
         state['current_download_id'] = str(entry['id'])
         state['sequence'] = sequence
         state['last_expected_download_id'] = expected_download_id
@@ -4899,7 +5096,8 @@ def preferences():
     data = request.json or {}
     allowed = {
         'download_dir', 'format', 'history_page_size', 'max_concurrent', 'player_mode',
-        'start_fullscreen', 'theme',
+        'start_fullscreen', 'theme', 'shuffle_min_height',
+        'shuffle_min_duration_minutes',
     }
     updates = {k: v for k, v in data.items() if k in allowed and v is not None}
     if not updates:
@@ -4915,6 +5113,28 @@ def preferences():
         updates["history_page_size"] = str(updates["history_page_size"])
         if updates["history_page_size"] not in {'5', '10', '20', '50'}:
             return jsonify({"error": "Videos per page must be 5, 10, 20, or 50"}), 400
+    if 'shuffle_min_height' in updates:
+        value = updates['shuffle_min_height']
+        if (isinstance(value, bool)
+                or not isinstance(value, (str, int))
+                or not str(value).isascii()
+                or not str(value).isdigit()
+                or int(str(value), 10) not in SHUFFLE_MIN_HEIGHTS):
+            return jsonify({
+                'error': 'Shuffle minimum quality is invalid'
+            }), 400
+        updates['shuffle_min_height'] = str(int(str(value), 10))
+    if 'shuffle_min_duration_minutes' in updates:
+        value = updates['shuffle_min_duration_minutes']
+        if (isinstance(value, bool)
+                or not isinstance(value, (str, int))
+                or not str(value).isascii()
+                or not str(value).isdigit()
+                or not 0 <= int(str(value), 10) <= 1440):
+            return jsonify({
+                'error': 'Shuffle minimum length must be a whole number from 0 through 1440'
+            }), 400
+        updates['shuffle_min_duration_minutes'] = str(int(str(value), 10))
     db_set_preferences(updates)
     return jsonify(db_get_preferences())
 
@@ -4928,6 +5148,86 @@ init_db()
 _ingest_service_lock = threading.Lock()
 _ingest_thread = None
 _ingest_stop_event = None
+_metadata_service_lock = threading.Lock()
+_metadata_thread = None
+_metadata_stop_event = None
+
+
+def _metadata_backfill(stop_event):
+    """Probe legacy final files serially without holding the database lock."""
+    with db() as conn:
+        rows = [dict(row) for row in conn.execute(
+            "SELECT id, filename FROM downloads "
+            "WHERE status = 'finished' AND filename IS NOT NULL "
+            "AND media_metadata_probed = 0 ORDER BY created_at"
+        ).fetchall()]
+
+    changed = False
+    for candidate in rows:
+        if stop_event.is_set():
+            break
+        download_id = candidate['id']
+        filename = candidate['filename']
+        current = db_get_download(download_id)
+        if (current is None or current.get('status') != 'finished'
+                or current.get('filename') != filename
+                or not os.path.isfile(filename)):
+            continue
+        real_path = os.path.realpath(filename)
+        if not _is_allowed_download_path(real_path):
+            continue
+
+        resolution, duration = ffprobe_media_metadata(filename)
+        if stop_event.is_set():
+            break
+        current = db_get_download(download_id)
+        if (current is None or current.get('status') != 'finished'
+                or current.get('filename') != filename
+                or not os.path.isfile(filename)
+                or os.path.realpath(filename) != real_path
+                or not _is_allowed_download_path(real_path)):
+            continue
+        with _db_lock, db() as conn:
+            updated = conn.execute(
+                "UPDATE downloads SET resolution = ?, duration_seconds = ?, "
+                "media_metadata_probed = 1 WHERE id = ? AND status = 'finished' "
+                "AND filename = ? AND media_metadata_probed = 0",
+                (resolution, duration, download_id, filename),
+            ).rowcount == 1
+        changed = changed or updated
+    if changed:
+        event_bus.publish('change', {'reason': 'metadata'})
+
+
+def start_metadata_backfill():
+    """Start the one low-priority legacy metadata worker exactly once."""
+    global _metadata_thread, _metadata_stop_event
+    with _metadata_service_lock:
+        if _metadata_thread is not None and _metadata_thread.is_alive():
+            return _metadata_thread
+        _metadata_stop_event = threading.Event()
+        _metadata_thread = threading.Thread(
+            target=_metadata_backfill,
+            args=(_metadata_stop_event,),
+            name='vdl-metadata',
+            daemon=True,
+        )
+        _metadata_thread.start()
+        return _metadata_thread
+
+
+def stop_metadata_backfill():
+    """Signal the metadata worker and wait briefly for its bounded probe."""
+    global _metadata_thread, _metadata_stop_event
+    with _metadata_service_lock:
+        thread = _metadata_thread
+        stop_event = _metadata_stop_event
+        _metadata_thread = None
+        _metadata_stop_event = None
+    if stop_event is not None:
+        stop_event.set()
+    if thread is not None and thread is not threading.current_thread():
+        thread.join(timeout=5)
 
 
 def _positive_seconds_from_env(name, default):
@@ -5072,6 +5372,7 @@ def main(argv=None):
         not debug or os.environ.get('WERKZEUG_RUN_MAIN') == 'true'
     )
     ingest_thread = start_ingest_watcher() if owns_ingest_watcher else None
+    metadata_thread = start_metadata_backfill() if owns_ingest_watcher else None
     print(
         f'VDL startup: UI v{APP_VERSION} | API v{APP_VERSION}',
         flush=True,
@@ -5081,6 +5382,8 @@ def main(argv=None):
     finally:
         if ingest_thread is not None:
             stop_ingest_watcher()
+        if metadata_thread is not None:
+            stop_metadata_backfill()
 
 
 if __name__ == '__main__':

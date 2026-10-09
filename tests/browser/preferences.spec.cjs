@@ -51,6 +51,8 @@ test('preferences persist and the temporary Saved icon restores to Save', async 
     await page.locator('#prefTheme').selectOption('dark');
     await page.locator('#prefMax').fill('1');
     await page.locator('#prefPageSize').selectOption('20');
+    await page.locator('#prefShuffleMinHeight').selectOption('1080');
+    await page.locator('#prefShuffleMinDuration').fill('12');
     await page.locator('#saveBtn').click();
     await expect(page.locator('#saveBtn use')).toHaveAttribute('href', '#i-check');
     await page.clock.fastForward(1600);
@@ -60,6 +62,8 @@ test('preferences persist and the temporary Saved icon restores to Save', async 
     expect(preferences.max_concurrent).toBe('1');
     expect(preferences.history_page_size).toBe('20');
     expect(preferences.theme).toBe('dark');
+    expect(preferences.shuffle_min_height).toBe('1080');
+    expect(preferences.shuffle_min_duration_minutes).toBe('12');
 });
 
 test('rejected preferences stay editable and are not displayed as saved', async ({ page }) => {
@@ -110,6 +114,9 @@ test('settings sections navigate and search across General and Playback', async 
     await page.getByRole('searchbox', { name: 'Search settings' }).fill('full screen');
     await expect(page.getByText('Start videos in full screen', { exact: true })).toBeVisible();
     await expect(page.getByText('Download directory', { exact: true })).toBeHidden();
+    await page.getByRole('searchbox', { name: 'Search settings' }).fill('shuffle duration');
+    await expect(page.getByText('Minimum video length (minutes)', { exact: true }))
+        .toBeVisible();
     await page.getByRole('searchbox', { name: 'Search settings' }).fill('not a setting');
     await expect(page.getByText('No settings match your search.')).toBeVisible();
 });
