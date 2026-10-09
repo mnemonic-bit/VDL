@@ -320,7 +320,15 @@ document.addEventListener('dragover', event => {
 });
 
 document.addEventListener('dragleave', event => {
-    if (!isFileDrag(event) || uploadInProgress) return;
+    if (uploadInProgress) return;
+    // A final page exit may follow several descendant enters, so it is authoritative
+    // even when the browser no longer exposes the external drag's data types.
+    if (event.relatedTarget === null && uploadDragDepth > 0) {
+        uploadDragDepth = 0;
+        hideUploadOverlay();
+        return;
+    }
+    if (!isFileDrag(event)) return;
     uploadDragDepth = Math.max(0, uploadDragDepth - 1);
     if (uploadDragDepth === 0) hideUploadOverlay();
 });

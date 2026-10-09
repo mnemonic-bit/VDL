@@ -134,6 +134,13 @@ fullscreen. Suggestion clicks now stop before the rebuild reaches the outside
 handler, and Info Escape prevents the browser default before closing. Browser
 regressions cover both event boundaries, and the reporter confirmed the fix in
 Firefox on macOS after deployment.
+Issue 47 was reported, resolved, and deployed in version `0.32.2` on 2026-10-10.
+Dragging a local video onto the page displayed the upload overlay, but moving
+the file back outside the page without dropping could leave the overlay open.
+Nested `dragenter` events left the depth counter above zero after the final
+page-level `dragleave`. A leave with no related in-document target now clears
+the complete drag state and closes the overlay. A browser regression covers
+the nested-entry exit sequence, and the reporter confirmed the deployed fix.
 
 ## Bug reports
 
@@ -183,6 +190,7 @@ Firefox on macOS after deployment.
 - [Bug 0044 — GitHub Actions had intermittent theme and image-digest failures](bug-0044-github-actions-had-intermittent-theme-and-image-digest-failures.md)
 - [Bug 0045 — Fullscreen Escape ignored the playback launch mode](bug-0045-fullscreen-escape-ignored-playback-launch-mode.md)
 - [Bug 0046 — History Info tag selection closed the popover and Escape exited macOS fullscreen](bug-0046-info-tag-selection-closed-popover-and-escape-exited-fullscreen.md)
+- [Bug 0047 — Upload overlay remained open after a file drag left the page](bug-0047-upload-overlay-remained-open-after-drag-left-page.md)
 
 ## Accepted UI decisions
 

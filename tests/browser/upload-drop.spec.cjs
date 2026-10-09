@@ -62,6 +62,29 @@ test('dropping a desktop video uploads it into History', async ({ page }) => {
 });
 
 
+test('the upload overlay closes when a file drag leaves the page', async ({ page }) => {
+    await page.evaluate(() => {
+        const transfer = new DataTransfer();
+        transfer.items.add(new File([], 'desktop-video.mp4', { type: 'video/mp4' }));
+        const options = {
+            bubbles: true,
+            cancelable: true,
+            dataTransfer: transfer,
+        };
+        document.body.dispatchEvent(new DragEvent('dragenter', options));
+        document.getElementById('uploadDropOverlay').dispatchEvent(
+            new DragEvent('dragenter', options),
+        );
+        document.documentElement.dispatchEvent(new DragEvent('dragleave', {
+            ...options,
+            relatedTarget: null,
+        }));
+    });
+
+    await expect(page.locator('#uploadDropOverlay')).toBeHidden();
+});
+
+
 test('an in-progress upload can be stopped and removed from Current downloads', async ({ page }) => {
     await page.request.post('/__test__/hold-uploads');
     await page.evaluate(() => {
