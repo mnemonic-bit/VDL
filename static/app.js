@@ -784,16 +784,24 @@ function searchQualityHeight(value) {
     return Number.isFinite(height) && height > 0 ? height : null;
 }
 
-function matchesSearchFilter(info) {
-    if (searchTerms.length === 0) return true;
+function searchPlaylistValues(terms = searchTerms) {
+    return terms
+        .map(tagSearchKey)
+        .filter(term => /^playlists?:/.test(term))
+        .map(term => term.replace(/^playlists?:/, '').trim());
+}
+
+function matchesSearchFilter(info, terms = searchTerms) {
+    if (terms.length === 0) return true;
     const title = tagSearchKey(info.title);
     const tags = new Set((Array.isArray(info.tags) ? info.tags : []).map(tagSearchKey));
     const userTerms = [];
     const qualityTerms = [];
     const starredTerms = [];
     const viewTerms = [];
+    const playlistTerms = [];
     const contentTerms = [];
-    searchTerms.forEach(term => {
+    terms.forEach(term => {
         const key = tagSearchKey(term);
         if (key.startsWith('user:')) userTerms.push(key.slice('user:'.length).trim());
         else if (key.startsWith('quality:')) {
@@ -804,6 +812,8 @@ function matchesSearchFilter(info) {
             starredTerms.push(key.slice('star:'.length).trim());
         } else if (key.startsWith('views:')) {
             viewTerms.push(key.slice('views:'.length).trim());
+        } else if (/^playlists?:/.test(key)) {
+            playlistTerms.push(key.replace(/^playlists?:/, '').trim());
         } else {
             contentTerms.push(term);
         }
@@ -833,6 +843,9 @@ function matchesSearchFilter(info) {
             (value === 'new' && viewCount === 0)
             || (/^\d+$/.test(value) && viewCount >= Number(value))
         ))) return false;
+    }
+    if (playlistTerms.length) {
+        if (!playlistTerms.includes('no')) return false;
     }
     if (contentTerms.length === 0) return true;
 
@@ -1972,6 +1985,7 @@ const PLAYLIST_VIDEO_EXTENSIONS = new Set([
     'mp4', 'm4v', 'webm', 'mkv', 'ogg', 'ogv', 'mov', 'avi',
 ]);
 let playlistSummaries = [];
+let visiblePlaylistCount = 0;
 let libraryEntries = [];
 let playlistEditorDraft = null;
 let playlistEditorBaseline = '';
@@ -1988,10 +2002,15 @@ function libraryTitle(info) {
 }
 
 function playlistMatchesSearch(playlist) {
-    const freeText = searchTerms.filter(term => !/^(quality|user|starred?|views):/i.test(term));
-    if (!freeText.length) return true;
-    const name = tagSearchKey(playlist.name);
-    return freeText.some(term => name.includes(tagSearchKey(term)));
+    const playlistValues = searchPlaylistValues();
+    if (playlistValues.length && !playlistValues.includes('yes')) return false;
+    const videoTerms = searchTerms.filter(term => !/^playlists?:/i.test(term));
+    const memberIds = new Set(
+        (playlist.member_ids || []).map(id => String(id)));
+    return libraryEntries.some(info => (
+        memberIds.has(String(info.id))
+        && matchesSearchFilter(info, videoTerms)
+    ));
 }
 
 function playlistProgressText(playlist) {
@@ -2040,12 +2059,14 @@ function renderPlaylistCard(playlist) {
 function renderPlaylists() {
     const shelf = document.getElementById('playlistShelf');
     const visible = playlistSummaries.filter(playlistMatchesSearch);
-    shelf.hidden = playlistSummaries.length === 0;
+    visiblePlaylistCount = visible.length;
+    shelf.hidden = visible.length === 0;
     document.getElementById('playlistShelfCount').textContent =
         `${visible.length} ${visible.length === 1 ? 'playlist' : 'playlists'}`;
     document.getElementById('playlistList').innerHTML = visible.length
         ? visible.map(renderPlaylistCard).join('')
-        : '<p class="playlist-no-match">No playlist names match this search.</p>';
+        : '';
+    updateHistoryEmptyState();
 }
 
 function fetchPlaylists() {
@@ -2700,6 +2721,26 @@ let _renderedHistoryIds = new Set();
 const pendingActiveAnimations = new Set();
 const pendingHistoryAnimations = new Set();
 
+function updateHistoryEmptyState() {
+    const hasFilter = searchTerms.length > 0;
+    const playlistValues = searchPlaylistValues();
+    const playlistOnly = playlistValues.includes('yes')
+        && !playlistValues.includes('no');
+    document.getElementById('historyEmptyTitle').textContent = playlistOnly
+        ? 'No matching playlists'
+        : hasFilter
+            ? 'No matching downloads'
+            : 'No downloads yet';
+    document.getElementById('historyEmptyMessage').textContent = playlistOnly
+        ? 'No playlists contain videos matching these search terms.'
+        : hasFilter
+            ? 'No download history matches these search terms.'
+            : 'Add a video URL or drop a local video here to get started.';
+    document.getElementById('historyEmptyAction').hidden = hasFilter;
+    document.getElementById('historyEmpty').style.display =
+        historyTotal || visiblePlaylistCount ? 'none' : '';
+}
+
 function endlessHistoryEnabled() {
     return historyPageSize === HISTORY_ENDLESS_MODE;
 }
@@ -2811,6 +2852,7 @@ function fetchHistory({ sortFavorites = false } = {}) {
         const active = data.filter(i => CURRENT_TAB_STATUSES.has(i.status));
         let historyEntries = data.filter(i => HISTORY_TAB_STATUSES.has(i.status));
         libraryEntries = historyEntries.slice();
+        renderPlaylists();
         if (sortFavorites) {
             historyOrdering = 'favorites_first';
             // The API is newest-first, and modern stable sorting preserves
@@ -2830,7 +2872,7 @@ function fetchHistory({ sortFavorites = false } = {}) {
         }
         historyOrderIds = historyEntries.map(info => String(info.id));
         refreshAvailableTags(historyEntries);
-        const done = historyEntries.filter(matchesSearchFilter);
+        const done = historyEntries.filter(info => matchesSearchFilter(info));
 
         historyTotal = done.length;
         const endless = endlessHistoryEnabled();
@@ -2938,17 +2980,9 @@ function fetchHistory({ sortFavorites = false } = {}) {
             }
         }
 
-        const hasFilter = searchTerms.length > 0;
         document.getElementById('currentEmpty').textContent = 'No current downloads.';
-        document.getElementById('historyEmptyTitle').textContent = hasFilter
-            ? 'No matching downloads'
-            : 'No downloads yet';
-        document.getElementById('historyEmptyMessage').textContent = hasFilter
-            ? 'No download history matches these search terms.'
-            : 'Add a video URL or drop a local video here to get started.';
-        document.getElementById('historyEmptyAction').hidden = hasFilter;
         document.getElementById('currentEmpty').style.display = active.length ? 'none' : '';
-        document.getElementById('historyEmpty').style.display = done.length ? 'none' : '';
+        updateHistoryEmptyState();
 
         const pager = document.getElementById('historyPager');
         historyEndlessSentinel.hidden = !endless || pageItems.length >= historyTotal;

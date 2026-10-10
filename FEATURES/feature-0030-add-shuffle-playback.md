@@ -302,8 +302,8 @@ cannot satisfy the threshold.
 
 Shuffle ignores:
 
-- the History search string and all `user:`, `quality:`, `star:`, and `views:`
-  terms in it;
+- the History search string and all `user:`, `quality:`, `star:`, `views:`, and
+  `playlist:`/`playlists:` terms in it;
 - the current History page and page size;
 - newest/favorites-first ordering;
 - favorite and view-count values; and

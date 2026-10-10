@@ -317,6 +317,64 @@ test('History search filters by minimum quality, favorite state, and views', asy
     await expect(page.locator('[data-row-id="filter-4k"]')).toBeVisible();
 });
 
+test('History search filters playlists by their member videos', async ({ page }) => {
+    await seed(page, {
+        id: 'playlist-member', status: 'finished', file: true,
+        name: 'playlist-member.mp4', title: 'Mountain film', resolution: '2160p',
+    });
+    await seed(page, {
+        id: 'playlist-free', status: 'finished', file: true,
+        name: 'playlist-free.mp4', title: 'City film', resolution: '720p',
+    });
+    for (const data of [
+        { name: 'Weekend', download_ids: ['playlist-member'] },
+        { name: 'Commute', download_ids: ['playlist-free'] },
+        { name: 'Empty', download_ids: [] },
+    ]) {
+        const playlist = await page.request.post('/api/playlists', { data });
+        expect(playlist.ok()).toBeTruthy();
+    }
+    await refresh(page);
+    await page.evaluate(() => fetchPlaylists());
+
+    const input = page.locator('#historySearchInput');
+    const cards = page.locator('#historyList [data-row-id]');
+    await page.locator('#historySearchToggle').click();
+
+    await expect(cards).toHaveCount(2);
+    await expect(page.locator('.playlist-card')).toHaveCount(2);
+    await expect(page.locator('.playlist-card', { hasText: 'Empty' })).toHaveCount(0);
+
+    await input.fill('mountain');
+    await expect(cards).toHaveCount(1);
+    await expect(page.locator('.playlist-card')).toHaveCount(1);
+    await expect(page.locator('.playlist-card', { hasText: 'Weekend' })).toBeVisible();
+
+    await input.fill('playlists:yes');
+    await expect(cards).toHaveCount(0);
+    await expect(page.locator('.playlist-card', { hasText: 'Weekend' })).toBeVisible();
+    await expect(page.locator('.playlist-card', { hasText: 'Commute' })).toBeVisible();
+    await expect(page.locator('.playlist-card', { hasText: 'Empty' })).toHaveCount(0);
+
+    await input.fill('playlist:yes quality:4k mountain');
+    await expect(cards).toHaveCount(0);
+    await expect(page.locator('.playlist-card')).toHaveCount(1);
+    await expect(page.locator('.playlist-card', { hasText: 'Weekend' })).toBeVisible();
+
+    await input.fill('playlist:yes quality:8k');
+    await expect(cards).toHaveCount(0);
+    await expect(page.locator('.playlist-card')).toHaveCount(0);
+
+    await input.fill('playlists:no quality:4k');
+    await expect(cards).toHaveCount(1);
+    await expect(page.locator('[data-row-id="playlist-member"]')).toBeVisible();
+    await expect(page.locator('.playlist-card')).toHaveCount(0);
+
+    await input.fill('playlist:maybe');
+    await expect(cards).toHaveCount(0);
+    await expect(page.locator('.playlist-card')).toHaveCount(0);
+});
+
 test('Header search expands from the leftmost magnifier', async ({ page }) => {
     const header = page.locator('#appHeader');
     const search = header.locator('#historySearch');

@@ -133,7 +133,8 @@ saved playlists. It applies, in this order:
 3. browser-playback eligibility (`finished`, a stored filename, and an
    allowed regular file that still exists);
 4. the stored filter using the same quoted-term, title, tag, `user:`,
-   `quality:`, `star:`/`starred:`, and `views:` semantics as History;
+   `quality:`, `star:`/`starred:`, `views:`, and
+   `playlist:`/`playlists:` semantics as History;
 5. the stored canonical ordering; and
 6. page size and coordinate.
 

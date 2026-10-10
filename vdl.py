@@ -1461,6 +1461,7 @@ def _matches_history_filter(entry, normalized_filter):
     quality_terms = []
     starred_terms = []
     view_terms = []
+    playlist_terms = []
     content_terms = []
     for term in terms:
         key = _history_search_key(term)
@@ -1476,6 +1477,8 @@ def _matches_history_filter(entry, normalized_filter):
             starred_terms.append(key[len('star:'):].strip())
         elif key.startswith('views:'):
             view_terms.append(key[len('views:'):].strip())
+        elif key.startswith(('playlist:', 'playlists:')):
+            playlist_terms.append(key.split(':', 1)[1].strip())
         else:
             content_terms.append(term)
 
@@ -1510,6 +1513,10 @@ def _matches_history_filter(entry, normalized_filter):
                 or (value.isdigit() and view_count >= int(value))
                 for value in view_terms):
             return False
+    # Playback selection contains only videos, so the browser's playlist-only
+    # result mode intentionally resolves to no candidates.
+    if playlist_terms and 'no' not in playlist_terms:
+        return False
     if not content_terms:
         return True
     return any(

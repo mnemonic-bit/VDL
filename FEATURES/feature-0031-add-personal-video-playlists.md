@@ -136,10 +136,14 @@ Deleting requires confirmation that states clearly that the contained videos
 will remain in the library. A completed card displays **Completed** and makes
 replay from the beginning explicit.
 
-Free-text History search may match playlist names and hide nonmatching
-playlist cards. Structured video filters such as `quality:`, `user:`, `star:`,
-and `views:` continue to describe videos and must not change playlist
-membership or playlist playback. Clearing search restores the full shelf.
+History search displays matching individual videos and non-empty playlists
+containing at least one matching video by default. Structured video filters
+such as `quality:`, `user:`, `star:`, and `views:` describe both direct video
+results and the member videos used to select playlists; they must not change
+playlist membership or playlist playback. `playlist:yes` or its exact alias
+`playlists:yes` limits the result type to matching playlist cards.
+`playlist:no` and `playlists:no` limit it to matching individual videos.
+Clearing search restores both unfiltered result types.
 
 ## Creation, quick-add, and editor design
 

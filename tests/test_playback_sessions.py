@@ -228,7 +228,8 @@ class PlaybackSessionTest(AppCase):
             self.set_created_at(download_id, 10)
 
         normalized = vdl._normalize_history_filter(
-            '"Alpine Ridge" user:admin quality:720 star:yes views:2'
+            '"Alpine Ridge" user:admin quality:720 star:yes views:2 '
+            'playlist:no'
         )
         matches = vdl.resolve_library_selection(
             admin["id"],
@@ -270,6 +271,22 @@ class PlaybackSessionTest(AppCase):
         self.assertTrue(vdl._matches_history_filter(
             {**entry, "favorite": False},
             vdl._normalize_history_filter("starred:no"),
+        ))
+        self.assertTrue(vdl._matches_history_filter(
+            entry,
+            vdl._normalize_history_filter("playlist:no"),
+        ))
+        self.assertFalse(vdl._matches_history_filter(
+            entry,
+            vdl._normalize_history_filter("playlist:yes"),
+        ))
+        self.assertFalse(vdl._matches_history_filter(
+            entry,
+            vdl._normalize_history_filter("playlists:yes"),
+        ))
+        self.assertFalse(vdl._matches_history_filter(
+            entry,
+            vdl._normalize_history_filter("playlist:maybe"),
         ))
         self.assertFalse(vdl._matches_history_filter(
             {**entry, "view_count": 1},
