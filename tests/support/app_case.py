@@ -18,6 +18,7 @@ class AppCase(unittest.TestCase):
         self._old_db_path = vdl.DB_PATH
         self._old_default_dir = vdl.DEFAULT_DOWNLOAD_DIR
         self._old_event_bus = vdl.event_bus
+        self._old_secret_key = vdl.app.secret_key
         self._threads_before = set(threading.enumerate())
 
         vdl.DB_PATH = os.path.join(self.temp_dir.name, "downloads.db")
@@ -33,10 +34,21 @@ class AppCase(unittest.TestCase):
         with vdl._worker_condition:
             vdl._worker_queue.clear()
             vdl._active_worker_count = 0
+            vdl._live_worker_ids.clear()
+        with vdl._pairing_lock:
+            vdl._pairing_codes.clear()
+        with vdl._companion_rate_lock:
+            vdl._failed_pair_rates.clear()
+            vdl._failed_pair_global.clear()
+            vdl._token_download_rates.clear()
+        with vdl._playback_sessions_lock:
+            vdl._playback_sessions.clear()
         vdl.init_db()
         vdl.db_set_preferences({"download_dir": self.download_dir})
         vdl.app.config.update(TESTING=True)
-        self.client = vdl.app.test_client()
+        admin = vdl.db_get_initial_admin()
+        vdl.db_set_initial_admin_password(admin["id"], "test-password")
+        self.client = self.authenticated_client()
 
     def tearDown(self):
         # Wake every worker owned by this test before restoring shared globals.
@@ -64,10 +76,29 @@ class AppCase(unittest.TestCase):
         with vdl._worker_condition:
             vdl._worker_queue.clear()
             vdl._active_worker_count = 0
+            vdl._live_worker_ids.clear()
+        with vdl._pairing_lock:
+            vdl._pairing_codes.clear()
+        with vdl._companion_rate_lock:
+            vdl._failed_pair_rates.clear()
+            vdl._failed_pair_global.clear()
+            vdl._token_download_rates.clear()
+        with vdl._playback_sessions_lock:
+            vdl._playback_sessions.clear()
         vdl.event_bus = self._old_event_bus
         vdl.DB_PATH = self._old_db_path
         vdl.DEFAULT_DOWNLOAD_DIR = self._old_default_dir
+        vdl.app.secret_key = self._old_secret_key
         self.temp_dir.cleanup()
+
+    def authenticated_client(self, username="admin", password="test-password"):
+        client = vdl.app.test_client()
+        response = client.post(
+            "/login",
+            data={"username": username, "password": password},
+        )
+        self.assertEqual(response.status_code, 302)
+        return client
 
     def insert(self, download_id="test0001", url="https://fixture.invalid/video"):
         vdl.db_insert_download(download_id, url)

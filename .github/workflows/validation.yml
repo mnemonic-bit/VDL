@@ -38,6 +38,9 @@ jobs:
                   python -m pip install --upgrade pip
                   python -m pip install -r requirements.txt
 
+            - name: Validate multi-platform container dependency lock
+              run: ./tests/container/check-lock.sh
+
             - name: Install browser dependencies
               working-directory: tests/browser
               run: |

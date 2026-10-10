@@ -40,6 +40,23 @@ class SseTest(AppCase):
         retained = [subscriber.get_nowait()[1]["index"] for _ in range(64)]
         self.assertEqual(retained, list(range(1, 65)))
 
+    def test_owner_targeted_events_do_not_reach_other_users(self):
+        bus = vdl.EventBus()
+        owner = bus.subscribe(10)
+        other = bus.subscribe(20)
+        legacy = bus.subscribe()
+        bus.publish(
+            "playlist-progress", {"playlist_id": "opaque"},
+            owner_user_id=10,
+        )
+        self.assertEqual(owner.get_nowait()[0], "playlist-progress")
+        with self.assertRaises(queue.Empty):
+            other.get_nowait()
+        with self.assertRaises(queue.Empty):
+            legacy.get_nowait()
+        bus.unsubscribe(owner)
+        self.assertNotIn(owner, bus._subs)
+
 
 if __name__ == "__main__":
     unittest.main()

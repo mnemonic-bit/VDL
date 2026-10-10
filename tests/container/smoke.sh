@@ -19,12 +19,16 @@ suffix="$$-$(date +%s)"
 name="vdl-smoke-$suffix"
 data_volume="vdl-smoke-data-$suffix"
 media_volume="vdl-smoke-media-$suffix"
+ingest_volume="vdl-smoke-ingest-$suffix"
 
 cleanup() {
     "$engine" rm -f "$name" >/dev/null 2>&1 || true
-    "$engine" volume rm "$data_volume" "$media_volume" >/dev/null 2>&1 || true
+    "$engine" volume rm "$data_volume" "$media_volume" "$ingest_volume" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
+
+grep -qi 'HTTPS reverse proxy' "$root/README.md"
+grep -qi 'non-default port' "$root/README.md"
 
 if [ "${1:-}" = "--build" ]; then
     "$engine" build --pull -t "$image" "$root"
@@ -50,8 +54,15 @@ fi
 
 "$engine" volume create "$data_volume" >/dev/null
 "$engine" volume create "$media_volume" >/dev/null
+"$engine" volume create "$ingest_volume" >/dev/null
+"$engine" run --rm --entrypoint ffmpeg \
+    -v "$ingest_volume:/ingest" "$image" \
+    -v error -f lavfi -i color=c=black:s=16x16:d=0.2 \
+    -c:v mpeg4 -an -y /ingest/watched-folder.mp4
 "$engine" run -d --name "$name" \
-    -v "$data_volume:/data" -v "$media_volume:/downloads" "$image" >/dev/null
+    -e VDL_INGEST_SCAN_SECONDS=1 -e VDL_INGEST_SETTLE_SECONDS=1 \
+    -v "$data_volume:/data" -v "$media_volume:/downloads" \
+    -v "$ingest_volume:/ingest:ro" "$image" >/dev/null
 
 for attempt in $(seq 1 40); do
     if "$engine" exec "$name" python -c \
@@ -68,25 +79,222 @@ for attempt in $(seq 1 40); do
 done
 
 "$engine" exec "$name" python - <<'PY'
+import hashlib
+import os
+import urllib.error
 import urllib.request
 
 for path in ('/api/health', '/', '/static/app.js', '/static/styles.css'):
     with urllib.request.urlopen('http://127.0.0.1:5000' + path, timeout=3) as response:
         assert response.status == 200, (path, response.status)
+try:
+    urllib.request.urlopen('http://127.0.0.1:5000/api/history', timeout=3)
+except urllib.error.HTTPError as error:
+    assert error.code == 401, error.code
+else:
+    raise AssertionError('history was available without authentication')
+
+package_path = '/app/browser-extension/dist/vdl-companion-firefox.xpi'
+checksum_path = package_path + '.sha256'
+with urllib.request.urlopen(
+    'http://127.0.0.1:5000/browser-extension/vdl-companion-firefox.xpi',
+    timeout=3,
+) as response:
+    package = response.read()
+    assert response.headers.get_content_type() == 'application/x-xpinstall'
+    assert response.headers['Content-Disposition'] == (
+        'inline; filename="vdl-companion-firefox.xpi"'
+    )
+    assert response.headers['Cache-Control'] == 'no-store'
+    assert response.headers['X-Content-Type-Options'] == 'nosniff'
+with urllib.request.urlopen(
+    'http://127.0.0.1:5000/browser-extension/vdl-companion-firefox.xpi?download=1',
+    timeout=3,
+) as response:
+    assert response.headers['Content-Disposition'] == (
+        'attachment; filename="vdl-companion-firefox.xpi"'
+    )
+with open(package_path, 'rb') as bundled:
+    assert package == bundled.read(), 'served XPI differs from the image artifact'
+with open(checksum_path, encoding='ascii') as checksum_file:
+    expected_hash = checksum_file.read().split()[0]
+assert hashlib.sha256(package).hexdigest() == expected_hash
+
+try:
+    urllib.request.urlopen(
+        'http://127.0.0.1:5000/api/extension/connections', timeout=3
+    )
+except urllib.error.HTTPError as error:
+    assert error.code == 401, error.code
+else:
+    raise AssertionError('companion management was available without authentication')
 PY
 
 "$engine" exec "$name" python - <<'PY'
 import json
-import sqlite3
+import os
+import subprocess
 import time
+import uuid
+import http.cookiejar
+import urllib.parse
 import urllib.request
 
+base_url = 'http://127.0.0.1:5000'
+cookies = http.cookiejar.CookieJar()
+opener = urllib.request.build_opener(
+    urllib.request.HTTPCookieProcessor(cookies)
+)
+setup = urllib.request.Request(
+    base_url + '/login',
+    data=urllib.parse.urlencode({
+        'username': 'admin',
+        'password': 'container-test-password',
+        'password_confirmation': 'container-test-password',
+    }).encode(),
+    method='POST',
+)
+opener.open(setup, timeout=3).close()
+
+pairing_request = urllib.request.Request(
+    base_url + '/api/extension/pairing-codes', data=b'', method='POST'
+)
+with opener.open(pairing_request, timeout=3) as response:
+    pairing_code = json.load(response)['code']
+companion_headers = {
+    'Content-Type': 'application/json',
+    'Origin': 'moz-extension://01234567-89ab-cdef-0123-456789abcdef',
+    'X-VDL-Companion-Protocol': '1',
+    'X-VDL-Companion-Version': '1.0.3',
+}
+pair_request = urllib.request.Request(
+    base_url + '/api/extension/pair',
+    data=json.dumps({
+        'code': pairing_code,
+        'origin': base_url,
+        'device_label': 'Container smoke',
+        'extension_version': '1.0.3',
+        'protocol_version': 1,
+    }).encode(),
+    headers=companion_headers,
+    method='POST',
+)
+with urllib.request.urlopen(pair_request, timeout=3) as response:
+    companion_token = json.load(response)['token']
+download_request = urllib.request.Request(
+    base_url + '/api/extension/downloads',
+    data=json.dumps({
+        'schema': 1,
+        'request_id': str(uuid.uuid4()),
+        'page_url': 'https://container-smoke.invalid/private-video',
+        'captured_at': int(time.time()),
+        'cookies': [],
+    }).encode(),
+    headers={
+        **companion_headers,
+        'Authorization': 'Bearer ' + companion_token,
+    },
+    method='POST',
+)
+with urllib.request.urlopen(download_request, timeout=3) as response:
+    companion_download = json.load(response)
+assert companion_download['visibility'] == 'private', companion_download
+with opener.open(base_url + '/api/history', timeout=3) as response:
+    companion_row = next(
+        row for row in json.load(response)
+        if row['id'] == companion_download['id']
+    )
+assert companion_row['browser_authenticated'] is True, companion_row
+assert companion_row['visibility'] == 'private', companion_row
+
+media_path = '/tmp/upload-smoke.mp4'
+subprocess.run(
+    [
+        'ffmpeg', '-v', 'error', '-f', 'lavfi',
+        '-i', 'color=c=black:s=16x16:d=0.2',
+        '-c:v', 'mpeg4', '-an', '-y', media_path,
+    ],
+    check=True,
+)
+with open(media_path, 'rb') as media:
+    payload = media.read()
+
+start = urllib.request.Request(
+    base_url + '/api/upload',
+    data=json.dumps({
+        'filename': 'container-upload.mp4',
+        'filesize': len(payload),
+    }).encode(),
+    headers={'Content-Type': 'application/json'},
+    method='POST',
+)
+with opener.open(start, timeout=3) as response:
+    upload_id = json.load(response)['id']
+transfer = urllib.request.Request(
+    f'{base_url}/api/upload/{upload_id}',
+    data=payload,
+    headers={'Content-Type': 'video/mp4'},
+    method='PUT',
+)
+opener.open(transfer, timeout=10).close()
+with opener.open(base_url + '/api/history') as response:
+    uploaded = next(row for row in json.load(response) if row['id'] == upload_id)
+assert uploaded['status'] == 'finished', uploaded
+assert uploaded['source_type'] == 'upload', uploaded
+assert uploaded['resolution'] == '16p', uploaded
+for _attempt in range(20):
+    with opener.open(base_url + '/api/history') as response:
+        watched = next(
+            (
+                row for row in json.load(response)
+                if row['title'] == 'watched-folder'
+            ),
+            None,
+        )
+    if watched is not None:
+        break
+    time.sleep(0.25)
+assert watched is not None, 'watched-folder.mp4 was not ingested'
+assert watched['status'] == 'finished', watched
+assert watched['source_type'] == 'upload', watched
+assert watched['resolution'] == '16p', watched
+remove = urllib.request.Request(
+    f'http://127.0.0.1:5000/api/remove/{upload_id}',
+    data=b'',
+    method='POST',
+)
+opener.open(remove, timeout=3).close()
+PY
+
+"$engine" exec "$name" python - <<'PY'
+import json
+import http.cookiejar
+import sqlite3
+import time
+import urllib.parse
+import urllib.request
+
+base_url = 'http://127.0.0.1:5000'
+cookies = http.cookiejar.CookieJar()
+opener = urllib.request.build_opener(
+    urllib.request.HTTPCookieProcessor(cookies)
+)
+login = urllib.request.Request(
+    base_url + '/login',
+    data=urllib.parse.urlencode({
+        'username': 'admin',
+        'password': 'container-test-password',
+    }).encode(),
+    method='POST',
+)
+opener.open(login, timeout=3).close()
+
 request = urllib.request.Request(
-    'http://127.0.0.1:5000/api/preferences',
+    base_url + '/api/preferences',
     data=json.dumps({'theme': 'dark'}).encode(),
     headers={'Content-Type': 'application/json'},
 )
-urllib.request.urlopen(request, timeout=3).close()
+opener.open(request, timeout=3).close()
 with open('/downloads/persist.mp4', 'wb') as output:
     output.write(b'persistent media')
 with sqlite3.connect('/data/downloads.db') as connection:
@@ -99,7 +307,9 @@ PY
 
 "$engine" rm -f "$name" >/dev/null
 "$engine" run -d --name "$name" \
-    -v "$data_volume:/data" -v "$media_volume:/downloads" "$image" >/dev/null
+    -e VDL_INGEST_SCAN_SECONDS=1 -e VDL_INGEST_SETTLE_SECONDS=1 \
+    -v "$data_volume:/data" -v "$media_volume:/downloads" \
+    -v "$ingest_volume:/ingest:ro" "$image" >/dev/null
 for attempt in $(seq 1 40); do
     if "$engine" exec "$name" python -c \
         "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/api/health', timeout=1)" \
@@ -110,13 +320,32 @@ for attempt in $(seq 1 40); do
 done
 "$engine" exec "$name" python - <<'PY'
 import json
+import http.cookiejar
+import urllib.parse
 import urllib.request
 
-with urllib.request.urlopen('http://127.0.0.1:5000/api/preferences') as response:
+base_url = 'http://127.0.0.1:5000'
+cookies = http.cookiejar.CookieJar()
+opener = urllib.request.build_opener(
+    urllib.request.HTTPCookieProcessor(cookies)
+)
+login = urllib.request.Request(
+    base_url + '/login',
+    data=urllib.parse.urlencode({
+        'username': 'admin',
+        'password': 'container-test-password',
+    }).encode(),
+    method='POST',
+)
+opener.open(login, timeout=3).close()
+
+with opener.open(base_url + '/api/preferences') as response:
     assert json.load(response)['theme'] == 'dark'
-with urllib.request.urlopen('http://127.0.0.1:5000/api/history') as response:
-    assert any(row['id'] == 'persist1' for row in json.load(response))
-with urllib.request.urlopen('http://127.0.0.1:5000/api/file/persist1') as response:
+with opener.open(base_url + '/api/history') as response:
+    history = json.load(response)
+assert any(row['id'] == 'persist1' for row in history)
+assert sum(row['title'] == 'watched-folder' for row in history) == 1, history
+with opener.open(base_url + '/api/file/persist1') as response:
     assert response.read() == b'persistent media'
 PY
 

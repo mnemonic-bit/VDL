@@ -1,5 +1,6 @@
 // Statuses that count as "in flight" (the worker thread is alive).
 const RUNNING_STATUSES = new Set(['starting', 'downloading']);
+const ACTIVE_PROGRESS_STATUSES = new Set(['starting', 'downloading', 'paused']);
 // Statuses shown under the Current tab. Cancelled and interrupted
 // stay here so the user can resume them; everything else terminal
 // goes to History.
@@ -7,34 +8,166 @@ const CURRENT_TAB_STATUSES = new Set(['starting', 'downloading', 'paused', 'canc
 const HISTORY_TAB_STATUSES = new Set(['finished', 'error']);
 const TERMINAL_STATUSES = new Set(['finished', 'error', 'cancelled', 'interrupted']);
 
-let _bannerDismissed = false;
+const favicon = document.getElementById('appFavicon');
+const idleFaviconHref = favicon ? favicon.getAttribute('href') : '';
+const appTitleIcon = document.getElementById('appTitleIcon');
+const appTitleProgressRing = document.getElementById('appTitleProgressRing');
 
-function showServerBanner() {
-    _bannerDismissed = false;
-    document.getElementById('serverBanner').style.display = '';
+function progressBytes(info) {
+    const total = Number(info.total_bytes);
+    if (!Number.isFinite(total) || total <= 0) return null;
+
+    const reportedDownloaded = Number(info.downloaded_bytes);
+    const downloaded = Number.isFinite(reportedDownloaded)
+        ? Math.min(total, Math.max(0, reportedDownloaded))
+        : 0;
+    return { downloaded, total };
 }
 
-function hideServerBanner() {
-    document.getElementById('serverBanner').style.display = 'none';
+function aggregateActiveProgress(downloads) {
+    const active = downloads.filter(info => ACTIVE_PROGRESS_STATUSES.has(info.status));
+    if (!active.length) return null;
+
+    let downloadedBytes = 0;
+    let totalBytes = 0;
+    for (const info of active) {
+        const progress = progressBytes(info);
+        if (!progress) return { count: active.length, percent: null };
+        downloadedBytes += progress.downloaded;
+        totalBytes += progress.total;
+    }
+
+    return {
+        count: active.length,
+        percent: (downloadedBytes / totalBytes) * 100,
+    };
+}
+
+function itemProgressPercent(info) {
+    const progress = progressBytes(info);
+    if (!progress) return null;
+    return Math.round((progress.downloaded / progress.total) * 1000) / 10;
+}
+
+function renderActionProgressIcon(symbolId, info) {
+    const percent = itemProgressPercent(info);
+    const progressAttr = percent === null ? '' : ` data-progress="${percent}"`;
+    const ringAttr = percent === null || percent <= 0
+        ? ' hidden'
+        : ` style="stroke-dashoffset: ${100 - percent};"`;
+    return `<svg class="icon action-progress-icon" viewBox="-2 -2 20 20" aria-hidden="true"${progressAttr}>
+                    <use href="#${symbolId}" x="0" y="0" width="16" height="16"/>
+                    <circle class="action-progress-track" cx="8" cy="8" r="8.1"/>
+                    <circle class="action-progress-ring" cx="8" cy="8" r="8.1" pathLength="100" transform="rotate(-90 8 8)"${ringAttr}/>
+                </svg>`;
+}
+
+function updateHeaderProgress(aggregate) {
+    if (!appTitleIcon || !appTitleProgressRing) return;
+    if (!aggregate) {
+        appTitleProgressRing.setAttribute('hidden', '');
+        delete appTitleIcon.dataset.progress;
+        delete appTitleIcon.dataset.runningCount;
+        return;
+    }
+
+    appTitleIcon.dataset.runningCount = String(aggregate.count);
+    if (aggregate.percent === null || aggregate.percent <= 0) {
+        appTitleProgressRing.setAttribute('hidden', '');
+        delete appTitleIcon.dataset.progress;
+        return;
+    }
+
+    const percent = Math.round(aggregate.percent * 10) / 10;
+    appTitleProgressRing.style.strokeDashoffset = String(100 - percent);
+    appTitleProgressRing.removeAttribute('hidden');
+    appTitleIcon.dataset.progress = String(percent);
+}
+
+function updateFavicon(aggregate) {
+    if (!favicon) return;
+    if (!aggregate || aggregate.percent === null) {
+        favicon.setAttribute('href', idleFaviconHref);
+        delete favicon.dataset.progress;
+        if (aggregate) {
+            favicon.dataset.runningCount = String(aggregate.count);
+        } else {
+            delete favicon.dataset.runningCount;
+        }
+        return;
+    }
+
+    const percent = Math.round(aggregate.percent * 10) / 10;
+    const radius = 7.5;
+    const angle = (percent / 100) * Math.PI * 2;
+    const endX = 8 + radius * Math.sin(angle);
+    const endY = 8 - radius * Math.cos(angle);
+    let progressShape = '';
+    if (percent >= 100) {
+        progressShape = `<circle cx="8" cy="8" r="${radius}" fill="#1f8a3b"/>`;
+    } else if (percent > 0) {
+        const largeArc = percent > 50 ? 1 : 0;
+        progressShape = `<path d="M8 8 L8 .5 A${radius} ${radius} 0 ${largeArc} 1 ${endX.toFixed(3)} ${endY.toFixed(3)} Z" fill="#1f8a3b"/>`;
+    }
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><circle cx="8" cy="8" r="${radius}" fill="#888"/>${progressShape}<g fill="none" stroke="white" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 4v5.5"/><path d="M5 7l3 3 3-3"/><path d="M4.5 12.5h7"/></g></svg>`;
+    favicon.setAttribute('href', `data:image/svg+xml,${encodeURIComponent(svg)}`);
+    favicon.dataset.progress = String(percent);
+    favicon.dataset.runningCount = String(aggregate.count);
+}
+
+function updateProgressIndicators(downloads) {
+    const aggregate = aggregateActiveProgress(downloads);
+    updateHeaderProgress(aggregate);
+    updateFavicon(aggregate);
+}
+
+function showServerStatus() {
+    document.getElementById('serverStatus').hidden = false;
+    document.getElementById('versionFooter').classList.add('server-unavailable');
+}
+
+function hideServerStatus() {
+    document.getElementById('serverStatus').hidden = true;
+    document.getElementById('versionFooter').classList.remove('server-unavailable');
 }
 
 function apiFetch(url, options) {
     return fetch(url, options).then(res => {
-        hideServerBanner();
+        hideServerStatus();
+        if (res.status === 401) {
+            window.location.assign('/login');
+            throw new Error('Your session has ended. Sign in again.');
+        }
         return res;
     }).catch(err => {
-        showServerBanner();
+        showServerStatus();
         throw err;
     });
 }
 
 function hideActionError() {
     document.getElementById('actionError').hidden = true;
+    document.getElementById('newDownloadError').hidden = true;
+    document.getElementById('settingsError').hidden = true;
+    document.getElementById('currentDrawerError').hidden = true;
 }
 
 function showActionError(message) {
-    document.getElementById('actionErrorMessage').textContent = message;
-    document.getElementById('actionError').hidden = false;
+    let errorId = 'actionError';
+    let messageId = 'actionErrorMessage';
+    if (document.getElementById('newDownloadDialog').open) {
+        errorId = 'newDownloadError';
+        messageId = 'newDownloadErrorMessage';
+    } else if (!document.getElementById('settingsPage').hidden) {
+        errorId = 'settingsError';
+        messageId = 'settingsErrorMessage';
+    } else if (document.getElementById('currentDownloadsDrawer').open) {
+        errorId = 'currentDrawerError';
+        messageId = 'currentDrawerErrorMessage';
+    }
+    const error = document.getElementById(errorId);
+    document.getElementById(messageId).textContent = message;
+    error.hidden = false;
 }
 
 function apiAction(url, options) {
@@ -50,6 +183,169 @@ function apiAction(url, options) {
             throw err;
         });
 }
+
+const uploadDropOverlay = document.getElementById('uploadDropOverlay');
+const uploadDropTitle = document.getElementById('uploadDropTitle');
+const uploadDropDetail = document.getElementById('uploadDropDetail');
+let uploadDragDepth = 0;
+let uploadInProgress = false;
+let uploadOverlayTimer = null;
+const activeUploadRequests = new Map();
+
+function isFileDrag(event) {
+    return event.dataTransfer
+        && Array.from(event.dataTransfer.types || []).includes('Files');
+}
+
+function showUploadOverlay(title, detail, uploading = false) {
+    clearTimeout(uploadOverlayTimer);
+    uploadDropTitle.textContent = title;
+    uploadDropDetail.textContent = detail;
+    uploadDropOverlay.classList.add('active');
+    uploadDropOverlay.classList.toggle('uploading', uploading);
+    uploadDropOverlay.setAttribute('aria-hidden', 'false');
+    if (!uploadDropOverlay.open) uploadDropOverlay.showModal();
+}
+
+function hideUploadOverlay() {
+    uploadDropOverlay.classList.remove('active', 'uploading');
+    uploadDropOverlay.setAttribute('aria-hidden', 'true');
+    if (uploadDropOverlay.open) uploadDropOverlay.close();
+}
+
+function transferDroppedVideo(id, file) {
+    return new Promise((resolve, reject) => {
+        const request = new XMLHttpRequest();
+        activeUploadRequests.set(String(id), request);
+        request.open('PUT', '/api/upload/' + encodeURIComponent(id));
+        request.setRequestHeader(
+            'Content-Type', file.type || 'application/octet-stream');
+        request.onload = () => {
+            const data = (() => {
+                try { return JSON.parse(request.responseText || '{}'); }
+                catch (error) { return {}; }
+            })();
+            if (request.status >= 200 && request.status < 300) {
+                resolve(data);
+            } else if (request.status === 409 && data.error === 'Upload cancelled') {
+                resolve(data);
+            } else {
+                reject(new Error(data.error || request.statusText || 'Upload failed'));
+            }
+        };
+        request.onerror = () => reject(new Error('Upload connection failed'));
+        request.onabort = () => resolve({ cancelled: true });
+        request.onloadend = () => {
+            activeUploadRequests.delete(String(id));
+            fetchHistory({ sortFavorites: true }).catch(() => {});
+        };
+        request.send(file);
+    });
+}
+
+async function registerDroppedVideo(file) {
+    const response = await apiFetch('/api/upload', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename: file.name, filesize: file.size }),
+    });
+    if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(data.error || response.statusText || 'Upload failed');
+    }
+    const data = await response.json();
+    return {
+        file,
+        id: data.id,
+        completion: transferDroppedVideo(data.id, file),
+    };
+}
+
+async function uploadDroppedVideos(files) {
+    if (uploadInProgress || !files.length) return;
+    uploadInProgress = true;
+    hideActionError();
+    const failures = [];
+    const transfers = [];
+
+    for (let index = 0; index < files.length; index += 1) {
+        const file = files[index];
+        const prefix = files.length > 1 ? `${index + 1} of ${files.length}: ` : '';
+        showUploadOverlay('Preparing upload…', prefix + file.name, true);
+        try {
+            transfers.push(await registerDroppedVideo(file));
+        } catch (error) {
+            failures.push(`${file.name}: ${error.message || 'Upload failed'}`);
+        }
+    }
+
+    uploadInProgress = false;
+    await fetchHistory().catch(() => {});
+    if (transfers.length > 0) {
+        const noun = transfers.length === 1 ? 'Upload' : `${transfers.length} uploads`;
+        showUploadOverlay(
+            `${noun} started`,
+            'Track progress or stop it from Current downloads.',
+        );
+        uploadOverlayTimer = setTimeout(hideUploadOverlay, 900);
+    } else {
+        hideUploadOverlay();
+    }
+
+    const results = await Promise.allSettled(
+        transfers.map(transfer => transfer.completion));
+    results.forEach((result, index) => {
+        if (result.status === 'rejected') {
+            failures.push(
+                `${transfers[index].file.name}: ${result.reason.message || 'Upload failed'}`);
+        }
+    });
+    if (failures.length) showActionError(failures.join(' '));
+}
+
+document.addEventListener('dragenter', event => {
+    if (!isFileDrag(event) || uploadInProgress) return;
+    event.preventDefault();
+    uploadDragDepth += 1;
+    showUploadOverlay(
+        'Drop video to add it',
+        'The original file will be copied into your library.',
+    );
+});
+
+document.addEventListener('dragover', event => {
+    if (!isFileDrag(event)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = uploadInProgress ? 'none' : 'copy';
+});
+
+document.addEventListener('dragleave', event => {
+    if (uploadInProgress) return;
+    // A final page exit may follow several descendant enters, so it is authoritative
+    // even when the browser no longer exposes the external drag's data types.
+    if (event.relatedTarget === null && uploadDragDepth > 0) {
+        uploadDragDepth = 0;
+        hideUploadOverlay();
+        return;
+    }
+    if (!isFileDrag(event)) return;
+    uploadDragDepth = Math.max(0, uploadDragDepth - 1);
+    if (uploadDragDepth === 0) hideUploadOverlay();
+});
+
+document.addEventListener('drop', event => {
+    if (!isFileDrag(event)) return;
+    event.preventDefault();
+    uploadDragDepth = 0;
+    if (uploadInProgress) return;
+    const files = Array.from(event.dataTransfer.files || []);
+    uploadDroppedVideos(files);
+});
+
+uploadDropOverlay.addEventListener('cancel', event => {
+    event.preventDefault();
+    if (!uploadInProgress) hideUploadOverlay();
+});
 
 function updateApiVersion(version, unavailable) {
     const footer = document.getElementById('versionFooter');
@@ -75,8 +371,52 @@ function updateApiVersion(version, unavailable) {
     warning.hidden = !mismatched;
     footer.classList.toggle('version-mismatch', mismatched);
     status.textContent = mismatched
-        ? `Version mismatch: UI version ${uiVersion}; ${apiLabel}. Refresh the page.`
+        ? `Version mismatch: UI version ${uiVersion}; ${apiLabel}. Use the Refresh page link to load the current UI.`
         : `UI and API version ${uiVersion} match.`;
+}
+
+let uptimeBaseline = null;
+
+function formatUptime(seconds) {
+    const totalSeconds = Math.max(0, Math.floor(Number(seconds)));
+    const units = [
+        { seconds: 365 * 24 * 60 * 60, label: 'Year' },
+        { seconds: 30 * 24 * 60 * 60, label: 'Month' },
+        { seconds: 24 * 60 * 60, label: 'Day' },
+        { seconds: 60 * 60, label: 'Hour' },
+        { seconds: 60, label: 'Minute' },
+        { seconds: 1, label: 'Second' },
+    ];
+    const unit = units.find(candidate => totalSeconds >= candidate.seconds)
+        || units[units.length - 1];
+    const value = Math.floor(totalSeconds / unit.seconds);
+    return `${value} ${unit.label}${value === 1 ? '' : 's'}`;
+}
+
+function renderUptime() {
+    if (!uptimeBaseline) return;
+    const elapsedSeconds = Math.max(0, (Date.now() - uptimeBaseline.receivedAt) / 1000);
+    document.getElementById('uptime').textContent =
+        `Uptime ${formatUptime(uptimeBaseline.seconds + elapsedSeconds)}`;
+}
+
+function updateUptime(seconds, unavailable) {
+    const uptime = document.getElementById('uptime');
+    if (unavailable) {
+        uptimeBaseline = null;
+        uptime.textContent = 'Uptime unavailable';
+        return;
+    }
+
+    const usableSeconds = Number(seconds);
+    if (typeof seconds !== 'number' || !Number.isFinite(usableSeconds) || usableSeconds < 0) {
+        uptimeBaseline = null;
+        uptime.textContent = 'Uptime unknown';
+        return;
+    }
+
+    uptimeBaseline = { seconds: usableSeconds, receivedAt: Date.now() };
+    renderUptime();
 }
 
 function checkHealth() {
@@ -85,13 +425,21 @@ function checkHealth() {
             if (!res.ok) throw new Error(`Health check failed with status ${res.status}`);
             return res.json();
         })
-        .then(data => updateApiVersion(data && data.version, false))
-        .catch(() => updateApiVersion(null, true));
+        .then(data => {
+            updateApiVersion(data && data.version, false);
+            updateUptime(data && data.uptime_seconds, false);
+        })
+        .catch(() => {
+            showServerStatus();
+            updateApiVersion(null, true);
+            updateUptime(null, true);
+        });
 }
 
 setInterval(() => {
     checkHealth();
 }, 30000);
+setInterval(renderUptime, 1000);
 
 checkHealth();
 
@@ -138,6 +486,7 @@ function startDownload(event) {
         containerSelect.selectedIndex = 0;
         resetOptions();
         if (optionsDetails && !optionsOpenedManually) setOptionsOpen(false);
+        closeNewDownload();
         fetchHistory();
     })
     .catch(() => {});
@@ -373,8 +722,7 @@ function resetOptions() {
 }
 
 let availableTags = [];
-let selectedTagFilters = [];
-let tagMatchMode = 'all';
+let searchTerms = [];
 const editingTagIds = new Set();
 const tagDrafts = new Map();
 const pendingTagCommits = new Set();
@@ -394,130 +742,277 @@ function refreshAvailableTags(rows) {
         (Array.isArray(row.tags) ? row.tags : []).forEach(tag => names.add(tag));
     });
     availableTags = sortTags(Array.from(names));
-    const available = new Set(availableTags);
-    selectedTagFilters = selectedTagFilters.filter(tag => available.has(tag));
-    renderTagFilter();
 }
 
-function renderTagFilterSuggestions(open) {
-    const input = document.getElementById('tagFilterInput');
-    const suggestions = document.getElementById('tagFilterSuggestions');
-    if (!input || !suggestions) return;
-    const query = tagSearchKey(input.value.trim());
-    const selected = new Set(selectedTagFilters);
-    const matches = availableTags.filter(tag => (
-        !selected.has(tag) && (!query || tagSearchKey(tag).includes(query))
-    ));
-    suggestions.innerHTML = '';
-    matches.forEach(tag => {
-        const button = document.createElement('button');
-        button.type = 'button';
-        button.className = 'tag-suggestion';
-        button.setAttribute('role', 'option');
-        button.textContent = tag;
-        button.addEventListener('mousedown', event => event.preventDefault());
-        button.addEventListener('click', () => {
-            selectedTagFilters.push(tag);
-            input.value = '';
-            historyPage = 0;
-            renderTagFilter();
-            fetchHistory();
-            input.focus();
-        });
-        suggestions.appendChild(button);
-    });
-    suggestions.hidden = !open || matches.length === 0;
-    input.setAttribute('aria-expanded', String(!suggestions.hidden));
-}
+function parseSearchTerms(value) {
+    const terms = [];
+    let draft = '';
+    let quoted = false;
 
-function renderTagFilter() {
-    const tokens = document.getElementById('tagFilterTokens');
-    const input = document.getElementById('tagFilterInput');
-    const clear = document.getElementById('clearTagFilter');
-    if (!tokens || !input || !clear) return;
-    tokens.querySelectorAll('.tag-filter-chip').forEach(chip => chip.remove());
-    selectedTagFilters.forEach(tag => {
-        const chip = document.createElement('span');
-        chip.className = 'tag-chip tag-filter-chip';
-        chip.append(document.createTextNode(tag));
-        const remove = document.createElement('button');
-        remove.type = 'button';
-        remove.setAttribute('aria-label', `Remove ${tag} filter`);
-        remove.textContent = '×';
-        remove.addEventListener('mousedown', event => event.preventDefault());
-        remove.addEventListener('click', () => {
-            selectedTagFilters = selectedTagFilters.filter(name => name !== tag);
-            historyPage = 0;
-            renderTagFilter();
-            fetchHistory();
-        });
-        chip.appendChild(remove);
-        tokens.insertBefore(chip, input);
-    });
-    clear.hidden = selectedTagFilters.length === 0;
-    renderTagFilterSuggestions(document.activeElement === input);
-}
-
-function matchesTagFilter(info) {
-    if (selectedTagFilters.length === 0) return true;
-    const tags = new Set(Array.isArray(info.tags) ? info.tags : []);
-    if (tagMatchMode === 'any') {
-        return selectedTagFilters.some(tag => tags.has(tag));
+    for (const character of String(value || '')) {
+        if (character === '"') {
+            quoted = !quoted;
+        } else if (/\s/.test(character) && !quoted) {
+            if (draft) terms.push(draft);
+            draft = '';
+        } else {
+            draft += character;
+        }
     }
-    return selectedTagFilters.every(tag => tags.has(tag));
+    if (draft) terms.push(draft);
+    return terms.map(term => term.trim()).filter(Boolean);
 }
 
-function tagFilterCommitDraft() {
-    const input = document.getElementById('tagFilterInput');
-    if (!input) return;
-    const query = tagSearchKey(input.value.trim());
-    if (!query) return;
-    const match = availableTags.find(tag => (
-        !selectedTagFilters.includes(tag) && tagSearchKey(tag) === query
-    ));
-    if (!match) return;
-    selectedTagFilters.push(match);
-    input.value = '';
+function searchQualityHeight(value) {
+    const key = tagSearchKey(value);
+    const aliases = {
+        '8k': 4320,
+        '4k': 2160,
+        'uhd': 2160,
+        '2k': 1440,
+        'qhd': 1440,
+    };
+    if (Object.prototype.hasOwnProperty.call(aliases, key)) return aliases[key];
+
+    const dimensions = key.match(/^(\d+)\s*[x×]\s*(\d+)$/);
+    const vertical = key.match(/^(\d+)\s*p?$/);
+    const height = dimensions
+        ? Number(dimensions[2])
+        : vertical
+            ? Number(vertical[1])
+            : 0;
+    return Number.isFinite(height) && height > 0 ? height : null;
+}
+
+function searchPlaylistValues(terms = searchTerms) {
+    return terms
+        .map(tagSearchKey)
+        .filter(term => /^playlists?:/.test(term))
+        .map(term => term.replace(/^playlists?:/, '').trim());
+}
+
+function matchesSearchFilter(info, terms = searchTerms) {
+    if (terms.length === 0) return true;
+    const title = tagSearchKey(info.title);
+    const tags = new Set((Array.isArray(info.tags) ? info.tags : []).map(tagSearchKey));
+    const userTerms = [];
+    const qualityTerms = [];
+    const starredTerms = [];
+    const viewTerms = [];
+    const playlistTerms = [];
+    const contentTerms = [];
+    terms.forEach(term => {
+        const key = tagSearchKey(term);
+        if (key.startsWith('user:')) userTerms.push(key.slice('user:'.length).trim());
+        else if (key.startsWith('quality:')) {
+            qualityTerms.push(searchQualityHeight(key.slice('quality:'.length).trim()));
+        } else if (key.startsWith('starred:')) {
+            starredTerms.push(key.slice('starred:'.length).trim());
+        } else if (key.startsWith('star:')) {
+            starredTerms.push(key.slice('star:'.length).trim());
+        } else if (key.startsWith('views:')) {
+            viewTerms.push(key.slice('views:'.length).trim());
+        } else if (/^playlists?:/.test(key)) {
+            playlistTerms.push(key.replace(/^playlists?:/, '').trim());
+        } else {
+            contentTerms.push(term);
+        }
+    });
+
+    if (userTerms.length) {
+        const downloadedBy = tagSearchKey(info.downloaded_by);
+        if (!userTerms.some(user => user && user === downloadedBy)) return false;
+    }
+    if (qualityTerms.length) {
+        const height = searchQualityHeight(info.resolution)
+            ?? searchQualityHeight(info.quality);
+        if (!qualityTerms.some(minimum => minimum !== null && height >= minimum)) return false;
+    }
+    if (starredTerms.length) {
+        const favorite = Boolean(info.favorite);
+        if (!starredTerms.some(value => (
+            (value === 'yes' && favorite) || (value === 'no' && !favorite)
+        ))) return false;
+    }
+    if (viewTerms.length) {
+        const numericViews = Number(info.view_count);
+        const viewCount = Number.isFinite(numericViews) && numericViews >= 0
+            ? numericViews
+            : 0;
+        if (!viewTerms.some(value => (
+            (value === 'new' && viewCount === 0)
+            || (/^\d+$/.test(value) && viewCount >= Number(value))
+        ))) return false;
+    }
+    if (playlistTerms.length) {
+        if (!playlistTerms.includes('no')) return false;
+    }
+    if (contentTerms.length === 0) return true;
+
+    const matchesContent = term => {
+        const key = tagSearchKey(term);
+        return tags.has(key) || title.includes(key);
+    };
+    return contentTerms.some(matchesContent);
+}
+
+function setHistorySearchExpanded(expanded) {
+    const search = document.getElementById('historySearch');
+    const toggle = document.getElementById('historySearchToggle');
+    search.classList.toggle('expanded', expanded);
+    toggle.setAttribute('aria-expanded', String(expanded));
+}
+
+function applyHistorySearch() {
+    const input = document.getElementById('historySearchInput');
+    document.getElementById('historySearchClear').hidden = !input.value;
+    searchTerms = parseSearchTerms(input.value);
     historyPage = 0;
-    renderTagFilter();
-    fetchHistory();
+    historyEndlessVisibleCount = HISTORY_ENDLESS_BATCH_SIZE;
+    renderPlaylists();
+    fetchHistory({ sortFavorites: true });
 }
 
-const tagFilterInput = document.getElementById('tagFilterInput');
-tagFilterInput.addEventListener('focus', () => renderTagFilterSuggestions(true));
-tagFilterInput.addEventListener('input', () => renderTagFilterSuggestions(true));
-tagFilterInput.addEventListener('keydown', event => {
-    if (event.key === 'Enter' || event.key === ',') {
+const historySearch = document.getElementById('historySearch');
+const historySearchToggle = document.getElementById('historySearchToggle');
+const historySearchInput = document.getElementById('historySearchInput');
+const historySearchClear = document.getElementById('historySearchClear');
+
+function closeAccountMenu(restoreFocus = false) {
+    const menu = document.getElementById('accountMenu');
+    const button = document.getElementById('accountMenuButton');
+    if (menu.hidden) return;
+    menu.hidden = true;
+    button.setAttribute('aria-expanded', 'false');
+    if (restoreFocus) button.focus();
+}
+
+function openAccountMenu({ focusFirst = false } = {}) {
+    closeHistoryInfo();
+    closeAllMenus();
+    const menu = document.getElementById('accountMenu');
+    const button = document.getElementById('accountMenuButton');
+    menu.hidden = false;
+    button.setAttribute('aria-expanded', 'true');
+    if (focusFirst) menu.querySelector('[role="menuitem"]').focus();
+}
+
+const accountMenuButton = document.getElementById('accountMenuButton');
+const accountMenu = document.getElementById('accountMenu');
+
+const playbackModeToggle = document.getElementById('playbackModeToggle');
+const playbackModeMenu = document.getElementById('playbackModeMenu');
+
+function closePlaybackModeMenu(restoreFocus = false) {
+    if (playbackModeMenu.hidden) return;
+    playbackModeMenu.hidden = true;
+    playbackModeToggle.setAttribute('aria-expanded', 'false');
+    if (restoreFocus) playbackModeToggle.focus();
+}
+
+function playbackModeItems() {
+    return Array.from(playbackModeMenu.querySelectorAll('[role="menuitem"]'))
+        .filter(item => !item.disabled);
+}
+
+function openPlaybackModeMenu(focus = null) {
+    closeHistoryInfo();
+    closeAllMenus();
+    playbackModeMenu.hidden = false;
+    playbackModeToggle.setAttribute('aria-expanded', 'true');
+    const items = playbackModeItems();
+    if (focus === 'first' && items.length) items[0].focus();
+    if (focus === 'last' && items.length) items[items.length - 1].focus();
+}
+
+playbackModeToggle.addEventListener('click', event => {
+    event.stopPropagation();
+    if (playbackModeMenu.hidden) openPlaybackModeMenu();
+    else closePlaybackModeMenu();
+});
+playbackModeToggle.addEventListener('keydown', event => {
+    if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+    event.preventDefault();
+    openPlaybackModeMenu(event.key === 'ArrowDown' ? 'first' : 'last');
+});
+playbackModeMenu.addEventListener('keydown', event => {
+    const items = playbackModeItems();
+    const current = items.indexOf(document.activeElement);
+    let next = null;
+    if (event.key === 'ArrowDown') next = (current + 1) % items.length;
+    else if (event.key === 'ArrowUp') next = (current - 1 + items.length) % items.length;
+    else if (event.key === 'Home') next = 0;
+    else if (event.key === 'End') next = items.length - 1;
+    else if (event.key === 'Escape') {
         event.preventDefault();
-        tagFilterCommitDraft();
-    } else if (event.key === 'Backspace' && !tagFilterInput.value && selectedTagFilters.length) {
-        selectedTagFilters.pop();
-        historyPage = 0;
-        renderTagFilter();
-        fetchHistory();
-    } else if (event.key === 'Escape') {
-        tagFilterInput.value = '';
-        renderTagFilterSuggestions(false);
-        tagFilterInput.blur();
+        closePlaybackModeMenu(true);
+        return;
     }
+    if (next === null || !items.length) return;
+    event.preventDefault();
+    items[next].focus();
 });
-tagFilterInput.addEventListener('blur', () => {
-    setTimeout(() => renderTagFilterSuggestions(false), 0);
+document.getElementById('endlessPlaybackButton').addEventListener(
+    'click', startSequentialPlayback,
+);
+document.getElementById('playbackMenuPlayAll').addEventListener(
+    'click', startSequentialPlayback,
+);
+document.getElementById('playbackMenuShuffle').addEventListener(
+    'click', startShufflePlayback,
+);
+accountMenuButton.addEventListener('click', event => {
+    event.stopPropagation();
+    if (accountMenu.hidden) openAccountMenu();
+    else closeAccountMenu();
 });
-document.getElementById('tagFilterPicker').addEventListener('click', () => {
-    tagFilterInput.focus();
+accountMenuButton.addEventListener('keydown', event => {
+    if (event.key !== 'ArrowDown') return;
+    event.preventDefault();
+    openAccountMenu({ focusFirst: true });
 });
-document.getElementById('tagMatchMode').addEventListener('change', event => {
-    tagMatchMode = event.target.value === 'any' ? 'any' : 'all';
-    historyPage = 0;
-    fetchHistory();
+accountMenu.addEventListener('keydown', event => {
+    const items = Array.from(accountMenu.querySelectorAll('[role="menuitem"]'));
+    const current = items.indexOf(document.activeElement);
+    let next = null;
+    if (event.key === 'ArrowDown') next = (current + 1) % items.length;
+    else if (event.key === 'ArrowUp') next = (current - 1 + items.length) % items.length;
+    else if (event.key === 'Home') next = 0;
+    else if (event.key === 'End') next = items.length - 1;
+    else if (event.key === 'Escape') {
+        event.preventDefault();
+        closeAccountMenu(true);
+        return;
+    }
+    if (next === null) return;
+    event.preventDefault();
+    items[next].focus();
 });
-document.getElementById('clearTagFilter').addEventListener('click', () => {
-    selectedTagFilters = [];
-    tagFilterInput.value = '';
-    historyPage = 0;
-    renderTagFilter();
-    fetchHistory();
+
+historySearchToggle.addEventListener('click', () => {
+    setHistorySearchExpanded(true);
+    historySearchInput.focus();
+});
+historySearchInput.addEventListener('focus', () => setHistorySearchExpanded(true));
+historySearchInput.addEventListener('input', applyHistorySearch);
+historySearchClear.addEventListener('click', () => {
+    historySearchInput.value = '';
+    applyHistorySearch();
+    historySearchInput.focus();
+});
+historySearchInput.addEventListener('keydown', event => {
+    if (event.key !== 'Escape') return;
+    event.preventDefault();
+    historySearchInput.value = '';
+    applyHistorySearch();
+    setHistorySearchExpanded(false);
+    historySearchToggle.focus();
+});
+historySearchInput.addEventListener('blur', () => {
+    setTimeout(() => {
+        if (historySearch.contains(document.activeElement)) return;
+        if (!historySearchInput.value) setHistorySearchExpanded(false);
+    }, 0);
 });
 
 function tagChipHtml(tag, removable) {
@@ -687,24 +1182,34 @@ function bindTagSuggestionButtons(shell) {
     const id = shell.dataset.tagId;
     shell.querySelectorAll('[data-suggest-tag]').forEach(button => {
         button.addEventListener('mousedown', event => event.preventDefault());
-        button.addEventListener('click', () => tagCommit(id, button.dataset.suggestTag));
+        button.addEventListener('click', event => {
+            // Committing rebuilds the suggestions synchronously, detaching the
+            // button before its click can reach the outside-popover handler.
+            event.stopPropagation();
+            tagCommit(id, button.dataset.suggestTag);
+        });
     });
 }
 
 function stopDownload(id) {
     closeAllMenus();
+    const uploadRequest = activeUploadRequests.get(String(id));
     apiAction('/api/stop/' + encodeURIComponent(id), { method: 'POST' })
-        .then(() => fetchHistory())
+        .then(() => {
+            if (uploadRequest) uploadRequest.abort();
+            return fetchHistory();
+        })
         .catch(() => fetchHistory());
 }
 
 const renameDrafts = new Map();
 
-function renderRenameControl(id, basename) {
+function renderRenameControl(id, basename, fullWidth = false) {
     if (renameDrafts.has(id)) {
         const draft = renameDrafts.get(id);
-        const widthStyle = draft.width ? `style="width:${draft.width}px"` : '';
-        return `<span class="rename-wrap" data-rename-id="${id}" data-mode="edit">
+        const widthStyle = draft.width && !fullWidth ? `style="width:${draft.width}px"` : '';
+        const widthClass = fullWidth ? ' rename-wrap-block' : '';
+        return `<span class="rename-wrap${widthClass}" data-rename-id="${id}" data-mode="edit">
                     <input class="rename-input" type="text" ${widthStyle} value="${escapeAttr(draft.value)}" data-orig="${escapeAttr(basename)}" oninput="renameOnInput('${id}', this.value)" />
                     <button class="rename-btn confirm" type="button" title="Save" aria-label="Save" onclick="renameCommit('${id}')">
                         <svg class="icon"><use href="#i-check"/></svg>
@@ -714,7 +1219,8 @@ function renderRenameControl(id, basename) {
                     </button>
                 </span>`;
     }
-    return `<span class="rename-wrap" data-rename-id="${id}" data-mode="display">
+    const widthClass = fullWidth ? ' rename-wrap-block' : '';
+    return `<span class="rename-wrap${widthClass}" data-rename-id="${id}" data-mode="display">
                 <span class="rename-display" data-orig="${escapeAttr(basename)}">${escapeHtml(basename)}</span>
                 <button class="rename-btn" type="button" title="Edit name" aria-label="Edit name" onclick="renameStart('${id}')">
                     <svg class="icon"><use href="#i-pencil"/></svg>
@@ -766,6 +1272,7 @@ function renameCancel(id) {
 }
 
 function renameCommit(id) {
+    const keepInfoOpen = openInfoId === String(id);
     const wrap = document.querySelector(`.rename-wrap[data-rename-id="${id}"]`);
     if (!wrap) { renameDrafts.delete(id); return; }
     const input = wrap.querySelector('.rename-input');
@@ -794,7 +1301,14 @@ function renameCommit(id) {
             return;
         }
         renameDrafts.delete(id);
-        fetchHistory();
+        fetchHistory().then(() => {
+            // The rename response and its SSE signal can reconcile in either
+            // order. Preserve the dialog the user was actively editing.
+            if (keepInfoOpen) {
+                openInfoId = String(id);
+                positionHistoryInfo(openInfoId);
+            }
+        });
     }).catch((err) => {
         alert('Rename failed: ' + err);
         input.disabled = false;
@@ -836,6 +1350,7 @@ function continueDownload(id, url) {
 }
 
 function deleteDownload(id) {
+    closeHistoryInfo();
     closeAllMenus();
     const row = document.querySelector(`[data-row-id="${id}"]`);
     if (row) {
@@ -845,6 +1360,45 @@ function deleteDownload(id) {
     apiAction('/api/remove/' + encodeURIComponent(id), { method: 'POST' })
         .then(() => fetchHistory())
         .catch(() => fetchHistory());
+}
+
+function toggleFavorite(button) {
+    if (button.disabled) return;
+    button.disabled = true;
+    const id = button.dataset.downloadId;
+    const favorite = button.dataset.favorite === 'true';
+    apiAction('/api/favorite/' + encodeURIComponent(id), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ favorite }),
+    })
+        .then(() => fetchHistory())
+        .catch(() => {
+            button.disabled = false;
+            return fetchHistory();
+        });
+}
+
+function changeDownloadVisibility(select) {
+    if (select.disabled) return;
+    const id = select.dataset.downloadId;
+    const previous = select.dataset.current;
+    const visibility = select.value;
+    select.disabled = true;
+    apiAction('/api/visibility/' + encodeURIComponent(id), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ visibility }),
+    })
+        .then(() => {
+            select.dataset.current = visibility;
+            return fetchHistory();
+        })
+        .catch(() => {
+            select.value = previous;
+            select.disabled = false;
+            return fetchHistory();
+        });
 }
 
 function clearHistory() {
@@ -866,15 +1420,111 @@ function clearHistory() {
 }
 
 let openMenuId = null;
+let openInfoId = null;
 let historyFetchDeferred = false;
+let historyFavoriteSortDeferred = false;
+const heldRowActionPointers = new Set();
+
+function historyRefreshBlocked() {
+    return openMenuId !== null || heldRowActionPointers.size > 0;
+}
+
+function resumeDeferredHistoryFetch() {
+    if (historyRefreshBlocked() || !historyFetchDeferred) return;
+    historyFetchDeferred = false;
+    const sortFavorites = historyFavoriteSortDeferred;
+    historyFavoriteSortDeferred = false;
+    // requestAnimationFrame runs after the click synthesized for pointerup, so
+    // the pressed action can finish before reconciliation replaces its row.
+    scheduleFetch({ sortFavorites });
+}
+
+document.addEventListener('pointerdown', (ev) => {
+    const target = ev.target.closest && ev.target.closest(
+        '#activeList .row-actions button, #historyList .row-actions button');
+    if (target) heldRowActionPointers.add(ev.pointerId);
+}, true);
+
+function releaseRowActionPointer(ev) {
+    if (!heldRowActionPointers.delete(ev.pointerId)) return;
+    resumeDeferredHistoryFetch();
+}
+
+document.addEventListener('pointerup', releaseRowActionPointer, true);
+document.addEventListener('pointercancel', releaseRowActionPointer, true);
+window.addEventListener('blur', () => {
+    if (heldRowActionPointers.size === 0) return;
+    heldRowActionPointers.clear();
+    resumeDeferredHistoryFetch();
+});
+
+function parseFormats(info) {
+    let formats = info.formats;
+    if (!formats) return [];
+    if (typeof formats === 'string') {
+        try { formats = JSON.parse(formats); } catch (e) { return []; }
+    }
+    return Array.isArray(formats) ? formats : [];
+}
+
+function describeFormat(format) {
+    const parts = [];
+    const height = Number(format.height);
+    const resolution = Number.isFinite(height) && height > 0
+        ? `${height}p`
+        : String(format.resolution || '').toLowerCase() === 'audio only'
+            ? ''
+            : format.resolution;
+    if (resolution) parts.push(String(resolution));
+
+    const fps = Number(format.fps);
+    if (Number.isFinite(fps) && fps > 0) parts.push(`${fps}fps`);
+    if (format.ext) parts.push(String(format.ext).toUpperCase());
+
+    const hasVideo = Boolean(format.vcodec && format.vcodec !== 'none');
+    const hasAudio = Boolean(format.acodec && format.acodec !== 'none');
+    if (hasVideo && hasAudio) parts.push('video + audio');
+    else if (hasVideo) parts.push('video');
+    else if (hasAudio) parts.push('audio');
+
+    if (parts.length) return parts.join(' ');
+    if (!format.format) return null;
+    const raw = String(format.format);
+    const prefix = format.format_id ? `${format.format_id} - ` : '';
+    return prefix && raw.startsWith(prefix) ? raw.slice(prefix.length) : raw;
+}
+
+function formatRequestedFormat(info) {
+    if (!info.requested_format) return null;
+    const requested = String(info.requested_format).trim();
+    if (!requested) return null;
+
+    const friendlySelectors = {
+        best: 'Best available',
+        'bestaudio/best': 'Best available audio',
+        'bestvideo+bestaudio/best': 'Best available video + audio',
+    };
+    if (friendlySelectors[requested]) return friendlySelectors[requested];
+
+    const heightSelector = requested.match(/^bestvideo\[height<=(\d+)\]\+bestaudio\/best$/);
+    if (heightSelector) return `Up to ${heightSelector[1]}p video + audio`;
+
+    const formats = parseFormats(info);
+    const requestedIds = requested.split('+');
+    const matches = requestedIds.map(formatId =>
+        formats.find(format => format && String(format.format_id) === formatId)
+    );
+    if (matches.length && matches.every(Boolean)) {
+        const descriptions = matches.map(describeFormat);
+        if (descriptions.every(Boolean)) return descriptions.join(' + ');
+    }
+
+    return /^\d+$/.test(requested) ? `Format ${requested}` : requested;
+}
 
 function renderFormatsTable(info) {
-    let formats = info.formats;
-    if (!formats) return '';
-    if (typeof formats === 'string') {
-        try { formats = JSON.parse(formats); } catch (e) { return ''; }
-    }
-    if (!Array.isArray(formats) || formats.length === 0) return '';
+    const formats = parseFormats(info);
+    if (formats.length === 0) return '';
 
     const fmtSize = (n) => {
         if (!n || isNaN(n)) return '';
@@ -919,15 +1569,95 @@ function onErrorDetailsToggle(id, el) {
 }
 
 function closeAllMenus() {
-    const shouldRefresh = openMenuId !== null && historyFetchDeferred;
+    const hadOpenMenu = openMenuId !== null;
     document.querySelectorAll('.kebab-menu.open').forEach(m => m.classList.remove('open'));
     openMenuId = null;
-    if (shouldRefresh) {
-        historyFetchDeferred = false;
+    closeAccountMenu();
+    closePlaybackModeMenu();
+    if (hadOpenMenu) {
         // Schedule after the click finishes so switching directly to another
         // menu keeps its actions stable and defers the refresh again.
-        scheduleFetch();
+        resumeDeferredHistoryFetch();
     }
+}
+
+function closeHistoryInfo() {
+    if (openInfoId === null) return;
+    document.querySelectorAll('.history-info-popover.open').forEach(popover => {
+        popover.classList.remove('open');
+    });
+    document.querySelectorAll('[data-info-action]').forEach(button => {
+        button.setAttribute('aria-expanded', 'false');
+    });
+    openInfoId = null;
+}
+
+function positionHistoryInfo(id) {
+    const card = document.querySelector(`#historyList [data-row-id="${CSS.escape(String(id))}"]`);
+    const button = card && card.querySelector('[data-info-action]');
+    const anchor = card && card.querySelector('.kebab-btn');
+    const popover = card && card.querySelector('.history-info-popover');
+    if (!button || !anchor || !popover) {
+        openInfoId = null;
+        return;
+    }
+
+    const viewportGap = 12;
+    const anchorGap = 8;
+    const appHeader = document.getElementById('appHeader');
+    const headerBottom = appHeader ? appHeader.getBoundingClientRect().bottom : 0;
+    const viewportTop = Math.max(viewportGap, headerBottom + viewportGap);
+    const width = Math.min(560, window.innerWidth - viewportGap * 2);
+    popover.style.width = `${width}px`;
+    popover.style.setProperty(
+        '--history-info-max-height',
+        `${Math.max(80, window.innerHeight - viewportTop - viewportGap)}px`,
+    );
+    popover.style.visibility = 'hidden';
+    popover.classList.add('open');
+
+    const buttonRect = anchor.getBoundingClientRect();
+    const left = Math.min(
+        window.innerWidth - width - viewportGap,
+        Math.max(viewportGap, buttonRect.right - width),
+    );
+    const availableBelow = Math.max(0, window.innerHeight - viewportGap
+        - buttonRect.bottom - anchorGap);
+    const availableAbove = Math.max(0, buttonRect.top - anchorGap - viewportTop);
+    const naturalHeight = popover.getBoundingClientRect().height;
+    let placement = naturalHeight <= availableBelow || availableBelow >= availableAbove
+        ? 'below'
+        : 'above';
+    const availableHeight = placement === 'below' ? availableBelow : availableAbove;
+    popover.style.setProperty(
+        '--history-info-max-height',
+        `${Math.max(80, availableHeight)}px`,
+    );
+    const popoverHeight = popover.getBoundingClientRect().height;
+    const top = placement === 'below'
+        ? buttonRect.bottom + anchorGap
+        : buttonRect.top - popoverHeight - anchorGap;
+    const pointerX = Math.min(width - 16, Math.max(16, buttonRect.left + buttonRect.width / 2 - left));
+    popover.style.left = `${left}px`;
+    popover.style.top = `${top}px`;
+    popover.style.setProperty('--popover-pointer-x', `${pointerX}px`);
+    popover.dataset.placement = placement;
+    popover.style.visibility = '';
+    button.setAttribute('aria-expanded', 'true');
+}
+
+function toggleHistoryInfo(id, ev) {
+    ev.stopPropagation();
+    const wasOpen = openInfoId === String(id);
+    closeAllMenus();
+    closeHistoryInfo();
+    if (wasOpen) return;
+    openInfoId = String(id);
+    positionHistoryInfo(openInfoId);
+}
+
+function restoreOpenHistoryInfo() {
+    if (openInfoId !== null) positionHistoryInfo(openInfoId);
 }
 
 function toggleMenu(id, ev) {
@@ -935,6 +1665,7 @@ function toggleMenu(id, ev) {
     const menu = document.getElementById('menu-' + id);
     if (!menu) return;
     const wasOpen = menu.classList.contains('open');
+    closeHistoryInfo();
     closeAllMenus();
     if (!wasOpen) {
         menu.classList.add('open');
@@ -942,14 +1673,152 @@ function toggleMenu(id, ev) {
     }
 }
 
+const HOVER_PREVIEW_DELAY_MS = 250;
+const HOVER_PREVIEW_CACHE_VERSION = 4;
+let hoverPreviewTimer = null;
+let pendingHoverPreview = null;
+let activeHoverPreview = null;
+
+function hoverPreviewsEnabled() {
+    return window.matchMedia('(hover: hover) and (pointer: fine)').matches
+        && !window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+}
+
+function stopHoverPreview(preview = activeHoverPreview || pendingHoverPreview) {
+    if (!preview) return;
+    if (pendingHoverPreview === preview) {
+        clearTimeout(hoverPreviewTimer);
+        hoverPreviewTimer = null;
+        pendingHoverPreview = null;
+    }
+
+    const video = preview.querySelector('.history-preview-video');
+    preview.classList.remove('preview-loading', 'preview-playing');
+    if (video) {
+        video.onplaying = null;
+        video.onerror = null;
+        video.pause();
+        video.removeAttribute('src');
+        video.load();
+    }
+    if (activeHoverPreview === preview) activeHoverPreview = null;
+}
+
+function startHoverPreview(preview) {
+    hoverPreviewTimer = null;
+    pendingHoverPreview = null;
+    const hoverRegion = preview.closest('.history-preview-wrap') || preview;
+    if (!preview.isConnected || !hoverRegion.matches(':hover') || !hoverPreviewsEnabled()) return;
+
+    if (activeHoverPreview && activeHoverPreview !== preview) {
+        stopHoverPreview(activeHoverPreview);
+    }
+    const video = preview.querySelector('.history-preview-video');
+    if (!video) return;
+
+    activeHoverPreview = preview;
+    preview.classList.add('preview-loading');
+    video.muted = true;
+    video.onplaying = () => {
+        if (activeHoverPreview !== preview) return;
+        preview.classList.remove('preview-loading');
+        preview.classList.add('preview-playing');
+    };
+    video.onerror = () => {
+        if (activeHoverPreview === preview) stopHoverPreview(preview);
+    };
+    video.src = '/api/preview/' + encodeURIComponent(preview.dataset.downloadId)
+        + '?v=' + HOVER_PREVIEW_CACHE_VERSION;
+    video.load();
+    const playback = video.play();
+    if (playback) {
+        playback.catch(() => {
+            if (activeHoverPreview === preview) stopHoverPreview(preview);
+        });
+    }
+}
+
+function scheduleHoverPreview(preview) {
+    if (!hoverPreviewsEnabled() || preview.classList.contains('thumbnail-unavailable')) return;
+    if (pendingHoverPreview && pendingHoverPreview !== preview) {
+        stopHoverPreview(pendingHoverPreview);
+    }
+    if (activeHoverPreview === preview || pendingHoverPreview === preview) return;
+    pendingHoverPreview = preview;
+    hoverPreviewTimer = setTimeout(
+        () => startHoverPreview(preview),
+        HOVER_PREVIEW_DELAY_MS,
+    );
+}
+
+document.addEventListener('pointerover', (ev) => {
+    const preview = ev.target.closest
+        ? ev.target.closest('button.history-preview[data-play-action]')
+        : null;
+    if (!preview || (ev.relatedTarget && preview.contains(ev.relatedTarget))) return;
+    scheduleHoverPreview(preview);
+});
+
+document.addEventListener('pointerout', (ev) => {
+    const hoverRegion = ev.target.closest
+        ? ev.target.closest('.history-preview-wrap')
+        : null;
+    const preview = hoverRegion
+        ? hoverRegion.querySelector('button.history-preview[data-play-action]')
+        : null;
+    // The favorite control overlays the preview as a sibling, so the wrapper
+    // is the stable hover boundary even while the pointer is over that control.
+    if (!preview || (ev.relatedTarget && hoverRegion.contains(ev.relatedTarget))) return;
+    stopHoverPreview(preview);
+});
+
+document.addEventListener('visibilitychange', () => {
+    if (document.hidden) stopHoverPreview();
+});
+
 document.addEventListener('click', (ev) => {
+    const favoriteAction = ev.target.closest('[data-favorite-action]');
+    if (favoriteAction) toggleFavorite(favoriteAction);
+
+    const playlistAddAction = ev.target.closest('[data-playlist-add-action]');
+    if (playlistAddAction) {
+        openPlaylistChooser(
+            playlistAddAction.dataset.downloadId, playlistAddAction,
+        );
+    }
+
+    const endlessAction = ev.target.closest('[data-endless-action]');
+    if (endlessAction) {
+        closeAllMenus();
+        startEndlessPlayback(
+            endlessAction.dataset.downloadId,
+            endlessAction.dataset.playLabel,
+            endlessAction.dataset.playExt,
+        );
+    }
+
     const playAction = ev.target.closest('[data-play-action]');
     if (playAction) {
+        stopHoverPreview();
+        recordView(playAction.dataset.downloadId);
         playVideo(
             playAction.dataset.downloadId,
             playAction.dataset.playLabel,
             playAction.dataset.playExt,
         );
+    }
+    const fileDownloadAction = ev.target.closest('[data-file-download-action]');
+    if (fileDownloadAction) {
+        closeAllMenus();
+        const link = document.createElement('a');
+        link.href = '/api/file/'
+            + encodeURIComponent(fileDownloadAction.dataset.downloadId)
+            + '?download=1';
+        link.download = '';
+        link.hidden = true;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
     }
     const urlAction = ev.target.closest('[data-url-action]');
     if (urlAction) {
@@ -970,7 +1839,9 @@ document.addEventListener('click', (ev) => {
                 break;
         }
     }
+    if (ev.target.closest('.history-info-popover')) return;
     if (ev.target.closest('.kebab-menu') || ev.target.closest('.kebab-btn')) return;
+    closeHistoryInfo();
     closeAllMenus();
 });
 
@@ -982,6 +1853,39 @@ function formatDateTime(epochSeconds) {
         year: 'numeric', month: '2-digit', day: '2-digit',
         hour: '2-digit', minute: '2-digit',
     });
+}
+
+function formatDuration(startEpochSeconds, endEpochSeconds) {
+    const start = Number(startEpochSeconds);
+    const end = Number(endEpochSeconds);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return null;
+
+    let remaining = Math.round(end - start);
+    const units = [
+        ['Day', 86400],
+        ['Hour', 3600],
+        ['Minute', 60],
+        ['Second', 1],
+    ];
+    const parts = [];
+    for (const [label, seconds] of units) {
+        const value = Math.floor(remaining / seconds);
+        if (value <= 0) continue;
+        parts.push(`${value} ${label}${value === 1 ? '' : 's'}`);
+        remaining %= seconds;
+        if (parts.length === 2) break;
+    }
+    return parts.length ? parts.join(' and ') : '0 Seconds';
+}
+
+function formatMediaDuration(durationSeconds) {
+    const seconds = Math.round(Number(durationSeconds));
+    if (!Number.isFinite(seconds) || seconds <= 0) return null;
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const remainder = seconds % 60;
+    const minuteText = hours ? String(minutes).padStart(2, '0') : String(minutes);
+    return `${hours ? `${hours}:` : ''}${minuteText}:${String(remainder).padStart(2, '0')}`;
 }
 
 function formatBytes(n) {
@@ -1033,16 +1937,29 @@ function openUrl(url) {
     }
 }
 
-const COPY_URL_HTML    = '<svg class="menu-icon"><use href="#i-copy"/></svg>Copy URL';
-const COPIED_HTML      = '<svg class="menu-icon"><use href="#i-check"/></svg>Copied';
+const COPIED_HTML = '<svg class="menu-icon"><use href="#i-check"/></svg>Copied';
 
 function copyToClipboard(text, btn) {
     const done = () => {
         if (!btn) return;
         if (btn._copyTimer) clearTimeout(btn._copyTimer);
+        if (btn._copyOriginalHtml === undefined) {
+            btn._copyOriginalHtml = btn.innerHTML;
+            btn._copyOriginalLabel = btn.getAttribute('aria-label');
+            btn._copyOriginalTitle = btn.getAttribute('title');
+        }
         btn.innerHTML = COPIED_HTML;
+        btn.setAttribute('aria-label', 'Copied');
+        btn.setAttribute('title', 'Copied');
         btn._copyTimer = setTimeout(() => {
-            btn.innerHTML = COPY_URL_HTML;
+            btn.innerHTML = btn._copyOriginalHtml;
+            if (btn._copyOriginalLabel === null) btn.removeAttribute('aria-label');
+            else btn.setAttribute('aria-label', btn._copyOriginalLabel);
+            if (btn._copyOriginalTitle === null) btn.removeAttribute('title');
+            else btn.setAttribute('title', btn._copyOriginalTitle);
+            delete btn._copyOriginalHtml;
+            delete btn._copyOriginalLabel;
+            delete btn._copyOriginalTitle;
             btn._copyTimer = null;
         }, 1500);
     };
@@ -1064,22 +1981,559 @@ function fallback(text, done) {
     document.body.removeChild(ta);
 }
 
+const PLAYLIST_VIDEO_EXTENSIONS = new Set([
+    'mp4', 'm4v', 'webm', 'mkv', 'ogg', 'ogv', 'mov', 'avi',
+]);
+let playlistSummaries = [];
+let visiblePlaylistCount = 0;
+let libraryEntries = [];
+let playlistEditorDraft = null;
+let playlistEditorBaseline = '';
+let playlistEditorReturnFocus = null;
+let playlistChooserDownloadId = null;
+let playlistChooserReturnFocus = null;
+
+function libraryTitle(info) {
+    if (info && info.title) return info.title;
+    if (info && info.filename) {
+        return info.filename.split('/').pop().split('\\').pop().replace(/\.[^.]+$/, '');
+    }
+    return 'Untitled download';
+}
+
+function playlistMatchesSearch(playlist) {
+    const playlistValues = searchPlaylistValues();
+    if (playlistValues.length && !playlistValues.includes('yes')) return false;
+    const videoTerms = searchTerms.filter(term => !/^playlists?:/i.test(term));
+    const memberIds = new Set(
+        (playlist.member_ids || []).map(id => String(id)));
+    return libraryEntries.some(info => (
+        memberIds.has(String(info.id))
+        && matchesSearchFilter(info, videoTerms)
+    ));
+}
+
+function playlistProgressText(playlist) {
+    if (playlist.progress && playlist.progress.completed) return 'Completed';
+    if (!playlist.item_count) return 'Empty playlist';
+    const item = Math.min(playlist.item_count, Number(playlist.resume_position || 0) + 1);
+    const seconds = playlist.progress ? playlist.progress.position_seconds : 0;
+    const position = seconds >= 1 ? ` · ${formatMediaDuration(seconds) || '0:00'}` : '';
+    return `Episode ${item} of ${playlist.item_count}${position}`;
+}
+
+function renderPlaylistMosaic(playlist) {
+    const ids = Array.isArray(playlist.mosaic_ids) ? playlist.mosaic_ids : [];
+    if (!ids.length) {
+        return '<div class="playlist-mosaic-empty"><svg aria-hidden="true"><use href="#i-playlist"/></svg><span>No videos yet</span></div>';
+    }
+    return ids.map(id => `<img src="/api/thumbnail/${encodeURIComponent(id)}" alt="" loading="lazy" onerror="this.classList.add('thumbnail-unavailable')">`).join('');
+}
+
+function renderPlaylistCard(playlist) {
+    const id = escapeAttr(playlist.id);
+    const duration = formatMediaDuration(playlist.duration_seconds);
+    const meta = `${playlist.item_count} ${playlist.item_count === 1 ? 'video' : 'videos'}${duration ? ` · ${duration}` : ''}`;
+    const completed = Boolean(playlist.progress && playlist.progress.completed);
+    const primary = completed ? 'Replay playlist' : 'Resume playlist';
+    return `<article class="playlist-card" data-playlist-id="${id}">
+        <button class="playlist-card-primary" type="button" onclick="startPlaylistPlayback('${id}', ${completed})" ${playlist.item_count ? '' : 'disabled'} aria-label="${primary}: ${escapeAttr(playlist.name)}">
+            <span class="playlist-mosaic count-${Math.min(4, playlist.mosaic_ids.length)}">${renderPlaylistMosaic(playlist)}</span>
+            <span class="playlist-marker"><svg aria-hidden="true"><use href="#i-playlist"/></svg>Playlist</span>
+            <span class="playlist-preview-meta">${escapeHtml(meta)}</span>
+        </button>
+        <div class="playlist-card-caption">
+            <div><strong title="${escapeAttr(playlist.name)}">${escapeHtml(playlist.name)}</strong><span class="playlist-resume">${escapeHtml(playlistProgressText(playlist))}</span></div>
+            <div class="menu-wrap">
+                <button class="kebab-btn" type="button" onclick="togglePlaylistMenu('${id}', event)" aria-label="More actions for ${escapeAttr(playlist.name)}"><svg class="icon"><use href="#i-kebab"/></svg></button>
+                <div id="playlist-menu-${id}" class="kebab-menu playlist-card-menu">
+                    <button type="button" onclick="startPlaylistPlayback('${id}', true)"><svg class="menu-icon"><use href="#i-play"/></svg>Play from beginning</button>
+                    <button type="button" onclick="openPlaylistEditor('${id}')"><svg class="menu-icon"><use href="#i-playlist"/></svg>Edit playlist</button>
+                    <button type="button" class="danger" onclick="deletePlaylist('${id}')"><svg class="menu-icon"><use href="#i-trash"/></svg>Delete playlist</button>
+                </div>
+            </div>
+        </div>
+    </article>`;
+}
+
+function renderPlaylists() {
+    const shelf = document.getElementById('playlistShelf');
+    const visible = playlistSummaries.filter(playlistMatchesSearch);
+    visiblePlaylistCount = visible.length;
+    shelf.hidden = visible.length === 0;
+    document.getElementById('playlistShelfCount').textContent =
+        `${visible.length} ${visible.length === 1 ? 'playlist' : 'playlists'}`;
+    document.getElementById('playlistList').innerHTML = visible.length
+        ? visible.map(renderPlaylistCard).join('')
+        : '';
+    updateHistoryEmptyState();
+}
+
+function fetchPlaylists() {
+    return apiFetch('/api/playlists').then(response => response.json()).then(data => {
+        playlistSummaries = Array.isArray(data) ? data : [];
+        renderPlaylists();
+    });
+}
+
+function togglePlaylistMenu(id, event) {
+    event.stopPropagation();
+    const menu = document.getElementById('playlist-menu-' + id);
+    const open = menu.classList.contains('open');
+    closeAllMenus();
+    if (!open) menu.classList.add('open');
+}
+
+function playlistEditorSnapshot() {
+    if (!playlistEditorDraft) return '';
+    return JSON.stringify({
+        name: playlistEditorDraft.name,
+        ids: playlistEditorDraft.items.map(item => item.id),
+    });
+}
+
+function markPlaylistEditorDirty() {
+    if (!playlistEditorDraft) return;
+    playlistEditorDraft.name = document.getElementById('playlistName').value;
+    const dirty = playlistEditorSnapshot() !== playlistEditorBaseline;
+    document.getElementById('playlistEditorDirty').hidden = !dirty;
+}
+
+function playableLibraryEntries() {
+    return libraryEntries.filter(info => {
+        if (info.status !== 'finished' || !info.filename) return false;
+        const extension = info.filename.split('.').pop().toLowerCase();
+        return PLAYLIST_VIDEO_EXTENSIONS.has(extension);
+    });
+}
+
+function renderPlaylistEditor() {
+    if (!playlistEditorDraft) return;
+    const selectedIds = new Set(
+        playlistEditorDraft.items.map(item => item.id).filter(Boolean),
+    );
+    const query = tagSearchKey(document.getElementById('playlistVideoSearch').value);
+    const available = playableLibraryEntries().filter(info => (
+        !selectedIds.has(String(info.id))
+        && (!query || tagSearchKey(libraryTitle(info)).includes(query))
+    ));
+    document.getElementById('playlistAvailable').innerHTML = available.length
+        ? available.map(info => `<button type="button" class="playlist-picker-row" onclick="playlistEditorAdd('${escapeAttr(info.id)}')"><img src="/api/thumbnail/${encodeURIComponent(info.id)}" alt=""><span>${escapeHtml(libraryTitle(info))}</span><svg aria-hidden="true"><use href="#i-plus"/></svg></button>`).join('')
+        : '<p>No available videos match.</p>';
+    document.getElementById('playlistSelected').innerHTML = playlistEditorDraft.items.length
+        ? playlistEditorDraft.items.map((item, index) => `<div class="playlist-selected-row${item.unavailable ? ' is-unavailable' : ''}" draggable="${!item.unavailable}" data-playlist-index="${index}">
+            <span class="playlist-drag-handle" aria-hidden="true">⋮⋮</span>
+            ${item.id ? `<img src="/api/thumbnail/${encodeURIComponent(item.id)}" alt="">` : '<span class="playlist-unavailable-thumb"><svg><use href="#i-camera"/></svg></span>'}
+            <span class="playlist-selected-title"><span>${index + 1}</span>${escapeHtml(item.title || 'Unavailable video')}</span>
+            <span class="playlist-order-actions">
+                <button type="button" onclick="playlistEditorMove(${index}, -1)" ${index === 0 ? 'disabled' : ''} aria-label="Move ${escapeAttr(item.title || 'video')} up">↑</button>
+                <button type="button" onclick="playlistEditorMove(${index}, 1)" ${index === playlistEditorDraft.items.length - 1 ? 'disabled' : ''} aria-label="Move ${escapeAttr(item.title || 'video')} down">↓</button>
+                <button type="button" onclick="playlistEditorRemove(${index})" aria-label="Remove ${escapeAttr(item.title || 'video')}"><svg><use href="#i-x"/></svg></button>
+            </span>
+        </div>`).join('')
+        : '<p>No videos selected.</p>';
+    bindPlaylistDragging();
+    markPlaylistEditorDirty();
+}
+
+function showPlaylistEditorError(message) {
+    const error = document.getElementById('playlistEditorError');
+    error.textContent = message || '';
+    error.hidden = !message;
+}
+
+async function openPlaylistEditor(id = null, initialDownloadId = null) {
+    closeAllMenus();
+    playlistEditorReturnFocus = document.activeElement;
+    showPlaylistEditorError('');
+    let detail = null;
+    if (id) {
+        const response = await apiFetch('/api/playlists/' + encodeURIComponent(id));
+        if (!response.ok) {
+            showActionError('The playlist could not be opened.');
+            return;
+        }
+        detail = await response.json();
+    }
+    const initial = initialDownloadId
+        ? playableLibraryEntries().find(item => String(item.id) === String(initialDownloadId))
+        : null;
+    playlistEditorDraft = {
+        id: detail ? detail.id : null,
+        revision: detail ? detail.revision : null,
+        name: detail ? detail.name : '',
+        items: detail ? detail.items.map(item => ({ ...item }))
+            : (initial ? [{
+                id: String(initial.id), title: libraryTitle(initial), unavailable: false,
+            }] : []),
+    };
+    document.getElementById('playlistEditorTitle').textContent =
+        detail ? 'Edit playlist' : 'Create playlist';
+    document.getElementById('playlistName').value = playlistEditorDraft.name;
+    document.getElementById('playlistVideoSearch').value = '';
+    playlistEditorBaseline = playlistEditorSnapshot();
+    renderPlaylistEditor();
+    const dialog = document.getElementById('playlistEditorDialog');
+    dialog.showModal();
+    document.getElementById('playlistName').focus();
+}
+
+function closePlaylistEditor(force = false) {
+    const dialog = document.getElementById('playlistEditorDialog');
+    if (!dialog.open) return;
+    markPlaylistEditorDirty();
+    if (!force && !document.getElementById('playlistEditorDirty').hidden
+            && !window.confirm('Discard unsaved playlist changes?')) return;
+    dialog.close();
+    playlistEditorDraft = null;
+    if (playlistEditorReturnFocus && playlistEditorReturnFocus.isConnected) {
+        playlistEditorReturnFocus.focus();
+    }
+}
+
+function playlistEditorAdd(id) {
+    const info = playableLibraryEntries().find(item => String(item.id) === String(id));
+    if (!info || !playlistEditorDraft) return;
+    playlistEditorDraft.items.push({
+        id: String(info.id), title: libraryTitle(info), unavailable: false,
+    });
+    renderPlaylistEditor();
+}
+
+function playlistEditorRemove(index) {
+    if (!playlistEditorDraft) return;
+    playlistEditorDraft.items.splice(index, 1);
+    renderPlaylistEditor();
+}
+
+function playlistEditorMove(index, delta) {
+    if (!playlistEditorDraft) return;
+    const next = index + delta;
+    if (next < 0 || next >= playlistEditorDraft.items.length) return;
+    const [item] = playlistEditorDraft.items.splice(index, 1);
+    playlistEditorDraft.items.splice(next, 0, item);
+    renderPlaylistEditor();
+    const rows = document.querySelectorAll('#playlistSelected .playlist-selected-row');
+    const focus = rows[next] && rows[next].querySelector('button:not(:disabled)');
+    if (focus) focus.focus();
+    document.getElementById('playlistMoveStatus').textContent =
+        `${item.title || 'Video'} moved to position ${next + 1}.`;
+}
+
+function bindPlaylistDragging() {
+    let dragged = null;
+    document.querySelectorAll('#playlistSelected .playlist-selected-row').forEach(row => {
+        row.addEventListener('dragstart', event => {
+            dragged = Number(row.dataset.playlistIndex);
+            event.dataTransfer.effectAllowed = 'move';
+        });
+        row.addEventListener('dragover', event => event.preventDefault());
+        row.addEventListener('drop', event => {
+            event.preventDefault();
+            const target = Number(row.dataset.playlistIndex);
+            if (dragged === null || dragged === target) return;
+            const [item] = playlistEditorDraft.items.splice(dragged, 1);
+            playlistEditorDraft.items.splice(target, 0, item);
+            renderPlaylistEditor();
+            document.getElementById('playlistMoveStatus').textContent =
+                `${item.title || 'Video'} moved to position ${target + 1}.`;
+        });
+    });
+}
+
+async function savePlaylistEditor(event) {
+    event.preventDefault();
+    if (!playlistEditorDraft) return;
+    playlistEditorDraft.name = document.getElementById('playlistName').value;
+    const unavailable = playlistEditorDraft.items.some(item => !item.id);
+    if (unavailable) {
+        showPlaylistEditorError('Remove unavailable videos before saving this playlist.');
+        return;
+    }
+    const editing = Boolean(playlistEditorDraft.id);
+    const url = editing
+        ? '/api/playlists/' + encodeURIComponent(playlistEditorDraft.id)
+        : '/api/playlists';
+    const body = editing ? {
+        name: playlistEditorDraft.name,
+        download_ids: playlistEditorDraft.items.map(item => item.id),
+        expected_revision: playlistEditorDraft.revision,
+    } : {
+        name: playlistEditorDraft.name,
+        download_ids: playlistEditorDraft.items.map(item => item.id),
+    };
+    const response = await apiFetch(url, {
+        method: editing ? 'PUT' : 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        showPlaylistEditorError(data.error || 'The playlist could not be saved.');
+        return;
+    }
+    await response.json();
+    playlistEditorBaseline = playlistEditorSnapshot();
+    closePlaylistEditor(true);
+    await fetchPlaylists();
+}
+
+function openPlaylistChooser(downloadId, opener = null) {
+    closeAllMenus();
+    playlistChooserDownloadId = String(downloadId);
+    playlistChooserReturnFocus = opener || document.activeElement;
+    const list = document.getElementById('playlistChooserList');
+    list.innerHTML = playlistSummaries.length
+        ? playlistSummaries.map(playlist => {
+            const included = (playlist.member_ids || []).includes(playlistChooserDownloadId);
+            return `<button type="button" onclick="quickAddToPlaylist('${escapeAttr(playlist.id)}')" ${included ? 'disabled' : ''}><span>${escapeHtml(playlist.name)}</span><span>${included ? 'Already added' : `${playlist.item_count} videos`}</span></button>`;
+        }).join('')
+        : '<p>You have no playlists yet.</p>';
+    document.getElementById('playlistChooserDialog').showModal();
+}
+
+function closePlaylistChooser() {
+    const dialog = document.getElementById('playlistChooserDialog');
+    if (dialog.open) dialog.close();
+    if (playlistChooserReturnFocus && playlistChooserReturnFocus.isConnected) {
+        playlistChooserReturnFocus.focus();
+    }
+}
+
+async function quickAddToPlaylist(playlistId) {
+    const response = await apiFetch(
+        '/api/playlists/' + encodeURIComponent(playlistId) + '/items', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ download_id: playlistChooserDownloadId }),
+        },
+    );
+    if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        showActionError(data.error || 'The video could not be added.');
+        return;
+    }
+    closePlaylistChooser();
+    await fetchPlaylists();
+}
+
+function createPlaylistFromChooser() {
+    const downloadId = playlistChooserDownloadId;
+    closePlaylistChooser();
+    openPlaylistEditor(null, downloadId);
+}
+
+async function deletePlaylist(id) {
+    closeAllMenus();
+    if (!window.confirm('Delete this playlist? Its videos will remain in your library.')) return;
+    const response = await apiFetch('/api/playlists/' + encodeURIComponent(id), {
+        method: 'DELETE',
+    });
+    if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        showActionError(data.error || 'The playlist could not be deleted.');
+        return;
+    }
+    await fetchPlaylists();
+}
+
+function renderHistoryCard(info) {
+    const id = String(info.id);
+    const isFinished = info.status === 'finished';
+    const isUpload = info.source_type === 'upload';
+    const hasPlay = isFinished && info.filename;
+    const safeUrl = escapeAttr(info.url);
+    const urlData = `data-url="${safeUrl}"`;
+
+    let displayTitle = info.title || '';
+    if (!displayTitle && info.filename) {
+        const base = info.filename.split('/').pop().split('\\').pop();
+        displayTitle = base.replace(/\.[^.]+$/, '');
+    }
+    if (!displayTitle) displayTitle = 'Untitled download';
+
+    const menuItems = [
+        `<button data-info-action aria-expanded="false" aria-controls="info-${escapeAttr(id)}" onclick="toggleHistoryInfo('${id}', event)"><svg class="menu-icon"><use href="#i-info"/></svg>Info</button>`,
+    ];
+    if (!isUpload) {
+        menuItems.push(`<button data-url-action="open" ${urlData}><svg class="menu-icon"><use href="#i-external"/></svg>Open URL</button>`);
+    }
+    if (hasPlay) {
+        const playLabel = info.filename.split('/').pop().split('\\').pop();
+        const playExt = info.filename.split('.').pop().toLowerCase();
+        menuItems.push(`<button data-endless-action data-download-id="${escapeAttr(id)}" data-play-label="${escapeAttr(playLabel)}" data-play-ext="${escapeAttr(playExt)}"><svg class="menu-icon"><use href="#i-play"/></svg>Play All</button>`);
+        if (PLAYLIST_VIDEO_EXTENSIONS.has(playExt)) {
+            menuItems.push(`<button data-playlist-add-action data-download-id="${escapeAttr(id)}"><svg class="menu-icon"><use href="#i-playlist"/></svg>Add to playlist…</button>`);
+        }
+        menuItems.push(`<button data-file-download-action data-download-id="${escapeAttr(id)}"><svg class="menu-icon"><use href="#i-download"/></svg>Download</button>`);
+    }
+    if (!isFinished) {
+        menuItems.push(`<button data-url-action="reload" data-download-id="${escapeAttr(id)}" ${urlData}><svg class="menu-icon"><use href="#i-sync"/></svg>Reload</button>`);
+    }
+    menuItems.push(`<button class="danger" onclick="deleteDownload('${id}')"><svg class="menu-icon"><use href="#i-trash"/></svg>Delete</button>`);
+
+    const favorite = Boolean(info.favorite);
+    const favoriteLabel = favorite ? 'Remove from favorites' : 'Add to favorites';
+    const favoriteButton = `
+                    <button class="favorite-toggle" type="button" data-favorite-action data-download-id="${escapeAttr(id)}" data-favorite="${favorite ? 'false' : 'true'}" aria-label="${favoriteLabel}" title="${favoriteLabel}" aria-pressed="${favorite}">
+                        <svg aria-hidden="true"><use href="#i-star"/></svg>
+                    </button>`;
+    const viewCount = Math.max(0, Number.parseInt(info.view_count, 10) || 0);
+    const newBadge = viewCount === 0
+        ? '<span class="history-preview-label history-preview-new">new</span>'
+        : '';
+    const quality = String(info.quality || '');
+    const qualityBadge = quality
+        ? `<span class="history-preview-label history-preview-quality${quality === '4k' ? ' is-4k' : ''}">${escapeHtml(quality)}</span>`
+        : '';
+    const mediaDuration = formatMediaDuration(info.duration_seconds);
+    const durationBadge = mediaDuration
+        ? `<span class="history-preview-label history-preview-duration">${mediaDuration}</span>`
+        : '';
+    let preview;
+    if (hasPlay) {
+        const playLabel = info.filename.split('/').pop().split('\\').pop();
+        const playExt = info.filename.split('.').pop().toLowerCase();
+        preview = `
+                <div class="history-preview-wrap">
+                    <button class="history-preview${mediaDuration ? ' has-preview-duration' : ''}" type="button" data-play-action data-download-id="${escapeAttr(id)}" data-play-label="${escapeAttr(playLabel)}" data-play-ext="${escapeAttr(playExt)}" aria-label="Play">
+                        <span class="history-preview-fallback"><svg><use href="#i-camera"/></svg><span>No video preview</span></span>
+                        <img src="/api/thumbnail/${encodeURIComponent(id)}" alt="" loading="lazy" onerror="this.closest('.history-preview').classList.add('thumbnail-unavailable')">
+                        <video class="history-preview-video" muted playsinline loop preload="none" aria-hidden="true"></video>
+                        ${newBadge}
+                        ${qualityBadge}
+                        ${durationBadge}
+                    </button>
+                    ${favoriteButton}
+                </div>`;
+    } else {
+        preview = `
+                <div class="history-preview-wrap">
+                    <div class="history-preview thumbnail-unavailable history-preview-error" aria-label="Preview unavailable">
+                        <span class="history-preview-fallback"><svg><use href="#i-camera"/></svg><span>Preview unavailable</span></span>
+                    </div>
+                    ${favoriteButton}
+                </div>`;
+    }
+
+    let fileControl = '';
+    if (info.filename) {
+        const base = info.filename.split('/').pop().split('\\').pop();
+        fileControl = `
+                            <div class="history-info-section history-file-section">
+                                <div class="history-info-label">File</div>
+                                ${isFinished
+        ? renderRenameControl(id, base, true)
+        : `<div class="history-file-value filename">${escapeHtml(base)}</div>`}
+                            </div>`;
+    }
+
+    const sourceControl = isUpload
+        ? `<div class="history-info-section history-source-section">
+                                <div class="history-info-label">Source</div>
+                                <div class="history-source-field"><span>Local upload</span></div>
+                            </div>`
+        : `<div class="history-info-section history-source-section">
+                                <div class="history-info-label">Original URL</div>
+                                <div class="history-source-field">
+                                    <span>${escapeHtml(info.url)}</span>
+                                    <button type="button" class="history-source-copy" data-url-action="copy" ${urlData} aria-label="Copy original URL" title="Copy original URL"><svg class="menu-icon"><use href="#i-copy"/></svg>Copy</button>
+                                </div>
+                            </div>`;
+
+    const metadata = [];
+    metadata.push(`<div class="history-status-row"><strong>Status:</strong> ${escapeHtml(info.status.charAt(0).toUpperCase() + info.status.slice(1))}</div>`);
+    const viewSummary = viewCount === 0
+        ? '<strong class="history-view-new">NEW</strong>'
+        : `<span><strong>Views:</strong> ${viewCount}</span>`;
+    metadata.push(`<div class="history-owner-row"><span><strong>Downloaded by:</strong> ${escapeHtml(info.downloaded_by || 'Unknown user')}</span> &middot; ${viewSummary}</div>`);
+    const sizeStr = formatBytes(info.filesize);
+    const requestedFormat = formatRequestedFormat(info);
+    const mediaParts = [];
+    if (info.resolution) mediaParts.push(`<strong>Quality:</strong> ${escapeHtml(info.resolution)}`);
+    if (sizeStr) mediaParts.push(`<strong>Size:</strong> ${sizeStr}`);
+    if (requestedFormat) mediaParts.push(`<strong>Requested format:</strong> ${escapeHtml(requestedFormat)}`);
+    if (mediaParts.length) metadata.push(`<div class="history-media-row">${mediaParts.join(' &middot; ')}</div>`);
+
+    const timingParts = [];
+    const startedStr = formatDateTime(info.created_at);
+    if (startedStr) timingParts.push(
+        `<strong>${isUpload ? 'Added' : 'Started'}:</strong> ${startedStr}`);
+    const durationStr = isUpload
+        ? null
+        : formatDuration(info.created_at, info.finished_at);
+    if (durationStr) timingParts.push(`<strong>Duration:</strong> ${durationStr}`);
+    if (timingParts.length) metadata.push(`<div class="history-timing-row">${timingParts.join(' &middot; ')}</div>`);
+
+    let errorBlock = '';
+    if (info.status === 'error' && info.progress) {
+        const detail = String(info.progress);
+        const openAttr = openErrorIds.has(id) ? ' open' : '';
+        const showFormats = /--list-formats/i.test(detail);
+        errorBlock = `
+                        <details class="error-details"${openAttr} ontoggle="onErrorDetailsToggle('${id}', this)">
+                            <summary><svg class="chev"><use href="#i-chevron"/></svg><strong>Error details</strong></summary>
+                            <pre class="error-text">${escapeHtml(detail)}</pre>
+                            ${showFormats ? renderFormatsTable(info) : ''}
+                        </details>`;
+    }
+
+    const visibility = info.visibility === 'private' ? 'private' : 'public';
+    const visibilityDisabled = info.can_manage_visibility
+        ? ''
+        : ' disabled title="Only the downloader or an administrator can change visibility"';
+    const visibilityControl = `
+                            <div class="history-info-section history-visibility-section">
+                                <label class="history-info-label" for="visibility-${escapeAttr(id)}">Visibility</label>
+                                <select id="visibility-${escapeAttr(id)}" data-visibility-select data-download-id="${escapeAttr(id)}" data-current="${visibility}" onchange="changeDownloadVisibility(this)"${visibilityDisabled}>
+                                    <option value="public"${visibility === 'public' ? ' selected' : ''}>Public</option>
+                                    <option value="private"${visibility === 'private' ? ' selected' : ''}>Private</option>
+                                </select>
+                                <div class="history-visibility-help">${visibility === 'public' ? 'Visible to all users' : 'Visible only to you and administrators'}</div>
+                            </div>`;
+
+    return `
+                <article class="history-card" data-row-id="${escapeAttr(id)}">
+                    ${preview}
+                    <div class="history-card-caption">
+                        <div class="history-card-title" title="${escapeAttr(displayTitle)}">${escapeHtml(displayTitle)}</div>
+                        <div class="menu-wrap">
+                            <button class="kebab-btn" onclick="toggleMenu('${id}', event)" aria-label="More actions"><svg class="icon"><use href="#i-kebab"/></svg></button>
+                            <div id="menu-${escapeAttr(id)}" class="kebab-menu">${menuItems.join('')}</div>
+                        </div>
+                    </div>
+                    <div id="info-${escapeAttr(id)}" class="history-info-popover" role="dialog" aria-label="Download information">
+                        <div class="history-info-content">
+                            <div class="history-info-header">
+                                <span class="history-info-heading"><svg aria-hidden="true"><use href="#i-info"/></svg><strong>INFO</strong></span>
+                                <button type="button" class="history-info-close" onclick="closeHistoryInfo()" aria-label="Close info"><svg><use href="#i-x"/></svg></button>
+                            </div>
+                            <div class="history-info-title">${escapeHtml(displayTitle)}</div>
+                            <div class="history-info-section">
+                                <div class="history-info-label">Tags</div>
+                                ${renderTagControl(info)}
+                            </div>
+                            ${fileControl}
+                            ${visibilityControl}
+                            ${sourceControl}
+                            <div class="meta history-info-meta">${metadata.join('')}</div>
+                            ${errorBlock}
+                        </div>
+                    </div>
+                </article>`;
+}
+
 function renderItem(info, inHistoryView = false) {
+    if (inHistoryView) return renderHistoryCard(info);
+
     const id = info.id;
     const isRunning = RUNNING_STATUSES.has(info.status);
     const isPaused = info.status === 'paused';
     const isCancelled = info.status === 'cancelled';
     const isTerminal = TERMINAL_STATUSES.has(info.status);
     const isFinished = info.status === 'finished';
+    const isUpload = info.source_type === 'upload';
     const isCurrentTabStopped = !inHistoryView && (isCancelled || info.status === 'interrupted');
-
-    let statusLabel;
-    if (isFinished) statusLabel = 'Complete';
-    else if (info.status === 'error') statusLabel = 'Error';
-    else if (info.status === 'cancelled') statusLabel = 'Cancelled';
-    else if (info.status === 'interrupted') statusLabel = 'Interrupted';
-    else if (isPaused) statusLabel = 'Paused';
-    else statusLabel = info.progress;
 
     // URLs stay in data attributes and are read through dataset by the
     // delegated click handler. Putting them inside inline JavaScript would
@@ -1091,16 +2545,21 @@ function renderItem(info, inHistoryView = false) {
     const menuItems = [];
 
     if (isRunning) {
-        primary = `<button class="stop-btn" onclick="stopDownload('${id}')"><svg class="icon"><use href="#i-stop"/></svg>Stop</button>`;
+        primary = `<button class="stop-btn icon-only" onclick="stopDownload('${id}')" aria-label="Stop" title="Stop">${renderActionProgressIcon('i-pause', info)}</button>`;
     } else if (isPaused) {
-        primary = `<button class="continue-btn" onclick="unpauseDownload('${id}')"><svg class="icon"><use href="#i-play"/></svg>Resume</button>`;
-    } else if (isCancelled || info.status === 'interrupted') {
-        primary = `<button class="continue-btn" data-url-action="continue" data-download-id="${id}" ${urlData}><svg class="icon"><use href="#i-play"/></svg>Continue</button>`;
+        primary = `<button class="continue-btn" onclick="unpauseDownload('${id}')">${renderActionProgressIcon('i-play', info)}Resume</button>`;
+    } else if (!isUpload && info.browser_authenticated
+            && (isCancelled || info.status === 'interrupted')) {
+        primary = '<span class="firefox-resend" title="Open the source page while signed in, then click the VDL Companion toolbar action.">Re-send from Firefox</span>';
+    } else if (!isUpload && (isCancelled || info.status === 'interrupted')) {
+        primary = `<button class="continue-btn icon-only" data-url-action="continue" data-download-id="${id}" ${urlData} aria-label="Continue" title="Continue">${renderActionProgressIcon('i-play', info)}</button>`;
     }
 
-    menuItems.push(`<button data-url-action="open" ${urlData}><svg class="menu-icon"><use href="#i-external"/></svg>Open URL</button>`);
+    if (!isUpload) {
+        menuItems.push(`<button data-url-action="open" ${urlData}><svg class="menu-icon"><use href="#i-external"/></svg>Open URL</button>`);
+    }
 
-    if (isRunning) {
+    if (isRunning && !isUpload) {
         menuItems.push(`<button onclick="pauseDownload('${id}')"><svg class="menu-icon"><use href="#i-pause"/></svg>Pause</button>`);
     }
 
@@ -1112,9 +2571,11 @@ function renderItem(info, inHistoryView = false) {
         if (!isFinished && !isCancelled && info.status !== 'interrupted') {
             menuItems.push(`<button data-url-action="reload" data-download-id="${id}" ${urlData}><svg class="menu-icon"><use href="#i-sync"/></svg>Reload</button>`);
         }
-        menuItems.push(`<button data-url-action="copy" ${urlData}><svg class="menu-icon"><use href="#i-copy"/></svg>Copy URL</button>`);
+        if (!isUpload) {
+            menuItems.push(`<button data-url-action="copy" ${urlData}><svg class="menu-icon"><use href="#i-copy"/></svg>Copy URL</button>`);
+        }
         menuItems.push(`<button class="danger" onclick="deleteDownload('${id}')"><svg class="menu-icon"><use href="#i-trash"/></svg>Delete</button>`);
-    } else {
+    } else if (!isUpload) {
         menuItems.push(`<button data-url-action="copy" ${urlData}><svg class="menu-icon"><use href="#i-copy"/></svg>Copy URL</button>`);
     }
 
@@ -1139,39 +2600,24 @@ function renderItem(info, inHistoryView = false) {
         ? `<div class="action-group">${leading}${kebabInner}</div>`
         : '';
 
-    let bottom = '';
-    if (isRunning || isCurrentTabStopped) {
-        const progressText = String(info.progress);
-        const parsedProgress = Number.parseFloat(progressText);
-        const isIndeterminate = isRunning
-            && (!progressText.trim().endsWith('%') || !Number.isFinite(parsedProgress));
-        const width = Number.isFinite(parsedProgress) ? parsedProgress : 0;
-        const etaStr = isRunning ? formatEta(info.eta) : '';
-        const sizeStr = formatBytes(info.filesize);
-        const resStr = info.resolution;
-        const statusRow = `<div class="status-row">
-                        <span><strong>Status:</strong> ${info.status} (${statusLabel})</span>
+    const isCurrentRow = !inHistoryView && CURRENT_TAB_STATUSES.has(info.status);
+    const etaStr = isRunning ? formatEta(info.eta) : '';
+    const downloadedPercent = itemProgressPercent(info);
+    const downloadSummaryParts = [];
+    const summarySize = formatBytes(info.filesize);
+    if (summarySize) downloadSummaryParts.push(`<strong>Total size:</strong> ${summarySize}`);
+    if (info.resolution) downloadSummaryParts.push(`<strong>Quality:</strong> ${info.resolution}`);
+    downloadSummaryParts.push(`<strong>${isUpload ? 'Uploaded' : 'Downloaded'}:</strong> ${downloadedPercent === null ? '&mdash;' : `${downloadedPercent}%`}`);
+    const downloadSummaryRow = isCurrentRow
+        ? `<div class="meta download-summary-row">
+                        <span>${downloadSummaryParts.join(' &middot; ')}</span>
                         ${etaStr ? `<span class="eta-right">${etaStr}</span>` : ''}
-                    </div>`;
-        const sizeQualityParts = [];
-        if (sizeStr) sizeQualityParts.push(`<strong>Total size:</strong> ${sizeStr}`);
-        if (resStr)  sizeQualityParts.push(`<strong>Quality:</strong> ${resStr}`);
-        const sizeQualityRow = sizeQualityParts.length
-            ? `<div class="meta">${sizeQualityParts.join(' &middot; ')}</div>`
-            : '';
-        let barClass = 'progress-bar-fill';
-        if (isIndeterminate) barClass += ' indeterminate';
-        else if (isCancelled) barClass += ' cancelled';
-        else if (info.status === 'interrupted') barClass += ' interrupted';
-        const widthStyle = isIndeterminate ? '' : ` style="width: ${width}%;"`;
-        bottom = `
-                    ${statusRow}
-                    ${sizeQualityRow}
-                    <div class="progress-bar-bg progress-bar-bottom">
-                        <div class="${barClass}"${widthStyle}></div>
-                    </div>`;
-    } else {
-        if (!isFinished && info.status !== 'error') {
+                    </div>`
+        : '';
+
+    let bottom = '';
+    if (!isRunning && !isCurrentTabStopped) {
+        if (!isFinished && info.status !== 'error' && !isPaused) {
             let barClass = 'progress-bar-fill';
             if (info.status === 'cancelled') barClass += ' cancelled';
             else if (info.status === 'interrupted') barClass += ' interrupted';
@@ -1191,26 +2637,33 @@ function renderItem(info, inHistoryView = false) {
                 meta.push(`<div><strong>File:</strong> <span class="filename">${escapeHtml(base)}</span></div>`);
             }
         }
-        if (info.resolution) meta.push(`<div><strong>Quality:</strong> ${info.resolution}</div>`);
         const sizeStr = formatBytes(info.filesize);
-        if (sizeStr) meta.push(`<div><strong>Size:</strong> ${sizeStr}</div>`);
         const startedStr = formatDateTime(info.created_at);
-        if (startedStr) meta.push(`<div><strong>Started:</strong> ${startedStr}</div>`);
-        const finishedStr = formatDateTime(info.finished_at);
-        if (finishedStr) {
-            const finLabel = info.status === 'finished' ? 'Finished'
-                           : info.status === 'error' ? 'Failed'
-                           : info.status === 'cancelled' ? 'Cancelled'
-                           : 'Ended';
-            meta.push(`<div><strong>${finLabel}:</strong> ${finishedStr}</div>`);
+        const requestedFormat = formatRequestedFormat(info);
+        if (inHistoryView) {
+            const mediaParts = [];
+            if (info.resolution) mediaParts.push(`<strong>Quality:</strong> ${info.resolution}`);
+            if (sizeStr) mediaParts.push(`<strong>Size:</strong> ${sizeStr}`);
+            if (requestedFormat) mediaParts.push(`<strong>Requested format:</strong> ${escapeHtml(requestedFormat)}`);
+            if (mediaParts.length) {
+                meta.push(`<div class="history-media-row">${mediaParts.join(' &middot; ')}</div>`);
+            }
+
+            const timingParts = [];
+            if (startedStr) timingParts.push(`<strong>Started:</strong> ${startedStr}`);
+            const durationStr = formatDuration(info.created_at, info.finished_at);
+            if (durationStr) timingParts.push(`<strong>Duration:</strong> ${durationStr}`);
+            if (timingParts.length) {
+                meta.push(`<div class="history-timing-row">${timingParts.join(' &middot; ')}</div>`);
+            }
+        } else if (startedStr) {
+            meta.push(`<div><strong>Started:</strong> ${startedStr}</div>`);
         }
-        if (info.requested_format) {
-            meta.push(`<div><strong>Requested format:</strong> <code class="fmt-code">${escapeHtml(info.requested_format)}</code></div>`);
+        if (!inHistoryView && requestedFormat) {
+            meta.push(`<div><strong>Requested format:</strong> ${escapeHtml(requestedFormat)}</div>`);
         }
         if (meta.length) bottom += `<div class="meta">${meta.join('')}</div>`;
     }
-
-    const warn = (isCancelled || info.status === 'interrupted') ? '<span class="warn-icon" title="Action required"></span>' : '';
 
     let errorBlock = '';
     if (info.status === 'error' && info.progress) {
@@ -1230,40 +2683,99 @@ function renderItem(info, inHistoryView = false) {
         const base = info.filename.split('/').pop().split('\\').pop();
         displayTitle = base.replace(/\.[^.]+$/, '');
     }
+    const authenticatedLabel = info.browser_authenticated
+        ? '<span class="firefox-session-label">Firefox session</span>'
+        : '';
     const titleRow = displayTitle
-        ? `<div class="item-title" title="${escapeAttr(displayTitle)}">${escapeHtml(displayTitle)}</div>`
+        ? `<div class="item-title" title="${escapeAttr(displayTitle)}">${escapeHtml(displayTitle)}${authenticatedLabel}</div>`
         : '';
     const tagRow = renderTagControl(info);
-
-    const urlLine = inHistoryView
-        ? (warn ? `<div>${warn}<strong>Status:</strong> ${info.status} (${statusLabel})</div>` : '')
-        : (isRunning || isCurrentTabStopped)
-            ? `<div>${warn}<strong>URL:</strong> ${escapeHtml(info.url)}</div>`
-            : `<div>${warn}<strong>URL:</strong> ${escapeHtml(info.url)}</div>
-                   <div><strong>Status:</strong> ${info.status} (${statusLabel})</div>`;
-    const headMeta = inHistoryView
-        ? (warn ? `<div class="meta">${urlLine}</div>` : '')
-        : `<div class="meta">${urlLine}</div>`;
 
     return `
                 <div class="history-item" data-row-id="${id}">
                     <div class="row-actions">${actions}</div>
                     ${titleRow}
                     ${tagRow}
-                    ${headMeta}
                     ${bottom}
+                    ${downloadSummaryRow}
                     ${errorBlock}
                 </div>
             `;
 }
 
-const HISTORY_PAGE_SIZE = 10;
+const DEFAULT_HISTORY_PAGE_SIZE = 10;
+const HISTORY_PAGE_SIZES = new Set([5, 10, 20, 50]);
+const HISTORY_ENDLESS_MODE = 'endless';
+const HISTORY_ENDLESS_BATCH_SIZE = 10;
+const ENDLESS_PLAYBACK_PAGE_SIZE = 100;
+let historyPageSize = DEFAULT_HISTORY_PAGE_SIZE;
 let historyPage = 0;
 let historyTotal = 0;
+let historyEndlessVisibleCount = HISTORY_ENDLESS_BATCH_SIZE;
+let historyEndlessLoadPending = false;
+let historyOrderIds = [];
+let historyOrdering = 'favorites_first';
+let historyPageItems = [];
 let _renderedActiveIds  = new Set();
 let _renderedHistoryIds = new Set();
+const pendingActiveAnimations = new Set();
+const pendingHistoryAnimations = new Set();
 
-function animateInsertedItem(element) {
+function updateHistoryEmptyState() {
+    const hasFilter = searchTerms.length > 0;
+    const playlistValues = searchPlaylistValues();
+    const playlistOnly = playlistValues.includes('yes')
+        && !playlistValues.includes('no');
+    document.getElementById('historyEmptyTitle').textContent = playlistOnly
+        ? 'No matching playlists'
+        : hasFilter
+            ? 'No matching downloads'
+            : 'No downloads yet';
+    document.getElementById('historyEmptyMessage').textContent = playlistOnly
+        ? 'No playlists contain videos matching these search terms.'
+        : hasFilter
+            ? 'No download history matches these search terms.'
+            : 'Add a video URL or drop a local video here to get started.';
+    document.getElementById('historyEmptyAction').hidden = hasFilter;
+    document.getElementById('historyEmpty').style.display =
+        historyTotal || visiblePlaylistCount ? 'none' : '';
+}
+
+function endlessHistoryEnabled() {
+    return historyPageSize === HISTORY_ENDLESS_MODE;
+}
+
+function loadNextEndlessHistoryBatch() {
+    if (!endlessHistoryEnabled() || historyEndlessLoadPending
+            || historyEndlessVisibleCount >= historyTotal) return;
+    historyEndlessLoadPending = true;
+    historyEndlessVisibleCount = Math.min(
+        historyTotal,
+        historyEndlessVisibleCount + HISTORY_ENDLESS_BATCH_SIZE,
+    );
+    fetchHistory().finally(() => {
+        historyEndlessLoadPending = false;
+    });
+}
+
+const historyEndlessSentinel = document.getElementById('historyEndlessSentinel');
+if ('IntersectionObserver' in window) {
+    const historyEndlessObserver = new IntersectionObserver(entries => {
+        if (entries.some(entry => entry.isIntersecting)) {
+            loadNextEndlessHistoryBatch();
+        }
+    }, { rootMargin: '0px 0px 160px' });
+    historyEndlessObserver.observe(historyEndlessSentinel);
+} else {
+    window.addEventListener('scroll', () => {
+        if (historyEndlessSentinel.getBoundingClientRect().top
+                <= window.innerHeight + 160) {
+            loadNextEndlessHistoryBatch();
+        }
+    }, { passive: true });
+}
+
+function animateInsertedItem(element, pendingAnimations, id) {
     // Rows vary with their metadata, so animate toward the natural box size
     // instead of leaving every completed row under a guessed height limit.
     const style = getComputedStyle(element);
@@ -1273,10 +2785,18 @@ function animateInsertedItem(element) {
     element.style.setProperty('--item-expanded-margin-bottom', style.marginBottom);
     element.style.setProperty('--item-expanded-border-top-width', style.borderTopWidth);
     element.style.setProperty('--item-expanded-border-bottom-width', style.borderBottomWidth);
+    pendingAnimations.add(id);
     element.classList.add('item-fade-in');
 
+    const started = event => {
+        if (event.target !== element || event.animationName !== 'item-fade-in') return;
+        pendingAnimations.delete(id);
+        element.removeEventListener('animationstart', started);
+    };
     const finish = event => {
         if (event.target !== element || event.animationName !== 'item-fade-in') return;
+        pendingAnimations.delete(id);
+        element.removeEventListener('animationstart', started);
         element.removeEventListener('animationend', finish);
         element.classList.remove('item-fade-in');
         for (const property of [
@@ -1290,11 +2810,13 @@ function animateInsertedItem(element) {
             element.style.removeProperty(property);
         }
     };
+    element.addEventListener('animationstart', started);
     element.addEventListener('animationend', finish);
 }
 
 function changePage(delta) {
-    const maxPage = Math.max(0, Math.ceil(historyTotal / HISTORY_PAGE_SIZE) - 1);
+    if (endlessHistoryEnabled()) return;
+    const maxPage = Math.max(0, Math.ceil(historyTotal / historyPageSize) - 1);
     const next = Math.min(maxPage, Math.max(0, historyPage + delta));
     if (next === historyPage) return;
     historyPage = next;
@@ -1302,40 +2824,80 @@ function changePage(delta) {
 }
 
 function goToPage(target) {
-    const maxPage = Math.max(0, Math.ceil(historyTotal / HISTORY_PAGE_SIZE) - 1);
+    if (endlessHistoryEnabled()) return;
+    const maxPage = Math.max(0, Math.ceil(historyTotal / historyPageSize) - 1);
     const next = Math.min(maxPage, Math.max(0, target));
     if (next === historyPage) return;
     historyPage = next;
     fetchHistory();
 }
 
-function fetchHistory() {
-    if (openMenuId !== null) {
+function fetchHistory({ sortFavorites = false } = {}) {
+    if (historyRefreshBlocked()) {
         historyFetchDeferred = true;
+        historyFavoriteSortDeferred ||= sortFavorites;
         return Promise.resolve();
     }
 
     return apiFetch('/api/history')
     .then(res => res.json())
     .then(data => {
-        if (openMenuId !== null) {
+        const itemCount = document.getElementById('itemCount');
+        itemCount.textContent = `${data.length} ${data.length === 1 ? 'item' : 'items'}`;
+        if (historyRefreshBlocked()) {
             historyFetchDeferred = true;
             return;
         }
-        const reversed = data.slice().reverse();
-        refreshAvailableTags(reversed);
-        const active = reversed.filter(i => (
-            CURRENT_TAB_STATUSES.has(i.status) && matchesTagFilter(i)
-        ));
-        const done = reversed.filter(i => (
-            HISTORY_TAB_STATUSES.has(i.status) && matchesTagFilter(i)
-        ));
+        updateProgressIndicators(data);
+        const active = data.filter(i => CURRENT_TAB_STATUSES.has(i.status));
+        let historyEntries = data.filter(i => HISTORY_TAB_STATUSES.has(i.status));
+        libraryEntries = historyEntries.slice();
+        renderPlaylists();
+        if (sortFavorites) {
+            historyOrdering = 'favorites_first';
+            // The API is newest-first, and modern stable sorting preserves
+            // that date order inside each favorite group.
+            historyEntries = historyEntries.slice().sort(
+                (left, right) => Number(Boolean(right.favorite))
+                    - Number(Boolean(left.favorite)));
+        } else if (historyOrderIds.length) {
+            // Reconciliation must not make a card jump when its star changes.
+            // Newly completed downloads still enter first; known cards retain
+            // the order last chosen by the user or by a filter execution.
+            const knownIds = new Set(historyOrderIds);
+            const byId = new Map(historyEntries.map(info => [String(info.id), info]));
+            const unseen = historyEntries.filter(info => !knownIds.has(String(info.id)));
+            const known = historyOrderIds.map(id => byId.get(id)).filter(Boolean);
+            historyEntries = unseen.concat(known);
+        }
+        historyOrderIds = historyEntries.map(info => String(info.id));
+        refreshAvailableTags(historyEntries);
+        const done = historyEntries.filter(info => matchesSearchFilter(info));
 
         historyTotal = done.length;
-        const maxPage = Math.max(0, Math.ceil(historyTotal / HISTORY_PAGE_SIZE) - 1);
+        const endless = endlessHistoryEnabled();
+        const maxPage = endless
+            ? 0
+            : Math.max(0, Math.ceil(historyTotal / historyPageSize) - 1);
         if (historyPage > maxPage) historyPage = maxPage;
-        const start = historyPage * HISTORY_PAGE_SIZE;
-        const pageItems = done.slice(start, start + HISTORY_PAGE_SIZE);
+        const start = endless ? 0 : historyPage * historyPageSize;
+        const visibleCount = endless ? historyEndlessVisibleCount : historyPageSize;
+        const pageItems = done.slice(start, start + visibleCount);
+        historyPageItems = pageItems;
+        const sequentialAvailable = pageItems.some(
+            info => info.status === 'finished' && info.filename,
+        );
+        const shuffleAvailable = historyEntries.some(
+            info => info.status === 'finished' && info.filename,
+        );
+        document.getElementById('endlessPlaybackButton').disabled = !sequentialAvailable;
+        document.getElementById('playbackMenuPlayAll').disabled = !sequentialAvailable;
+        document.getElementById('playbackMenuShuffle').disabled = !shuffleAvailable;
+        document.getElementById('playbackModeToggle').disabled =
+            !sequentialAvailable && !shuffleAvailable;
+        if (document.getElementById('playbackModeToggle').disabled) {
+            closePlaybackModeMenu();
+        }
 
         let focusRestore = null;
         const ae = document.activeElement;
@@ -1363,37 +2925,45 @@ function fetchHistory() {
             }
         }
 
-        const activeTabVisible   = document.getElementById('tab-current').classList.contains('active');
-        const historyTabVisible  = document.getElementById('tab-history').classList.contains('active');
+        const currentDrawerVisible = document.getElementById('currentDownloadsDrawer').open;
 
         const newActiveIds  = new Set(active.map(i => String(i.id)));
         const newHistoryIds = new Set(pageItems.map(i => String(i.id)));
+        // An SSE burst can replace a newly inserted node before animationstart.
+        // Retry only that pre-start window; restarting an animation already in
+        // progress makes successive reconciliations keep cards in motion.
+        pendingActiveAnimations.forEach(id => {
+            if (!newActiveIds.has(id)) pendingActiveAnimations.delete(id);
+        });
+        pendingHistoryAnimations.forEach(id => {
+            if (!newHistoryIds.has(id)) pendingHistoryAnimations.delete(id);
+        });
 
+        stopHoverPreview();
         document.getElementById('activeList').innerHTML  = active.map(i => renderItem(i, false)).join('');
         document.getElementById('historyList').innerHTML = pageItems.map(i => renderItem(i, true)).join('');
 
-        if (activeTabVisible) {
+        if (currentDrawerVisible) {
             newActiveIds.forEach(id => {
-                if (!_renderedActiveIds.has(id)) {
+                if (!_renderedActiveIds.has(id) || pendingActiveAnimations.has(id)) {
                     const el = document.querySelector(`#activeList [data-row-id="${id}"]`);
-                    if (el) animateInsertedItem(el);
+                    if (el) animateInsertedItem(el, pendingActiveAnimations, id);
                 }
             });
         }
-        if (historyTabVisible) {
-            newHistoryIds.forEach(id => {
-                if (!_renderedHistoryIds.has(id)) {
-                    const el = document.querySelector(`#historyList [data-row-id="${id}"]`);
-                    if (el) animateInsertedItem(el);
-                }
-            });
-        }
+        newHistoryIds.forEach(id => {
+            if (!_renderedHistoryIds.has(id) || pendingHistoryAnimations.has(id)) {
+                const el = document.querySelector(`#historyList [data-row-id="${id}"]`);
+                if (el) animateInsertedItem(el, pendingHistoryAnimations, id);
+            }
+        });
 
         _renderedActiveIds  = newActiveIds;
         _renderedHistoryIds = newHistoryIds;
 
         bindRenameInputs();
         bindTagEditors();
+        restoreOpenHistoryInfo();
 
         if (focusRestore) {
             const newInput = focusRestore.tagId
@@ -1410,24 +2980,19 @@ function fetchHistory() {
             }
         }
 
-        const hasFilter = selectedTagFilters.length > 0;
-        document.getElementById('currentEmpty').textContent = hasFilter
-            ? 'No current downloads match this tag filter.'
-            : 'No active downloads. Paste a URL above to start.';
-        document.getElementById('historyEmpty').textContent = hasFilter
-            ? 'No download history matches this tag filter.'
-            : 'No completed downloads yet.';
+        document.getElementById('currentEmpty').textContent = 'No current downloads.';
         document.getElementById('currentEmpty').style.display = active.length ? 'none' : '';
-        document.getElementById('historyEmpty').style.display = done.length ? 'none' : '';
+        updateHistoryEmptyState();
 
         const pager = document.getElementById('historyPager');
-        if (historyTotal > HISTORY_PAGE_SIZE) {
+        historyEndlessSentinel.hidden = !endless || pageItems.length >= historyTotal;
+        if (!endless && historyTotal > historyPageSize) {
             pager.style.display = '';
             document.getElementById('pagerInfo').textContent =
                 `Page ${historyPage + 1} of ${maxPage + 1} · ${historyTotal} items`;
             document.getElementById('pagerPrev').disabled = historyPage <= 0;
             document.getElementById('pagerNext').disabled = historyPage >= maxPage;
-            const showJump = maxPage >= 2;
+            const showJump = maxPage >= 3;
             const first = document.getElementById('pagerFirst');
             const last = document.getElementById('pagerLast');
             first.style.display = showJump ? '' : 'none';
@@ -1439,16 +3004,27 @@ function fetchHistory() {
         }
 
         const badge = document.getElementById('currentBadge');
+        const currentButton = document.getElementById('currentDownloadsButton');
+        const currentLabel = `${active.length} ${active.length === 1 ? 'item' : 'items'}`;
+        document.getElementById('currentDrawerCount').textContent = currentLabel;
+        currentButton.hidden = active.length === 0;
+        currentButton.setAttribute(
+            'aria-label', active.length
+                ? `Current downloads, ${currentLabel}`
+                : 'Current downloads, no items',
+        );
         if (active.length) {
             badge.textContent = active.length;
-            badge.style.display = '';
+            badge.hidden = false;
         } else {
-            badge.style.display = 'none';
+            badge.hidden = true;
         }
     });
 }
 
 let playerMode = 'overlay';
+let startVideosFullscreen = false;
+let playerStartedFullscreen = false;
 
 // MIME types for <source type="..."> — tells the browser the codec upfront so
 // it doesn't have to sniff, which is required for WEBM on some browsers.
@@ -1463,14 +3039,224 @@ const _VIDEO_MIME = {
     flac: 'audio/flac', wav: 'audio/wav',
 };
 
-function playVideo(id, label, ext) {
-    const url = '/api/file/' + encodeURIComponent(id);
-    if (playerMode === 'new_tab') {
-        window.open(url, '_blank', 'noopener');
+const PLAYER_CONTROLS_IDLE_MS = 2000;
+const PLAYER_HANDOFF_TIMEOUT_MS = 20_000;
+const PLAYBACK_KEEPALIVE_MS = 5 * 60 * 1000;
+const PLAYLIST_PROGRESS_SAVE_MS = 10 * 1000;
+const MAX_AUTOMATIC_SKIPS = 10;
+let playerControlsTimer = null;
+let playerMediaCleanup = null;
+
+const endlessPlayback = {
+    active: false,
+    mode: 'sequential',
+    phase: 'idle',
+    presentation: 'original',
+    launchProvenance: 'original',
+    epoch: 0,
+    loadGeneration: 0,
+    sessionId: null,
+    sequence: 0,
+    currentDownloadId: null,
+    currentItem: null,
+    advancePending: false,
+    handoffInProgress: false,
+    returnFullscreenNeeded: false,
+    failureCount: 0,
+    failedGeneration: null,
+    watchdogTimer: null,
+    keepaliveTimer: null,
+    playlistId: null,
+    playlistRevision: null,
+    playlistQueue: [],
+    playlistPosition: null,
+    progressSequence: 0,
+    progressTimer: null,
+    lastSavedPosition: null,
+};
+
+function hidePlayerControls() {
+    clearTimeout(playerControlsTimer);
+    playerControlsTimer = null;
+    document.querySelector('.player-box').classList.remove('player-controls-visible');
+}
+
+function showPlayerControls() {
+    const backdrop = document.getElementById('playerBackdrop');
+    if (!backdrop.classList.contains('open')) return;
+    const player = backdrop.querySelector('.player-box');
+    player.classList.add('player-controls-visible');
+    clearTimeout(playerControlsTimer);
+    playerControlsTimer = setTimeout(hidePlayerControls, PLAYER_CONTROLS_IDLE_MS);
+}
+
+function showPlayerTransition(message, actions = [], focusAction = null) {
+    const transition = document.getElementById('playerTransition');
+    const status = document.getElementById('playerStatus');
+    const actionIds = {
+        continue: 'playerContinue',
+        fullscreen: 'playerReturnFullscreen',
+        retry: 'playerRetry',
+        restart: 'playerRestart',
+        skip: 'playerSkip',
+        stop: 'playerStopEndless',
+        settings: 'playerPlaybackSettings',
+        close: 'playerTransitionClose',
+    };
+    status.textContent = message || '';
+    Object.entries(actionIds).forEach(([name, id]) => {
+        document.getElementById(id).hidden = !actions.includes(name);
+    });
+    transition.hidden = !message && actions.length === 0;
+    if (focusAction && actionIds[focusAction]) {
+        setTimeout(() => {
+            const button = document.getElementById(actionIds[focusAction]);
+            if (!transition.hidden && !button.hidden) button.focus();
+        }, 0);
+    }
+}
+
+function clearPlaybackWatchdog() {
+    clearTimeout(endlessPlayback.watchdogTimer);
+    endlessPlayback.watchdogTimer = null;
+}
+
+function armPlaybackWatchdog(generation) {
+    clearPlaybackWatchdog();
+    if (!endlessPlayback.active || document.hidden) return;
+    endlessPlayback.watchdogTimer = setTimeout(() => {
+        if (generation !== endlessPlayback.loadGeneration) return;
+        handlePlaybackFailure(generation, 'The next video did not become ready in time.');
+    }, PLAYER_HANDOFF_TIMEOUT_MS);
+}
+
+function applyOriginalPlayerSize(generation) {
+    if (generation !== endlessPlayback.loadGeneration) return;
+    const video = document.getElementById('playerVideo');
+    if (!video.videoWidth || !video.videoHeight) return;
+    video.style.width = `${video.videoWidth}px`;
+    video.style.height = `${video.videoHeight}px`;
+}
+
+function clearPlayerMediaCallbacks() {
+    clearPlaybackWatchdog();
+    if (playerMediaCleanup) playerMediaCleanup();
+    playerMediaCleanup = null;
+}
+
+function markPlaybackStarted(generation) {
+    if (generation !== endlessPlayback.loadGeneration) return;
+    clearPlaybackWatchdog();
+    endlessPlayback.phase = 'playing';
+    endlessPlayback.handoffInProgress = false;
+    endlessPlayback.failureCount = 0;
+    endlessPlayback.failedGeneration = null;
+    if (endlessPlayback.returnFullscreenNeeded) {
+        showPlayerTransition(
+            'Playback continued in the overlay.', ['fullscreen'], 'fullscreen',
+        );
+    } else {
+        showPlayerTransition('', []);
+    }
+}
+
+function handlePlaybackFailure(generation, message) {
+    if (!endlessPlayback.active
+            || generation !== endlessPlayback.loadGeneration
+            || endlessPlayback.failedGeneration === generation) return;
+    clearPlaybackWatchdog();
+    endlessPlayback.failedGeneration = generation;
+    endlessPlayback.phase = 'failed';
+    endlessPlayback.handoffInProgress = false;
+    endlessPlayback.failureCount += 1;
+    const selectionSize = endlessPlayback.mode === 'playlist'
+        ? endlessPlayback.playlistQueue.length
+        : historyTotal;
+    const currentLimit = Math.max(1, Math.min(MAX_AUTOMATIC_SKIPS, selectionSize || 1));
+    if (endlessPlayback.failureCount >= currentLimit) {
+        showPlayerTransition(
+            message,
+            ['retry', 'skip', 'stop', 'close'],
+            'retry',
+        );
         return;
     }
+    showPlayerTransition(`${message} Skipping to the next video.`, []);
+    setTimeout(() => advanceEndlessPlayback(), 0);
+}
+
+function observePlaybackPromise(playback, generation) {
+    if (!playback || typeof playback.then !== 'function') return;
+    playback.then(
+        () => markPlaybackStarted(generation),
+        error => {
+            if (generation !== endlessPlayback.loadGeneration
+                    || !endlessPlayback.active) return;
+            if (error && error.name === 'NotAllowedError') {
+                clearPlaybackWatchdog();
+                endlessPlayback.phase = 'awaiting-user';
+                endlessPlayback.handoffInProgress = false;
+                showPlayerTransition(
+                    'Your browser paused automatic playback.',
+                    ['continue', 'stop', 'close'],
+                    'continue',
+                );
+                return;
+            }
+            handlePlaybackFailure(
+                generation,
+                'This video could not be played.',
+            );
+        },
+    );
+}
+
+function loadPlaybackItem(item, { automatic = false, seekSeconds = null } = {}) {
     const video = document.getElementById('playerVideo');
-    document.getElementById('playerTitle').textContent = label || '';
+    clearPlayerMediaCallbacks();
+    const generation = ++endlessPlayback.loadGeneration;
+    const epoch = endlessPlayback.epoch;
+    endlessPlayback.phase = 'loading';
+    endlessPlayback.failedGeneration = null;
+    endlessPlayback.currentItem = item;
+    endlessPlayback.currentDownloadId = String(item.id);
+    video.style.removeProperty('width');
+    video.style.removeProperty('height');
+
+    const current = callback => event => {
+        if (epoch === endlessPlayback.epoch
+                && generation === endlessPlayback.loadGeneration) callback(event);
+    };
+    const onMetadata = current(() => {
+        if (Number.isFinite(Number(seekSeconds))) {
+            const requested = Math.max(0, Number(seekSeconds));
+            const duration = Number(video.duration);
+            video.currentTime = Number.isFinite(duration)
+                ? Math.min(requested, duration)
+                : requested;
+        }
+        applyOriginalPlayerSize(generation);
+        armPlaybackWatchdog(generation);
+    });
+    const onResize = current(() => applyOriginalPlayerSize(generation));
+    const onCanPlay = current(() => armPlaybackWatchdog(generation));
+    const onPlaying = current(() => markPlaybackStarted(generation));
+    const onError = current(() => handlePlaybackFailure(
+        generation, 'This video is missing or uses an unsupported format.',
+    ));
+    video.addEventListener('loadedmetadata', onMetadata);
+    video.addEventListener('resize', onResize);
+    video.addEventListener('canplay', onCanPlay);
+    video.addEventListener('playing', onPlaying);
+    video.addEventListener('error', onError);
+    playerMediaCleanup = () => {
+        video.removeEventListener('loadedmetadata', onMetadata);
+        video.removeEventListener('resize', onResize);
+        video.removeEventListener('canplay', onCanPlay);
+        video.removeEventListener('playing', onPlaying);
+        video.removeEventListener('error', onError);
+    };
+
     // Clear any previous <source> children and src attribute before reloading.
     // Setting video.src directly doesn't carry a type hint; using a <source>
     // element with an explicit type lets the browser decide playability before
@@ -1478,27 +3264,796 @@ function playVideo(id, label, ext) {
     video.removeAttribute('src');
     video.innerHTML = '';
     const source = document.createElement('source');
-    source.src = url;
-    const mime = _VIDEO_MIME[ext] || null;
+    source.src = '/api/file/' + encodeURIComponent(item.id);
+    const mime = _VIDEO_MIME[item.extension] || null;
     if (mime) source.type = mime;
     video.appendChild(source);
     video.load();
-    document.getElementById('playerBackdrop').classList.add('open');
+    if (endlessPlayback.active) {
+        showPlayerTransition(`Loading ${item.title || 'next video'}`, []);
+        armPlaybackWatchdog(generation);
+    }
+    if (automatic) {
+        try {
+            observePlaybackPromise(video.play(), generation);
+        } catch (error) {
+            handlePlaybackFailure(generation, 'This video could not be played.');
+        }
+    }
+    return generation;
 }
 
-function closePlayer(ev) {
+function requestPlayerFullscreen({ launch = false } = {}) {
+    const video = document.getElementById('playerVideo');
+    try {
+        if (video.requestFullscreen) {
+            if (launch) playerStartedFullscreen = true;
+            const request = video.requestFullscreen();
+            if (request) request.catch(() => {
+                if (launch) {
+                    playerStartedFullscreen = false;
+                    endlessPlayback.launchProvenance = 'original';
+                } else if (endlessPlayback.active) {
+                    endlessPlayback.returnFullscreenNeeded = true;
+                    showPlayerTransition(
+                        'Fullscreen could not be restored. Try again from this button.',
+                        ['fullscreen', 'stop', 'close'],
+                        'fullscreen',
+                    );
+                }
+            });
+            return;
+        }
+        if (video.webkitEnterFullscreen) {
+            if (launch) playerStartedFullscreen = true;
+            video.webkitEnterFullscreen();
+        }
+    } catch (error) {
+        if (launch) {
+            playerStartedFullscreen = false;
+            endlessPlayback.launchProvenance = 'original';
+        } else if (endlessPlayback.active) {
+            endlessPlayback.returnFullscreenNeeded = true;
+            showPlayerTransition(
+                'Fullscreen could not be restored. Try again from this button.',
+                ['fullscreen', 'stop', 'close'],
+                'fullscreen',
+            );
+        }
+        // Full screen is browser-controlled; the overlay remains usable.
+    }
+}
+
+function openBuiltInPlayer({ fullscreen = false, requestFullscreen = true } = {}) {
+    const backdrop = document.getElementById('playerBackdrop');
+    hidePlayerControls();
+    backdrop.classList.add('open');
+    endlessPlayback.launchProvenance = fullscreen ? 'fullscreen' : 'original';
+    endlessPlayback.presentation = 'original';
+    playerStartedFullscreen = false;
+    if (fullscreen && requestFullscreen) requestPlayerFullscreen({ launch: true });
+}
+
+function releasePlaybackLease(sessionId) {
+    if (!sessionId) return;
+    fetch('/api/playback-sessions/' + encodeURIComponent(sessionId), {
+        method: 'DELETE',
+        keepalive: true,
+    }).catch(() => {});
+}
+
+function deactivateEndlessPlayback({ release = true } = {}) {
+    const sessionId = endlessPlayback.sessionId;
+    clearInterval(endlessPlayback.keepaliveTimer);
+    endlessPlayback.keepaliveTimer = null;
+    clearInterval(endlessPlayback.progressTimer);
+    endlessPlayback.progressTimer = null;
+    endlessPlayback.active = false;
+    endlessPlayback.sessionId = null;
+    endlessPlayback.sequence = 0;
+    endlessPlayback.advancePending = false;
+    endlessPlayback.handoffInProgress = false;
+    endlessPlayback.returnFullscreenNeeded = false;
+    if (release) releasePlaybackLease(sessionId);
+}
+
+function playVideo(id, label, ext) {
+    const url = '/api/file/' + encodeURIComponent(id);
+    if (playerMode === 'new_tab') {
+        window.open(url, '_blank', 'noopener');
+        return;
+    }
+    endlessPlayback.epoch += 1;
+    deactivateEndlessPlayback();
+    endlessPlayback.mode = 'sequential';
+    endlessPlayback.phase = 'loading';
+    document.getElementById('playlistQueue').hidden = true;
+    document.querySelector('.player-box').classList.remove('playlist-player');
+    openBuiltInPlayer({
+        fullscreen: startVideosFullscreen,
+        requestFullscreen: false,
+    });
+    loadPlaybackItem({ id, title: label, extension: ext });
+    if (startVideosFullscreen) requestPlayerFullscreen({ launch: true });
+}
+
+function recordView(id) {
+    // Playback starts immediately; view accounting must never make opening the
+    // player depend on a second network round trip.
+    apiFetch('/api/view/' + encodeURIComponent(id), { method: 'POST' })
+        .catch(() => {});
+}
+
+function closePlayer() {
     const backdrop = document.getElementById('playerBackdrop');
     const video = document.getElementById('playerVideo');
+    const closeButton = backdrop.querySelector('.player-close');
+    if (endlessPlayback.active && endlessPlayback.mode === 'playlist') {
+        savePlaylistProgress({ force: true, keepalive: true });
+    }
+    endlessPlayback.epoch += 1;
+    endlessPlayback.loadGeneration += 1;
+    deactivateEndlessPlayback();
+    clearPlayerMediaCallbacks();
+    endlessPlayback.phase = 'idle';
+    endlessPlayback.currentDownloadId = null;
+    endlessPlayback.currentItem = null;
+    endlessPlayback.playlistId = null;
+    endlessPlayback.playlistRevision = null;
+    endlessPlayback.playlistQueue = [];
+    endlessPlayback.playlistPosition = null;
+    endlessPlayback.progressSequence = 0;
+    endlessPlayback.lastSavedPosition = null;
+    clearInterval(endlessPlayback.progressTimer);
+    endlessPlayback.progressTimer = null;
+    playerStartedFullscreen = false;
+    hidePlayerControls();
+    showPlayerTransition('', []);
+    if (document.activeElement === closeButton) closeButton.blur();
     video.pause();
+    video.style.removeProperty('width');
+    video.style.removeProperty('height');
     video.removeAttribute('src');
     video.innerHTML = '';
     video.load();
     backdrop.classList.remove('open');
+    backdrop.querySelector('.player-box').classList.remove('playlist-player');
+    document.getElementById('playlistQueue').hidden = true;
+}
+
+async function playbackResponseError(response) {
+    const data = await response.json().catch(() => ({}));
+    const error = new Error(data.error || response.statusText || 'Playback request failed');
+    error.code = data.code || null;
+    return error;
+}
+
+function startPlaybackKeepalive(epoch) {
+    clearInterval(endlessPlayback.keepaliveTimer);
+    endlessPlayback.keepaliveTimer = setInterval(() => {
+        if (epoch !== endlessPlayback.epoch || !endlessPlayback.sessionId) return;
+        apiFetch(
+            '/api/playback-sessions/'
+                + encodeURIComponent(endlessPlayback.sessionId)
+                + '/keepalive',
+            { method: 'POST' },
+        ).then(response => {
+            if (response.status === 404 && epoch === endlessPlayback.epoch) {
+                deactivateEndlessPlayback({ release: false });
+                showPlayerTransition(
+                    'The endless playback session expired. Start a new session to continue.',
+                    ['restart', 'close'],
+                    'restart',
+                );
+            }
+        }).catch(() => {});
+    }, PLAYBACK_KEEPALIVE_MS);
+}
+
+function historyPositionForId(id) {
+    const position = historyPageItems.findIndex(
+        item => String(item.id) === String(id),
+    );
+    return Math.max(0, position);
+}
+
+function startEndlessPlaybackFromView() {
+    const first = historyPageItems.find(
+        item => item.status === 'finished' && item.filename,
+    );
+    if (!first) return;
+    const label = first.filename.split('/').pop().split('\\').pop();
+    const extension = first.filename.split('.').pop().toLowerCase();
+    startEndlessPlayback(first.id, label, extension, 'sequential');
+}
+
+function startSequentialPlayback() {
+    closePlaybackModeMenu();
+    startEndlessPlaybackFromView();
+}
+
+function startShufflePlayback() {
+    closePlaybackModeMenu();
+    startEndlessPlayback(null, '', '', 'shuffle');
+}
+
+function renderPlaylistQueue() {
+    const queue = document.getElementById('playlistQueueItems');
+    queue.innerHTML = endlessPlayback.playlistQueue.map((item, index) => {
+        const active = index === endlessPlayback.playlistPosition;
+        const duration = formatMediaDuration(item.duration_seconds);
+        if (item.unavailable || !item.id) {
+            return `<div class="playlist-queue-row is-unavailable" data-queue-position="${index}"><span class="playlist-queue-number">${index + 1}</span><span class="playlist-queue-thumb"><svg><use href="#i-camera"/></svg></span><span><strong>Unavailable video</strong><small>Skipped during playback</small></span></div>`;
+        }
+        return `<button type="button" class="playlist-queue-row${active ? ' is-active' : ''}" data-queue-position="${index}" onclick="selectPlaylistQueueItem('${escapeAttr(item.id)}')" ${active ? 'aria-current="true"' : ''}>
+            <span class="playlist-queue-number">${index + 1}</span>
+            <img src="/api/thumbnail/${encodeURIComponent(item.id)}" alt="">
+            <span><strong>${escapeHtml(item.title || 'Untitled video')}</strong>${duration ? `<small>${duration}</small>` : ''}</span>
+        </button>`;
+    }).join('');
+    requestAnimationFrame(() => {
+        const active = queue.querySelector('[aria-current="true"]');
+        if (active) active.scrollIntoView({ block: 'nearest' });
+    });
+}
+
+function savePlaylistProgress({ force = false, keepalive = false } = {}) {
+    if (!endlessPlayback.active || endlessPlayback.mode !== 'playlist'
+            || !endlessPlayback.playlistId
+            || !endlessPlayback.currentDownloadId) return Promise.resolve();
+    const video = document.getElementById('playerVideo');
+    const position = Math.max(0, Number(video.currentTime) || 0);
+    if (!force && endlessPlayback.lastSavedPosition !== null
+            && Math.abs(position - endlessPlayback.lastSavedPosition) < 1) {
+        return Promise.resolve();
+    }
+    endlessPlayback.progressSequence += 1;
+    const sequence = endlessPlayback.progressSequence;
+    endlessPlayback.lastSavedPosition = position;
+    return fetch(
+        '/api/playlists/' + encodeURIComponent(endlessPlayback.playlistId) + '/progress',
+        {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                download_id: endlessPlayback.currentDownloadId,
+                position_seconds: position,
+                completed: false,
+                write_sequence: sequence,
+            }),
+            keepalive,
+        },
+    ).then(response => {
+        if (!response.ok && !keepalive) {
+            return playbackResponseError(response).then(error => { throw error; });
+        }
+        return response.ok;
+    }).catch(error => {
+        if (!keepalive) showPlayerTransition(
+            error.message || 'Playlist progress could not be saved.',
+            ['retry', 'close'],
+        );
+        return false;
+    });
+}
+
+function startPlaylistProgressTimer() {
+    clearInterval(endlessPlayback.progressTimer);
+    endlessPlayback.progressTimer = setInterval(() => {
+        const video = document.getElementById('playerVideo');
+        if (!video.paused && !video.ended) savePlaylistProgress();
+    }, PLAYLIST_PROGRESS_SAVE_MS);
+}
+
+function startPlaylistPlayback(playlistId, restart = false) {
+    closeAllMenus();
+    endlessPlayback.epoch += 1;
+    const epoch = endlessPlayback.epoch;
+    deactivateEndlessPlayback();
+    endlessPlayback.active = true;
+    endlessPlayback.mode = 'playlist';
+    endlessPlayback.phase = 'opening';
+    endlessPlayback.failureCount = 0;
+    endlessPlayback.playlistId = String(playlistId);
+    endlessPlayback.returnFullscreenNeeded = false;
+    openBuiltInPlayer({ fullscreen: startVideosFullscreen, requestFullscreen: false });
+    document.querySelector('.player-box').classList.add('playlist-player');
+    document.getElementById('playlistQueue').hidden = false;
+    document.getElementById('playlistQueueItems').innerHTML = '';
+    showPlayerTransition('Opening playlist…', []);
+    if (startVideosFullscreen) requestPlayerFullscreen({ launch: true });
+
+    apiFetch('/api/playback-sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            mode: 'playlist', playlist_id: String(playlistId), restart,
+        }),
+    }).then(async response => {
+        if (epoch !== endlessPlayback.epoch || !endlessPlayback.active) return;
+        if (response.status === 204) {
+            deactivateEndlessPlayback({ release: false });
+            showPlayerTransition('This playlist has no playable videos.', ['close']);
+            return;
+        }
+        if (!response.ok) throw await playbackResponseError(response);
+        const data = await response.json();
+        if (epoch !== endlessPlayback.epoch || !endlessPlayback.active) {
+            releasePlaybackLease(data.session_id);
+            return;
+        }
+        endlessPlayback.sessionId = data.session_id;
+        endlessPlayback.sequence = data.sequence;
+        endlessPlayback.playlistRevision = data.playlist_revision;
+        endlessPlayback.playlistQueue = data.queue || [];
+        endlessPlayback.playlistPosition = data.queue_position;
+        endlessPlayback.progressSequence = data.progress_sequence || 0;
+        endlessPlayback.currentDownloadId = String(data.item.id);
+        endlessPlayback.lastSavedPosition = Number(data.resume_seconds) || 0;
+        renderPlaylistQueue();
+        loadPlaybackItem(data.item, {
+            automatic: true,
+            seekSeconds: data.resume_seconds,
+        });
+        recordView(data.item.id);
+        startPlaybackKeepalive(epoch);
+        startPlaylistProgressTimer();
+    }).catch(error => {
+        if (epoch !== endlessPlayback.epoch || !endlessPlayback.active) return;
+        deactivateEndlessPlayback({ release: false });
+        showPlayerTransition(
+            error.message || 'The playlist could not be opened.', ['close'],
+        );
+    });
+}
+
+async function selectPlaylistQueueItem(downloadId) {
+    if (endlessPlayback.mode !== 'playlist' || !endlessPlayback.sessionId
+            || endlessPlayback.advancePending
+            || String(downloadId) === endlessPlayback.currentDownloadId) return;
+    const saved = await savePlaylistProgress({ force: true });
+    if (!saved) return;
+    const epoch = endlessPlayback.epoch;
+    const sequence = endlessPlayback.sequence + 1;
+    const expectedId = endlessPlayback.currentDownloadId;
+    endlessPlayback.advancePending = true;
+    showPlayerTransition('Loading selected video…', []);
+    try {
+        const response = await apiFetch(
+            '/api/playback-sessions/' + encodeURIComponent(endlessPlayback.sessionId)
+                + '/select', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    expected_download_id: expectedId,
+                    download_id: String(downloadId),
+                    sequence,
+                }),
+            },
+        );
+        if (!response.ok) throw await playbackResponseError(response);
+        const data = await response.json();
+        if (epoch !== endlessPlayback.epoch || !endlessPlayback.active) return;
+        endlessPlayback.sequence = data.sequence;
+        endlessPlayback.currentDownloadId = String(data.item.id);
+        endlessPlayback.playlistPosition = data.queue_position;
+        endlessPlayback.progressSequence = Math.max(
+            endlessPlayback.progressSequence, data.progress_sequence || 0,
+        );
+        endlessPlayback.lastSavedPosition = 0;
+        renderPlaylistQueue();
+        loadPlaybackItem(data.item, { automatic: true });
+        recordView(data.item.id);
+    } catch (error) {
+        if (epoch === endlessPlayback.epoch) showPlayerTransition(
+            error.message || 'The selected video could not be loaded.',
+            ['retry', 'close'],
+        );
+    } finally {
+        if (epoch === endlessPlayback.epoch) endlessPlayback.advancePending = false;
+    }
+}
+
+function startEndlessPlayback(id = null, label = '', extension = '', mode = 'sequential') {
+    if (mode === 'sequential' && !id && historyTotal === 0) return;
+    endlessPlayback.epoch += 1;
+    const epoch = endlessPlayback.epoch;
+    deactivateEndlessPlayback();
+    endlessPlayback.active = true;
+    endlessPlayback.mode = mode;
+    endlessPlayback.phase = 'opening';
+    endlessPlayback.failureCount = 0;
+    endlessPlayback.returnFullscreenNeeded = false;
+    document.getElementById('playlistQueue').hidden = true;
+    document.querySelector('.player-box').classList.remove('playlist-player');
+    openBuiltInPlayer({
+        fullscreen: startVideosFullscreen,
+        requestFullscreen: false,
+    });
+
+    if (id && mode === 'sequential') {
+        loadPlaybackItem({ id, title: label, extension }, { automatic: true });
+        recordView(id);
+    } else {
+        showPlayerTransition(
+            mode === 'shuffle' ? 'Starting shuffle…' : 'Starting endless playback…',
+            [],
+        );
+    }
+    if (startVideosFullscreen) requestPlayerFullscreen({ launch: true });
+
+    const historyPosition = id ? historyPositionForId(id) : 0;
+    const playbackPageSize = endlessHistoryEnabled()
+        ? ENDLESS_PLAYBACK_PAGE_SIZE
+        : historyPageSize;
+    const body = mode === 'shuffle' ? { mode: 'shuffle' } : {
+        mode: 'sequential',
+        filter: historySearchInput.value,
+        ordering: historyOrdering,
+        page_size: playbackPageSize,
+        page: endlessHistoryEnabled()
+            ? Math.floor(historyPosition / playbackPageSize)
+            : historyPage,
+        position: endlessHistoryEnabled()
+            ? historyPosition % playbackPageSize
+            : historyPosition,
+    };
+    if (id && mode === 'sequential') body.start_download_id = String(id);
+    apiFetch('/api/playback-sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+    }).then(async response => {
+        if (response.status === 204) {
+            if (epoch !== endlessPlayback.epoch || !endlessPlayback.active) return;
+            deactivateEndlessPlayback({ release: false });
+            showPlayerTransition('No playable videos remain in this selection.', ['close']);
+            return;
+        }
+        if (!response.ok) {
+            if (epoch !== endlessPlayback.epoch || !endlessPlayback.active) return;
+            const error = await playbackResponseError(response);
+            if (error.code === 'no_shuffle_candidates') {
+                endlessPlayback.phase = 'create-failed';
+                showPlayerTransition(error.message, ['settings', 'close'], 'settings');
+                return;
+            }
+            if (error.code === 'shuffle_metadata_pending') {
+                endlessPlayback.phase = 'create-failed';
+                showPlayerTransition(
+                    'Older videos are still being prepared for Shuffle.',
+                    ['retry', 'close'],
+                    'retry',
+                );
+                return;
+            }
+            throw error;
+        }
+        const data = await response.json();
+        if (epoch !== endlessPlayback.epoch || !endlessPlayback.active) {
+            releasePlaybackLease(data.session_id);
+            return;
+        }
+        endlessPlayback.sessionId = data.session_id;
+        endlessPlayback.mode = data.mode || mode;
+        endlessPlayback.sequence = data.sequence;
+        endlessPlayback.currentDownloadId = String(data.item.id);
+        startPlaybackKeepalive(epoch);
+        if (!id || String(id) !== String(data.item.id)) {
+            loadPlaybackItem(data.item, { automatic: true });
+            recordView(data.item.id);
+        } else {
+            endlessPlayback.currentItem = data.item;
+            if (endlessPlayback.phase === 'failed') advanceEndlessPlayback();
+        }
+    }).catch(error => {
+        if (epoch !== endlessPlayback.epoch || !endlessPlayback.active) return;
+        deactivateEndlessPlayback({ release: false });
+        showPlayerTransition(
+            `${error.message || 'Endless playback could not start.'} The current video can still be played.`,
+            ['close'],
+        );
+    });
+}
+
+function advanceEndlessPlayback(completed = false) {
+    if (!endlessPlayback.active || !endlessPlayback.sessionId
+            || endlessPlayback.advancePending) return;
+    const epoch = endlessPlayback.epoch;
+    const sessionId = endlessPlayback.sessionId;
+    const expectedId = endlessPlayback.currentDownloadId;
+    const nextSequence = endlessPlayback.sequence + 1;
+    endlessPlayback.advancePending = true;
+    endlessPlayback.handoffInProgress = true;
+    endlessPlayback.phase = 'advancing';
+    clearPlaybackWatchdog();
+    showPlayerTransition(
+        endlessPlayback.mode === 'shuffle'
+            ? 'Loading a random video'
+            : 'Loading next video',
+        [],
+    );
+    apiFetch(
+        '/api/playback-sessions/' + encodeURIComponent(sessionId) + '/advance',
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                expected_download_id: expectedId,
+                sequence: nextSequence,
+                completed: endlessPlayback.mode === 'playlist' && completed,
+            }),
+        },
+    ).then(async response => {
+        if (epoch !== endlessPlayback.epoch || !endlessPlayback.active) return;
+        if (response.status === 204) {
+            const mode = endlessPlayback.mode;
+            deactivateEndlessPlayback({ release: false });
+            showPlayerTransition(
+                mode === 'playlist'
+                    ? (completed ? 'Playlist complete.' : 'No playable videos remain in this playlist.')
+                    : mode === 'shuffle'
+                    ? 'No eligible videos remain.'
+                    : 'No playable videos remain in this selection.',
+                ['close'],
+            );
+            return;
+        }
+        if (response.status === 404) {
+            deactivateEndlessPlayback({ release: false });
+            showPlayerTransition(
+                'The endless playback session expired. Start a new session to continue.',
+                ['restart', 'close'],
+                'restart',
+            );
+            return;
+        }
+        if (!response.ok) throw await playbackResponseError(response);
+        const data = await response.json();
+        if (epoch !== endlessPlayback.epoch || !endlessPlayback.active) return;
+        endlessPlayback.sequence = data.sequence;
+        endlessPlayback.currentDownloadId = String(data.item.id);
+        if (endlessPlayback.mode === 'playlist') {
+            endlessPlayback.playlistPosition = data.queue_position;
+            endlessPlayback.progressSequence = data.progress_sequence;
+            endlessPlayback.lastSavedPosition = 0;
+            renderPlaylistQueue();
+            recordView(data.item.id);
+        }
+        loadPlaybackItem(data.item, { automatic: true });
+    }).catch(error => {
+        if (epoch !== endlessPlayback.epoch || !endlessPlayback.active) return;
+        endlessPlayback.phase = 'failed';
+        // Retry must repeat the same idempotent advance request instead of
+        // attempting to replay the media item that has already ended.
+        endlessPlayback.handoffInProgress = true;
+        showPlayerTransition(
+            error.message || 'The next video could not be loaded.',
+            ['retry', 'stop', 'close'],
+            'retry',
+        );
+    }).finally(() => {
+        if (epoch === endlessPlayback.epoch) endlessPlayback.advancePending = false;
+    });
+}
+
+function continueEndlessPlayback() {
+    retryEndlessPlayback();
+}
+
+function restartEndlessPlayback() {
+    if (endlessPlayback.mode === 'shuffle') {
+        startShufflePlayback();
+        return;
+    }
+    if (endlessPlayback.mode === 'playlist' && endlessPlayback.playlistId) {
+        startPlaylistPlayback(endlessPlayback.playlistId);
+        return;
+    }
+    const item = endlessPlayback.currentItem;
+    if (!item) return;
+    startEndlessPlayback(item.id, item.title, item.extension);
+}
+
+function retryEndlessPlayback() {
+    if (!endlessPlayback.active) return;
+    if (endlessPlayback.phase === 'create-failed'
+            && endlessPlayback.mode === 'shuffle') {
+        startShufflePlayback();
+        return;
+    }
+    if (endlessPlayback.phase === 'failed' && endlessPlayback.handoffInProgress) {
+        advanceEndlessPlayback();
+        return;
+    }
+    const generation = endlessPlayback.loadGeneration;
+    endlessPlayback.failedGeneration = null;
+    endlessPlayback.phase = 'loading';
+    showPlayerTransition('Resuming playback…', []);
+    try {
+        observePlaybackPromise(
+            document.getElementById('playerVideo').play(), generation,
+        );
+        armPlaybackWatchdog(generation);
+    } catch (error) {
+        handlePlaybackFailure(generation, 'This video could not be played.');
+    }
+}
+
+function skipEndlessPlayback() {
+    if (!endlessPlayback.active) return;
+    endlessPlayback.failedGeneration = endlessPlayback.loadGeneration;
+    advanceEndlessPlayback();
+}
+
+function stopEndlessPlayback() {
+    if (!endlessPlayback.active) return;
+    deactivateEndlessPlayback();
+    endlessPlayback.phase = 'playing';
+    showPlayerTransition('Endless playback stopped.', ['close']);
+}
+
+function openPlaybackSettingsFromPlayer() {
+    closePlayer();
+    openSettings().then(() => {
+        settingsSearchInput.value = '';
+        applySettingsSearch();
+        setActiveSettingsSection('playback');
+        document.getElementById('settings-playback').scrollIntoView({
+            behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches
+                ? 'auto' : 'smooth',
+            block: 'start',
+        });
+    });
+}
+
+function returnEndlessFullscreen() {
+    if (!endlessPlayback.active) return;
+    endlessPlayback.returnFullscreenNeeded = false;
+    requestPlayerFullscreen();
+    if (endlessPlayback.phase === 'awaiting-user') continueEndlessPlayback();
+    else showPlayerTransition('', []);
+}
+
+function handleFullscreenExit() {
+    const backdrop = document.getElementById('playerBackdrop');
+    if (!backdrop.classList.contains('open')) return;
+    endlessPlayback.presentation = 'original';
+    if (endlessPlayback.active && endlessPlayback.handoffInProgress) {
+        endlessPlayback.returnFullscreenNeeded = true;
+        showPlayerTransition(
+            'Fullscreen ended while the next video was loading.',
+            ['fullscreen'],
+            'fullscreen',
+        );
+        return;
+    }
+    if (playerStartedFullscreen
+            && endlessPlayback.launchProvenance === 'fullscreen') closePlayer();
+}
+
+document.addEventListener('fullscreenchange', () => {
+    if (document.fullscreenElement === document.getElementById('playerVideo')) {
+        endlessPlayback.presentation = 'standard-fullscreen';
+        return;
+    }
+    if (!document.fullscreenElement) handleFullscreenExit();
+});
+
+const playerVideo = document.getElementById('playerVideo');
+playerVideo.addEventListener('webkitbeginfullscreen', () => {
+    endlessPlayback.presentation = 'webkit-fullscreen';
+});
+playerVideo.addEventListener('webkitendfullscreen', handleFullscreenExit);
+playerVideo.addEventListener('ended', () => {
+    if (endlessPlayback.active && endlessPlayback.phase === 'playing') {
+        advanceEndlessPlayback(endlessPlayback.mode === 'playlist');
+    }
+});
+playerVideo.addEventListener('pause', () => {
+    if (endlessPlayback.active && endlessPlayback.mode === 'playlist'
+            && !playerVideo.ended) {
+        savePlaylistProgress({ force: true });
+    }
+});
+window.addEventListener('pagehide', () => {
+    if (endlessPlayback.active && endlessPlayback.mode === 'playlist') {
+        savePlaylistProgress({ force: true, keepalive: true });
+    }
+});
+
+document.addEventListener('visibilitychange', () => {
+    if (!endlessPlayback.active) return;
+    if (document.hidden) clearPlaybackWatchdog();
+    else if (endlessPlayback.phase === 'loading') {
+        armPlaybackWatchdog(endlessPlayback.loadGeneration);
+    }
+});
+
+document.getElementById('playerBackdrop').addEventListener(
+    'mousemove', showPlayerControls,
+);
+
+function togglePlayerPlayback() {
+    const video = document.getElementById('playerVideo');
+    if (!video.paused && !video.ended) {
+        video.pause();
+        return;
+    }
+    try {
+        const playback = video.play();
+        if (endlessPlayback.active) {
+            observePlaybackPromise(playback, endlessPlayback.loadGeneration);
+        } else if (playback && typeof playback.catch === 'function') {
+            // Keyboard playback should not leak a rejected autoplay promise.
+            playback.catch(() => {});
+        }
+    } catch (error) {
+        if (endlessPlayback.active) {
+            handlePlaybackFailure(
+                endlessPlayback.loadGeneration,
+                'This video could not be played.',
+            );
+        }
+    }
+}
+
+function handlePlayerShortcut(ev) {
+    const backdrop = document.getElementById('playerBackdrop');
+    if (!backdrop.classList.contains('open')
+            || ev.defaultPrevented || ev.ctrlKey || ev.metaKey || ev.altKey) return false;
+
+    const fullscreenShortcut = (ev.key === 'f' || ev.key === 'F')
+        && endlessPlayback.presentation === 'original';
+    const playbackShortcut = ev.key === ' ' && !ev.shiftKey;
+    if (!fullscreenShortcut && !playbackShortcut) return false;
+
+    // Space must retain its native activation when a visible player action has focus.
+    if (playbackShortcut && ev.target instanceof Element
+            && backdrop.contains(ev.target)
+            && ev.target.closest('button, input, textarea, select, [contenteditable="true"]')) {
+        return false;
+    }
+
+    ev.preventDefault();
+    if (ev.repeat) return true;
+    if (fullscreenShortcut) requestPlayerFullscreen();
+    else togglePlayerPlayback();
+    return true;
 }
 
 document.addEventListener('keydown', (ev) => {
+    if (handlePlayerShortcut(ev)) return;
+
+    // Editors use Escape to cancel their own transient state. Respect that
+    // before treating the same key as a request to close an enclosing layer.
+    if (ev.defaultPrevented) return;
     if (ev.key === 'Escape' && document.getElementById('playerBackdrop').classList.contains('open')) {
         closePlayer();
+    } else if (ev.key === 'Escape' && document.getElementById('playlistEditorDialog').open) {
+        ev.preventDefault();
+        closePlaylistEditor();
+    } else if (ev.key === 'Escape' && document.getElementById('playlistChooserDialog').open) {
+        ev.preventDefault();
+        closePlaylistChooser();
+    } else if (ev.key === 'Escape' && document.getElementById('newDownloadDialog').open) {
+        ev.preventDefault();
+        closeNewDownload();
+    } else if (ev.key === 'Escape' && document.getElementById('extensionPairingDialog').open) {
+        ev.preventDefault();
+        closeExtensionPairingDialog();
+    } else if (ev.key === 'Escape' && !document.getElementById('settingsPage').hidden) {
+        ev.preventDefault();
+        closeSettings();
+    } else if (ev.key === 'Escape' && document.getElementById('currentDownloadsDrawer').open) {
+        ev.preventDefault();
+        closeCurrentDownloads();
+    } else if (ev.key === 'Escape' && !document.getElementById('accountMenu').hidden) {
+        ev.preventDefault();
+        closeAccountMenu(true);
+    } else if (ev.key === 'Escape' && openInfoId !== null) {
+        ev.preventDefault();
+        closeHistoryInfo();
     }
 
     const isPaste = (ev.key === 'v' || ev.key === 'V') && (ev.ctrlKey || ev.metaKey) && !ev.shiftKey && !ev.altKey;
@@ -1510,22 +4065,711 @@ document.addEventListener('keydown', (ev) => {
         || (active && active.isContentEditable);
     if (isEditable) return;
 
-    urlInput.focus();
-    urlInput.select();
+    openNewDownload();
 });
 
-function switchTab(name) {
-    document.querySelectorAll('.tab').forEach(t => {
-        t.classList.toggle('active', t.dataset.tab === name);
-    });
-    document.querySelectorAll('.tab-panel').forEach(p => {
-        p.classList.toggle('active', p.id === 'tab-' + name);
-    });
-    document.getElementById('tagFilter').style.display = name === 'preferences'
-        ? 'none'
-        : '';
-    closeAllMenus();
+function focusNewDownload() {
+    openNewDownload();
 }
+
+let newDownloadReturnFocus = null;
+
+function openNewDownload() {
+    const dialog = document.getElementById('newDownloadDialog');
+    if (!dialog.open) {
+        // Avoid stacking modal workflows if a paste shortcut is pressed while
+        // another dialog has focus; paste within its editable controls remains
+        // available through the guard in the keydown handler above.
+        if (!document.getElementById('settingsPage').hidden
+                || document.getElementById('currentDownloadsDrawer').open
+                || document.getElementById('playerBackdrop').classList.contains('open')) return;
+        newDownloadReturnFocus = document.activeElement;
+        closeHistoryInfo();
+        closeAllMenus();
+        hideActionError();
+        dialog.showModal();
+        document.getElementById('newDownloadButton').setAttribute('aria-expanded', 'true');
+    }
+    urlInput.focus();
+    urlInput.select();
+}
+
+function closeNewDownload() {
+    const dialog = document.getElementById('newDownloadDialog');
+    if (dialog.open) dialog.close();
+}
+
+const newDownloadDialog = document.getElementById('newDownloadDialog');
+newDownloadDialog.addEventListener('close', () => {
+    hideActionError();
+    document.getElementById('newDownloadButton').setAttribute('aria-expanded', 'false');
+    if (newDownloadReturnFocus && newDownloadReturnFocus.isConnected) {
+        newDownloadReturnFocus.focus();
+    }
+    newDownloadReturnFocus = null;
+});
+newDownloadDialog.addEventListener('click', ev => {
+    // Native select popups can bubble clicks with synthetic viewport
+    // coordinates. Only the dialog itself can represent its backdrop; child
+    // controls must never be classified as outside clicks by coordinates.
+    if (ev.target === newDownloadDialog) closeNewDownload();
+});
+
+let currentDrawerReturnFocus = null;
+
+function openCurrentDownloads() {
+    const drawer = document.getElementById('currentDownloadsDrawer');
+    if (drawer.open) return;
+    currentDrawerReturnFocus = document.activeElement;
+    closeHistoryInfo();
+    closeAllMenus();
+    hideActionError();
+    drawer.showModal();
+    document.getElementById('currentDownloadsButton').setAttribute('aria-expanded', 'true');
+}
+
+function closeCurrentDownloads() {
+    const drawer = document.getElementById('currentDownloadsDrawer');
+    if (drawer.open) drawer.close();
+}
+
+const currentDownloadsDrawer = document.getElementById('currentDownloadsDrawer');
+currentDownloadsDrawer.addEventListener('close', () => {
+    hideActionError();
+    closeAllMenus();
+    document.getElementById('currentDownloadsButton').setAttribute('aria-expanded', 'false');
+    if (currentDrawerReturnFocus && currentDrawerReturnFocus.isConnected
+            && !currentDrawerReturnFocus.hidden) {
+        currentDrawerReturnFocus.focus();
+    } else {
+        document.getElementById('newDownloadButton').focus();
+    }
+    currentDrawerReturnFocus = null;
+});
+currentDownloadsDrawer.addEventListener('click', ev => {
+    const bounds = currentDownloadsDrawer.getBoundingClientRect();
+    const outside = ev.clientX < bounds.left || ev.clientX > bounds.right
+        || ev.clientY < bounds.top || ev.clientY > bounds.bottom;
+    if (outside) closeCurrentDownloads();
+});
+
+let settingsOpenPromise = null;
+
+function openSettings() {
+    const page = document.getElementById('settingsPage');
+    closeAllMenus();
+    if (!page.hidden) return Promise.resolve();
+    if (settingsOpenPromise) return settingsOpenPromise;
+    closeHistoryInfo();
+    hideActionError();
+    // Keep the form unavailable until its server values are applied so a late
+    // response cannot overwrite a choice made immediately after opening it.
+    settingsOpenPromise = Promise.allSettled([
+        loadPreferences(),
+        loadUsers(),
+        loadExtensionConnections(),
+    ]).then(() => {
+        document.getElementById('tab-history').hidden = true;
+        page.hidden = false;
+        document.body.classList.add('settings-open');
+        window.scrollTo({ top: 0 });
+    }).finally(() => {
+        settingsOpenPromise = null;
+    });
+    return settingsOpenPromise;
+}
+
+function closeSettings() {
+    const page = document.getElementById('settingsPage');
+    if (page.hidden) return;
+    page.hidden = true;
+    document.getElementById('tab-history').hidden = false;
+    document.body.classList.remove('settings-open');
+    clearExtensionPairing();
+    hideActionError();
+    window.scrollTo({ top: 0 });
+    document.getElementById('accountMenuButton').focus();
+}
+
+const settingsSearchInput = document.getElementById('settingsSearchInput');
+const settingsSections = Array.from(document.querySelectorAll('.settings-section'));
+const settingsNavButtons = Array.from(document.querySelectorAll('[data-settings-section]'));
+
+function setActiveSettingsSection(name) {
+    settingsNavButtons.forEach(button => {
+        const active = button.dataset.settingsSection === name;
+        button.classList.toggle('active', active);
+        if (active) button.setAttribute('aria-current', 'page');
+        else button.removeAttribute('aria-current');
+    });
+}
+
+function applySettingsSearch() {
+    const terms = settingsSearchInput.value.toLocaleLowerCase().trim()
+        .split(/\s+/).filter(Boolean);
+    let resultCount = 0;
+    let firstMatchingSection = null;
+
+    settingsSections.forEach(section => {
+        let sectionMatches = 0;
+        section.querySelectorAll('.setting-item, [data-setting-keywords]').forEach(item => {
+            const searchable = `${item.textContent} ${item.dataset.settingKeywords || ''}`
+                .toLocaleLowerCase();
+            const available = item.dataset.settingAvailable !== 'false';
+            const matches = available && terms.every(term => searchable.includes(term));
+            item.hidden = !matches;
+            if (matches) sectionMatches += 1;
+        });
+        section.hidden = terms.length > 0 && sectionMatches === 0;
+        if (sectionMatches > 0 && firstMatchingSection === null) {
+            firstMatchingSection = section.dataset.settingsName;
+        }
+        resultCount += sectionMatches;
+    });
+
+    document.getElementById('settingsNoResults').hidden = resultCount !== 0;
+    if (terms.length > 0 && firstMatchingSection !== null) {
+        setActiveSettingsSection(firstMatchingSection);
+    }
+}
+
+settingsNavButtons.forEach(button => {
+    button.addEventListener('click', () => {
+        settingsSearchInput.value = '';
+        applySettingsSearch();
+        const name = button.dataset.settingsSection;
+        if (name !== 'browser-extension') clearExtensionPairing();
+        setActiveSettingsSection(name);
+        document.getElementById(`settings-${name}`).scrollIntoView({
+            behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches
+                ? 'auto' : 'smooth',
+            block: 'start',
+        });
+    });
+});
+
+settingsSearchInput.addEventListener('input', applySettingsSearch);
+settingsSearchInput.addEventListener('keydown', event => {
+    if (event.key !== 'Escape' || !settingsSearchInput.value) return;
+    event.stopPropagation();
+    settingsSearchInput.value = '';
+    applySettingsSearch();
+});
+
+let extensionPairingExpiresAt = 0;
+let extensionPairingTimer = null;
+let bundledExtension = null;
+let extensionPairingAllowed = false;
+
+function isLocalHttpHostname(value) {
+    const hostname = String(value || '').toLowerCase().replace(/\.$/, '');
+    if (hostname === 'localhost' || hostname.endsWith('.localhost') ||
+            hostname === '[::1]' || hostname === '::1') {
+        return true;
+    }
+    const octets = hostname.split('.');
+    if (octets.length !== 4 || !octets.every(
+        octet => /^\d+$/.test(octet) && Number(octet) <= 255
+    )) return false;
+    const first = Number(octets[0]);
+    const second = Number(octets[1]);
+    return first === 127 || first === 10 ||
+        (first === 100 && second >= 64 && second <= 127) ||
+        (first === 172 && second >= 16 && second <= 31) ||
+        (first === 192 && second === 168);
+}
+
+function isPairableVdlLocation(value, privateHttpAllowed = false) {
+    return value.protocol === 'https:' ||
+        (value.protocol === 'http:' && privateHttpAllowed &&
+            isLocalHttpHostname(value.hostname));
+}
+
+function extensionStatus(message) {
+    document.getElementById('extensionStatus').textContent = message || '';
+}
+
+function extensionPairingFeedback(message) {
+    document.getElementById('extensionPairingFeedback').textContent = message || '';
+}
+
+function setExtensionPairingCopied(copied) {
+    const button = document.getElementById('extensionCopyPairing');
+    button.classList.toggle('copied', copied);
+    button.querySelector('use').setAttribute('href', copied ? '#i-check' : '#i-copy');
+    button.querySelector('.extension-copy-label').textContent = copied
+        ? 'Copied' : 'Copy pairing string';
+}
+
+function clearExtensionPairing() {
+    if (extensionPairingTimer) clearInterval(extensionPairingTimer);
+    extensionPairingTimer = null;
+    extensionPairingExpiresAt = 0;
+    const field = document.getElementById('extensionPairingString');
+    if (field) field.value = '';
+    const output = document.getElementById('extensionPairingOutput');
+    if (output) output.hidden = true;
+    const details = document.getElementById('extensionPairingDetails');
+    if (details) details.open = false;
+    setExtensionPairingCopied(false);
+    extensionPairingFeedback('');
+    const dialog = document.getElementById('extensionPairingDialog');
+    if (dialog && dialog.open) dialog.close();
+}
+
+function closeExtensionPairingDialog() {
+    const dialog = document.getElementById('extensionPairingDialog');
+    if (dialog.open) dialog.close();
+}
+
+function pairingString(origin, code) {
+    const bytes = new TextEncoder().encode(JSON.stringify({ origin, code }));
+    let binary = '';
+    bytes.forEach(byte => { binary += String.fromCharCode(byte); });
+    return `vdl-pair-v1:${btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')}`;
+}
+
+function updatePairingExpiry() {
+    const remaining = Math.max(0, Math.ceil(extensionPairingExpiresAt - Date.now() / 1000));
+    const label = document.getElementById('extensionPairingExpiry');
+    if (!remaining) {
+        clearExtensionPairing();
+        extensionStatus('');
+        return;
+    }
+    label.textContent = `${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, '0')} remaining`;
+}
+
+function createExtensionPairing() {
+    if (!extensionPairingAllowed) return;
+    apiAction('/api/extension/pairing-codes', { method: 'POST' })
+        .then(response => response.json()).then(response => {
+        document.getElementById('extensionPairingString').value = pairingString(
+            window.location.origin, response.code,
+        );
+        document.getElementById('extensionPairingOutput').hidden = false;
+        extensionPairingExpiresAt = response.expires_at;
+        updatePairingExpiry();
+        if (extensionPairingTimer) clearInterval(extensionPairingTimer);
+        extensionPairingTimer = setInterval(updatePairingExpiry, 1000);
+        const dialog = document.getElementById('extensionPairingDialog');
+        document.getElementById('extensionPairingDetails').open = false;
+        setExtensionPairingCopied(false);
+        extensionPairingFeedback('');
+        dialog.showModal();
+        document.getElementById('extensionCopyPairing').focus();
+        extensionStatus('Pairing string created. Copy it to continue in VDL Companion.');
+    }).catch(() => {});
+}
+
+async function copyExtensionPairing() {
+    const field = document.getElementById('extensionPairingString');
+    try {
+        await navigator.clipboard.writeText(field.value);
+        setExtensionPairingCopied(true);
+        extensionPairingFeedback('Copied. Continue in VDL Companion.');
+        extensionStatus('Pairing string copied.');
+    } catch (_) {
+        document.getElementById('extensionPairingDetails').open = true;
+        field.focus();
+        field.select();
+        setExtensionPairingCopied(false);
+        extensionPairingFeedback('Copy was blocked. The pairing string is shown and selected below.');
+        extensionStatus('Copy was blocked. The pairing string is selected for manual copying.');
+    }
+}
+
+function invalidateExtensionPairing() {
+    apiAction('/api/extension/pairing-codes/current', { method: 'DELETE' })
+        .then(() => {
+            clearExtensionPairing();
+            extensionStatus('Pairing string invalidated.');
+        }).catch(() => {});
+}
+
+function extensionPackageAction() {
+    if (!bundledExtension) return;
+    if (bundledExtension.signed) {
+        extensionStatus('Firefox should show an Add confirmation. If it does not, right-click the install button, save the XPI, then install it from about:addons.');
+    } else {
+        extensionStatus('Downloading the unsigned development XPI. Firefox Release cannot install it; use about:debugging for temporary testing or ask the operator for an AMO-signed package.');
+    }
+}
+
+function versionParts(value) {
+    return String(value || '').split('.').map(part => Number(part) || 0);
+}
+
+function isNewerVersion(left, right) {
+    const a = versionParts(left);
+    const b = versionParts(right);
+    for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
+        if ((a[index] || 0) !== (b[index] || 0)) return (a[index] || 0) > (b[index] || 0);
+    }
+    return false;
+}
+
+function formatConnectionTime(value) {
+    return value ? new Date(value * 1000).toLocaleString() : 'Never';
+}
+
+function renderExtensionConnection(connection) {
+    const update = bundledExtension && isNewerVersion(
+        bundledExtension.version, connection.extension_version,
+    ) ? '<span class="extension-update-label">Update available</span>' : '';
+    return `<article class="extension-connection" data-connection-id="${escapeAttr(connection.id)}">
+                <div><strong>${escapeHtml(connection.device_label)}</strong>${update}</div>
+                <dl>
+                    <dt>Extension</dt><dd>${escapeHtml(connection.extension_version)}</dd>
+                    <dt>Paired</dt><dd>${formatConnectionTime(connection.created_at)}</dd>
+                    <dt>Last used</dt><dd>${formatConnectionTime(connection.last_used_at)}</dd>
+                </dl>
+                <button type="button" class="danger extension-revoke-button"
+                        aria-label="Revoke ${escapeAttr(connection.device_label)}"
+                        title="Revoke connection"
+                        onclick="revokeExtensionConnection('${escapeAttr(connection.id)}', this)">
+                    <svg aria-hidden="true"><use href="#i-trash"/></svg>
+                </button>
+            </article>`;
+}
+
+function loadExtensionConnections() {
+    const create = document.getElementById('extensionCreatePairing');
+    create.disabled = true;
+    return apiFetch('/api/extension/connections').then(response => response.json()).then(data => {
+        extensionPairingAllowed = isPairableVdlLocation(
+            window.location, Boolean(data.http_pairing_allowed),
+        );
+        const localHttp = window.location.protocol === 'http:' && extensionPairingAllowed;
+        create.disabled = !extensionPairingAllowed;
+        document.getElementById('extensionHttpsStatus').textContent = localHttp
+            ? 'This private HTTP origin is enabled by the VDL operator. Traffic is not encrypted.'
+            : extensionPairingAllowed
+                ? 'This trusted HTTPS origin is ready to pair.'
+                : 'Pairing is disabled here. Use HTTPS or ask the operator to allow this local IPv4 CIDR.';
+        bundledExtension = data.bundled_extension;
+        const install = document.getElementById('extensionInstallLink');
+        if (bundledExtension) {
+            install.href = bundledExtension.signed
+                ? bundledExtension.url : bundledExtension.download_url;
+            if (bundledExtension.signed) install.removeAttribute('download');
+            else install.setAttribute('download', 'vdl-companion-firefox.xpi');
+            install.removeAttribute('aria-disabled');
+            install.classList.remove('disabled');
+            document.getElementById('extensionInstallHint').textContent = bundledExtension.signed
+                ? 'Firefox will show an Add confirmation. Installation and pairing are separate steps.'
+                : 'This bundled development package is not Mozilla-signed, so Firefox Release cannot install it. Download it only for temporary testing, or ask the operator for a signed package.';
+        } else {
+            install.removeAttribute('href');
+            install.setAttribute('aria-disabled', 'true');
+            install.classList.add('disabled');
+            document.getElementById('extensionInstallHint').textContent = 'The bundled extension failed its integrity check. Contact the VDL operator.';
+        }
+        const connections = data.connections || [];
+        document.getElementById('extensionConnectionList').innerHTML = connections.map(renderExtensionConnection).join('');
+        document.getElementById('extensionNoConnections').hidden = connections.length > 0;
+        const needsUpdate = connections.some(connection => bundledExtension && isNewerVersion(
+            bundledExtension.version, connection.extension_version,
+        ));
+        install.textContent = bundledExtension && !bundledExtension.signed
+            ? 'Download unsigned XPI'
+            : needsUpdate ? 'Update Firefox extension' : 'Install Firefox extension';
+    });
+}
+
+function revokeExtensionConnection(connectionId, button) {
+    if (!window.confirm('Revoke this VDL Companion connection?')) return;
+    apiAction(`/api/extension/connections/${encodeURIComponent(connectionId)}`, {
+        method: 'DELETE',
+    }).then(() => loadExtensionConnections()).then(() => {
+        extensionStatus('Companion connection revoked.');
+        const next = document.querySelector('.extension-connection button');
+        (next || document.getElementById('extensionCreatePairing')).focus();
+    }).catch(() => { button.focus(); });
+}
+
+let managedRoles = [];
+let managedCurrentUserId = null;
+let managedUsers = [];
+let managedUserEditId = null;
+let managedUserDraft = null;
+let managedRemoveUserId = null;
+const NEW_USER_ROW_ID = 'new';
+const USER_EDIT_LOCK_TITLE = 'Save or cancel the current user changes before editing another user';
+
+function userRoleOptions(selectedRole) {
+    return managedRoles.map(role => (
+        `<option value="${escapeAttr(role)}"${role === selectedRole ? ' selected' : ''}>${escapeHtml(role.charAt(0).toUpperCase() + role.slice(1))}</option>`
+    )).join('');
+}
+
+function managedUserValues(row) {
+    return {
+        username: row.querySelector('.user-login-input').value,
+        name: row.querySelector('.user-name-input').value,
+        role: row.querySelector('.user-role-input').value,
+    };
+}
+
+function userEditActions(rowId, isNew) {
+    const saveAction = isNew ? '' : ` onclick="updateUser(${rowId})"`;
+    const saveType = isNew ? 'submit' : 'button';
+    const form = isNew ? ' form="addUserForm"' : '';
+    return `<button type="${saveType}"${form} class="user-action user-save"${saveAction} aria-label="Save" title="Save">
+                <svg aria-hidden="true"><use href="#i-check"/></svg>
+            </button>
+            <button type="button" class="user-action user-cancel" onclick="cancelUserEdit()" aria-label="Cancel" title="Cancel">
+                <svg aria-hidden="true"><use href="#i-x"/></svg>
+            </button>`;
+}
+
+function userDefaultActions(user, locked) {
+    const isCurrent = user.id === managedCurrentUserId;
+    const disabled = locked || isCurrent;
+    const suspendLabel = user.suspended ? 'Resume' : 'Suspend';
+    const suspendIcon = user.suspended ? 'i-play' : 'i-pause';
+    const disabledReason = isCurrent
+        ? ` title="You cannot ${user.suspended ? 'resume' : 'suspend'} your own account"`
+        : ` title="${suspendLabel}"`;
+    return `<button type="button" class="user-action user-suspend" onclick="setUserSuspended(${user.id}, ${!user.suspended})"
+                    aria-label="${suspendLabel}" aria-pressed="${user.suspended}"${disabled ? ' disabled' : ''}${disabledReason}>
+                <svg aria-hidden="true"><use href="#${suspendIcon}"/></svg>
+            </button>
+            <button type="button" class="user-action user-remove" onclick="removeUser(${user.id})"
+                    aria-label="Remove" title="Remove"${disabled ? ' disabled' : ''}>
+                <svg aria-hidden="true"><use href="#i-trash"/></svg>
+            </button>`;
+}
+
+function renderManagedUserRow(user) {
+    const rowId = String(user.id);
+    const editing = managedUserEditId === rowId;
+    const locked = managedUserEditId !== null && !editing;
+    const values = editing ? managedUserDraft : {
+        username: user.username,
+        name: user.name,
+        role: user.roles[0] || '',
+    };
+    const disabled = locked ? ' disabled' : '';
+    const lockedClass = locked ? ' user-row-locked' : '';
+    const lockedTitle = locked ? ` title="${USER_EDIT_LOCK_TITLE}"` : '';
+    const hasOtherActiveAdmin = managedUsers.some(candidate => (
+        candidate.id !== user.id
+        && candidate.roles.includes('admin')
+        && !candidate.suspended
+    ));
+    const disableRoleChange = user.roles.includes('admin') && !hasOtherActiveAdmin;
+    const roleDisabled = locked || disableRoleChange ? ' disabled' : '';
+    const roleTitle = locked
+        ? ` title="${USER_EDIT_LOCK_TITLE}"`
+        : disableRoleChange
+        ? ' title="You cannot change the role of the last administrator on the system"'
+        : '';
+    const currentLabel = user.id === managedCurrentUserId
+        ? '<span class="user-you">you</span>' : '';
+    return `<tr class="user-row${editing ? ' user-row-editing' : ''}${user.suspended ? ' user-row-suspended' : ''}${lockedClass}" data-user-id="${user.id}"${lockedTitle}>
+                <td>
+                    <div class="user-field-with-status">
+                        <input class="user-login-input" type="text" maxlength="64" required value="${escapeAttr(values.username)}"
+                               aria-label="Login name for ${escapeAttr(user.username)}"${disabled}
+                               oninput="userFieldChanged('${rowId}', 'username', this)" onkeydown="userFieldKeydown(event)">
+                        ${currentLabel}
+                    </div>
+                </td>
+                <td><input class="user-name-input" type="text" maxlength="128" required value="${escapeAttr(values.name)}"
+                           aria-label="Name for ${escapeAttr(user.username)}"${disabled}
+                           oninput="userFieldChanged('${rowId}', 'name', this)" onkeydown="userFieldKeydown(event)"></td>
+                <td><div class="user-role-field"${roleTitle}>
+                    <select class="user-role-input" aria-label="Role for ${escapeAttr(user.username)}"${roleDisabled}
+                            onchange="userFieldChanged('${rowId}', 'role', this)" onkeydown="userFieldKeydown(event)">${userRoleOptions(values.role)}</select>
+                </div></td>
+                <td class="user-actions">${editing ? userEditActions(rowId, false) : userDefaultActions(user, locked)}</td>
+            </tr>`;
+}
+
+function renderNewUserRow() {
+    const editing = managedUserEditId === NEW_USER_ROW_ID;
+    const locked = managedUserEditId !== null && !editing;
+    const values = editing ? managedUserDraft : { username: '', name: '', role: 'normal' };
+    const disabled = locked ? ' disabled' : '';
+    const lockedClass = locked ? ' user-row-locked' : '';
+    const lockedTitle = locked ? ` title="${USER_EDIT_LOCK_TITLE}"` : '';
+    const actions = editing ? userEditActions(NEW_USER_ROW_ID, true) : (
+        `<button type="button" class="user-action user-add" onclick="startNewUser()" aria-label="Add user" title="${locked ? USER_EDIT_LOCK_TITLE : 'Add user'}"${disabled}>
+            <svg aria-hidden="true"><use href="#i-plus"/></svg>
+        </button>`
+    );
+    return `<tr class="user-row user-row-new${editing ? ' user-row-editing' : ''}${lockedClass}" data-user-id="${NEW_USER_ROW_ID}"${lockedTitle}>
+                <td><input id="newUsername" form="addUserForm" class="user-login-input" type="text" maxlength="64" required
+                           value="${escapeAttr(values.username)}" placeholder="Login name" autocomplete="off" aria-label="New login name"${disabled}
+                           oninput="userFieldChanged('${NEW_USER_ROW_ID}', 'username', this)" onkeydown="userFieldKeydown(event)"></td>
+                <td><input id="newUserName" form="addUserForm" class="user-name-input" type="text" maxlength="128" required
+                           value="${escapeAttr(values.name)}" placeholder="Name" autocomplete="off" aria-label="New user name"${disabled}
+                           oninput="userFieldChanged('${NEW_USER_ROW_ID}', 'name', this)" onkeydown="userFieldKeydown(event)"></td>
+                <td><select id="newUserRole" form="addUserForm" class="user-role-input" aria-label="New user role"${disabled}
+                            onchange="userFieldChanged('${NEW_USER_ROW_ID}', 'role', this)" onkeydown="userFieldKeydown(event)">${userRoleOptions(values.role)}</select></td>
+                <td class="user-actions">${actions}</td>
+            </tr>`;
+}
+
+function renderUsers(users = null) {
+    const list = document.getElementById('userList');
+    if (!list) return;
+    if (users !== null) managedUsers = users;
+    list.innerHTML = managedUsers.map(renderManagedUserRow).join('') + renderNewUserRow();
+}
+
+function loadUsers() {
+    if (!document.getElementById('userList')) return Promise.resolve();
+    return apiAction('/api/users').then(response => response.json()).then(data => {
+        managedRoles = data.roles || [];
+        managedCurrentUserId = data.current_user_id;
+        managedUserEditId = null;
+        managedUserDraft = null;
+        renderUsers(data.users || []);
+    }).catch(() => {});
+}
+
+function focusManagedUserField(rowId, field) {
+    requestAnimationFrame(() => {
+        const row = document.querySelector(`[data-user-id="${rowId}"]`);
+        const control = row && row.querySelector(`.user-${field === 'username' ? 'login' : field}-input`);
+        if (!control) return;
+        control.focus();
+        if (typeof control.setSelectionRange === 'function') {
+            control.setSelectionRange(control.value.length, control.value.length);
+        }
+    });
+}
+
+function userFieldChanged(rowId, field, control) {
+    if (managedUserEditId !== null && managedUserEditId !== rowId) return;
+    if (managedUserEditId === null) {
+        managedUserEditId = rowId;
+        managedUserDraft = managedUserValues(control.closest('.user-row'));
+        renderUsers();
+        focusManagedUserField(rowId, field);
+        return;
+    }
+    managedUserDraft[field] = control.value;
+}
+
+function userFieldKeydown(event) {
+    if (event.key === 'Escape' && managedUserEditId !== null) {
+        event.preventDefault();
+        cancelUserEdit();
+    }
+}
+
+function startNewUser() {
+    if (managedUserEditId !== null) return;
+    const row = document.querySelector(`[data-user-id="${NEW_USER_ROW_ID}"]`);
+    managedUserEditId = NEW_USER_ROW_ID;
+    managedUserDraft = managedUserValues(row);
+    renderUsers();
+    focusManagedUserField(NEW_USER_ROW_ID, 'username');
+}
+
+function cancelUserEdit() {
+    managedUserEditId = null;
+    managedUserDraft = null;
+    renderUsers();
+}
+
+function generatedInitialPassword() {
+    if (!window.crypto || typeof window.crypto.getRandomValues !== 'function') {
+        throw new Error('A secure initial password could not be generated');
+    }
+    const bytes = new Uint8Array(16);
+    window.crypto.getRandomValues(bytes);
+    return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function showCreatedUserDialog(user, password) {
+    const dialog = document.getElementById('userCreatedDialog');
+    document.getElementById('userCreatedName').textContent = user.name || user.username;
+    const passwordInput = document.getElementById('userCreatedPassword');
+    passwordInput.value = password;
+    dialog.showModal();
+    passwordInput.select();
+}
+
+function addUser(event) {
+    event.preventDefault();
+    if (managedUserEditId !== NEW_USER_ROW_ID) return;
+    let password;
+    try {
+        password = generatedInitialPassword();
+    } catch (error) {
+        showActionError(error.message);
+        return;
+    }
+    const body = {
+        username: managedUserDraft.username,
+        name: managedUserDraft.name,
+        password,
+        role: managedUserDraft.role,
+    };
+    apiAction('/api/users', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+    }).then(response => response.json()).then(user => {
+        showCreatedUserDialog(user, password);
+        return loadUsers();
+    }).catch(() => {});
+}
+
+function updateUser(userId) {
+    if (managedUserEditId !== String(userId) || !managedUserDraft) return;
+    const body = {
+        username: managedUserDraft.username,
+        name: managedUserDraft.name,
+        role: managedUserDraft.role,
+    };
+    apiAction(`/api/users/${userId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+    }).then(response => response.json()).then(user => {
+        if (userId === managedCurrentUserId) {
+            document.getElementById('currentUsername').textContent = user.username;
+            if (!user.roles.includes('admin')) window.location.reload();
+        }
+        return loadUsers();
+    }).catch(() => {});
+}
+
+function setUserSuspended(userId, suspended) {
+    apiAction(`/api/users/${userId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ suspended }),
+    }).then(loadUsers).catch(() => {});
+}
+
+function removeUser(userId) {
+    const user = managedUsers.find(candidate => candidate.id === userId);
+    const dialog = document.getElementById('userRemoveDialog');
+    if (!user || !dialog || managedUserEditId !== null) return;
+    managedRemoveUserId = userId;
+    document.getElementById('userRemoveName').textContent = user.name || user.username;
+    dialog.returnValue = '';
+    dialog.showModal();
+}
+
+const userRemoveDialog = document.getElementById('userRemoveDialog');
+if (userRemoveDialog) {
+    userRemoveDialog.addEventListener('close', () => {
+        const userId = managedRemoveUserId;
+        managedRemoveUserId = null;
+        if (userRemoveDialog.returnValue !== 'remove' || userId === null) return;
+        apiAction(`/api/users/${userId}`, { method: 'DELETE' })
+            .then(loadUsers).catch(() => {});
+    });
+}
+
+window.addEventListener('resize', closeHistoryInfo);
 
 function isPresetValue(v) {
     const sel = document.getElementById('prefFormat');
@@ -1535,7 +4779,8 @@ function isPresetValue(v) {
 function refreshCustomVisibility() {
     const sel = document.getElementById('prefFormat');
     const row = document.getElementById('customFormatRow');
-    row.style.display = sel.value === '__custom__' ? '' : 'none';
+    row.dataset.settingAvailable = String(sel.value === '__custom__');
+    applySettingsSearch();
 }
 
 document.getElementById('prefFormat').addEventListener('change', refreshCustomVisibility);
@@ -1559,10 +4804,29 @@ if (window.matchMedia) {
     else if (mq.addListener) mq.addListener(onChange);
 }
 
+let preferencesLoadGeneration = 0;
+
 function loadPreferences() {
-    apiFetch('/api/preferences').then(r => r.json()).then(p => {
+    const generation = ++preferencesLoadGeneration;
+    return apiFetch('/api/preferences').then(r => r.json()).then(p => {
+        // A settings-open refresh supersedes the bootstrap request if the two
+        // overlap; only the newest response may populate editable controls.
+        if (generation !== preferencesLoadGeneration) return;
         document.getElementById('prefDir').value = p.download_dir || '';
         document.getElementById('prefMax').value = p.max_concurrent || '';
+        const configuredPageSize = Number(p.history_page_size);
+        const nextPageSize = p.history_page_size === HISTORY_ENDLESS_MODE
+            ? HISTORY_ENDLESS_MODE
+            : (HISTORY_PAGE_SIZES.has(configuredPageSize)
+                ? configuredPageSize
+                : DEFAULT_HISTORY_PAGE_SIZE);
+        document.getElementById('prefPageSize').value = String(nextPageSize);
+        if (historyPageSize !== nextPageSize) {
+            historyPageSize = nextPageSize;
+            historyPage = 0;
+            historyEndlessVisibleCount = HISTORY_ENDLESS_BATCH_SIZE;
+            if (historyTotal > 0) fetchHistory();
+        }
 
         const stored = p.format || 'bestvideo+bestaudio/best';
         const sel = document.getElementById('prefFormat');
@@ -1577,6 +4841,19 @@ function loadPreferences() {
 
         playerMode = (p.player_mode === 'new_tab') ? 'new_tab' : 'overlay';
         document.getElementById('prefPlayer').value = playerMode;
+        startVideosFullscreen = p.start_fullscreen === 'true';
+        document.getElementById('prefStartFullscreen').checked = startVideosFullscreen;
+        refreshFullscreenAvailability();
+        const shuffleHeights = new Set([
+            '0', '360', '480', '720', '1080', '1440', '2160', '4320',
+        ]);
+        const shuffleHeight = String(p.shuffle_min_height ?? '0');
+        document.getElementById('prefShuffleMinHeight').value =
+            shuffleHeights.has(shuffleHeight) ? shuffleHeight : '0';
+        const shuffleMinutes = String(p.shuffle_min_duration_minutes ?? '0');
+        document.getElementById('prefShuffleMinDuration').value =
+            /^\d+$/.test(shuffleMinutes)
+                && Number(shuffleMinutes) <= 1440 ? shuffleMinutes : '0';
 
         const theme = ['light', 'dark', 'system'].includes(p.theme) ? p.theme : 'system';
         document.getElementById('prefTheme').value = theme;
@@ -1588,6 +4865,19 @@ document.getElementById('prefTheme').addEventListener('change', (ev) => {
     applyTheme(ev.target.value);
 });
 
+function refreshFullscreenAvailability() {
+    const overlay = document.getElementById('prefPlayer').value === 'overlay';
+    const checkbox = document.getElementById('prefStartFullscreen');
+    checkbox.disabled = !overlay;
+    document.getElementById('prefStartFullscreenHint').textContent = overlay
+        ? 'Automatically enter full screen when the built-in player opens.'
+        : 'Available when videos play in the overlay on this page.';
+}
+
+document.getElementById('prefPlayer').addEventListener(
+    'change', refreshFullscreenAvailability,
+);
+
 function savePreferences() {
     const sel = document.getElementById('prefFormat');
     const fmt = sel.value === '__custom__'
@@ -1597,8 +4887,14 @@ function savePreferences() {
     const body = {
         download_dir: document.getElementById('prefDir').value,
         format: fmt || 'best',
+        history_page_size: document.getElementById('prefPageSize').value,
         max_concurrent: document.getElementById('prefMax').value,
         player_mode: document.getElementById('prefPlayer').value,
+        start_fullscreen: document.getElementById('prefStartFullscreen').checked
+            ? 'true' : 'false',
+        shuffle_min_height: document.getElementById('prefShuffleMinHeight').value,
+        shuffle_min_duration_minutes:
+            document.getElementById('prefShuffleMinDuration').value,
         theme: document.getElementById('prefTheme').value,
     };
     apiAction('/api/preferences', {
@@ -1606,7 +4902,17 @@ function savePreferences() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
     }).then(() => {
+        const nextPageSize = body.history_page_size === HISTORY_ENDLESS_MODE
+            ? HISTORY_ENDLESS_MODE
+            : Number(body.history_page_size);
+        if (historyPageSize !== nextPageSize) {
+            historyPageSize = nextPageSize;
+            historyPage = 0;
+            historyEndlessVisibleCount = HISTORY_ENDLESS_BATCH_SIZE;
+            fetchHistory();
+        }
         playerMode = body.player_mode;
+        startVideosFullscreen = body.start_fullscreen === 'true';
         applyTheme(body.theme);
         const btn = document.getElementById('saveBtn');
         btn.innerHTML = '<svg class="btn-icon"><use href="#i-check"/></svg><span>Saved</span>';
@@ -1621,24 +4927,50 @@ function savePreferences() {
 loadPreferences();
 
 let pendingFetch = false;
-function scheduleFetch() {
+let pendingFavoriteSort = false;
+function scheduleFetch({ sortFavorites = false } = {}) {
+    pendingFavoriteSort ||= sortFavorites;
     if (pendingFetch) return;
     pendingFetch = true;
-    requestAnimationFrame(() => {
+    // Firefox pauses animation frames in background tabs, which is exactly
+    // where VDL sits while its toolbar companion starts a download.
+    setTimeout(() => {
         pendingFetch = false;
-        fetchHistory();
-    });
+        const applyFavoriteSort = pendingFavoriteSort;
+        pendingFavoriteSort = false;
+        fetchHistory({ sortFavorites: applyFavoriteSort });
+        fetchPlaylists();
+    }, 0);
 }
 
 function connectEventStream() {
     const es = new EventSource('/api/events');
     es.addEventListener('ready', scheduleFetch);
     es.addEventListener('change', scheduleFetch);
+    es.addEventListener('playlist-progress', fetchPlaylists);
     es.addEventListener('error', () => {
-        showServerBanner();
+        showServerStatus();
     });
     return es;
 }
 
 connectEventStream();
-fetchHistory();
+// A fresh page has no visual order to preserve, so establish favorite-first
+// ordering once. Later reconciliations keep that order until a filter runs.
+fetchHistory({ sortFavorites: true });
+fetchPlaylists();
+
+document.getElementById('playlistName').addEventListener(
+    'input', markPlaylistEditorDirty,
+);
+document.getElementById('playlistVideoSearch').addEventListener(
+    'input', renderPlaylistEditor,
+);
+document.getElementById('playlistEditorDialog').addEventListener('cancel', event => {
+    event.preventDefault();
+    closePlaylistEditor();
+});
+document.getElementById('playlistChooserDialog').addEventListener('cancel', event => {
+    event.preventDefault();
+    closePlaylistChooser();
+});

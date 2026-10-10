@@ -4,10 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Video Downloader</title>
-    <!-- Favicon: green disc with the same download arrow used on the
-         primary submit button. Inlined as a data: URL so we don't need
-         a dedicated route. -->
-    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7.5' fill='%231f8a3b'/><g fill='none' stroke='white' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M8 4v5.5'/><path d='M5 7l3 3 3-3'/><path d='M4.5 12.5h7'/></g></svg>">
+    <!-- The client replaces this idle icon with aggregate progress while
+         downloads run. Keeping the fallback inline avoids a dedicated route. -->
+    <link id="appFavicon" rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7.5' fill='%231f8a3b'/><g fill='none' stroke='white' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'><path d='M8 4v5.5'/><path d='M5 7l3 3 3-3'/><path d='M4.5 12.5h7'/></g></svg>">
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css', v=ui_version) }}">
     <script>
         (function () {
@@ -22,14 +21,17 @@
     </script>
 </head>
 <body>
-    <div id="serverBanner" class="server-banner" style="display:none;" role="alert">
-        <span>Server is not available — actions will not work until the connection is restored.</span>
-        <button type="button" class="server-banner-close" onclick="hideServerBanner()" aria-label="Dismiss"><svg width="14" height="14"><use href="#i-x"/></svg></button>
-    </div>
     <div id="actionError" class="action-error" role="alert" aria-live="assertive" hidden>
         <span id="actionErrorMessage"></span>
         <button type="button" class="action-error-close" onclick="hideActionError()" aria-label="Dismiss error"><svg width="14" height="14"><use href="#i-x"/></svg></button>
     </div>
+    <dialog id="uploadDropOverlay" class="upload-drop-overlay" aria-hidden="true">
+        <div class="upload-drop-message" role="status" aria-live="polite">
+            <svg aria-hidden="true"><use href="#i-upload"/></svg>
+            <strong id="uploadDropTitle">Drop video to add it</strong>
+            <span id="uploadDropDetail">The original file will be copied into your library.</span>
+        </div>
+    </dialog>
     <!-- Octicon-style icon set: 16x16 viewBox, currentColor, stroke 1.6.
          Designed to read consistently at the small sizes used in toolbars
          and inline buttons. -->
@@ -38,6 +40,27 @@
             <symbol id="i-download" viewBox="0 0 16 16">
                 <g fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M8 2.5v7.2"/><path d="M4.3 6.2L8 9.9l3.7-3.7"/><path d="M2.8 13.2h10.4"/>
+                </g>
+            </symbol>
+            <symbol id="i-upload" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M8 10.5v-8"/><path d="M4.5 6L8 2.5 11.5 6"/><path d="M3 9.5v3a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1v-3"/>
+                </g>
+            </symbol>
+            <symbol id="i-plus" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+                    <path d="M8 3v10"/><path d="M3 8h10"/>
+                </g>
+            </symbol>
+            <symbol id="i-search" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="7" cy="7" r="4.5"/><path d="M10.4 10.4l3.1 3.1"/>
+                </g>
+            </symbol>
+            <symbol id="i-app-download" viewBox="0 0 16 16">
+                <circle cx="8" cy="8" r="7.5" fill="currentColor"/>
+                <g fill="none" stroke="white" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M8 4v5.5"/><path d="M5 7l3 3 3-3"/><path d="M4.5 12.5h7"/>
                 </g>
             </symbol>
             <symbol id="i-save" viewBox="0 0 16 16">
@@ -84,6 +107,24 @@
                     <path d="M5 3.5v9l8-4.5z"/>
                 </g>
             </symbol>
+            <symbol id="i-caret-down" viewBox="0 0 16 16">
+                <path fill="currentColor" d="M3.2 5.8h9.6L8 10.6z"/>
+            </symbol>
+            <symbol id="i-shuffle" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M2 4h2.2c3.8 0 3.8 8 7.6 8H14"/>
+                    <path d="M11.5 9.5L14 12l-2.5 2.5"/>
+                    <path d="M2 12h2.2c1.2 0 2.1-.8 2.9-1.9"/>
+                    <path d="M8.9 5.9C9.7 4.8 10.6 4 11.8 4H14"/>
+                    <path d="M11.5 1.5L14 4l-2.5 2.5"/>
+                </g>
+            </symbol>
+            <symbol id="i-playlist" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M2 3h8M2 7h8M2 11h5"/>
+                    <path d="M11 9v5l3-2.5z" fill="currentColor" stroke="none"/>
+                </g>
+            </symbol>
             <symbol id="i-sync" viewBox="0 0 16 16">
                 <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9"/>
@@ -95,6 +136,26 @@
                     <circle cx="8" cy="3" r="1.4"/>
                     <circle cx="8" cy="8" r="1.4"/>
                     <circle cx="8" cy="13" r="1.4"/>
+                </g>
+            </symbol>
+            <symbol id="i-info" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+                    <circle cx="8" cy="8" r="6.25"/>
+                    <path d="M8 7v4"/>
+                </g>
+                <circle cx="8" cy="4.6" r="0.9" fill="currentColor"/>
+            </symbol>
+            <symbol id="i-cog" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="8" cy="8" r="4.8"/>
+                    <circle cx="8" cy="8" r="2.1"/>
+                    <path d="M8 1.2v2M8 12.8v2M1.2 8h2M12.8 8h2M3.2 3.2l1.4 1.4M11.4 11.4l1.4 1.4M12.8 3.2l-1.4 1.4M4.6 11.4l-1.4 1.4"/>
+                </g>
+            </symbol>
+            <symbol id="i-sign-out" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M6.5 2.5H3.2a1 1 0 0 0-1 1v9a1 1 0 0 0 1 1h3.3"/>
+                    <path d="M9.5 5l3 3-3 3M12.5 8H5.8"/>
                 </g>
             </symbol>
             <symbol id="i-stop" viewBox="0 0 16 16">
@@ -125,79 +186,106 @@
                 <path d="M4.5 8.2 L7 10.6 L11.6 5.6" fill="none" stroke="#fff"
                       stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
             </symbol>
+            <symbol id="i-star" viewBox="0 0 16 16">
+                <path d="M8 1.6l1.85 3.76 4.15.6-3 2.93.71 4.13L8 11.07l-3.71 1.95L5 8.89 2 5.96l4.15-.6z"/>
+            </symbol>
         </defs>
     </svg>
 
-    <h2>Download Video</h2>
-    <form id="downloadForm" class="form-group" onsubmit="startDownload(event)">
-        <div class="url-wrap">
-            <input type="url" id="urlInput" placeholder="Enter video URL here..." required autocomplete="off">
-            <button type="button" id="urlClear" class="url-clear" aria-label="Clear URL" style="display:none;"><svg width="14" height="14"><use href="#i-x"/></svg></button>
-        </div>
-        <button type="submit"><svg class="btn-icon"><use href="#i-download"/></svg><span>Download</span></button>
-    </form>
-
-    <div id="optionsContainer">
-        <details class="options-panel">
-            <summary class="options-summary">
-                <svg class="chev" viewBox="0 0 16 16" width="16" height="16">
-                    <path fill="currentColor" d="M8 12.3L1 5.5l1.4-1.4L8 9.5l5.6-5.4L15 5.5z"/>
-                </svg>
-                Download Options
-            </summary>
-            <div class="options-content">
-                <div id="optionsOverlay" class="options-overlay">
-                    <span class="options-overlay-msg">Select a URL to see available options</span>
-                </div>
-                <div class="options-row">
-                    <label for="optionsQualitySelect">Quality</label>
-                    <select id="optionsQualitySelect" class="options-select" style="flex: 1;" disabled>
-                        <option value="">Use default preference</option>
-                    </select>
-                </div>
-                <div class="options-row">
-                    <label for="optionsContainerSelect">Container Format</label>
-                    <select id="optionsContainerSelect" class="options-select" style="flex: 1;" disabled>
-                        <option value="">Automatic</option>
-                    </select>
-                </div>
-                <div class="options-row">
-                    <label for="optionsFilename">Title/Filename</label>
-                    <input type="text" id="optionsFilename" placeholder="Will be auto-filled from video title" style="flex: 1;">
+    <header id="appHeader" class="app-header">
+        <h2 class="app-title">
+            <svg id="appTitleIcon" class="app-title-icon" viewBox="-1.5 -1.5 19 19" aria-hidden="true">
+                <use href="#i-app-download" x="0" y="0" width="16" height="16"/>
+                <circle id="appTitleProgressTrack" class="app-title-progress-track" cx="8" cy="8" r="8.1"/>
+                <circle id="appTitleProgressRing" class="app-title-progress-ring" cx="8" cy="8" r="8.1"
+                        pathLength="100" transform="rotate(-90 8 8)" hidden/>
+            </svg>
+            <span>Video Download Helper</span>
+        </h2>
+        <div class="header-actions">
+            <div id="historySearch" class="header-search" role="search">
+                <button id="historySearchToggle" class="header-search-toggle" type="button"
+                        aria-label="Search history" aria-expanded="false" aria-controls="historySearchInput">
+                    <svg aria-hidden="true"><use href="#i-search"/></svg>
+                </button>
+                <input id="historySearchInput" class="header-search-input" type="text" maxlength="256"
+                       placeholder="Search title, tag, or filters" autocomplete="off"
+                       aria-label="Search history by title, tag, user, quality, star, or views">
+                <button id="historySearchClear" class="header-search-clear" type="button"
+                        aria-label="Clear search" hidden>
+                    <svg aria-hidden="true"><use href="#i-x"/></svg>
+                </button>
+            </div>
+            <div id="playbackModeControl" class="playback-mode-control">
+                <button id="endlessPlaybackButton" class="endless-playback-button" type="button"
+                        aria-label="Play All"
+                        title="Play the current History selection continuously in the built-in player" disabled>
+                    <svg aria-hidden="true"><use href="#i-play"/></svg>
+                    <span>Play All</span>
+                </button>
+                <button id="playbackModeToggle" class="playback-mode-toggle" type="button"
+                        aria-label="Choose playback mode" aria-haspopup="menu"
+                        aria-expanded="false" aria-controls="playbackModeMenu" disabled>
+                    <svg aria-hidden="true"><use href="#i-caret-down"/></svg>
+                </button>
+                <div id="playbackModeMenu" class="playback-mode-menu" role="menu" hidden>
+                    <button id="playbackMenuPlayAll" type="button" role="menuitem" disabled>
+                        <svg aria-hidden="true"><use href="#i-play"/></svg><span>Play All</span>
+                    </button>
+                    <button id="playbackMenuShuffle" type="button" role="menuitem" disabled>
+                        <svg aria-hidden="true"><use href="#i-shuffle"/></svg><span>Shuffle</span>
+                    </button>
                 </div>
             </div>
-        </details>
-    </div>
-
-    <div class="tabs" role="tablist">
-        <button class="tab active" data-tab="current" onclick="switchTab('current')">Current<span id="currentBadge" class="badge" style="display: none;">0</span></button>
-        <button class="tab" data-tab="history" onclick="switchTab('history')">Download History</button>
-        <button class="tab" data-tab="preferences" onclick="switchTab('preferences')">Preferences</button>
-    </div>
-
-    <div id="tagFilter" class="tag-filter" aria-label="Filter downloads by tag">
-        <select id="tagMatchMode" class="tag-match-mode" aria-label="Tag match mode">
-            <option value="all">ALL</option>
-            <option value="any">ANY</option>
-        </select>
-        <div id="tagFilterPicker" class="tag-filter-picker">
-            <div id="tagFilterTokens" class="tag-filter-tokens">
-                <input id="tagFilterInput" type="text" maxlength="64" placeholder="Filter by tag" autocomplete="off" aria-label="Filter by tag" aria-expanded="false" aria-controls="tagFilterSuggestions">
+            <button id="createPlaylistButton" class="create-playlist-button" type="button"
+                    onclick="openPlaylistEditor()" aria-label="Create playlist"
+                    aria-haspopup="dialog" aria-controls="playlistEditorDialog">
+                <svg aria-hidden="true"><use href="#i-playlist"/></svg>
+                <span>Create playlist</span>
+            </button>
+            <button id="newDownloadButton" class="new-download-button" type="button"
+                    onclick="openNewDownload()" aria-label="New download"
+                    aria-haspopup="dialog" aria-controls="newDownloadDialog" aria-expanded="false">
+                <svg aria-hidden="true"><use href="#i-plus"/></svg>
+            </button>
+            <button id="currentDownloadsButton" class="current-downloads-button" type="button"
+                    onclick="openCurrentDownloads()" aria-label="Current downloads"
+                    aria-haspopup="dialog" aria-controls="currentDownloadsDrawer" aria-expanded="false" hidden>
+                <svg aria-hidden="true"><use href="#i-download"/></svg>
+                <span class="current-downloads-label">Current downloads</span>
+                <span id="currentBadge" class="badge" hidden>0</span>
+            </button>
+            <div class="account-menu-wrap">
+                <button id="accountMenuButton" class="account-menu-button" type="button"
+                        aria-haspopup="menu" aria-expanded="false" aria-controls="accountMenu">
+                    <span id="currentUsername" class="current-username">{{ current_user.username }}</span>
+                    <svg aria-hidden="true"><use href="#i-chevron"/></svg>
+                </button>
+                <div id="accountMenu" class="account-menu" role="menu" hidden>
+                    <button id="settingsButton" class="account-menu-item" type="button"
+                            onclick="openSettings()" role="menuitem" aria-controls="settingsPage">
+                        <svg aria-hidden="true"><use href="#i-cog"/></svg>
+                        <span>Settings</span>
+                    </button>
+                    <form method="post" action="{{ url_for('logout') }}" class="logout-form" role="none">
+                        <button class="account-menu-item logout-button" type="submit" role="menuitem">
+                            <svg aria-hidden="true"><use href="#i-sign-out"/></svg>
+                            <span>Sign out</span>
+                        </button>
+                    </form>
+                </div>
             </div>
-            <div id="tagFilterSuggestions" class="tag-suggestions tag-filter-suggestions" role="listbox" hidden></div>
         </div>
-        <button id="clearTagFilter" class="tag-filter-clear" type="button" hidden>Clear</button>
-    </div>
+    </header>
 
-    <div id="tab-current" class="tab-panel active">
-        <div id="activeList"></div>
-        <p id="currentEmpty" class="empty">No active downloads. Paste a URL above to start.</p>
-    </div>
-
-    <div id="tab-history" class="tab-panel">
-        <div class="tab-header">
-            <button class="clear-btn" onclick="clearHistory()" style="margin-left:auto;">Clear History</button>
-        </div>
+    <section id="tab-history" class="history-panel" aria-label="Download history">
+        <section id="playlistShelf" class="playlist-shelf" aria-labelledby="playlistShelfTitle" hidden>
+            <div class="playlist-shelf-heading">
+                <h2 id="playlistShelfTitle">Playlists</h2>
+                <span id="playlistShelfCount"></span>
+            </div>
+            <div id="playlistList" class="playlist-list"></div>
+        </section>
         <div id="historyList"></div>
         <div id="historyPager" class="pager" style="display:none;">
             <button id="pagerFirst" onclick="goToPage(0)" aria-label="Jump to first page">«</button>
@@ -206,68 +294,472 @@
             <button id="pagerNext" onclick="changePage(1)" aria-label="Next page">›</button>
             <button id="pagerLast" onclick="goToPage(Infinity)" aria-label="Jump to last page">»</button>
         </div>
-        <p id="historyEmpty" class="empty">No completed downloads yet.</p>
-    </div>
+        <div id="historyEndlessSentinel" class="history-endless-sentinel" role="status" hidden>
+            Loading more videos…
+        </div>
+        <div id="historyEmpty" class="history-empty">
+            <strong id="historyEmptyTitle">No downloads yet</strong>
+            <span id="historyEmptyMessage">Add a video URL or drop a local video here to get started.</span>
+            <button id="historyEmptyAction" type="button" onclick="focusNewDownload()">Start a download</button>
+        </div>
+    </section>
+
+    <section id="settingsPage" class="settings-page" aria-labelledby="settingsTitle" hidden>
+        <div class="settings-page-header">
+            <button class="settings-back" type="button" onclick="closeSettings()" aria-label="Back to videos">
+                <svg aria-hidden="true"><use href="#i-chevron"/></svg>
+            </button>
+            <h1 id="settingsTitle">Settings</h1>
+        </div>
+        <div class="settings-page-body">
+            <div class="settings-search" role="search">
+                <svg aria-hidden="true"><use href="#i-search"/></svg>
+                <label for="settingsSearchInput" class="visually-hidden">Search settings</label>
+                <input id="settingsSearchInput" type="search" placeholder="Search settings" autocomplete="off">
+            </div>
+            <div class="settings-layout">
+                <nav class="settings-nav" aria-label="Settings sections">
+                    <button type="button" class="active" data-settings-section="general" aria-current="page">General</button>
+                    <button type="button" data-settings-section="playback">Playback</button>
+                    <button type="button" data-settings-section="browser-extension">Browser Extension</button>
+                    {% if is_admin %}
+                    <button type="button" data-settings-section="users">Users</button>
+                    <button type="button" class="danger" data-settings-section="danger">Danger Zone</button>
+                    {% endif %}
+                </nav>
+                <div class="settings-content">
+                    <div id="settingsError" class="action-error settings-error" role="alert" aria-live="assertive" hidden>
+                        <span id="settingsErrorMessage"></span>
+                        <button type="button" class="action-error-close" onclick="hideActionError()" aria-label="Dismiss error"><svg width="14" height="14"><use href="#i-x"/></svg></button>
+                    </div>
+
+                    <section id="settings-general" class="settings-section" data-settings-name="general" tabindex="-1">
+                        <h2>General</h2>
+                        <div class="setting-item" data-setting-keywords="download directory folder location path">
+                            <div class="setting-copy">
+                                <label for="prefDir">Download directory</label>
+                                <span>Where completed videos and partial downloads are stored.</span>
+                            </div>
+                            <input type="text" id="prefDir">
+                        </div>
+                        <div class="setting-item" data-setting-keywords="quality format resolution audio video default">
+                            <div class="setting-copy">
+                                <label for="prefFormat">Quality</label>
+                                <span>The default format used for new downloads.</span>
+                            </div>
+                            <select id="prefFormat">
+                                <option value="bestvideo+bestaudio/best">Best available (video + audio merged)</option>
+                                <option value="best">Best single file (no merge needed)</option>
+                                <option value="bestvideo[height<=2160]+bestaudio/best">Up to 2160p (4K)</option>
+                                <option value="bestvideo[height<=1440]+bestaudio/best">Up to 1440p (2K)</option>
+                                <option value="bestvideo[height<=1080]+bestaudio/best">Up to 1080p (Full HD)</option>
+                                <option value="bestvideo[height<=720]+bestaudio/best">Up to 720p (HD)</option>
+                                <option value="bestvideo[height<=480]+bestaudio/best">Up to 480p (SD)</option>
+                                <option value="worstvideo+worstaudio/worst">Smallest file (lowest quality)</option>
+                                <option value="bestaudio/best">Audio only (best)</option>
+                                <option value="__custom__">Custom (advanced)</option>
+                            </select>
+                        </div>
+                        <div class="setting-item" id="customFormatRow" data-setting-keywords="custom advanced format selector yt-dlp" data-setting-available="false" hidden>
+                            <div class="setting-copy">
+                                <label for="prefFormatCustom">Custom format</label>
+                                <span>An advanced yt-dlp format selector.</span>
+                            </div>
+                            <input type="text" id="prefFormatCustom" placeholder="e.g. bestvideo[ext=mp4]+bestaudio[ext=m4a]">
+                        </div>
+                        <div class="setting-item" data-setting-keywords="maximum concurrent simultaneous parallel downloads workers">
+                            <div class="setting-copy">
+                                <label for="prefMax">Max concurrent downloads</label>
+                                <span>How many downloads may run at the same time.</span>
+                            </div>
+                            <input type="number" id="prefMax" min="1">
+                        </div>
+                        <div class="setting-item" data-setting-keywords="videos items per page pagination history library">
+                            <div class="setting-copy">
+                                <label for="prefPageSize">Videos per page</label>
+                                <span>How many videos are shown on each library page.</span>
+                            </div>
+                            <select id="prefPageSize">
+                                <option value="5">5</option>
+                                <option value="10">10</option>
+                                <option value="20">20</option>
+                                <option value="50">50</option>
+                                <option value="endless">Endless scrolling</option>
+                            </select>
+                        </div>
+                        <div class="setting-item" data-setting-keywords="theme appearance light dark system color">
+                            <div class="setting-copy">
+                                <label for="prefTheme">Theme</label>
+                                <span>Use a light, dark, or system-matched appearance.</span>
+                            </div>
+                            <select id="prefTheme">
+                                <option value="system">System (follow OS setting)</option>
+                                <option value="light">Light</option>
+                                <option value="dark">Dark</option>
+                            </select>
+                        </div>
+                    </section>
+
+                    <section id="settings-playback" class="settings-section" data-settings-name="playback" tabindex="-1">
+                        <h2>Playback</h2>
+                        <div class="setting-item" data-setting-keywords="play videos player overlay new browser tab window">
+                            <div class="setting-copy">
+                                <label for="prefPlayer">Play videos in</label>
+                                <span>Choose between the built-in player and a browser tab.</span>
+                            </div>
+                            <select id="prefPlayer">
+                                <option value="overlay">Overlay on this page</option>
+                                <option value="new_tab">New browser tab</option>
+                            </select>
+                        </div>
+                        <div class="setting-item" data-setting-keywords="start videos full screen fullscreen player display">
+                            <div class="setting-copy">
+                                <label for="prefStartFullscreen">Start videos in full screen</label>
+                                <span id="prefStartFullscreenHint">Automatically enter full screen when the built-in player opens.</span>
+                            </div>
+                            <input type="checkbox" id="prefStartFullscreen" aria-describedby="prefStartFullscreenHint">
+                        </div>
+                        <h3 class="settings-subheading">Shuffle</h3>
+                        <div class="setting-item" data-setting-keywords="shuffle random quality resolution">
+                            <div class="setting-copy">
+                                <label for="prefShuffleMinHeight">Minimum video quality</label>
+                                <span>Include videos at or above this resolution.</span>
+                            </div>
+                            <select id="prefShuffleMinHeight">
+                                <option value="0">Any quality</option>
+                                <option value="360">360p</option>
+                                <option value="480">480p</option>
+                                <option value="720">720p</option>
+                                <option value="1080">1080p</option>
+                                <option value="1440">1440p</option>
+                                <option value="2160">2160p (4K)</option>
+                                <option value="4320">4320p (8K)</option>
+                            </select>
+                        </div>
+                        <div class="setting-item" data-setting-keywords="shuffle random length duration minutes">
+                            <div class="setting-copy">
+                                <label for="prefShuffleMinDuration">Minimum video length (minutes)</label>
+                                <span id="prefShuffleMinDurationHint">0 includes videos of any known length. Both Shuffle filters apply together.</span>
+                            </div>
+                            <input id="prefShuffleMinDuration" type="number" min="0" max="1440" step="1" value="0" aria-describedby="prefShuffleMinDurationHint">
+                        </div>
+                    </section>
+
+                    <section id="settings-browser-extension" class="settings-section" data-settings-name="browser-extension" tabindex="-1">
+                        <h2>Browser Extension</h2>
+                        <p class="settings-section-intro">VDL Companion sends the current page URL and that site's eligible Firefox cookies only after you click its toolbar action.</p>
+                        <div class="extension-warning" role="note">
+                            Cookies can grant the same website access as your signed-in browser session. VDL stores the page URL and query, but keeps cookies only in memory for the live download.
+                        </div>
+                        <div class="setting-item" data-setting-keywords="firefox install update extension companion addon browser">
+                            <div class="setting-copy">
+                                <strong>Install VDL Companion</strong>
+                                <span id="extensionInstallHint">Firefox will show an Add confirmation. Installation and pairing are separate steps.</span>
+                            </div>
+                            <a id="extensionInstallLink" class="settings-button-link" href="/browser-extension/vdl-companion-firefox.xpi" onclick="extensionPackageAction()">Install Firefox extension</a>
+                        </div>
+                        <div class="setting-item extension-pairing-item" data-setting-keywords="pair connect code string https localhost loopback private network cidr copy invalidate">
+                            <div class="setting-copy">
+                                <strong>Pair this Firefox profile</strong>
+                                <span>Create a one-time pairing string that is valid for five minutes.</span>
+                                <span id="extensionHttpsStatus" class="extension-origin-status">Checking whether this origin is safe for pairing…</span>
+                            </div>
+                            <div class="extension-pairing-controls">
+                                <button id="extensionCreatePairing" type="button" onclick="createExtensionPairing()">Create pairing string</button>
+                            </div>
+                        </div>
+                        <div class="extension-connections" data-setting-keywords="connections paired devices revoke token sign out">
+                            <h3>Active companion connections</h3>
+                            <p>The five-minute limit applies only to an unused pairing string. A successful connection remains active until you revoke it here or choose Unpair in the extension.</p>
+                            <div id="extensionConnectionList"></div>
+                            <p id="extensionNoConnections">No active companion connections.</p>
+                        </div>
+                        <p id="extensionStatus" class="extension-live-status" role="status" aria-live="polite"></p>
+                    </section>
+
+                    {% if is_admin %}
+                    <section id="settings-users" class="settings-section" data-settings-name="users" tabindex="-1">
+                        <h2>Users</h2>
+                        <p class="settings-section-intro">Add accounts and manage access to this application.</p>
+                        <div class="user-table-scroll" data-setting-keywords="users accounts add create role name suspend remove">
+                            <table class="user-table">
+                                <thead>
+                                    <tr>
+                                        <th scope="col">Login Name</th>
+                                        <th scope="col">Name</th>
+                                        <th scope="col">Role</th>
+                                        <th scope="col"><span class="visually-hidden">Actions</span></th>
+                                    </tr>
+                                </thead>
+                                <tbody id="userList" aria-live="polite"></tbody>
+                            </table>
+                        </div>
+                        <form id="addUserForm" onsubmit="addUser(event)"></form>
+                    </section>
+                    {% endif %}
+
+                    {% if is_admin %}
+                    <section id="settings-danger" class="settings-section settings-danger" data-settings-name="danger" tabindex="-1">
+                        <h2>Danger Zone</h2>
+                        <div class="setting-item settings-history-row" data-setting-keywords="clear delete remove download history files completed failed">
+                            <div class="setting-copy">
+                                <strong>Download history</strong>
+                                <span>Remove completed and failed downloads and their files.</span>
+                            </div>
+                            <button class="clear-btn" type="button" onclick="clearHistory()">Clear History</button>
+                        </div>
+                    </section>
+                    {% endif %}
+
+                    <p id="settingsNoResults" class="settings-no-results" role="status" hidden>No settings match your search.</p>
+                    <div class="pref-actions">
+                        <button id="saveBtn" type="button" onclick="savePreferences()"><svg class="btn-icon"><use href="#i-save"/></svg><span>Save</span></button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <dialog id="extensionPairingDialog" class="user-dialog extension-pairing-dialog" aria-labelledby="extensionPairingTitle" aria-describedby="extensionPairingInstructions" aria-modal="true">
+        <div id="extensionPairingOutput" class="user-dialog-card" hidden>
+            <div class="extension-pairing-dialog-header">
+                <div>
+                    <span class="extension-pairing-eyebrow">VDL Companion</span>
+                    <h2 id="extensionPairingTitle">Pair Firefox with VDL</h2>
+                </div>
+                <button type="button" class="extension-pairing-close" aria-label="Close pairing dialog" onclick="closeExtensionPairingDialog()">
+                    <svg aria-hidden="true"><use href="#i-x"/></svg>
+                </button>
+            </div>
+            <p id="extensionPairingInstructions">The pairing string connects this Firefox profile without sharing your VDL password.</p>
+            <div class="extension-pairing-ready" role="status">
+                <svg aria-hidden="true"><use href="#i-check-circle"/></svg>
+                <div>
+                    <strong>Pairing string ready</strong>
+                    <span>It can be used once.</span>
+                </div>
+                <span id="extensionPairingExpiry"></span>
+            </div>
+            <ol class="extension-pairing-steps">
+                <li>
+                    <span class="extension-step-number" aria-hidden="true">1</span>
+                    <div class="extension-step-content">
+                        <strong>Copy the pairing string</strong>
+                        <span>You will paste it into the extension in the next step.</span>
+                        <button id="extensionCopyPairing" type="button" class="extension-copy-primary" onclick="copyExtensionPairing()">
+                            <svg class="btn-icon" aria-hidden="true"><use href="#i-copy"/></svg>
+                            <span class="extension-copy-label">Copy pairing string</span>
+                        </button>
+                        <p id="extensionPairingFeedback" class="extension-pairing-feedback" role="status" aria-live="polite"></p>
+                    </div>
+                </li>
+                <li>
+                    <span class="extension-step-number" aria-hidden="true">2</span>
+                    <div class="extension-step-content">
+                        <strong>Finish in VDL Companion</strong>
+                        <span>Open the extension from the Firefox toolbar, paste the string, then choose <em>Pair with this VDL</em>.</span>
+                    </div>
+                </li>
+            </ol>
+            <details id="extensionPairingDetails" class="extension-pairing-details">
+                <summary>
+                    <span>Show pairing string</span>
+                    <svg aria-hidden="true"><use href="#i-chevron"/></svg>
+                </summary>
+                <label for="extensionPairingString">Pairing string</label>
+                <textarea id="extensionPairingString" readonly spellcheck="false"></textarea>
+            </details>
+            <div class="user-dialog-actions extension-pairing-actions">
+                <button type="button" class="danger extension-invalidate-button" onclick="invalidateExtensionPairing()">Invalidate pairing string</button>
+                <button type="button" onclick="closeExtensionPairingDialog()">Done</button>
+            </div>
+        </div>
+    </dialog>
+
+    {% if is_admin %}
+    <dialog id="userRemoveDialog" class="user-dialog" aria-labelledby="userRemoveTitle" aria-modal="true">
+        <form method="dialog" class="user-dialog-card">
+            <h2 id="userRemoveTitle">Remove user?</h2>
+            <p>Remove <strong id="userRemoveName"></strong>? This account will no longer be able to sign in.</p>
+            <div class="user-dialog-actions">
+                <button type="submit" value="cancel">Cancel</button>
+                <button type="submit" value="remove" class="danger">Remove</button>
+            </div>
+        </form>
+    </dialog>
+    <dialog id="userCreatedDialog" class="user-dialog" aria-labelledby="userCreatedTitle" aria-modal="true">
+        <form method="dialog" class="user-dialog-card">
+            <h2 id="userCreatedTitle">User added</h2>
+            <p>Share this generated initial password with <strong id="userCreatedName"></strong>. It is shown only once.</p>
+            <label for="userCreatedPassword">Initial password</label>
+            <input id="userCreatedPassword" type="text" readonly>
+            <div class="user-dialog-actions">
+                <button type="submit" value="close">Done</button>
+            </div>
+        </form>
+    </dialog>
+    {% endif %}
+
+    <dialog id="newDownloadDialog" class="new-download-dialog" aria-labelledby="newDownloadTitle" aria-modal="true">
+        <div class="new-download-dialog-header">
+            <h2 id="newDownloadTitle">New download</h2>
+            <button class="new-download-close" type="button" onclick="closeNewDownload()" aria-label="Close new download">
+                <svg aria-hidden="true"><use href="#i-x"/></svg>
+            </button>
+        </div>
+        <div class="new-download-dialog-body">
+            <div id="newDownloadError" class="action-error" role="alert" aria-live="assertive" hidden>
+                <span id="newDownloadErrorMessage"></span>
+                <button type="button" class="action-error-close" onclick="hideActionError()" aria-label="Dismiss error"><svg width="14" height="14"><use href="#i-x"/></svg></button>
+            </div>
+            <form id="downloadForm" class="form-group" onsubmit="startDownload(event)">
+                <label for="urlInput" class="visually-hidden">Download URL</label>
+                <div class="url-wrap">
+                    <input type="url" id="urlInput" placeholder="Enter video URL here..." required autocomplete="off">
+                    <button type="button" id="urlClear" class="url-clear" aria-label="Clear URL" style="display:none;"><svg width="14" height="14"><use href="#i-x"/></svg></button>
+                </div>
+                <button type="submit"><svg class="btn-icon"><use href="#i-download"/></svg><span>Download</span></button>
+            </form>
+
+            <div id="optionsContainer">
+                <details class="options-panel">
+                    <summary class="options-summary">
+                        <svg class="chev" viewBox="0 0 16 16" width="16" height="16">
+                            <path fill="currentColor" d="M8 12.3L1 5.5l1.4-1.4L8 9.5l5.6-5.4L15 5.5z"/>
+                        </svg>
+                        Download Options
+                    </summary>
+                    <div class="options-content">
+                        <div id="optionsOverlay" class="options-overlay">
+                            <span class="options-overlay-msg">Select a URL to see available options</span>
+                        </div>
+                        <div class="options-row">
+                            <label for="optionsQualitySelect">Quality</label>
+                            <select id="optionsQualitySelect" class="options-select" style="flex: 1;" disabled>
+                                <option value="">Use default preference</option>
+                            </select>
+                        </div>
+                        <div class="options-row">
+                            <label for="optionsContainerSelect">Container Format</label>
+                            <select id="optionsContainerSelect" class="options-select" style="flex: 1;" disabled>
+                                <option value="">Automatic</option>
+                            </select>
+                        </div>
+                        <div class="options-row">
+                            <label for="optionsFilename">Title/Filename</label>
+                            <input type="text" id="optionsFilename" placeholder="Will be auto-filled from video title" style="flex: 1;">
+                        </div>
+                    </div>
+                </details>
+            </div>
+        </div>
+    </dialog>
+
+    <dialog id="currentDownloadsDrawer" class="current-drawer" aria-labelledby="currentDownloadsTitle" aria-modal="true">
+        <div class="current-drawer-shell">
+            <div class="current-drawer-header">
+                <div>
+                    <h2 id="currentDownloadsTitle">Current downloads</h2>
+                    <span id="currentDrawerCount">0 items</span>
+                </div>
+                <button class="current-drawer-close" type="button" onclick="closeCurrentDownloads()" aria-label="Close current downloads" autofocus>
+                    <svg aria-hidden="true"><use href="#i-x"/></svg>
+                </button>
+            </div>
+            <div class="current-drawer-body">
+                <div id="currentDrawerError" class="action-error" role="alert" aria-live="assertive" hidden>
+                    <span id="currentDrawerErrorMessage"></span>
+                    <button type="button" class="action-error-close" onclick="hideActionError()" aria-label="Dismiss error"><svg width="14" height="14"><use href="#i-x"/></svg></button>
+                </div>
+                <div id="activeList"></div>
+                <p id="currentEmpty" class="empty">No current downloads.</p>
+            </div>
+        </div>
+    </dialog>
+
+    <dialog id="playlistEditorDialog" class="playlist-editor-dialog" aria-labelledby="playlistEditorTitle">
+        <form method="dialog" class="playlist-editor-shell" onsubmit="savePlaylistEditor(event)">
+            <div class="playlist-editor-header">
+                <div>
+                    <h2 id="playlistEditorTitle">Create playlist</h2>
+                    <span id="playlistEditorDirty" class="playlist-dirty" hidden>Unsaved changes</span>
+                </div>
+                <button type="button" class="playlist-dialog-close" onclick="closePlaylistEditor()" aria-label="Close playlist editor"><svg aria-hidden="true"><use href="#i-x"/></svg></button>
+            </div>
+            <div class="playlist-editor-body">
+                <div id="playlistEditorError" class="action-error" role="alert" aria-live="assertive" hidden></div>
+                <label class="playlist-field">Playlist name
+                    <input id="playlistName" type="text" maxlength="120" required autocomplete="off">
+                </label>
+                <label class="playlist-field">Find videos
+                    <input id="playlistVideoSearch" type="text" placeholder="Search finished videos" autocomplete="off">
+                </label>
+                <div class="playlist-editor-columns">
+                    <section aria-labelledby="playlistAvailableTitle">
+                        <h3 id="playlistAvailableTitle">Available videos</h3>
+                        <div id="playlistAvailable" class="playlist-picker-list"></div>
+                    </section>
+                    <section aria-labelledby="playlistSelectedTitle">
+                        <h3 id="playlistSelectedTitle">Playlist order</h3>
+                        <div id="playlistSelected" class="playlist-selected-list"></div>
+                    </section>
+                </div>
+                <div id="playlistMoveStatus" class="visually-hidden" role="status" aria-live="polite"></div>
+            </div>
+            <div class="playlist-editor-actions">
+                <button type="button" onclick="closePlaylistEditor()">Cancel</button>
+                <button id="playlistSaveButton" type="submit">Save playlist</button>
+            </div>
+        </form>
+    </dialog>
+
+    <dialog id="playlistChooserDialog" class="playlist-chooser-dialog" aria-labelledby="playlistChooserTitle">
+        <div class="playlist-chooser-shell">
+            <div class="playlist-editor-header">
+                <h2 id="playlistChooserTitle">Add to playlist</h2>
+                <button type="button" class="playlist-dialog-close" onclick="closePlaylistChooser()" aria-label="Close playlist chooser"><svg aria-hidden="true"><use href="#i-x"/></svg></button>
+            </div>
+            <div id="playlistChooserList" class="playlist-chooser-list"></div>
+            <button type="button" class="playlist-new-choice" onclick="createPlaylistFromChooser()"><svg aria-hidden="true"><use href="#i-plus"/></svg>New playlist…</button>
+        </div>
+    </dialog>
 
     <div id="playerBackdrop" class="player-backdrop" onclick="closePlayer(event)">
-        <div class="player-box" onclick="event.stopPropagation()">
-            <div id="playerTitle" class="player-title"></div>
-            <button class="player-close" onclick="closePlayer()" aria-label="Close player"><svg style="width:24px;height:24px"><use href="#i-x"/></svg></button>
-            <video id="playerVideo" controls autoplay></video>
-        </div>
-    </div>
-
-    <div id="tab-preferences" class="tab-panel">
-        <div class="pref-row">
-            <label for="prefDir">Download directory</label>
-            <input type="text" id="prefDir" style="width: 300px;">
-        </div>
-        <div class="pref-row">
-            <label for="prefFormat">Quality</label>
-            <select id="prefFormat" style="width: 320px;">
-                <option value="bestvideo+bestaudio/best">Best available (video + audio merged)</option>
-                <option value="best">Best single file (no merge needed)</option>
-                <option value="bestvideo[height<=2160]+bestaudio/best">Up to 2160p (4K)</option>
-                <option value="bestvideo[height<=1440]+bestaudio/best">Up to 1440p (2K)</option>
-                <option value="bestvideo[height<=1080]+bestaudio/best">Up to 1080p (Full HD)</option>
-                <option value="bestvideo[height<=720]+bestaudio/best">Up to 720p (HD)</option>
-                <option value="bestvideo[height<=480]+bestaudio/best">Up to 480p (SD)</option>
-                <option value="worstvideo+worstaudio/worst">Smallest file (lowest quality)</option>
-                <option value="bestaudio/best">Audio only (best)</option>
-                <option value="__custom__">Custom (advanced)</option>
-            </select>
-        </div>
-        <div class="pref-row" id="customFormatRow" style="display: none;">
-            <label for="prefFormatCustom">Custom format</label>
-            <input type="text" id="prefFormatCustom" style="width: 320px;" placeholder="e.g. bestvideo[ext=mp4]+bestaudio[ext=m4a]">
-        </div>
-        <div class="pref-row">
-            <label for="prefMax">Max concurrent</label>
-            <input type="number" id="prefMax" min="1" style="width: 80px;">
-        </div>
-        <div class="pref-row">
-            <label for="prefPlayer">Play videos in</label>
-            <select id="prefPlayer" style="width: 320px;">
-                <option value="overlay">Overlay on this page</option>
-                <option value="new_tab">New browser tab</option>
-            </select>
-        </div>
-        <div class="pref-row">
-            <label for="prefTheme">Theme</label>
-            <select id="prefTheme" style="width: 320px;">
-                <option value="system">System (follow OS setting)</option>
-                <option value="light">Light</option>
-                <option value="dark">Dark</option>
-            </select>
-        </div>
-        <div class="pref-actions">
-            <button id="saveBtn" onclick="savePreferences()"><svg class="btn-icon"><use href="#i-save"/></svg><span>Save</span></button>
+        <div class="player-box player-original-size" onclick="event.stopPropagation()">
+            <button class="player-close" type="button" onclick="closePlayer()" aria-label="Close player"><svg aria-hidden="true"><use href="#i-x"/></svg></button>
+            <div class="player-layout">
+                <div class="player-media-column">
+                    <video id="playerVideo" controls autoplay></video>
+                    <div id="playerTransition" class="player-transition" hidden>
+                        <span id="playerStatus" role="status" aria-live="polite"></span>
+                        <div class="player-transition-actions">
+                            <button id="playerContinue" type="button" onclick="continueEndlessPlayback()" hidden>Continue playback</button>
+                            <button id="playerReturnFullscreen" type="button" onclick="returnEndlessFullscreen()" hidden>Return to fullscreen</button>
+                            <button id="playerRetry" type="button" onclick="retryEndlessPlayback()" hidden>Retry</button>
+                            <button id="playerRestart" type="button" onclick="restartEndlessPlayback()" hidden>Start a new session</button>
+                            <button id="playerSkip" type="button" onclick="skipEndlessPlayback()" hidden>Skip</button>
+                            <button id="playerStopEndless" type="button" onclick="stopEndlessPlayback()" hidden>Stop endless playback</button>
+                            <button id="playerPlaybackSettings" type="button" onclick="openPlaybackSettingsFromPlayer()" hidden>Open Playback settings</button>
+                            <button id="playerTransitionClose" type="button" onclick="closePlayer()" hidden>Close</button>
+                        </div>
+                    </div>
+                </div>
+                <aside id="playlistQueue" class="playlist-queue" aria-labelledby="playlistQueueTitle" hidden>
+                    <h2 id="playlistQueueTitle">Playlist queue</h2>
+                    <div id="playlistQueueItems" class="playlist-queue-items"></div>
+                </aside>
+            </div>
         </div>
     </div>
 
     <footer id="versionFooter" class="version-footer" data-ui-version="{{ ui_version }}">
-        <span>UI v{{ ui_version }}</span><span aria-hidden="true"> · </span><span id="apiVersion">API checking…</span>
-        <span id="versionWarning" class="version-warning" hidden> · version mismatch — refresh</span>
+        <span id="serverStatus" class="server-status" role="alert" hidden>Server is not available — actions will not work until the connection is restored.</span>
+        <span id="itemCount">0 items</span><span aria-hidden="true"> · </span><span>UI v{{ ui_version }}</span><span aria-hidden="true"> · </span><span id="apiVersion">API checking…</span>
+        <span aria-hidden="true"> · </span><span id="uptime">Uptime checking…</span>
+        <span id="versionWarning" class="version-warning" hidden>
+            <span>version mismatch</span>
+            <a class="version-refresh-link" href="{{ url_for('index') }}">Refresh page</a>
+        </span>
         <span id="versionStatus" class="visually-hidden" role="status" aria-live="polite">API version is being checked.</span>
     </footer>
 

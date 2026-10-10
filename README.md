@@ -2,8 +2,10 @@
 
 A lightweight local video-downloader UI powered by yt-dlp. VDL provides a
 browser interface for choosing formats, tracking concurrent downloads, pausing
-or resuming work, organising entries with tags, and playing completed media.
+or resuming work, importing local videos by dropping them onto the page,
+organising entries with tags, and playing completed media.
 Live progress arrives over Server-Sent Events without browser polling.
+The UI and media APIs require a signed-in user.
 
 [![Latest release](https://img.shields.io/github/v/release/mnemonic-bit/VDL?display_name=tag&sort=semver)](https://github.com/mnemonic-bit/VDL/releases/latest)
 [![Main pipeline](https://github.com/mnemonic-bit/VDL/actions/workflows/main.yml/badge.svg?branch=main&event=push)](https://github.com/mnemonic-bit/VDL/actions/workflows/main.yml?query=branch%3Amain+event%3Apush)
@@ -33,8 +35,8 @@ behavior-changing release according to the policy in `AGENTS.md`.
 
 ## Run with Docker Compose
 
-The default deployment binds only to host loopback and stores media and SQLite
-state in independent named volumes:
+The default deployment publishes port 5000 on all host interfaces and stores
+media and SQLite state in independent named volumes:
 
 ```bash
 docker compose up --build -d
@@ -52,6 +54,57 @@ VDL_PORT=8080 docker compose up --build -d
 Stop containers with `docker compose down`. This preserves `vdl-data` and
 `vdl-downloads`; `docker compose down -v` intentionally deletes both volumes.
 
+### Watched ingest folder
+
+Compose mounts the repository's `./ingest` directory at `/ingest` read-only in
+the container. Copy a movie into that host directory and VDL will add a
+validated copy to Download History after the file has remained unchanged for
+60 seconds. The original stays in `./ingest`; remove it after the History item
+appears to keep the periodic directory scan small. Receipts in SQLite prevent
+an unchanged source from being imported again across restarts.
+
+A file appearing under its final name cannot prove that its writer is done.
+For a guaranteed completion handoff, copy under an ignored temporary name and
+rename it only after the copy completes. Both paths must be in the ingest
+directory so the rename is atomic:
+
+```bash
+cp /path/to/movie.mkv ./ingest/.movie.mkv.part
+mv ./ingest/.movie.mkv.part ./ingest/movie.mkv
+```
+
+Direct copies are supported as a convenience: VDL requires three unchanged
+observations spanning the settle period, compares device, inode, size, and
+nanosecond modification time before and after copying, then validates the
+copy with `ffprobe` before publishing it. A stalled writer can still exceed
+any finite settle period, which is why the temporary-name protocol is the
+strict option.
+
+Set `VDL_INGEST_HOST_DIR` to bind another host folder. The container only needs
+read and search permission on it:
+
+```bash
+VDL_INGEST_HOST_DIR=/srv/vdl/ingest docker compose up --build -d
+```
+
+`VDL_INGEST_SCAN_SECONDS` defaults to `10` and
+`VDL_INGEST_SETTLE_SECONDS` defaults to `60`; both accept values of at least
+one second. The scan is flat and uses directory metadata only, so idle cost is
+proportional to the number of top-level inbox entries, not their byte size.
+Hidden files, directories, symlinks, and names ending in `.part`, `.partial`,
+`.tmp`, `.crdownload`, or `.download` are ignored. Native runs can opt in with
+`VDL_INGEST_DIR`; leaving it unset disables the watcher.
+
+### First sign-in and user access
+
+The first visit asks you to set a password for the built-in `admin` account;
+there is no preset password. Passwords are stored as one-way Werkzeug hashes.
+After signing in, administrators can open **Settings → Users** to add normal or
+administrator accounts, rename accounts, suspend or resume access, reset
+passwords, and remove users. VDL prevents removal, suspension, or demotion of
+the last active administrator. Renaming the bootstrap administrator does not
+recreate an `admin` account on restart.
+
 Podman can build and run the same image. A Compose provider (`podman-compose`
 or Docker Compose) is required to use `compose.yaml` through Podman.
 
@@ -60,7 +113,8 @@ or Docker Compose) is required to use `compose.yaml` through Podman.
 ```bash
 docker build --pull -t vdl:local .
 docker run --rm -p 127.0.0.1:5000:5000 \
-  -v vdl-downloads:/downloads -v vdl-data:/data vdl:local
+  -v vdl-downloads:/downloads -v vdl-data:/data \
+  -v /srv/vdl/ingest:/ingest:ro vdl:local
 ```
 
 The image contains yt-dlp `2026.08.19`, Deno `2.9.5`, EJS, curl-cffi,
@@ -73,6 +127,7 @@ Published multi-platform images are available from GHCR:
 docker pull ghcr.io/mnemonic-bit/vdl:latest
 docker run --rm -p 127.0.0.1:5000:5000 \
   -v vdl-downloads:/downloads -v vdl-data:/data \
+  -v /srv/vdl/ingest:/ingest:ro \
   ghcr.io/mnemonic-bit/vdl:latest
 ```
 
@@ -83,10 +138,10 @@ published platform image has GitHub-native provenance and an SPDX SBOM
 attestation. Verify them with GitHub CLI:
 
 ```bash
-gh attestation verify oci://ghcr.io/mnemonic-bit/vdl:v0.4.0 \
+gh attestation verify oci://ghcr.io/mnemonic-bit/vdl:v0.4.1 \
   --repo mnemonic-bit/VDL
 amd64_digest=$(docker buildx imagetools inspect \
-  ghcr.io/mnemonic-bit/vdl:v0.4.0 --raw | \
+  ghcr.io/mnemonic-bit/vdl:v0.4.1 --raw | \
   jq -r '.manifests[] | select(.platform.architecture == "amd64") | .digest')
 gh attestation verify "oci://ghcr.io/mnemonic-bit/vdl@$amd64_digest" \
   --repo mnemonic-bit/VDL \
@@ -114,34 +169,43 @@ controls and do not guarantee a successful download.
 ## Storage, backup, and upgrades
 
 List the concrete named-volume locations with `docker volume inspect`. Back up
-both volumes while VDL is stopped; `/data` contains download history and
-preferences, while `/downloads` contains completed media and resumable partials.
+both volumes while VDL is stopped; `/data` contains users, password hashes,
+session signing state, download history, and preferences, while `/downloads`
+contains completed media and resumable partials.
 
 Upgrades are immutable and reviewed: update image digests and dependency pins,
 update `requirements-container.constraints`, regenerate
-`requirements-container.txt`, rebuild with `--pull`, run the smoke
-checks, then recreate the service. Do not run `yt-dlp -U`, `pip install -U`, or
-a Deno updater inside a running container. Rollback starts the previous image
-against the same two volumes; this feature adds no database migration.
+`requirements-container.txt` for both `manylinux_2_17_x86_64` and
+`manylinux_2_17_aarch64`, run `./tests/container/check-lock.sh`, rebuild with
+`--pull`, run the smoke checks, then recreate the service. Do not run
+`yt-dlp -U`, `pip install -U`, or a Deno updater inside a running container.
+Rollback starts the previous image against the same two volumes. Startup
+automatically creates the access-control tables when upgrading an older
+database.
 
-Bind mounts are supported in place of the named volumes, but both host paths
-must already be writable by UID/GID 10001:
+Bind mounts are supported in place of the named volumes. The data and download
+paths must already be writable by UID/GID 10001; the ingest path only needs to
+be readable and searchable:
 
 ```bash
 sudo install -d -o 10001 -g 10001 /srv/vdl/data /srv/vdl/downloads
+sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0755 /srv/vdl/ingest
 docker run --rm -p 127.0.0.1:5000:5000 \
-  -v /srv/vdl/data:/data -v /srv/vdl/downloads:/downloads vdl:local
+  -v /srv/vdl/data:/data -v /srv/vdl/downloads:/downloads \
+  -v /srv/vdl/ingest:/ingest:ro vdl:local
 ```
 
-The entrypoint fails with a clear ownership error instead of starting a server
-that cannot create its database or media files.
+The entrypoint fails with a clear storage-access error instead of starting a
+server that cannot create its database, write media, or read the ingest mount.
 
 ## Network exposure
 
-The UI accepts arbitrary operator-supplied URLs and has no authentication. The
-Compose port therefore binds to `127.0.0.1`. LAN or Internet exposure requires
-a separately reviewed authenticated reverse proxy, request limits, and an SSRF
-policy; changing the bind address alone is not a safe public deployment.
+The UI accepts arbitrary operator-supplied URLs and requires a local VDL
+account. The Compose port binds to `0.0.0.0`; use strong passwords and still
+restrict access to a trusted network or place it behind a hardened reverse
+proxy with request limits and an SSRF policy before exposing it publicly. The
+login is an application access boundary, not protection against hostile URLs
+submitted by an authorized user.
 
 Only download media you are authorised to access and use. VDL does not bypass
 DRM or access controls, and operators remain responsible for applicable site
@@ -183,7 +247,8 @@ unrelated removal or restriction should be recorded rather than treated as a
 container build failure.
 
 Inspect image health with `docker inspect --format '{{json .State.Health}}'`
-or the equivalent Podman command. `/api/health` is local-only and does not call
+or the equivalent Podman command. `/api/health` intentionally remains
+unauthenticated for runtime probes, exposes no library data, and does not call
 YouTube or the optional provider.
 
 ## Native development
@@ -197,6 +262,69 @@ python vdl.py
 
 Native development defaults to <http://127.0.0.1:5000>. ffmpeg remains an
 external system dependency.
+
+## Firefox authenticated downloads
+
+VDL Companion lets a signed-in user send the current Firefox page and the
+cookies applicable to that page to VDL with one explicit toolbar click. This
+is useful for media the site exposes only to the user's legitimate browser
+session. It does not bypass DRM, CAPTCHA, bot protection, geographic or account
+authorization, or a site's terms.
+
+Pairing requires desktop Firefox 140 or later. Trusted HTTPS remains the
+recommended transport and is required for public addresses. For local use,
+plain HTTP is enabled on loopback by default. An operator may explicitly allow
+RFC1918 private or RFC6598 shared IPv4 networks with a comma-separated CIDR
+list, for example:
+
+```bash
+VDL_COMPANION_HTTP_CIDRS=192.168.1.0/24 docker compose up --build -d
+```
+
+For this workspace's shared-address subnet, the equivalent is
+`VDL_COMPANION_HTTP_CIDRS=100.96.0.0/24`.
+
+Then open the exact private address, such as `http://192.168.1.20:5000`.
+Private HTTP sends page URLs, cookies, and the companion token without
+transport encryption, so enable it only on a network whose users and traffic
+you trust. Hostnames and public IP ranges are intentionally not accepted for
+this exception.
+
+For other deployments, put VDL behind an HTTPS reverse proxy and forward
+requests to the normal VDL HTTP listener. The public URL may use a non-default port,
+for example `https://vdl.example:8443`, but it must have no path prefix.
+Install the proxy's private certificate authority in Firefox when using an
+internal CA.
+
+For a typical reverse proxy, preserve the original request path and host, allow
+long-lived `/api/events` responses without buffering, and proxy the fixed XPI
+and `/api/extension/*` paths unchanged. No forwarded-scheme trust setting is
+needed for pairing: Settings uses the browser's authoritative
+`window.location.origin`.
+
+To use the companion:
+
+1. Open VDL Settings → Browser Extension and install the bundled XPI. Firefox
+   always displays its own Add confirmation.
+2. Create and copy the five-minute pairing string, paste it into the extension
+   onboarding page, verify the exact destination origin, and confirm pairing.
+3. Open a signed-in video page and click **Download current page with VDL**.
+   Firefox asks for access the first time each website host is used.
+4. Install a newer bundled XPI when Settings reports an update. The stable
+   add-on identity updates the existing installation in place.
+5. Use **Revoke** in VDL Settings or **Unpair** in the extension options to end
+   a connection. Signing out of the VDL web UI alone does not revoke it.
+
+Firefox Containers are isolated by the clicked tab's cookie store. Private
+windows, partitioned/FPI cookies, related identity-provider domains,
+localStorage, custom browser headers, Android/iOS Firefox, and non-Firefox
+browsers are not supported. If an authenticated download is cancelled or VDL
+restarts, revisit the signed-in source page and click the companion again;
+ordinary Continue is intentionally unavailable because cookies are never
+persisted. VDL stores the source URL and its query in the downloads database,
+while browser cookies remain in the live worker's memory only. See
+[the companion privacy notice](browser-extension/PRIVACY.md) for the complete
+data-handling disclosure.
 
 ## Project status and support
 

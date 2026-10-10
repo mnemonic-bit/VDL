@@ -16,4 +16,11 @@ for directory in /data /downloads; do
     fi
 done
 
+if [ -n "${VDL_INGEST_DIR:-}" ]; then
+    if [ ! -d "$VDL_INGEST_DIR" ] || [ ! -r "$VDL_INGEST_DIR" ] || [ ! -x "$VDL_INGEST_DIR" ]; then
+        echo "VDL cannot read ingest directory $VDL_INGEST_DIR as UID/GID 10001:10001" >&2
+        exit 1
+    fi
+fi
+
 exec "$@"

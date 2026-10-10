@@ -52,14 +52,16 @@ Flask + `yt-dlp` video-downloader UI. **Single-process, single-file backend** ([
 - **History tab** shows: `finished` + `error` only
 
 ## CONVENTIONS
+- **Keep codebase-memory in sync:** if the `codebase-memory-mcp` index is stale or otherwise out of sync with the current repository, immediately re-index the current repository before relying on graph results.
 - **Comment culture**: rationale-not-what. Existing comments explain *why* (e.g. why `speed=0.0` not `None`, why `continuedl=True` is explicit, why we drop the head on full queue). Match this register.
 - **Frontend has NO build step**: `app.js` loads raw. No `import`/`export`, no bundler, no transpiler. Browser globals only.
 - **Icons** live in [`index.html` `<defs>`](file:///workspace/templates/index.html#L28-L121) — reference via `<svg><use href="#i-name"/></svg>`. Never inline duplicate SVG paths in JS templates.
 - **CSS theming** via `:root` and `html[data-theme="dark"]` custom properties. No hard-coded hex outside the var blocks (a few action-button colours excepted).
 - **Indentation**: 4 spaces (Python and JS).
 - **Commit style**: `fix:`, `feature:`, `refactor:` prefixes; lowercase imperative.
-- **Podman port binding**: when starting containers with Podman, publish host ports on all interfaces (for example, `--publish 0.0.0.0:5000:5000`).
-- **Version bump is a completion criterion**: update root `VERSION` in the same change as shipped behavior. Features increment `MINOR` and reset `PATCH`; bug fixes increment `PATCH`; breaking or incompatible API changes increment `MAJOR` and reset `MINOR` and `PATCH` (including while major is zero). For mixed changes, apply only the highest-impact bump: `MAJOR` before `MINOR`, then `PATCH`. Documentation, tests, formatting, and behavior-neutral refactors do not independently require a bump.
+- **Podman deployment:** follow [`PODMAN.md`](PODMAN.md) when building or running the app with Podman.
+- **Coverage gates completion:** before claiming any feature or bug fix is done, run `./tests/run-all.sh --unit` and verify that `vdl.py` line coverage meets the enforced 90% minimum. A passing test suite without the coverage result is insufficient; use Python 3.12 to match GitHub Actions when the result is close to the threshold.
+- **Code changes require their own version bump**: increment root `VERSION` before completing each distinct requested change that modifies code. Documentation-only changes, including bug specs and agent-instruction updates, leave `VERSION` unchanged. An existing uncommitted version change belongs to earlier work and must not be reused; increment `VERSION` again for a new code change. Features increment `MINOR` and reset `PATCH`; bug fixes and code changes without greater SemVer impact increment `PATCH`; breaking or incompatible API changes increment `MAJOR` and reset `MINOR` and `PATCH` (including while major is zero). For a mixed code-and-documentation change, apply one bump at the highest code impact: `MAJOR` before `MINOR`, then `PATCH`.
 
 ## ANTI-PATTERNS (THIS PROJECT)
 - **DO NOT** add a bundler / transpiler / framework to the frontend. It's intentionally vanilla.
@@ -76,7 +78,6 @@ Flask + `yt-dlp` video-downloader UI. **Single-process, single-file backend** ([
 - **Container dependencies are separately locked.** Native development uses `requirements.txt`; the image installs the hashed `requirements-container.txt` and keeps the optional BgUtils plugin dormant unless `VDL_POT_PROVIDER_URL` is set.
 - **`/api/resume` ≠ `/api/unpause`**: `resume` spawns a NEW worker thread for `cancelled`/`interrupted` rows (relies on yt-dlp's `continuedl=True` to find the `.part` file). `unpause` clears the flag for an ALIVE paused worker.
 - **Cancel beats pause**: [`request_cancel` drops the pause flag](file:///workspace/vdl.py#L290-L295) so a paused worker wakes up and aborts. Don't re-arm pause during cancel.
-- **No CI or linter.** Run `python -m unittest discover -s tests -v`; UI lifecycle and external-site verification remain manual.
 - **`media/` and `downloads.db` are tracked-in-tree but gitignored.** A fresh clone has neither; both are created on first run.
 
 ## COMMANDS
@@ -94,7 +95,7 @@ HOST=0.0.0.0 FLASK_DEBUG=0 python vdl.py
 # Override DB / download dir (e.g. in a container)
 DOWNLOADS_DB=/data/downloads.db DOWNLOADS_DIR=/downloads python vdl.py
 
-# Container deployment (loopback-only port, persistent named volumes)
+# Container deployment (all interfaces, persistent named volumes)
 docker compose up --build -d
 
 # Optional PO-token provider profile

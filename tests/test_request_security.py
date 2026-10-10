@@ -25,6 +25,7 @@ class CrossOriginMutationTest(AppCase):
         remove_path = self.finished_file("remove01", "remove.mp4")
         rename_path = self.finished_file("rename01", "rename.mp4")
         clear_path = self.finished_file("clear001", "clear.mp4")
+        view_path = self.finished_file("view0001", "view.mp4")
 
         with (
             mock.patch.object(vdl, "background_download"),
@@ -53,6 +54,7 @@ class CrossOriginMutationTest(AppCase):
                 "stop": self.client.post("/api/stop/stop0001", headers=form_origin),
                 "resume": self.client.post("/api/resume/resume01", headers=form_origin),
                 "remove": self.client.post("/api/remove/remove01", headers=form_origin),
+                "view": self.client.post("/api/view/view0001", headers=form_origin),
                 "clear": self.client.post("/api/clear", headers=form_origin),
             }
 
@@ -70,12 +72,14 @@ class CrossOriginMutationTest(AppCase):
 
         self.assertIsNotNone(vdl.db_get_download("clear001"))
         self.assertIsNotNone(vdl.db_get_download("remove01"))
+        self.assertEqual(vdl.db_get_download("view0001")["view_count"], 0)
         self.assertEqual(
             vdl.db_get_download("rename01")["filename"], rename_path
         )
         self.assertTrue(os.path.isfile(clear_path))
         self.assertTrue(os.path.isfile(remove_path))
         self.assertTrue(os.path.isfile(rename_path))
+        self.assertTrue(os.path.isfile(view_path))
 
     def test_same_origin_and_non_browser_api_requests_remain_supported(self):
         self.insert("same0001")

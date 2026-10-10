@@ -1,6 +1,16 @@
 import argparse
+import base64
+import gc
+import hashlib
+import hmac
+import io
+import ipaddress
 
-from flask import Flask, render_template, request, jsonify, send_file, abort, Response, stream_with_context
+from flask import (
+    Flask, Response, abort, g, jsonify, redirect, render_template, request,
+    send_file, session, stream_with_context, url_for,
+)
+from werkzeug.security import check_password_hash, generate_password_hash
 import yt_dlp
 import threading
 import queue
@@ -9,12 +19,18 @@ import uuid
 import sqlite3
 import os
 import re
+import math
 import time
 import subprocess
 import mimetypes
 import copy
+import secrets
+import stat
+import tempfile
 import unicodedata
+import zipfile
 from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -49,6 +65,90 @@ def _load_app_version(version_path=None):
 # Loading once keeps health checks cheap and makes a missing or malformed
 # release declaration a startup failure instead of an ambiguous runtime state.
 APP_VERSION = _load_app_version()
+# A monotonic clock measures process lifetime without wall-clock corrections
+# making the displayed uptime jump backwards or forwards.
+APP_STARTED_AT = time.monotonic()
+COMPANION_PROTOCOL = 1
+COMPANION_PROTOCOLS = (COMPANION_PROTOCOL,)
+COMPANION_PACKAGE_VERSION = '1.0.3'
+COMPANION_PAIRING_CODE_FORMAT = 2
+COMPANION_XPI_NAME = 'vdl-companion-firefox.xpi'
+COMPANION_XPI_PATH = (
+    Path(__file__).resolve().parent / 'browser-extension' / 'dist'
+    / COMPANION_XPI_NAME
+)
+COMPANION_XPI_CHECKSUM_PATH = COMPANION_XPI_PATH.with_suffix('.xpi.sha256')
+COMPANION_ENDPOINTS = {
+    'extension_pair', 'extension_status', 'extension_downloads',
+    'extension_token', 'extension_preflight',
+}
+EXTENSION_NO_STORE_ENDPOINTS = COMPANION_ENDPOINTS | {
+    'extension_pairing_codes', 'extension_current_pairing_code',
+    'extension_connections', 'extension_connection',
+}
+
+# Pairing codes deliberately disappear on restart. The bounded rate windows
+# have the same process lifetime and never retain request bodies or credentials.
+_pairing_codes = {}
+_pairing_lock = threading.Lock()
+_companion_rate_lock = threading.Lock()
+_failed_pair_rates = {}
+_failed_pair_global = []
+_token_download_rates = {}
+
+
+def _validated_companion_http_networks(value):
+    """Return explicit local IPv4 networks allowed to pair over HTTP."""
+    networks = [ipaddress.ip_network('127.0.0.0/8')]
+    local_ranges = tuple(ipaddress.ip_network(item) for item in (
+        '10.0.0.0/8', '100.64.0.0/10', '172.16.0.0/12',
+        '192.168.0.0/16',
+    ))
+    for raw in (value or '').split(','):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            network = ipaddress.ip_network(raw, strict=True)
+        except ValueError as exc:
+            raise RuntimeError(
+                'VDL_COMPANION_HTTP_CIDRS must contain comma-separated '
+                'canonical IPv4 CIDRs'
+            ) from exc
+        if network.version != 4 or not any(
+                network.subnet_of(parent) for parent in local_ranges):
+            raise RuntimeError(
+                'VDL_COMPANION_HTTP_CIDRS permits only private or shared '
+                'local IPv4 networks'
+            )
+        if network not in networks:
+            networks.append(network)
+    return tuple(networks)
+
+
+COMPANION_HTTP_NETWORKS = _validated_companion_http_networks(
+    os.environ.get('VDL_COMPANION_HTTP_CIDRS')
+)
+
+
+def _companion_http_host_allowed(hostname):
+    hostname = (hostname or '').rstrip('.').lower()
+    if hostname == 'localhost' or hostname.endswith('.localhost'):
+        return True
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        return False
+    return address.is_loopback or (
+        address.version == 4 and any(
+            address in network for network in COMPANION_HTTP_NETWORKS
+        )
+    )
+
+
+def _get_uptime_seconds():
+    """Return the number of complete seconds this application has been running."""
+    return max(0, int(time.monotonic() - APP_STARTED_AT))
 
 
 def _validated_pot_provider_url(value):
@@ -103,6 +203,10 @@ def yt_dlp_options(options):
     return merged
 
 app = Flask(__name__)
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+)
 
 
 def _normalized_http_origin(value):
@@ -129,13 +233,54 @@ def _normalized_http_origin(value):
     return parsed.scheme.lower(), parsed.hostname.lower(), port
 
 
+def _companion_management_origin():
+    origin = _normalized_http_origin(
+        request.headers.get('Origin') or request.host_url
+    )
+    if origin is None or not (
+            origin[0] == 'https'
+            or (origin[0] == 'http' and _companion_http_host_allowed(origin[1]))):
+        return None
+    scheme, hostname, port = origin
+    display_host = f'[{hostname}]' if ':' in hostname else hostname
+    default_port = 443 if scheme == 'https' else 80
+    return f'{scheme}://{display_host}' + (
+        f':{port}' if port != default_port else ''
+    )
+
+
+def _is_extension_origin(value):
+    """Accept only Firefox's opaque per-install extension origin."""
+    if not value:
+        return False
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == 'moz-extension'
+        and bool(parsed.hostname)
+        and parsed.username is None
+        and parsed.password is None
+        and port is None
+        and parsed.path in ('', '/')
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
 @app.before_request
 def reject_cross_origin_api_mutation():
-    """Keep browser form submissions from mutating the loopback service."""
-    if (
-        not request.path.startswith('/api/')
-        or request.method not in ('POST', 'PUT', 'PATCH', 'DELETE')
-    ):
+    """Keep browser form submissions from mutating the service."""
+    if request.endpoint in COMPANION_ENDPOINTS:
+        origin = request.headers.get('Origin')
+        if origin is not None and not _is_extension_origin(origin):
+            return _companion_error(
+                400, 'invalid_request', 'Invalid extension origin'
+            )
+        return None
+    if request.method not in ('POST', 'PUT', 'PATCH', 'DELETE'):
         return None
 
     origin = request.headers.get('Origin')
@@ -152,6 +297,63 @@ def reject_cross_origin_api_mutation():
         return jsonify({"error": "Cross-origin request denied"}), 403
     return None
 
+
+@app.before_request
+def require_authenticated_user():
+    """Resolve the signed session before any private UI or API is served."""
+    # Static styling is needed by the sign-in page, and the data-free health
+    # probe must remain available to container runtimes before anyone signs in.
+    if request.endpoint in (
+            'static', 'login', 'health', 'browser_extension_package',
+            *COMPANION_ENDPOINTS):
+        return None
+    if request.path.startswith('/browser-extension/'):
+        abort(404)
+
+    user_id = session.get('user_id')
+    user = db_get_user_by_id(user_id) if user_id is not None else None
+    if (user is not None
+            and not user['suspended']
+            and user['password_hash'] is not None
+            and session.get('session_version') == user['session_version']):
+        g.current_user = user
+        return None
+
+    session.clear()
+    if request.path.startswith('/api/'):
+        return jsonify({"error": "Authentication required"}), 401
+    return redirect(url_for('login'))
+
+
+@app.after_request
+def companion_response_headers(response):
+    """Apply the narrow CORS and cache boundary to companion responses."""
+    if request.endpoint not in EXTENSION_NO_STORE_ENDPOINTS:
+        return response
+    response.headers['Cache-Control'] = 'no-store'
+    if request.endpoint not in COMPANION_ENDPOINTS:
+        return response
+    origin = request.headers.get('Origin')
+    if origin and _is_extension_origin(origin):
+        response.headers['Access-Control-Allow-Origin'] = origin
+        response.headers.add('Vary', 'Origin')
+    return response
+
+
+def admin_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if 'admin' not in g.current_user['roles']:
+            return jsonify({"error": "Administrator access required"}), 403
+        return view(*args, **kwargs)
+    return wrapped
+
+
+def _start_user_session(user):
+    session.clear()
+    session['user_id'] = user['id']
+    session['session_version'] = user['session_version']
+
 # ---------------------------------------------------------------------------
 # Event bus (server -> browser push)
 # ---------------------------------------------------------------------------
@@ -163,27 +365,30 @@ def reject_cross_origin_api_mutation():
 
 class EventBus:
     def __init__(self):
-        self._subs = set()
+        self._subs = {}
         self._lock = threading.Lock()
 
-    def subscribe(self):
+    def subscribe(self, user_id=None):
         # maxsize keeps a stuck/disconnected client from ballooning memory.
         # If full, we drop the oldest event for that subscriber -- stale clients
         # always reconcile by refetching /api/history on the next event anyway.
         q = queue.Queue(maxsize=64)
         with self._lock:
-            self._subs.add(q)
+            self._subs[q] = user_id
         return q
 
     def unsubscribe(self, q):
         with self._lock:
-            self._subs.discard(q)
+            self._subs.pop(q, None)
 
-    def publish(self, kind, payload=None):
+    def publish(self, kind, payload=None, owner_user_id=None):
         msg = (kind, payload)
         with self._lock:
-            subs = list(self._subs)
-        for q in subs:
+            subs = list(self._subs.items())
+        for q, subscriber_user_id in subs:
+            if (owner_user_id is not None
+                    and subscriber_user_id != owner_user_id):
+                continue
             try:
                 q.put_nowait(msg)
             except queue.Full:
@@ -222,11 +427,43 @@ DEFAULT_DOWNLOAD_DIR = os.environ.get("DOWNLOADS_DIR", ".")
 HISTORY_STATUSES = ('finished', 'error')
 TERMINAL_STATUSES = HISTORY_STATUSES + ('cancelled', 'interrupted')
 
+PLAYBACK_SESSION_TTL_SECONDS = 30 * 60
+PLAYBACK_SESSION_MAX_PER_USER = 8
+PLAYBACK_SESSION_MAX_FILTER_LENGTH = 256
+PLAYBACK_SESSION_MAX_PAGE_SIZE = 100
+PLAYBACK_SESSION_MAX_COORDINATE = 1_000_000
+PLAYBACK_SESSION_ORDERINGS = ('newest', 'favorites_first')
+SHUFFLE_MIN_HEIGHTS = (0, 360, 480, 720, 1080, 1440, 2160, 4320)
+PLAYLIST_MAX_ITEMS = 10_000
+PLAYLIST_MAX_POSITION_SECONDS = 31 * 24 * 60 * 60
+BROWSER_VIDEO_EXTENSIONS = {
+    '.mp4', '.m4v', '.webm', '.mkv', '.ogg', '.ogv', '.mov', '.avi',
+}
+
 # A single lock serialises writes from background threads. SQLite itself is
 # safe for concurrent reads, but multiple writers across threads on the same
 # connection cause "database is locked" errors. We open a fresh connection
 # per operation and guard writes with this lock.
 _db_lock = threading.Lock()
+_upload_lock = threading.Lock()
+# Preview generation opens the source seven times and encodes a new asset.
+# Serialising that work keeps a burst of first-time hovers from saturating the
+# host while cached previews continue to bypass the lock entirely.
+_preview_generation_lock = threading.Lock()
+_NO_UPDATE = object()
+
+# Endless playback is disposable navigation state. Keeping it outside SQLite
+# makes process restarts an explicit lease boundary and avoids leaving behind
+# playlist-shaped records for a feature that deliberately resolves live data.
+_playback_sessions = {}
+_playback_sessions_lock = threading.Lock()
+
+# Upload and download completion keep their long-standing inspection helpers
+# patchable for callers while sharing one ffprobe invocation in production.
+# Results are consumed immediately by the publishing worker and keyed by the
+# unique temporary/final path so concurrent completions cannot cross wires.
+_media_probe_cache = {}
+_media_probe_cache_lock = threading.Lock()
 
 # Workers wait here before entering yt-dlp. A FIFO queue keeps a burst in
 # worker-arrival order while the counter lets preference changes take
@@ -234,6 +471,10 @@ _db_lock = threading.Lock()
 _worker_condition = threading.Condition()
 _worker_queue = []
 _active_worker_count = 0
+# Terminal status is visible before a worker has necessarily unwound its
+# yt-dlp stack. Keep that resource-ownership lifetime separate from the slot
+# counter so removal cannot unlink a file the worker still has open.
+_live_worker_ids = set()
 
 
 @contextmanager
@@ -263,6 +504,28 @@ def init_db():
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS app_config (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS roles (
+                id   INTEGER PRIMARY KEY,
+                name TEXT NOT NULL COLLATE NOCASE UNIQUE
+            );
+            CREATE TABLE IF NOT EXISTS users (
+                id              INTEGER PRIMARY KEY,
+                username        TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                password_hash   TEXT,
+                suspended       INTEGER NOT NULL DEFAULT 0
+                                CHECK (suspended IN (0, 1)),
+                session_version INTEGER NOT NULL DEFAULT 0,
+                created_at      REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS user_roles (
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                role_id INTEGER NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+                PRIMARY KEY (user_id, role_id)
+            );
             CREATE TABLE IF NOT EXISTS tags (
                 id              INTEGER PRIMARY KEY,
                 name            TEXT NOT NULL,
@@ -275,6 +538,62 @@ def init_db():
                 created_at  REAL NOT NULL,
                 PRIMARY KEY (download_id, tag_id)
             );
+            CREATE TABLE IF NOT EXISTS playlists (
+                id                 TEXT PRIMARY KEY,
+                owner_user_id      INTEGER NOT NULL
+                                         REFERENCES users(id) ON DELETE CASCADE,
+                name               TEXT NOT NULL,
+                revision           INTEGER NOT NULL DEFAULT 1,
+                created_at         REAL NOT NULL,
+                content_updated_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS playlist_items (
+                playlist_id TEXT NOT NULL
+                                 REFERENCES playlists(id) ON DELETE CASCADE,
+                download_id TEXT NOT NULL
+                                 REFERENCES downloads(id) ON DELETE CASCADE,
+                position    INTEGER NOT NULL CHECK (position >= 0),
+                added_at    REAL NOT NULL,
+                PRIMARY KEY (playlist_id, download_id),
+                UNIQUE (playlist_id, position)
+            );
+            CREATE TABLE IF NOT EXISTS playlist_progress (
+                playlist_id     TEXT PRIMARY KEY
+                                     REFERENCES playlists(id) ON DELETE CASCADE,
+                download_id     TEXT REFERENCES downloads(id) ON DELETE SET NULL,
+                position_seconds REAL NOT NULL DEFAULT 0,
+                completed       INTEGER NOT NULL DEFAULT 0
+                                      CHECK (completed IN (0, 1)),
+                write_sequence  INTEGER NOT NULL DEFAULT 0,
+                updated_at      REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS playlists_owner_updated
+                ON playlists(owner_user_id, content_updated_at DESC, id);
+            CREATE INDEX IF NOT EXISTS playlist_items_download
+                ON playlist_items(download_id);
+            CREATE TABLE IF NOT EXISTS ingest_receipts (
+                source_path TEXT PRIMARY KEY,
+                device      INTEGER NOT NULL,
+                inode       INTEGER NOT NULL,
+                filesize    INTEGER NOT NULL,
+                mtime_ns    INTEGER NOT NULL,
+                download_id TEXT NOT NULL,
+                ingested_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS extension_tokens (
+                id                     TEXT PRIMARY KEY,
+                user_id                INTEGER NOT NULL
+                                           REFERENCES users(id) ON DELETE CASCADE,
+                token_verifier         BLOB NOT NULL,
+                device_label           TEXT NOT NULL,
+                extension_version      TEXT NOT NULL,
+                protocol_version       INTEGER NOT NULL,
+                paired_session_version INTEGER NOT NULL,
+                created_at             REAL NOT NULL,
+                last_used_at           REAL
+            );
+            CREATE INDEX IF NOT EXISTS extension_tokens_user_id
+                ON extension_tokens(user_id);
             CREATE INDEX IF NOT EXISTS download_tags_tag_id
                 ON download_tags(tag_id);
             CREATE TRIGGER IF NOT EXISTS delete_unused_tag
@@ -314,15 +633,119 @@ def init_db():
             # Keep the user's basename separate from yt-dlp's reported path.
             # Resumed workers need the same template to find existing parts.
             ("requested_filename", "ALTER TABLE downloads ADD COLUMN requested_filename TEXT"),
+            # Progress percentages are presentation data. Keep the underlying
+            # byte counts so every client can aggregate jobs without losing
+            # precision or giving small and large downloads equal weight.
+            ("downloaded_bytes", "ALTER TABLE downloads ADD COLUMN downloaded_bytes INTEGER"),
+            ("total_bytes", "ALTER TABLE downloads ADD COLUMN total_bytes INTEGER"),
+            # Existing libraries start unstarred; favorites are an explicit
+            # user choice rather than something inferred during migration.
+            ("favorite", "ALTER TABLE downloads ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0"),
+            # A view is an explicit preview activation. Keeping the counter
+            # independent of media requests avoids counting range fetches,
+            # downloads, and generated hover previews as watches.
+            ("view_count", "ALTER TABLE downloads ADD COLUMN view_count INTEGER NOT NULL DEFAULT 0"),
+            # URL downloads and local uploads share the library, but upload
+            # rows have no remote source or requested yt-dlp format.
+            ("source_type", "ALTER TABLE downloads ADD COLUMN source_type TEXT NOT NULL DEFAULT 'download'"),
+            # Keep both the stable account identity and a display-name
+            # snapshot. The snapshot still identifies the downloader after an
+            # administrator removes that account; the join below reflects
+            # account renames while it exists.
+            ("owner_user_id", "ALTER TABLE downloads ADD COLUMN owner_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL"),
+            ("owner_username", "ALTER TABLE downloads ADD COLUMN owner_username TEXT"),
+            # Existing shared libraries must remain visible after upgrading.
+            ("visibility", "ALTER TABLE downloads ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public' CHECK (visibility IN ('public', 'private'))"),
+            # Browser credentials remain process-only; these fields record only
+            # the download's resume policy and idempotency key.
+            ("browser_authenticated", "ALTER TABLE downloads ADD COLUMN browser_authenticated INTEGER NOT NULL DEFAULT 0"),
+            ("extension_request_id", "ALTER TABLE downloads ADD COLUMN extension_request_id TEXT"),
+            # Final-container metadata is probed after publishing decisions,
+            # never inferred from a source stream that may later be remuxed.
+            ("duration_seconds", "ALTER TABLE downloads ADD COLUMN duration_seconds REAL"),
+            ("media_metadata_probed", "ALTER TABLE downloads ADD COLUMN media_metadata_probed INTEGER NOT NULL DEFAULT 0"),
         ]:
             if col not in existing_cols:
                 conn.execute(ddl)
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS downloads_extension_request "
+            "ON downloads(owner_user_id, extension_request_id) "
+            "WHERE extension_request_id IS NOT NULL"
+        )
+
+        existing_user_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(users)")
+        }
+        for col, ddl in [
+            # Login names remain stable account identifiers while this field
+            # gives the administration UI a human-readable label.
+            ("name", "ALTER TABLE users ADD COLUMN name TEXT NOT NULL DEFAULT ''"),
+        ]:
+            if col not in existing_user_cols:
+                conn.execute(ddl)
+        conn.execute(
+            "UPDATE users SET name = username WHERE name = ''"
+        )
+
+        existing_progress_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(playlist_progress)")
+        }
+        if "write_sequence" not in existing_progress_cols:
+            conn.execute(
+                "ALTER TABLE playlist_progress ADD COLUMN "
+                "write_sequence INTEGER NOT NULL DEFAULT 0"
+            )
+
+        # Roles are rows rather than a users-table enum so deployments can add
+        # role names later without another schema migration. The join table is
+        # intentionally many-to-many even though today's UI assigns one role.
+        for role_name in ('normal', 'admin'):
+            conn.execute(
+                "INSERT OR IGNORE INTO roles(name) VALUES (?)",
+                (role_name,),
+            )
+        bootstrap_created = conn.execute(
+            "SELECT 1 FROM app_config WHERE key = 'bootstrap_admin_created'"
+        ).fetchone()
+        if bootstrap_created is None:
+            conn.execute(
+                "INSERT OR IGNORE INTO users(username, name, password_hash, created_at) "
+                "VALUES ('admin', 'admin', NULL, ?)",
+                (time.time(),),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO user_roles(user_id, role_id) "
+                "SELECT users.id, roles.id FROM users, roles "
+                "WHERE users.username = 'admin' AND roles.name = 'admin'"
+            )
+            # The marker, rather than the username, records bootstrap. An
+            # administrator may rename the account without init_db recreating
+            # a new passwordless account named "admin" on the next restart.
+            conn.execute(
+                "INSERT INTO app_config(key, value) VALUES (?, ?)",
+                ('bootstrap_admin_created', '1'),
+            )
+
+        # Persisting the signing key keeps browser sessions valid across clean
+        # restarts without asking operators to manage another required secret.
+        conn.execute(
+            "INSERT OR IGNORE INTO app_config(key, value) VALUES (?, ?)",
+            ('session_secret', secrets.token_hex(32)),
+        )
+        app.secret_key = conn.execute(
+            "SELECT value FROM app_config WHERE key = 'session_secret'"
+        ).fetchone()['value']
         # Seed defaults only if missing.
         defaults = {
             "download_dir": DEFAULT_DOWNLOAD_DIR,
             "format": "best",
+            "history_page_size": "10",
             "max_concurrent": "3",
             "player_mode": "overlay",
+            "start_fullscreen": "false",
+            "shuffle_min_height": "0",
+            "shuffle_min_duration_minutes": "0",
             "theme": "system",
         }
         for k, v in defaults.items():
@@ -347,21 +770,115 @@ def init_db():
         )
 
 
-def db_insert_download(download_id, url):
+def db_insert_download(download_id, url, owner_user_id=None,
+                       owner_username=None):
     with _db_lock, db() as conn:
         conn.execute(
-            "INSERT INTO downloads(id, url, status, progress, created_at) "
-            "VALUES (?, ?, 'starting', '0%', ?)",
-            (download_id, url, time.time()),
+            "INSERT INTO downloads(id, url, status, progress, created_at, "
+            "owner_user_id, owner_username) "
+            "VALUES (?, ?, 'starting', '0%', ?, ?, ?)",
+            (
+                download_id, url, time.time(), owner_user_id,
+                owner_username,
+            ),
         )
     event_bus.publish('change', {'reason': 'insert', 'id': download_id})
+
+
+def db_insert_upload(download_id, upload_name, title, filesize, output_dir,
+                     owner_user_id=None, owner_username=None):
+    """Register a local upload before the browser starts transferring it."""
+    with _db_lock, db() as conn:
+        conn.execute(
+            "INSERT INTO downloads("
+            "id, url, status, progress, created_at, filesize, title, "
+            "output_dir, requested_filename, downloaded_bytes, total_bytes, "
+            "source_type, owner_user_id, owner_username"
+            ") VALUES (?, '', 'starting', '0%', ?, ?, ?, ?, ?, 0, ?, "
+            "'upload', ?, ?)",
+            (
+                download_id, time.time(), filesize, title, output_dir,
+                upload_name, filesize, owner_user_id, owner_username,
+            ),
+        )
+    event_bus.publish('change', {'reason': 'insert', 'id': download_id})
+
+
+def db_insert_ingested_video(download_id, source_path, source_signature,
+                             upload_name, title, filesize, output_dir,
+                             filename, resolution, duration_seconds=None):
+    """Atomically register a watched-folder video and its source receipt."""
+    now = time.time()
+    device, inode, _signature_size, mtime_ns = source_signature
+    with _db_lock, db() as conn:
+        conn.execute(
+            "INSERT INTO downloads("
+            "id, url, status, progress, created_at, filename, resolution, "
+            "duration_seconds, media_metadata_probed, "
+            "filesize, speed, eta, title, finished_at, output_dir, "
+            "requested_filename, downloaded_bytes, total_bytes, source_type"
+            ") VALUES (?, '', 'finished', '100%', ?, ?, ?, ?, 1, ?, 0, 0, ?, ?, "
+            "?, ?, ?, ?, 'upload')",
+            (
+                download_id, now, filename, resolution, duration_seconds,
+                filesize, title, now,
+                output_dir, upload_name, filesize, filesize,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO ingest_receipts("
+            "source_path, device, inode, filesize, mtime_ns, download_id, "
+            "ingested_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(source_path) DO UPDATE SET "
+            "device = excluded.device, inode = excluded.inode, "
+            "filesize = excluded.filesize, mtime_ns = excluded.mtime_ns, "
+            "download_id = excluded.download_id, "
+            "ingested_at = excluded.ingested_at",
+            (
+                source_path, device, inode, filesize, mtime_ns, download_id,
+                now,
+            ),
+        )
+    event_bus.publish('change', {'reason': 'insert', 'id': download_id})
+
+
+def db_get_ingest_receipts(directory):
+    """Return source signatures already imported from one watched folder."""
+    directory = os.path.realpath(directory)
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT source_path, device, inode, filesize, mtime_ns "
+            "FROM ingest_receipts"
+        ).fetchall()
+    return {
+        row['source_path']: (
+            row['device'], row['inode'], row['filesize'], row['mtime_ns'],
+        )
+        for row in rows
+        if os.path.dirname(row['source_path']) == directory
+    }
+
+
+def db_prune_ingest_receipts(directory, visible_paths):
+    """Forget removed inbox files so a later replacement can be imported."""
+    receipts = db_get_ingest_receipts(directory)
+    missing = set(receipts).difference(visible_paths)
+    if not missing:
+        return
+    with _db_lock, db() as conn:
+        conn.executemany(
+            "DELETE FROM ingest_receipts WHERE source_path = ?",
+            ((path,) for path in missing),
+        )
 
 
 def db_update_download(download_id, *, status=None, progress=None,
                        filename=None, resolution=None, filesize=None,
                        speed=None, eta=None, title=None, finished_at=None,
                        formats=None, requested_format=None, output_dir=None,
-                       requested_filename=None):
+                       requested_filename=None, downloaded_bytes=None,
+                       total_bytes=_NO_UPDATE, duration_seconds=_NO_UPDATE,
+                       media_metadata_probed=None):
     fields, values = [], []
     if status is not None:
         fields.append("status = ?"); values.append(status)
@@ -389,6 +906,15 @@ def db_update_download(download_id, *, status=None, progress=None,
         fields.append("output_dir = ?"); values.append(output_dir)
     if requested_filename is not None:
         fields.append("requested_filename = ?"); values.append(requested_filename)
+    if downloaded_bytes is not None:
+        fields.append("downloaded_bytes = ?"); values.append(downloaded_bytes)
+    if total_bytes is not _NO_UPDATE:
+        fields.append("total_bytes = ?"); values.append(total_bytes)
+    if duration_seconds is not _NO_UPDATE:
+        fields.append("duration_seconds = ?"); values.append(duration_seconds)
+    if media_metadata_probed is not None:
+        fields.append("media_metadata_probed = ?")
+        values.append(1 if media_metadata_probed else 0)
     if not fields:
         return
     values.append(download_id)
@@ -429,13 +955,117 @@ def _db_download_tags(conn, download_id):
 def db_get_download(download_id):
     with db() as conn:
         row = conn.execute(
-            "SELECT * FROM downloads WHERE id = ?", (download_id,)
+            "SELECT downloads.*, "
+            "COALESCE(users.username, downloads.owner_username) "
+            "AS downloaded_by "
+            "FROM downloads "
+            "LEFT JOIN users ON users.id = downloads.owner_user_id "
+            "WHERE downloads.id = ?",
+            (download_id,),
         ).fetchone()
         if row is None:
             return None
         result = dict(row)
+        result["favorite"] = bool(result["favorite"])
+        result["quality"] = classify_video_quality(result["resolution"])
         result["tags"] = _db_download_tags(conn, download_id)
         return result
+
+
+def db_set_download_visibility(download_id, visibility):
+    """Persist public/private visibility and report whether it changed."""
+    if visibility not in ('public', 'private'):
+        raise ValueError('Visibility must be public or private')
+    with _db_lock, db() as conn:
+        row = conn.execute(
+            "SELECT visibility FROM downloads WHERE id = ?", (download_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        changed = row['visibility'] != visibility
+        if changed:
+            conn.execute(
+                "UPDATE downloads SET visibility = ? WHERE id = ?",
+                (visibility, download_id),
+            )
+    if changed:
+        event_bus.publish(
+            'change', {'reason': 'visibility', 'id': download_id}
+        )
+    return changed
+
+
+def db_set_download_favorite(download_id, favorite):
+    """Persist one explicit favorite state and report whether it changed."""
+    with _db_lock, db() as conn:
+        row = conn.execute(
+            "SELECT favorite FROM downloads WHERE id = ?", (download_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        changed = bool(row["favorite"]) != favorite
+        if changed:
+            conn.execute(
+                "UPDATE downloads SET favorite = ? WHERE id = ?",
+                (int(favorite), download_id),
+            )
+    if changed:
+        event_bus.publish("change", {"reason": "favorite", "id": download_id})
+    return changed
+
+
+def db_increment_view_count(download_id):
+    """Atomically record one explicit playback activation."""
+    with _db_lock, db() as conn:
+        cursor = conn.execute(
+            "UPDATE downloads SET view_count = view_count + 1 "
+            "WHERE id = ? AND status = 'finished'",
+            (download_id,),
+        )
+        if cursor.rowcount != 1:
+            return None
+        view_count = conn.execute(
+            "SELECT view_count FROM downloads WHERE id = ?",
+            (download_id,),
+        ).fetchone()["view_count"]
+    event_bus.publish("change", {"reason": "view", "id": download_id})
+    return view_count
+
+
+def classify_video_quality(resolution):
+    """Return a compact display tier for a stored video resolution."""
+    value = str(resolution or '').strip().lower()
+    aliases = {
+        '8k': '8k',
+        '4k': '4k',
+        'uhd': '4k',
+        '2k': '2k',
+        'qhd': '2k',
+    }
+    if value in aliases:
+        return aliases[value]
+
+    dimensions = re.fullmatch(r'(\d+)\s*[x×]\s*(\d+)', value)
+    vertical = re.fullmatch(r'(\d+)\s*p?', value)
+    if dimensions:
+        height = int(dimensions.group(2))
+    elif vertical:
+        height = int(vertical.group(1))
+    else:
+        return None
+
+    for minimum, label in (
+        (4320, '8k'),
+        (2160, '4k'),
+        (1440, '2k'),
+        (1080, '1080p'),
+        (720, '720p'),
+        (480, '480p'),
+        (360, '360p'),
+    ):
+        if height >= minimum:
+            return label
+    return str(height) if height > 0 else None
 
 
 TAG_MAX_LENGTH = 64
@@ -463,12 +1093,24 @@ def _validated_tag_name(value):
     return display_name, display_name.casefold()
 
 
-def db_list_tags():
+def db_list_tags(user_id=None, is_admin=False):
     """Return every tag still attached to at least one download entry."""
     with db() as conn:
+        visibility_sql = ""
+        values = ()
+        if user_id is not None and not is_admin:
+            visibility_sql = (
+                " JOIN download_tags ON download_tags.tag_id = tags.id "
+                "JOIN downloads ON downloads.id = download_tags.download_id "
+                "WHERE downloads.visibility = 'public' "
+                "OR downloads.owner_user_id = ? "
+            )
+            values = (user_id,)
         return [
             row["name"] for row in conn.execute(
-                "SELECT name FROM tags ORDER BY name COLLATE NOCASE, name"
+                "SELECT DISTINCT tags.name FROM tags " + visibility_sql
+                + "ORDER BY tags.name COLLATE NOCASE, tags.name",
+                values,
             )
         ]
 
@@ -533,6 +1175,13 @@ def delete_download_artifacts(entry, fallback_dir=None):
         # generated download ID used to identify yt-dlp's temporary files.
         candidates.update((filename, filename + ".part", filename + ".ytdl"))
 
+    thumbnail = _thumbnail_path(entry, fallback_dir)
+    if thumbnail:
+        candidates.add(thumbnail)
+    preview = _preview_path(entry, fallback_dir)
+    if preview:
+        candidates.add(preview)
+
     search_dirs = {entry.get("output_dir"), fallback_dir}
     if filename:
         search_dirs.add(os.path.dirname(os.path.abspath(filename)))
@@ -553,29 +1202,101 @@ def delete_download_artifacts(entry, fallback_dir=None):
             pass
 
     removed = 0
-    for path in candidates:
-        try:
-            os.remove(path)
-            removed += 1
-        except FileNotFoundError:
-            # A postprocessor may already have consumed a temporary file.
-            pass
+    # A first-hover request may still be encoding after the UI asks to remove
+    # its row. Waiting here prevents that request from publishing an orphaned
+    # preview after the artifact scan has already finished.
+    with _preview_generation_lock:
+        for path in candidates:
+            try:
+                os.remove(path)
+                removed += 1
+            except FileNotFoundError:
+                # A postprocessor may already have consumed a temporary file.
+                pass
     return removed
 
 
+def _db_remove_download_from_playlists(conn, download_id):
+    """Remove one membership everywhere and repair order/progress atomically."""
+    affected = conn.execute(
+        "SELECT playlist_items.playlist_id, playlist_items.position, "
+        "playlist_progress.download_id AS progress_download_id "
+        "FROM playlist_items "
+        "LEFT JOIN playlist_progress "
+        "ON playlist_progress.playlist_id = playlist_items.playlist_id "
+        "WHERE playlist_items.download_id = ?",
+        (download_id,),
+    ).fetchall()
+    now = time.time()
+    for row in affected:
+        playlist_id = row['playlist_id']
+        removed_position = row['position']
+        conn.execute(
+            "DELETE FROM playlist_items "
+            "WHERE playlist_id = ? AND download_id = ?",
+            (playlist_id, download_id),
+        )
+        # The removed position is now free. Moving later rows in ascending
+        # order keeps every intermediate state valid under the UNIQUE key.
+        shifted = conn.execute(
+            "SELECT download_id, position FROM playlist_items "
+            "WHERE playlist_id = ? AND position > ? ORDER BY position",
+            (playlist_id, removed_position),
+        ).fetchall()
+        for item in shifted:
+            conn.execute(
+                "UPDATE playlist_items SET position = ? "
+                "WHERE playlist_id = ? AND download_id = ?",
+                (item['position'] - 1, playlist_id, item['download_id']),
+            )
+        if row['progress_download_id'] == download_id:
+            target = conn.execute(
+                "SELECT download_id FROM playlist_items "
+                "WHERE playlist_id = ? ORDER BY "
+                "CASE WHEN position >= ? THEN 0 ELSE 1 END, "
+                "CASE WHEN position >= ? THEN position ELSE -position END "
+                "LIMIT 1",
+                (playlist_id, removed_position, removed_position),
+            ).fetchone()
+            if target is None:
+                conn.execute(
+                    "DELETE FROM playlist_progress WHERE playlist_id = ?",
+                    (playlist_id,),
+                )
+            else:
+                conn.execute(
+                    "UPDATE playlist_progress SET download_id = ?, "
+                    "position_seconds = 0, completed = 0, "
+                    "write_sequence = write_sequence + 1, updated_at = ? "
+                    "WHERE playlist_id = ?",
+                    (target['download_id'], now, playlist_id),
+                )
+        conn.execute(
+            "UPDATE playlists SET revision = revision + 1, "
+            "content_updated_at = ? WHERE id = ?",
+            (now, playlist_id),
+        )
+    return len(affected)
+
+
 def db_remove_download_if_inactive(download_id, fallback_dir=None):
-    """Atomically remove a non-active row and return its prior contents."""
+    """Atomically remove a non-active, fully stopped download row."""
     with _db_lock, db() as conn:
         row = conn.execute(
             "SELECT * FROM downloads WHERE id = ?", (download_id,)
         ).fetchone()
         entry = dict(row) if row else None
-        if entry is None or entry['status'] in ('starting', 'downloading', 'paused'):
+        with _worker_condition:
+            worker_is_live = download_id in _live_worker_ids
+        if (entry is None
+                or entry['status'] in ('starting', 'downloading', 'paused')
+                or worker_is_live):
             return entry, False
         # Keep the row as a retry handle if filesystem cleanup fails. Holding
         # the state lock also prevents Resume from claiming the same partial
         # files while they are being removed.
         delete_download_artifacts(entry, fallback_dir)
+        _db_remove_download_from_playlists(conn, download_id)
         cur = conn.execute(
             "DELETE FROM downloads WHERE id = ? "
             "AND status NOT IN ('starting', 'downloading', 'paused')",
@@ -602,6 +1323,8 @@ def db_clear_history():
         files_deleted = sum(
             delete_download_artifacts(entry, fallback_dir) for entry in entries
         )
+        for entry in entries:
+            _db_remove_download_from_playlists(conn, entry['id'])
         cur = conn.execute(
             f"DELETE FROM downloads WHERE status IN ({placeholders})",
             HISTORY_STATUSES,
@@ -612,13 +1335,31 @@ def db_clear_history():
     return rows, files_deleted
 
 
-def db_list_downloads():
+def db_list_downloads(user_id=None, is_admin=False):
     with db() as conn:
+        visibility_sql = ""
+        values = ()
+        if user_id is not None and not is_admin:
+            visibility_sql = (
+                "WHERE downloads.visibility = 'public' "
+                "OR downloads.owner_user_id = ? "
+            )
+            values = (user_id,)
         rows = conn.execute(
-            "SELECT id, url, status, progress, created_at, "
+            "SELECT downloads.id, url, status, progress, "
+            "downloads.created_at, "
             "filename, resolution, filesize, speed, eta, title, finished_at, "
-            "formats, requested_format "
-            "FROM downloads ORDER BY created_at ASC"
+            "duration_seconds, media_metadata_probed, "
+            "formats, requested_format, downloaded_bytes, total_bytes, favorite, "
+            "view_count, "
+            "source_type, owner_user_id, visibility, browser_authenticated, "
+            "COALESCE(users.username, downloads.owner_username) "
+            "AS downloaded_by "
+            "FROM downloads "
+            "LEFT JOIN users ON users.id = downloads.owner_user_id "
+            + visibility_sql
+            + "ORDER BY downloads.created_at DESC",
+            values,
         ).fetchall()
         downloads = [dict(r) for r in rows]
         tags_by_download = {}
@@ -632,8 +1373,809 @@ def db_list_downloads():
                 row["name"]
             )
         for download in downloads:
+            download["favorite"] = bool(download["favorite"])
+            download["browser_authenticated"] = bool(
+                download["browser_authenticated"]
+            )
+            download["media_metadata_probed"] = bool(
+                download["media_metadata_probed"]
+            )
+            download["quality"] = classify_video_quality(
+                download["resolution"]
+            )
             download["tags"] = tags_by_download.get(download["id"], [])
+            download["can_manage_visibility"] = (
+                is_admin or download["owner_user_id"] == user_id
+            )
+            # The stable account id is an authorization detail; clients only
+            # need the display name and this derived capability.
+            download.pop("owner_user_id")
         return downloads
+
+
+def _parse_history_filter(value):
+    """Mirror the browser's quote-aware History tokenization."""
+    terms = []
+    draft = []
+    quoted = False
+    for character in value:
+        if character == '"':
+            quoted = not quoted
+        elif character.isspace() and not quoted:
+            if draft:
+                terms.append(''.join(draft))
+                draft = []
+        else:
+            draft.append(character)
+    if draft:
+        terms.append(''.join(draft))
+    return [term.strip() for term in terms if term.strip()]
+
+
+def _normalize_history_filter(value):
+    if not isinstance(value, str):
+        raise ValueError('Filter must be text')
+    value = unicodedata.normalize('NFC', value).strip()
+    if len(value) > PLAYBACK_SESSION_MAX_FILTER_LENGTH:
+        raise ValueError(
+            f'Filter must be at most {PLAYBACK_SESSION_MAX_FILTER_LENGTH} characters'
+        )
+    # Re-quoting whitespace-bearing terms preserves their token boundary when
+    # the normalized value is parsed again on each live resolution.
+    return ' '.join(
+        f'"{term}"' if any(character.isspace() for character in term) else term
+        for term in _parse_history_filter(value)
+    )
+
+
+def _history_search_key(value):
+    return str(value or '').lower()
+
+
+def _history_quality_height(value):
+    key = _history_search_key(value)
+    aliases = {
+        '8k': 4320, '4k': 2160, 'uhd': 2160,
+        '2k': 1440, 'qhd': 1440,
+    }
+    if key in aliases:
+        return aliases[key]
+    dimensions = re.fullmatch(r'(\d+)\s*[x×]\s*(\d+)', key)
+    vertical = re.fullmatch(r'(\d+)\s*p?', key)
+    height = int(dimensions.group(2)) if dimensions else (
+        int(vertical.group(1)) if vertical else 0
+    )
+    return height if height > 0 else None
+
+
+def _matches_history_filter(entry, normalized_filter):
+    terms = _parse_history_filter(normalized_filter)
+    if not terms:
+        return True
+
+    title = _history_search_key(entry.get('title'))
+    tags = {
+        _history_search_key(tag) for tag in entry.get('tags', [])
+    }
+    user_terms = []
+    quality_terms = []
+    starred_terms = []
+    view_terms = []
+    playlist_terms = []
+    content_terms = []
+    for term in terms:
+        key = _history_search_key(term)
+        if key.startswith('user:'):
+            user_terms.append(key[len('user:'):].strip())
+        elif key.startswith('quality:'):
+            quality_terms.append(
+                _history_quality_height(key[len('quality:'):].strip())
+            )
+        elif key.startswith('starred:'):
+            starred_terms.append(key[len('starred:'):].strip())
+        elif key.startswith('star:'):
+            starred_terms.append(key[len('star:'):].strip())
+        elif key.startswith('views:'):
+            view_terms.append(key[len('views:'):].strip())
+        elif key.startswith(('playlist:', 'playlists:')):
+            playlist_terms.append(key.split(':', 1)[1].strip())
+        else:
+            content_terms.append(term)
+
+    if user_terms:
+        downloaded_by = _history_search_key(entry.get('downloaded_by'))
+        if not any(term and term == downloaded_by for term in user_terms):
+            return False
+    if quality_terms:
+        height = _history_quality_height(entry.get('resolution'))
+        if height is None:
+            height = _history_quality_height(entry.get('quality'))
+        if not any(
+                minimum is not None
+                and height is not None
+                and height >= minimum
+                for minimum in quality_terms):
+            return False
+    if starred_terms:
+        favorite = bool(entry.get('favorite'))
+        if not any(
+                (value == 'yes' and favorite)
+                or (value == 'no' and not favorite)
+                for value in starred_terms):
+            return False
+    if view_terms:
+        try:
+            view_count = max(0, int(entry.get('view_count') or 0))
+        except (TypeError, ValueError):
+            view_count = 0
+        if not any(
+                (value == 'new' and view_count == 0)
+                or (value.isdigit() and view_count >= int(value))
+                for value in view_terms):
+            return False
+    # Playback selection contains only videos, so the browser's playlist-only
+    # result mode intentionally resolves to no candidates.
+    if playlist_terms and 'no' not in playlist_terms:
+        return False
+    if not content_terms:
+        return True
+    return any(
+        (_history_search_key(term) in title)
+        or (_history_search_key(term) in tags)
+        for term in content_terms
+    )
+
+
+def _playable_library_entry(entry):
+    if entry.get('status') != 'finished':
+        return False
+    filename = entry.get('filename')
+    if not filename or not os.path.isfile(filename):
+        return False
+    return _is_allowed_download_path(os.path.realpath(filename))
+
+
+def resolve_library_selection(user_id, is_admin, normalized_filter, ordering):
+    """Return the current canonical, visible, browser-playable selection."""
+    entries = [
+        entry for entry in db_list_downloads(user_id, is_admin=is_admin)
+        if _playable_library_entry(entry)
+        and _matches_history_filter(entry, normalized_filter)
+    ]
+    if ordering == 'favorites_first':
+        entries.sort(
+            key=lambda entry: (
+                bool(entry.get('favorite')),
+                float(entry.get('created_at') or 0),
+                str(entry.get('id') or ''),
+            ),
+            reverse=True,
+        )
+    else:
+        entries.sort(
+            key=lambda entry: (
+                float(entry.get('created_at') or 0),
+                str(entry.get('id') or ''),
+            ),
+            reverse=True,
+        )
+    return entries
+
+
+def resolve_library_page(user_id, is_admin, normalized_filter, ordering,
+                         page_size, page):
+    """Resolve one deterministic page without retaining the result set."""
+    selection = resolve_library_selection(
+        user_id, is_admin, normalized_filter, ordering
+    )
+    start = page * page_size
+    return selection[start:start + page_size], len(selection)
+
+
+def _shuffle_preferences(preferences):
+    """Validate persisted shuffle thresholds without silently repairing them."""
+    raw_height = preferences.get('shuffle_min_height', '0')
+    raw_minutes = preferences.get('shuffle_min_duration_minutes', '0')
+    if (not isinstance(raw_height, str) or not raw_height.isascii()
+            or not raw_height.isdigit()):
+        raise ValueError('Stored Shuffle minimum quality is invalid')
+    if (not isinstance(raw_minutes, str) or not raw_minutes.isascii()
+            or not raw_minutes.isdigit()):
+        raise ValueError('Stored Shuffle minimum length is invalid')
+    height = int(raw_height, 10)
+    minutes = int(raw_minutes, 10)
+    if height not in SHUFFLE_MIN_HEIGHTS:
+        raise ValueError('Stored Shuffle minimum quality is invalid')
+    if not 0 <= minutes <= 1440:
+        raise ValueError('Stored Shuffle minimum length is invalid')
+    return height, minutes * 60
+
+
+def resolve_shuffle_pool(user_id, is_admin, minimum_height,
+                         minimum_duration_seconds):
+    """Resolve the live authorized pool and whether legacy metadata blocks it."""
+    candidates = []
+    metadata_pending = False
+    for entry in db_list_downloads(user_id, is_admin=is_admin):
+        if entry.get('status') != 'finished':
+            continue
+        filename = entry.get('filename')
+        if not filename or not os.path.isfile(filename):
+            continue
+        if Path(filename).suffix.lower() not in BROWSER_VIDEO_EXTENSIONS:
+            continue
+        real_path = os.path.realpath(filename)
+        if not _is_allowed_download_path(real_path):
+            continue
+
+        height = _history_quality_height(entry.get('resolution'))
+        probed = bool(entry.get('media_metadata_probed'))
+        if height is None:
+            if not probed:
+                metadata_pending = True
+            continue
+        if minimum_height and height < minimum_height:
+            continue
+
+        duration = _finite_positive_number(entry.get('duration_seconds'))
+        if minimum_duration_seconds and (
+                duration is None or duration < minimum_duration_seconds):
+            if duration is None and not probed:
+                metadata_pending = True
+            continue
+        candidates.append(entry)
+    return candidates, metadata_pending
+
+
+def _shuffle_choice(candidates):
+    """Choose uniformly without making a seeded sequence part of the API."""
+    return candidates[secrets.randbelow(len(candidates))]
+
+
+def _playback_item(entry):
+    filename = entry.get('filename') or ''
+    title = entry.get('title') or Path(filename).stem or 'Untitled download'
+    return {
+        'id': str(entry['id']),
+        'title': title,
+        'extension': Path(filename).suffix.lstrip('.').lower(),
+    }
+
+
+def _prune_playback_sessions_locked(now):
+    expired = [
+        session_id for session_id, state in _playback_sessions.items()
+        if now - state['last_activity'] >= PLAYBACK_SESSION_TTL_SECONDS
+    ]
+    for session_id in expired:
+        _playback_sessions.pop(session_id, None)
+
+
+def _release_playback_sessions_for_user(user_id):
+    if user_id is None:
+        return
+    with _playback_sessions_lock:
+        owned = [
+            session_id for session_id, state in _playback_sessions.items()
+            if state['owner_user_id'] == user_id
+        ]
+        for session_id in owned:
+            _playback_sessions.pop(session_id, None)
+
+
+def _playback_session_response(state, entry):
+    response = {
+        'session_id': state['session_id'],
+        'mode': state['mode'],
+        'sequence': state['sequence'],
+        'page': state.get('page'),
+        'position': state.get('position'),
+        'item': _playback_item(entry),
+    }
+    if state['mode'] == 'playlist':
+        response.update({
+            'playlist_id': state['playlist_id'],
+            'playlist_revision': state['playlist_revision'],
+            'queue_position': state['playlist_position'],
+            'queue': state['playlist_queue'],
+            'resume_seconds': state.get('resume_seconds', 0),
+            'progress_sequence': state.get('progress_sequence', 0),
+        })
+    return response
+
+
+class PlaylistNotFound(Exception):
+    """Hide unknown and foreign playlist identifiers behind one response."""
+
+
+class PlaylistRevisionConflict(Exception):
+    """An editor or playback request used stale playlist state."""
+
+
+def _validated_playlist_name(value):
+    if not isinstance(value, str):
+        raise ValueError('Playlist name is required')
+    name = unicodedata.normalize('NFC', value).strip()
+    if (not name or len(name) > 120
+            or any(unicodedata.category(character).startswith('C')
+                   for character in name)):
+        raise ValueError(
+            'Playlist name must be between 1 and 120 visible characters'
+        )
+    return name
+
+
+def _validated_playlist_download_ids(value):
+    if not isinstance(value, list):
+        raise ValueError('download_ids must be an array')
+    if len(value) > PLAYLIST_MAX_ITEMS:
+        raise ValueError(
+            f'A playlist may contain at most {PLAYLIST_MAX_ITEMS} videos'
+        )
+    if any(not isinstance(item, str) or not item or len(item) > 128
+           for item in value):
+        raise ValueError('Every download id must be a non-empty string')
+    if len(set(value)) != len(value):
+        raise ValueError('A video may occur only once in a playlist')
+    return value
+
+
+def _playlist_download_visible(entry, user_id, is_admin):
+    return bool(entry) and (
+        entry.get('visibility') == 'public'
+        or entry.get('owner_user_id') == user_id
+        or is_admin
+    )
+
+
+def _playlist_download_playable(entry, user_id, is_admin):
+    if (not _playlist_download_visible(entry, user_id, is_admin)
+            or entry.get('status') != 'finished'):
+        return False
+    filename = entry.get('filename')
+    if (not filename or Path(filename).suffix.lower()
+            not in BROWSER_VIDEO_EXTENSIONS or not os.path.isfile(filename)):
+        return False
+    return _is_allowed_download_path(os.path.realpath(filename))
+
+
+def _playlist_download_row(conn, download_id):
+    row = conn.execute(
+        "SELECT id, status, filename, title, duration_seconds, visibility, "
+        "owner_user_id FROM downloads WHERE id = ?",
+        (download_id,),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def _playlist_item(entry, position):
+    if entry is None:
+        return {
+            'id': None,
+            'position': position,
+            'unavailable': True,
+            'title': 'Unavailable video',
+            'extension': '',
+            'duration_seconds': None,
+        }
+    item = _playback_item(entry)
+    item.update({
+        'position': position,
+        'unavailable': False,
+        'duration_seconds': _finite_positive_number(
+            entry.get('duration_seconds')
+        ),
+        'thumbnail_url': f"/api/thumbnail/{entry['id']}",
+    })
+    return item
+
+
+class PlaylistService:
+    """Own playlist authorization, validation, repair, and transactions."""
+
+    @staticmethod
+    def _owned(conn, playlist_id, user_id):
+        row = conn.execute(
+            "SELECT id, owner_user_id, name, revision, created_at, "
+            "content_updated_at FROM playlists "
+            "WHERE id = ? AND owner_user_id = ?",
+            (playlist_id, user_id),
+        ).fetchone()
+        if row is None:
+            raise PlaylistNotFound()
+        return dict(row)
+
+    @staticmethod
+    def _members(conn, playlist_id):
+        return conn.execute(
+            "SELECT playlist_items.download_id, downloads.id AS id, "
+            "playlist_items.position, "
+            "playlist_items.added_at, downloads.status, downloads.filename, "
+            "downloads.title, downloads.duration_seconds, "
+            "downloads.visibility, downloads.owner_user_id "
+            "FROM playlist_items "
+            "LEFT JOIN downloads ON downloads.id = playlist_items.download_id "
+            "WHERE playlist_items.playlist_id = ? "
+            "ORDER BY playlist_items.position",
+            (playlist_id,),
+        ).fetchall()
+
+    @staticmethod
+    def _progress(conn, playlist_id):
+        row = conn.execute(
+            "SELECT playlist_id, download_id, position_seconds, completed, "
+            "write_sequence, updated_at FROM playlist_progress "
+            "WHERE playlist_id = ?",
+            (playlist_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        progress = dict(row)
+        progress['completed'] = bool(progress['completed'])
+        return progress
+
+    def _validated_downloads(self, conn, download_ids, user_id, is_admin):
+        entries = []
+        for download_id in _validated_playlist_download_ids(download_ids):
+            entry = _playlist_download_row(conn, download_id)
+            if not _playlist_download_playable(entry, user_id, is_admin):
+                raise ValueError(
+                    'Every playlist video must be visible, finished, present, '
+                    'safe, and browser-playable'
+                )
+            entries.append(entry)
+        return entries
+
+    def _repair_progress(self, conn, playlist_id, members, old_position=None):
+        progress = self._progress(conn, playlist_id)
+        if not members:
+            conn.execute(
+                "DELETE FROM playlist_progress WHERE playlist_id = ?",
+                (playlist_id,),
+            )
+            return None
+        member_ids = [row['download_id'] for row in members]
+        if progress is None or progress['download_id'] in member_ids:
+            return progress
+        target_position = min(
+            max(0, int(old_position or 0)), len(member_ids) - 1
+        )
+        now = time.time()
+        conn.execute(
+            "UPDATE playlist_progress SET download_id = ?, "
+            "position_seconds = 0, completed = 0, "
+            "write_sequence = write_sequence + 1, updated_at = ? "
+            "WHERE playlist_id = ?",
+            (member_ids[target_position], now, playlist_id),
+        )
+        return self._progress(conn, playlist_id)
+
+    def list_summaries(self, user_id, is_admin=False):
+        with _db_lock, db() as conn:
+            rows = conn.execute(
+                "SELECT id, owner_user_id, name, revision, created_at, "
+                "content_updated_at FROM playlists WHERE owner_user_id = ? "
+                "ORDER BY content_updated_at DESC, id ASC",
+                (user_id,),
+            ).fetchall()
+            summaries = []
+            for raw in rows:
+                playlist = dict(raw)
+                members = self._members(conn, playlist['id'])
+                progress = self._repair_progress(
+                    conn, playlist['id'], members,
+                    next((row['position'] for row in members
+                          if row['download_id'] == (
+                              self._progress(conn, playlist['id']) or {}
+                          ).get('download_id')), 0),
+                )
+                visible = []
+                duration = 0.0
+                for row in members:
+                    entry = dict(row)
+                    if _playlist_download_visible(entry, user_id, is_admin):
+                        visible.append(entry)
+                        known = _finite_positive_number(
+                            entry.get('duration_seconds')
+                        )
+                        if known is not None:
+                            duration += known
+                resume_position = next(
+                    (row['position'] for row in members
+                     if progress and row['download_id'] == progress['download_id']),
+                    0,
+                )
+                playlist.update({
+                    'item_count': len(members),
+                    'duration_seconds': duration or None,
+                    'mosaic_ids': [row['download_id'] for row in visible[:4]],
+                    'member_ids': [row['download_id'] for row in members],
+                    'progress': progress,
+                    'resume_position': resume_position,
+                })
+                summaries.append(playlist)
+            return summaries
+
+    def get(self, playlist_id, user_id, is_admin=False):
+        with _db_lock, db() as conn:
+            playlist = self._owned(conn, playlist_id, user_id)
+            members = self._members(conn, playlist_id)
+            progress = self._progress(conn, playlist_id)
+            old_position = next(
+                (row['position'] for row in members
+                 if progress and row['download_id'] == progress['download_id']),
+                0,
+            )
+            progress = self._repair_progress(
+                conn, playlist_id, members, old_position
+            )
+            items = []
+            for row in members:
+                entry = dict(row)
+                visible = _playlist_download_visible(entry, user_id, is_admin)
+                items.append(_playlist_item(entry if visible else None,
+                                            row['position']))
+            playlist.update({'items': items, 'progress': progress})
+            return playlist
+
+    def create(self, user_id, name, download_id=None, is_admin=False,
+               download_ids=None):
+        name = _validated_playlist_name(name)
+        if download_ids is None:
+            download_ids = [] if download_id is None else [download_id]
+        elif download_id is not None:
+            raise ValueError('Use download_id or download_ids, not both')
+        playlist_id = str(uuid.uuid4())
+        now = time.time()
+        with _db_lock, db() as conn:
+            entries = self._validated_downloads(
+                conn, download_ids, user_id, is_admin
+            )
+            conn.execute(
+                "INSERT INTO playlists(id, owner_user_id, name, revision, "
+                "created_at, content_updated_at) VALUES (?, ?, ?, 1, ?, ?)",
+                (playlist_id, user_id, name, now, now),
+            )
+            for position, entry in enumerate(entries):
+                conn.execute(
+                    "INSERT INTO playlist_items(playlist_id, download_id, "
+                    "position, added_at) VALUES (?, ?, ?, ?)",
+                    (playlist_id, entry['id'], position, now),
+                )
+        event_bus.publish('change', {
+            'reason': 'playlist-create', 'playlist_id': playlist_id,
+        }, owner_user_id=user_id)
+        return self.get(playlist_id, user_id, is_admin)
+
+    def replace(self, playlist_id, user_id, name, download_ids,
+                expected_revision, is_admin=False):
+        name = _validated_playlist_name(name)
+        if (isinstance(expected_revision, bool)
+                or not isinstance(expected_revision, int)
+                or expected_revision < 1):
+            raise ValueError('expected_revision must be a positive integer')
+        now = time.time()
+        with _db_lock, db() as conn:
+            playlist = self._owned(conn, playlist_id, user_id)
+            if playlist['revision'] != expected_revision:
+                raise PlaylistRevisionConflict()
+            entries = self._validated_downloads(
+                conn, download_ids, user_id, is_admin
+            )
+            old_members = self._members(conn, playlist_id)
+            old_added = {
+                row['download_id']: row['added_at'] for row in old_members
+            }
+            progress = self._progress(conn, playlist_id)
+            old_position = next(
+                (row['position'] for row in old_members
+                 if progress and row['download_id'] == progress['download_id']),
+                0,
+            )
+            conn.execute(
+                "DELETE FROM playlist_items WHERE playlist_id = ?",
+                (playlist_id,),
+            )
+            for position, entry in enumerate(entries):
+                conn.execute(
+                    "INSERT INTO playlist_items(playlist_id, download_id, "
+                    "position, added_at) VALUES (?, ?, ?, ?)",
+                    (playlist_id, entry['id'], position,
+                     old_added.get(entry['id'], now)),
+                )
+            conn.execute(
+                "UPDATE playlists SET name = ?, revision = revision + 1, "
+                "content_updated_at = ? WHERE id = ?",
+                (name, now, playlist_id),
+            )
+            self._repair_progress(
+                conn, playlist_id, self._members(conn, playlist_id), old_position
+            )
+        event_bus.publish('change', {
+            'reason': 'playlist-edit', 'playlist_id': playlist_id,
+        }, owner_user_id=user_id)
+        return self.get(playlist_id, user_id, is_admin)
+
+    def add(self, playlist_id, user_id, download_id, is_admin=False):
+        if not isinstance(download_id, str) or not download_id:
+            raise ValueError('download_id is required')
+        now = time.time()
+        changed = False
+        with _db_lock, db() as conn:
+            self._owned(conn, playlist_id, user_id)
+            entry = self._validated_downloads(
+                conn, [download_id], user_id, is_admin
+            )[0]
+            existing = conn.execute(
+                "SELECT 1 FROM playlist_items "
+                "WHERE playlist_id = ? AND download_id = ?",
+                (playlist_id, download_id),
+            ).fetchone()
+            if existing is None:
+                count = conn.execute(
+                    "SELECT COUNT(*) FROM playlist_items WHERE playlist_id = ?",
+                    (playlist_id,),
+                ).fetchone()[0]
+                if count >= PLAYLIST_MAX_ITEMS:
+                    raise ValueError(
+                        f'A playlist may contain at most {PLAYLIST_MAX_ITEMS} videos'
+                    )
+                conn.execute(
+                    "INSERT INTO playlist_items(playlist_id, download_id, "
+                    "position, added_at) VALUES (?, ?, ?, ?)",
+                    (playlist_id, entry['id'], count, now),
+                )
+                conn.execute(
+                    "UPDATE playlists SET revision = revision + 1, "
+                    "content_updated_at = ? WHERE id = ?",
+                    (now, playlist_id),
+                )
+                changed = True
+        if changed:
+            event_bus.publish('change', {
+                'reason': 'playlist-add', 'playlist_id': playlist_id,
+            }, owner_user_id=user_id)
+        result = self.get(playlist_id, user_id, is_admin)
+        result['changed'] = changed
+        return result
+
+    def delete(self, playlist_id, user_id):
+        with _db_lock, db() as conn:
+            self._owned(conn, playlist_id, user_id)
+            conn.execute("DELETE FROM playlists WHERE id = ?", (playlist_id,))
+        event_bus.publish('change', {
+            'reason': 'playlist-delete', 'playlist_id': playlist_id,
+        }, owner_user_id=user_id)
+
+    def save_progress(self, playlist_id, user_id, download_id, seconds,
+                      completed, write_sequence):
+        if (isinstance(seconds, bool) or not isinstance(seconds, (int, float))
+                or not math.isfinite(seconds) or seconds < 0
+                or seconds > PLAYLIST_MAX_POSITION_SECONDS):
+            raise ValueError('position_seconds must be a finite nonnegative number')
+        if not isinstance(completed, bool):
+            raise ValueError('completed must be true or false')
+        if (isinstance(write_sequence, bool)
+                or not isinstance(write_sequence, int)
+                or not 0 <= write_sequence <= PLAYBACK_SESSION_MAX_COORDINATE):
+            raise ValueError('write_sequence is outside the allowed range')
+        if download_id is not None and (
+                not isinstance(download_id, str) or not download_id):
+            raise ValueError('download_id must be a string or null')
+        if download_id is None and not completed:
+            raise ValueError('An incomplete playlist requires a current video')
+
+        changed = False
+        with _db_lock, db() as conn:
+            self._owned(conn, playlist_id, user_id)
+            if download_id is not None:
+                member = conn.execute(
+                    "SELECT 1 FROM playlist_items "
+                    "WHERE playlist_id = ? AND download_id = ?",
+                    (playlist_id, download_id),
+                ).fetchone()
+                if member is None:
+                    raise PlaylistRevisionConflict()
+            current = self._progress(conn, playlist_id)
+            if current is not None and write_sequence < current['write_sequence']:
+                return False
+            if current is not None and write_sequence == current['write_sequence']:
+                same = (
+                    current['download_id'] == download_id
+                    and math.isclose(current['position_seconds'], float(seconds),
+                                     abs_tol=0.001)
+                    and current['completed'] == completed
+                )
+                if not same:
+                    raise PlaylistRevisionConflict()
+                return False
+            conn.execute(
+                "INSERT INTO playlist_progress(playlist_id, download_id, "
+                "position_seconds, completed, write_sequence, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(playlist_id) DO UPDATE SET "
+                "download_id = excluded.download_id, "
+                "position_seconds = excluded.position_seconds, "
+                "completed = excluded.completed, "
+                "write_sequence = excluded.write_sequence, "
+                "updated_at = excluded.updated_at",
+                (playlist_id, download_id, float(seconds), int(completed),
+                 write_sequence, time.time()),
+            )
+            changed = True
+        if changed:
+            event_bus.publish('playlist-progress', {
+                'reason': 'playlist-progress', 'playlist_id': playlist_id,
+            }, owner_user_id=user_id)
+        return changed
+
+    def playback_snapshot(self, playlist_id, user_id, restart=False,
+                          start_download_id=None, is_admin=False):
+        detail = self.get(playlist_id, user_id, is_admin)
+        with db() as conn:
+            members = self._members(conn, playlist_id)
+            snapshot_ids = [row['download_id'] for row in members]
+            queue_items = []
+            playable = {}
+            for row in members:
+                entry = dict(row)
+                if _playlist_download_playable(entry, user_id, is_admin):
+                    playable[row['position']] = entry
+                    queue_items.append(_playlist_item(entry, row['position']))
+                else:
+                    queue_items.append(_playlist_item(None, row['position']))
+        if not playable:
+            return detail, queue_items, snapshot_ids, None, 0, 0
+        progress = detail.get('progress')
+        if progress and progress['completed'] and not restart:
+            raise PlaylistRevisionConflict('completed')
+        if start_download_id is not None:
+            start_position = next(
+                (position for position, entry in playable.items()
+                 if entry['id'] == start_download_id), None
+            )
+            if start_position is None:
+                raise PlaylistRevisionConflict()
+            resume_seconds = 0
+        elif restart or not progress:
+            start_position = min(playable)
+            resume_seconds = 0
+        else:
+            start_position = next(
+                (position for position, entry in playable.items()
+                 if entry['id'] == progress['download_id']), None
+            )
+            if start_position is None:
+                start_position = min(playable)
+                resume_seconds = 0
+            else:
+                resume_seconds = float(progress['position_seconds'])
+                if resume_seconds < 5:
+                    resume_seconds = 0
+                duration = _finite_positive_number(
+                    playable[start_position].get('duration_seconds')
+                )
+                if (duration is not None
+                        and duration - min(duration, resume_seconds)
+                        <= max(30, duration * 0.05)):
+                    next_positions = [
+                        position for position in playable
+                        if position > start_position
+                    ]
+                    if next_positions:
+                        start_position = min(next_positions)
+                        resume_seconds = 0
+                    else:
+                        self.save_progress(
+                            playlist_id, user_id, progress['download_id'], 0,
+                            True, int(progress.get('write_sequence') or 0) + 1,
+                        )
+                        raise PlaylistRevisionConflict('completed')
+        return (detail, queue_items, snapshot_ids, playable[start_position],
+                start_position, resume_seconds)
+
+
+playlists = PlaylistService()
 
 
 def db_get_preferences():
@@ -653,6 +2195,785 @@ def db_set_preferences(updates: dict):
     if "max_concurrent" in updates:
         with _worker_condition:
             _worker_condition.notify_all()
+
+
+def _db_user(conn, where, values):
+    row = conn.execute(
+        "SELECT id, username, name, password_hash, suspended, session_version, "
+        f"created_at FROM users WHERE {where}",
+        values,
+    ).fetchone()
+    if row is None:
+        return None
+    user = dict(row)
+    user['suspended'] = bool(user['suspended'])
+    user['roles'] = [
+        role['name'] for role in conn.execute(
+            "SELECT roles.name FROM roles "
+            "JOIN user_roles ON user_roles.role_id = roles.id "
+            "WHERE user_roles.user_id = ? "
+            "ORDER BY roles.name COLLATE NOCASE",
+            (user['id'],),
+        )
+    ]
+    return user
+
+
+def db_get_user_by_id(user_id):
+    with db() as conn:
+        return _db_user(conn, "id = ?", (user_id,))
+
+
+def db_get_user_by_username(username):
+    with db() as conn:
+        return _db_user(conn, "username = ? COLLATE NOCASE", (username,))
+
+
+def db_get_initial_admin():
+    """Return the passwordless bootstrap administrator, if it still exists."""
+    with db() as conn:
+        row = conn.execute(
+            "SELECT users.id FROM users "
+            "JOIN user_roles ON user_roles.user_id = users.id "
+            "JOIN roles ON roles.id = user_roles.role_id "
+            "WHERE roles.name = 'admin' AND users.password_hash IS NULL "
+            "ORDER BY users.created_at, users.id LIMIT 1"
+        ).fetchone()
+        return _db_user(conn, "id = ?", (row['id'],)) if row else None
+
+
+def db_list_roles():
+    with db() as conn:
+        return [
+            row['name'] for row in conn.execute(
+                "SELECT name FROM roles ORDER BY name COLLATE NOCASE"
+            )
+        ]
+
+
+def _public_user(user):
+    return {
+        key: value for key, value in user.items()
+        if key != 'password_hash'
+    }
+
+
+def db_list_users():
+    with db() as conn:
+        ids = [
+            row['id'] for row in conn.execute(
+                "SELECT id FROM users ORDER BY username COLLATE NOCASE"
+            )
+        ]
+        return [_public_user(_db_user(conn, "id = ?", (user_id,)))
+                for user_id in ids]
+
+
+def _b64url(data):
+    return base64.urlsafe_b64encode(data).decode('ascii').rstrip('=')
+
+
+def _credential_verifier(value):
+    key = str(app.secret_key).encode('utf-8')
+    return hmac.new(key, value.encode('utf-8'), hashlib.sha256).digest()
+
+
+def _companion_error(status, code, message):
+    response = jsonify({'error': message, 'code': code})
+    response.headers['Cache-Control'] = 'no-store'
+    return response, status
+
+
+def _bundled_extension():
+    """Return verified package metadata without trusting a mutable artifact."""
+    try:
+        expected_line = COMPANION_XPI_CHECKSUM_PATH.read_text(
+            encoding='ascii'
+        ).strip()
+        expected, filename = expected_line.split(None, 1)
+        filename = filename.lstrip('*')
+        if (not re.fullmatch(r'[0-9a-f]{64}', expected)
+                or filename != COMPANION_XPI_NAME):
+            return None
+        package_bytes = COMPANION_XPI_PATH.read_bytes()
+        actual = hashlib.sha256(package_bytes).hexdigest()
+        with zipfile.ZipFile(io.BytesIO(package_bytes)) as archive:
+            archive_names = {name.lower() for name in archive.namelist()}
+    except (OSError, ValueError, zipfile.BadZipFile):
+        return None
+    if not hmac.compare_digest(actual, expected):
+        return None
+    return {
+        'version': COMPANION_PACKAGE_VERSION,
+        'url': '/browser-extension/vdl-companion-firefox.xpi',
+        'download_url': '/browser-extension/vdl-companion-firefox.xpi?download=1',
+        'sha256': actual,
+        # Firefox Release refuses unsigned packages. Surface the development
+        # artifact honestly instead of leaving a click to fail without useful
+        # feedback; AMO-signed XPIs contain this signature trio.
+        'signed': {
+            'meta-inf/manifest.mf',
+            'meta-inf/mozilla.sf',
+            'meta-inf/mozilla.rsa',
+        }.issubset(archive_names),
+    }
+
+
+def _validated_device_label(value):
+    if not isinstance(value, str):
+        raise ValueError('Device label is required')
+    label = unicodedata.normalize('NFC', value).strip()
+    if (not 1 <= len(label) <= 80
+            or any(unicodedata.category(char).startswith('C') for char in label)):
+        raise ValueError('Device label must contain 1 to 80 visible characters')
+    return label
+
+
+def _validated_extension_version(value):
+    if (not isinstance(value, str) or not value or len(value) > 64
+            or not re.fullmatch(r'[0-9A-Za-z][0-9A-Za-z.+-]*', value)):
+        raise ValueError('Invalid extension version')
+    return value
+
+
+def _companion_protocol_error():
+    package = _bundled_extension()
+    return jsonify({
+        'error': 'Companion update required',
+        'code': 'incompatible_protocol',
+        'supported_protocols': list(COMPANION_PROTOCOLS),
+        'extension_url': (
+            package['url'] if package else
+            '/browser-extension/vdl-companion-firefox.xpi'
+        ),
+    }), 426
+
+
+def _require_companion_protocol():
+    raw = request.headers.get('X-VDL-Companion-Protocol')
+    if raw != str(COMPANION_PROTOCOL):
+        return _companion_protocol_error()
+    try:
+        _validated_extension_version(
+            request.headers.get('X-VDL-Companion-Version')
+        )
+    except ValueError:
+        return _companion_error(
+            400, 'invalid_request', 'Invalid companion version header'
+        )
+    return None
+
+
+def _read_json_body(limit, *, require_length=False):
+    """Enforce route limits before Flask is allowed to decode JSON."""
+    if request.mimetype != 'application/json':
+        return None, _companion_error(
+            415, 'unsupported_media_type', 'Content-Type must be application/json'
+        )
+    if require_length and request.content_length is None:
+        return None, _companion_error(
+            400, 'invalid_request', 'Content-Length is required'
+        )
+    if request.content_length is not None and request.content_length > limit:
+        return None, _companion_error(
+            413, 'request_too_large', 'Request body is too large'
+        )
+    raw = request.get_data(cache=True)
+    if len(raw) > limit:
+        return None, _companion_error(
+            413, 'request_too_large', 'Request body is too large'
+        )
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError, UnicodeDecodeError):
+        return None, _companion_error(400, 'invalid_request', 'Invalid JSON request')
+    if not isinstance(data, dict):
+        return None, _companion_error(400, 'invalid_request', 'A JSON object is required')
+    return data, None
+
+
+def _prune_rate_window(values, now, seconds=60):
+    cutoff = now - seconds
+    return [timestamp for timestamp in values if timestamp > cutoff]
+
+
+def _failed_pair_rate_limited(remote_addr):
+    now = time.time()
+    key = remote_addr or ''
+    with _companion_rate_lock:
+        global _failed_pair_global
+        _failed_pair_global = _prune_rate_window(_failed_pair_global, now)
+        values = _prune_rate_window(_failed_pair_rates.get(key, []), now)
+        _failed_pair_rates[key] = values
+        return len(values) >= 10 or len(_failed_pair_global) >= 60
+
+
+def _record_failed_pair(remote_addr):
+    now = time.time()
+    key = remote_addr or ''
+    with _companion_rate_lock:
+        global _failed_pair_global
+        _failed_pair_global = _prune_rate_window(_failed_pair_global, now)
+        values = _prune_rate_window(_failed_pair_rates.get(key, []), now)
+        values.append(now)
+        _failed_pair_rates[key] = values
+        _failed_pair_global.append(now)
+        # An attacker can vary addresses, so retain only currently live keys.
+        if len(_failed_pair_rates) > 1024:
+            stale = [item for item, stamps in _failed_pair_rates.items()
+                     if not _prune_rate_window(stamps, now)]
+            for item in stale[:len(_failed_pair_rates) - 1024]:
+                _failed_pair_rates.pop(item, None)
+            while len(_failed_pair_rates) > 1024:
+                _failed_pair_rates.pop(next(iter(_failed_pair_rates)))
+
+
+def _token_rate_limited(token_id, request_id):
+    now = time.time()
+    with _companion_rate_lock:
+        values = [
+            (seen_id, timestamp)
+            for seen_id, timestamp in _token_download_rates.get(token_id, [])
+            if timestamp > now - 60
+        ]
+        if any(seen_id == request_id for seen_id, _timestamp in values):
+            _token_download_rates[token_id] = values
+            return False
+        if len(values) >= 10:
+            _token_download_rates[token_id] = values
+            return True
+        values.append((request_id, now))
+        _token_download_rates[token_id] = values
+        while len(_token_download_rates) > 4096:
+            _token_download_rates.pop(next(iter(_token_download_rates)))
+        return False
+
+
+def _new_pairing_code(user_id, origin):
+    now = time.time()
+    # Keep the established 16-byte code shape so older companions can still
+    # pair. New companions recognize the format byte and creation time, while
+    # 88 unpredictable bits remain ample for a five-minute rate-limited code.
+    payload = (
+        bytes((COMPANION_PAIRING_CODE_FORMAT,))
+        + int(now).to_bytes(4, 'big')
+        + secrets.token_bytes(11)
+    )
+    raw = 'VDL1-' + _b64url(payload)
+    record = {
+        'verifier': _credential_verifier(raw),
+        'user_id': user_id,
+        'origin': origin,
+        'created_at': now,
+        'expires_at': now + 300,
+    }
+    with _pairing_lock:
+        _pairing_codes[user_id] = record
+    return raw, record['expires_at']
+
+
+def _consume_pairing_code(code, origin):
+    if (not isinstance(code, str)
+            or not re.fullmatch(r'VDL1-[A-Za-z0-9_-]{22}', code)):
+        return None
+    verifier = _credential_verifier(code)
+    now = time.time()
+    with _pairing_lock:
+        matched_user_id = None
+        for user_id, record in list(_pairing_codes.items()):
+            if record['expires_at'] <= now:
+                _pairing_codes.pop(user_id, None)
+                continue
+            if (record['origin'] == origin
+                    and hmac.compare_digest(record['verifier'], verifier)):
+                matched_user_id = user_id
+        if matched_user_id is None:
+            return None
+        # Consume before the database write so even a lost/error response can
+        # never replay the credential.
+        _pairing_codes.pop(matched_user_id, None)
+        return matched_user_id
+
+
+def _new_companion_token(user, device_label, extension_version):
+    token_id = _b64url(secrets.token_bytes(16))
+    token = f'vdlx_{token_id}.{_b64url(secrets.token_bytes(32))}'
+    with _db_lock, db() as conn:
+        conn.execute(
+            "INSERT INTO extension_tokens("
+            "id, user_id, token_verifier, device_label, extension_version, "
+            "protocol_version, paired_session_version, created_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                token_id, user['id'], _credential_verifier(token),
+                device_label, extension_version, COMPANION_PROTOCOL,
+                user['session_version'], time.time(),
+            ),
+        )
+    return token_id, token
+
+
+def _companion_authenticate():
+    header = request.headers.get('Authorization', '')
+    match = re.fullmatch(
+        r'Bearer (vdlx_([A-Za-z0-9_-]{22})\.[A-Za-z0-9_-]{43})', header
+    )
+    if match is None:
+        return None
+    token, token_id = match.groups()
+    with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM extension_tokens WHERE id = ?", (token_id,)
+        ).fetchone()
+    if row is None or not hmac.compare_digest(
+            bytes(row['token_verifier']), _credential_verifier(token)):
+        return None
+    user = db_get_user_by_id(row['user_id'])
+    if (user is None or user['suspended'] or user['password_hash'] is None
+            or user['session_version'] != row['paired_session_version']):
+        return None
+
+    now = time.time()
+    reported_version = request.headers.get('X-VDL-Companion-Version')
+    if row['last_used_at'] is None or row['last_used_at'] <= now - 300:
+        try:
+            version = _validated_extension_version(reported_version)
+        except ValueError:
+            version = row['extension_version']
+        with _db_lock, db() as conn:
+            conn.execute(
+                "UPDATE extension_tokens SET last_used_at = ?, "
+                "extension_version = ? WHERE id = ?",
+                (now, version, token_id),
+            )
+    return {'id': token_id, 'user': user}
+
+
+def _canonical_page_url(value):
+    if (not isinstance(value, str) or len(value.encode('utf-8')) > 8192
+            or any(ord(character) < 32 or ord(character) == 127
+                   for character in value)):
+        raise ValueError('Invalid page URL')
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+        hostname = parsed.hostname
+    except (ValueError, UnicodeError) as exc:
+        raise ValueError('Invalid page URL') from exc
+    if (parsed.scheme.lower() not in ('http', 'https') or not hostname
+            or parsed.username is not None or parsed.password is not None):
+        raise ValueError('Invalid page URL')
+    try:
+        ascii_host = hostname.encode('idna').decode('ascii').lower()
+    except UnicodeError as exc:
+        raise ValueError('Invalid page URL') from exc
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError('Invalid page URL')
+    if ':' in ascii_host and not ascii_host.startswith('['):
+        display_host = f'[{ascii_host}]'
+    else:
+        display_host = ascii_host
+    default_port = 443 if parsed.scheme.lower() == 'https' else 80
+    authority = display_host + (f':{port}' if port and port != default_port else '')
+    path = parsed.path or '/'
+    return f'{parsed.scheme.lower()}://{authority}{path}' + (
+        f'?{parsed.query}' if parsed.query else ''
+    )
+
+
+def _cookie_string(value, field, maximum, *, allow_empty=False, ascii_only=False):
+    if not isinstance(value, str) or (not value and not allow_empty):
+        raise ValueError(f'Invalid cookie {field}')
+    try:
+        encoded = value.encode('ascii' if ascii_only else 'utf-8')
+    except UnicodeError as exc:
+        raise ValueError(f'Invalid cookie {field}') from exc
+    if len(encoded) > maximum or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError(f'Invalid cookie {field}')
+    return value
+
+
+def _domain_matches(hostname, domain, host_only):
+    try:
+        host_ip = ipaddress.ip_address(hostname)
+    except ValueError:
+        host_ip = None
+    try:
+        domain_ip = ipaddress.ip_address(domain)
+    except ValueError:
+        domain_ip = None
+    if host_ip is not None or domain_ip is not None:
+        return host_ip is not None and domain_ip is not None and host_ip == domain_ip
+    return domain == hostname if host_only else (
+        domain == hostname or hostname.endswith('.' + domain)
+    )
+
+
+def _cookie_path_matches(request_path, cookie_path):
+    return (
+        cookie_path == request_path
+        or (
+            request_path.startswith(cookie_path)
+            and (cookie_path.endswith('/') or request_path[len(cookie_path):].startswith('/'))
+        )
+    )
+
+
+def _validated_cookies(value, canonical_url):
+    if not isinstance(value, list) or len(value) > 300:
+        raise ValueError('Invalid cookies')
+    parsed = urlsplit(canonical_url)
+    hostname = parsed.hostname
+    request_path = parsed.path or '/'
+    allowed = {
+        'name', 'value', 'domain', 'host_only', 'path', 'secure',
+        'http_only', 'expires',
+    }
+    result = []
+    seen = set()
+    now = time.time()
+    for item in value:
+        if not isinstance(item, dict) or set(item) != allowed:
+            raise ValueError('Invalid cookie fields')
+        name = _cookie_string(item['name'], 'name', 256)
+        cookie_value = _cookie_string(
+            item['value'], 'value', 16384, allow_empty=True
+        )
+        raw_domain = _cookie_string(
+            item['domain'], 'domain', 253, ascii_only=True
+        ).lower()
+        domain = raw_domain[1:] if raw_domain.startswith('.') else raw_domain
+        path = _cookie_string(item['path'], 'path', 2048)
+        if (not domain or domain.startswith('.') or not path.startswith('/')
+                or any(character in domain for character in '/\\@[]')):
+            raise ValueError('Invalid cookie scope')
+        try:
+            domain_ip = ipaddress.ip_address(domain)
+        except ValueError:
+            domain_ip = None
+        if domain_ip is None and (
+                any(not label or len(label) > 63
+                    or label.startswith('-') or label.endswith('-')
+                    or not re.fullmatch(r'[a-z0-9-]+', label)
+                    for label in domain.rstrip('.').split('.'))
+                or domain.endswith('.')):
+            raise ValueError('Invalid cookie scope')
+        for boolean in ('host_only', 'secure', 'http_only'):
+            if not isinstance(item[boolean], bool):
+                raise ValueError(f'Invalid cookie {boolean}')
+        if not _domain_matches(hostname, domain, item['host_only']):
+            raise ValueError('Cookie domain does not match page URL')
+        if not _cookie_path_matches(request_path, path):
+            raise ValueError('Cookie path does not match page URL')
+        if item['secure'] and parsed.scheme != 'https':
+            raise ValueError('Secure cookie requires HTTPS')
+        expires = item['expires']
+        if expires is not None:
+            if isinstance(expires, bool) or not isinstance(expires, int):
+                raise ValueError('Invalid cookie expiry')
+            try:
+                time.localtime(expires)
+            except (OverflowError, OSError, ValueError) as exc:
+                raise ValueError('Invalid cookie expiry') from exc
+            if expires <= now:
+                raise ValueError('Cookie has expired')
+        key = (domain, path, name)
+        if key in seen:
+            raise ValueError('Duplicate cookie')
+        seen.add(key)
+        result.append({
+            'name': name, 'value': cookie_value, 'domain': domain,
+            'host_only': item['host_only'], 'path': path,
+            'secure': item['secure'], 'http_only': item['http_only'],
+            'expires': expires,
+        })
+    return result
+
+
+class RewindingCookieBuffer(io.StringIO):
+    """Keep yt-dlp's refreshed cookie jar readable by its next context."""
+    def truncate(self, size=None):
+        result = super().truncate(0 if size is None else size)
+        if size in (None, 0):
+            self.seek(0)
+        return result
+
+
+def _cookies_to_netscape(cookies):
+    lines = ['# Netscape HTTP Cookie File']
+    for cookie in cookies:
+        domain = cookie['domain'] if cookie['host_only'] else '.' + cookie['domain']
+        if cookie['http_only']:
+            domain = '#HttpOnly_' + domain
+        lines.append('\t'.join((
+            domain,
+            'FALSE' if cookie['host_only'] else 'TRUE',
+            cookie['path'],
+            'TRUE' if cookie['secure'] else 'FALSE',
+            str(cookie['expires'] or 0),
+            cookie['name'],
+            cookie['value'],
+        )))
+    return RewindingCookieBuffer('\n'.join(lines) + '\n')
+
+
+def _redact_sensitive_text(value, secrets_to_hide=()):
+    text = str(value)
+    for secret in secrets_to_hide:
+        if secret:
+            text = text.replace(secret, '<redacted>')
+    text = re.sub(r'(https?://[^\s?#]+)\?[^\s#]*', r'\1?<redacted>', text)
+    text = re.sub(r'(https?://[^\s#]+)#[^\s]*', r'\1', text)
+    text = re.sub(r'(?i)(authorization\s*[:=]\s*)([^\s,;]+)', r'\1<redacted>', text)
+    return text
+
+
+class _RedactingYtdlpLogger:
+    def __init__(self, sensitive_values):
+        self._sensitive_values = tuple(sensitive_values)
+
+    def debug(self, message):
+        pass
+
+    def warning(self, message):
+        pass
+
+    def error(self, message):
+        # DownloadError remains the authoritative user-visible failure; this
+        # sink prevents yt-dlp from independently emitting credential text.
+        _redact_sensitive_text(message, self._sensitive_values)
+
+
+def _resolve_companion_download(user, request_id, canonical_url):
+    """Resolve idempotency, dedupe, resume, or insert under one transaction."""
+    with _db_lock, db() as conn:
+        row = conn.execute(
+            "SELECT id, url, status, visibility FROM downloads "
+            "WHERE owner_user_id = ? AND extension_request_id = ?",
+            (user['id'], request_id),
+        ).fetchone()
+        if row is not None:
+            if row['url'] != canonical_url:
+                return None, 'conflict', None
+            return dict(row), 'existing', None
+
+        row = conn.execute(
+            "SELECT id, url, status, visibility FROM downloads "
+            "WHERE owner_user_id = ? AND browser_authenticated = 1 "
+            "AND url = ? AND status IN ('starting', 'downloading', 'paused') "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            (user['id'], canonical_url),
+        ).fetchone()
+        if row is not None:
+            return dict(row), 'already_active', None
+
+        row = conn.execute(
+            "SELECT id, url, status, visibility FROM downloads "
+            "WHERE owner_user_id = ? AND browser_authenticated = 1 "
+            "AND url = ? AND status IN ('cancelled', 'interrupted') "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            (user['id'], canonical_url),
+        ).fetchone()
+        if row is not None:
+            conn.execute(
+                "UPDATE downloads SET status = 'starting', progress = '0%', "
+                "extension_request_id = ? WHERE id = ?",
+                (request_id, row['id']),
+            )
+            result = dict(row)
+            result['status'] = 'starting'
+            return result, 'resumed', 'update'
+
+        while True:
+            download_id = str(uuid.uuid4())[:8]
+            if conn.execute(
+                    "SELECT 1 FROM downloads WHERE id = ?", (download_id,)
+            ).fetchone() is None:
+                break
+        conn.execute(
+            "INSERT INTO downloads("
+            "id, url, status, progress, created_at, owner_user_id, "
+            "owner_username, visibility, browser_authenticated, "
+            "extension_request_id"
+            ") VALUES (?, ?, 'starting', '0%', ?, ?, ?, 'private', 1, ?)",
+            (
+                download_id, canonical_url, time.time(), user['id'],
+                user['username'], request_id,
+            ),
+        )
+        return {
+            'id': download_id, 'url': canonical_url, 'status': 'starting',
+            'visibility': 'private',
+        }, 'started', 'insert'
+
+
+def _validated_username(value):
+    if not isinstance(value, str):
+        raise ValueError('Username is required')
+    username = unicodedata.normalize('NFC', value).strip()
+    if (not username or len(username) > 64
+            or any(ord(character) < 32 for character in username)):
+        raise ValueError('Username must be between 1 and 64 visible characters')
+    return username
+
+
+def _validated_user_name(value):
+    if not isinstance(value, str):
+        raise ValueError('Name is required')
+    name = unicodedata.normalize('NFC', value).strip()
+    if (not name or len(name) > 128
+            or any(ord(character) < 32 for character in name)):
+        raise ValueError('Name must be between 1 and 128 visible characters')
+    return name
+
+
+def _validated_password(value):
+    if not isinstance(value, str) or len(value) < 8:
+        raise ValueError('Password must contain at least 8 characters')
+    if len(value) > 1024:
+        raise ValueError('Password is too long')
+    return value
+
+
+def _db_role_id(conn, role_name):
+    row = conn.execute(
+        "SELECT id FROM roles WHERE name = ? COLLATE NOCASE",
+        (role_name,),
+    ).fetchone()
+    if row is None:
+        raise ValueError('Unknown role')
+    return row['id']
+
+
+def db_set_initial_admin_password(user_id, password):
+    password_hash = generate_password_hash(_validated_password(password))
+    with _db_lock, db() as conn:
+        cursor = conn.execute(
+            "UPDATE users SET password_hash = ?, session_version = session_version + 1 "
+            "WHERE id = ? AND password_hash IS NULL",
+            (password_hash, user_id),
+        )
+        if cursor.rowcount != 1:
+            return None
+        return _db_user(conn, "id = ?", (user_id,))
+
+
+def db_create_user(username, password, role_name, name=None):
+    username = _validated_username(username)
+    name = _validated_user_name(username if name is None else name)
+    password_hash = generate_password_hash(_validated_password(password))
+    with _db_lock, db() as conn:
+        role_id = _db_role_id(conn, role_name)
+        try:
+            cursor = conn.execute(
+                "INSERT INTO users(username, name, password_hash, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (username, name, password_hash, time.time()),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError('A user with that login name already exists') from exc
+        conn.execute(
+            "INSERT INTO user_roles(user_id, role_id) VALUES (?, ?)",
+            (cursor.lastrowid, role_id),
+        )
+        return _public_user(_db_user(conn, "id = ?", (cursor.lastrowid,)))
+
+
+def _db_other_active_admin_exists(conn, user_id):
+    return conn.execute(
+        "SELECT 1 FROM users "
+        "JOIN user_roles ON user_roles.user_id = users.id "
+        "JOIN roles ON roles.id = user_roles.role_id "
+        "WHERE roles.name = 'admin' AND users.suspended = 0 "
+        "AND users.id != ? LIMIT 1",
+        (user_id,),
+    ).fetchone() is not None
+
+
+def db_update_user(user_id, *, username=None, name=None, password=None,
+                   role_name=None, suspended=None):
+    with _db_lock, db() as conn:
+        user = _db_user(conn, "id = ?", (user_id,))
+        if user is None:
+            return None
+        if role_name is not None and not isinstance(role_name, str):
+            raise ValueError('Unknown role')
+
+        demotes_admin = (
+            'admin' in user['roles']
+            and role_name is not None
+            and role_name.casefold() != 'admin'
+        )
+        suspends_active_admin = (
+            'admin' in user['roles']
+            and not user['suspended']
+            and suspended is True
+        )
+        if ((demotes_admin or suspends_active_admin)
+                and not _db_other_active_admin_exists(conn, user_id)):
+            raise ValueError('At least one active administrator is required')
+
+        if username is not None:
+            username = _validated_username(username)
+            try:
+                conn.execute(
+                    "UPDATE users SET username = ? WHERE id = ?",
+                    (username, user_id),
+                )
+                # Keep the fallback label current in case this account is
+                # removed later and the foreign key becomes NULL.
+                conn.execute(
+                    "UPDATE downloads SET owner_username = ? "
+                    "WHERE owner_user_id = ?",
+                    (username, user_id),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError('A user with that login name already exists') from exc
+        if name is not None:
+            conn.execute(
+                "UPDATE users SET name = ? WHERE id = ?",
+                (_validated_user_name(name), user_id),
+            )
+        if suspended is not None:
+            if not isinstance(suspended, bool):
+                raise ValueError('Suspended must be true or false')
+            conn.execute(
+                "UPDATE users SET suspended = ? WHERE id = ?",
+                (int(suspended), user_id),
+            )
+        if password is not None:
+            password_hash = generate_password_hash(
+                _validated_password(password)
+            )
+            conn.execute(
+                "UPDATE users SET password_hash = ?, "
+                "session_version = session_version + 1 WHERE id = ?",
+                (password_hash, user_id),
+            )
+        if role_name is not None:
+            role_id = _db_role_id(conn, role_name)
+            conn.execute("DELETE FROM user_roles WHERE user_id = ?", (user_id,))
+            conn.execute(
+                "INSERT INTO user_roles(user_id, role_id) VALUES (?, ?)",
+                (user_id, role_id),
+            )
+        updated = _public_user(_db_user(conn, "id = ?", (user_id,)))
+    if suspended is True:
+        _release_playback_sessions_for_user(user_id)
+    return updated
+
+
+def db_delete_user(user_id):
+    with _db_lock, db() as conn:
+        user = _db_user(conn, "id = ?", (user_id,))
+        if user is None:
+            return False
+        if ('admin' in user['roles']
+                and not _db_other_active_admin_exists(conn, user_id)):
+            raise ValueError('At least one active administrator is required')
+        conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    _release_playback_sessions_for_user(user_id)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -958,6 +3279,8 @@ def progress_hook(d, download_id):
             download_id,
             status='downloading',
             progress=progress,
+            downloaded_bytes=max(0, int(downloaded or 0)),
+            total_bytes=int(filesize) if filesize and filesize > 0 else None,
             speed=float(speed) if speed else None,
             eta=eta,
             filesize=filesize,
@@ -998,10 +3321,19 @@ def progress_hook(d, download_id):
                 d.get('downloaded_bytes', 0),
             )
         title = info.get('title') or info.get('fulltitle')
+        finished_total = (
+            int(filesize) if filesize and filesize > 0 else None
+        )
         db_update_download(
             download_id,
             status='downloading',
             progress='100%',
+            downloaded_bytes=(
+                finished_total
+                if finished_total is not None
+                else max(0, int(d.get('downloaded_bytes') or 0))
+            ),
+            total_bytes=finished_total,
             filename=filename,
             resolution=resolution,
             filesize=int(filesize) if filesize else None,
@@ -1147,7 +3479,29 @@ def _validated_custom_filename(value):
     return stem
 
 
-def background_download(url, download_id):
+def background_download(url, download_id, cookie_bundle=None):
+    with _worker_condition:
+        _live_worker_ids.add(download_id)
+    try:
+        return _background_download(url, download_id, cookie_bundle)
+    finally:
+        # Fragment downloaders can retain their locked destination stream in a
+        # progress-hook reference cycle when cancellation skips normal cleanup.
+        # Finalize those unreachable objects before Remove may unlink the file.
+        gc.collect()
+        with _worker_condition:
+            _live_worker_ids.discard(download_id)
+            _worker_condition.notify_all()
+
+
+def _background_download(url, download_id, cookie_bundle=None):
+    sensitive_values = tuple(
+        secret
+        for cookie in (cookie_bundle or ()) if isinstance(cookie, dict)
+        for secret in (cookie.get('name', ''), cookie.get('value', ''))
+        if secret
+    )
+    cookie_buffer = None
     prefs = db_get_preferences()
     output_dir = prefs.get("download_dir", ".")
     try:
@@ -1213,7 +3567,16 @@ def background_download(url, download_id):
             options['postprocessors'] = [
                 {'key': 'FFmpegExtractAudio', 'preferredcodec': 'm4a'},
             ]
-        return yt_dlp_options(options)
+        return with_cookie_options(options)
+
+    def with_cookie_options(options):
+        # Add the live secret only after the deployment helper's deep copy.
+        merged = yt_dlp_options(options)
+        if cookie_buffer is not None:
+            cookie_buffer.seek(0)
+            merged['cookiefile'] = cookie_buffer
+            merged['logger'] = _RedactingYtdlpLogger(sensitive_values)
+        return merged
 
     # Persist the yt-dlp format selector that we're about to use, so the
     # History tab can show *what was asked for* whenever a download fails
@@ -1229,6 +3592,21 @@ def background_download(url, download_id):
         clear_cancel(download_id)
         clear_pause(download_id)
         return
+
+    if cookie_bundle is not None:
+        try:
+            cookie_buffer = _cookies_to_netscape(cookie_bundle)
+            cookie_bundle = None
+        except Exception as exc:
+            db_update_download(
+                download_id, status='error',
+                progress=_redact_sensitive_text(exc, sensitive_values),
+                finished_at=time.time(),
+            )
+            clear_cancel(download_id)
+            clear_pause(download_id)
+            _release_worker_slot()
+            return
 
     # A Continue action starts a new worker, so its in-memory filter is gone.
     # The last persisted ETA is a much safer baseline than yt-dlp's first
@@ -1252,7 +3630,7 @@ def background_download(url, download_id):
         if is_cancel_requested(download_id):
             raise DownloadCancelled()
         try:
-            probe_opts = yt_dlp_options({
+            probe_opts = with_cookie_options({
                 'quiet': True,
                 'noprogress': True,
                 'skip_download': True,
@@ -1333,6 +3711,10 @@ def background_download(url, download_id):
                 # download — leaving the resolution column unset for some
                 # extractors. ffprobe always reflects the final container.
                 final_res = ffprobe_resolution(final_path)
+                final_duration = _consume_media_probe(final_path, final_res)
+                thumbnail_path = _thumbnail_path(entry, output_dir)
+                if thumbnail_path:
+                    generate_video_thumbnail(final_path, thumbnail_path)
                 db_update_download(
                     download_id,
                     status='finished',
@@ -1340,6 +3722,8 @@ def background_download(url, download_id):
                     filename=final_path,
                     filesize=os.path.getsize(final_path),
                     resolution=final_res,
+                    duration_seconds=final_duration,
+                    media_metadata_probed=True,
                     speed=0.0,
                     eta=0,
                     finished_at=time.time(),
@@ -1354,10 +3738,20 @@ def background_download(url, download_id):
         if is_cancel_requested(download_id):
             db_update_download(download_id, status='cancelled', finished_at=time.time())
         else:
-            db_update_download(download_id, status='error', progress=str(e), finished_at=time.time())
+            db_update_download(
+                download_id, status='error',
+                progress=_redact_sensitive_text(e, sensitive_values),
+                finished_at=time.time(),
+            )
     except Exception as e:
-        db_update_download(download_id, status='error', progress=str(e), finished_at=time.time())
+        db_update_download(
+            download_id, status='error',
+            progress=_redact_sensitive_text(e, sensitive_values),
+            finished_at=time.time(),
+        )
     finally:
+        if cookie_buffer is not None:
+            cookie_buffer.close()
         clear_cancel(download_id)
         clear_pause(download_id)
         _clear_progress_estimate(download_id)
@@ -1365,20 +3759,540 @@ def background_download(url, download_id):
         _release_worker_slot()
 
 
+def _finite_positive_number(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number > 0 else None
+
+
+def ffprobe_media_metadata(path, *, timeout=10, require_video=False):
+    """Return final-container resolution and duration from one ffprobe run."""
+    try:
+        result = subprocess.run(
+            [
+                'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                '-show_entries', 'stream=height,duration:format=duration',
+                '-of', 'json', path,
+            ],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except FileNotFoundError as exc:
+        if require_video:
+            raise RuntimeError(
+                'ffprobe is required to validate uploaded videos'
+            ) from exc
+        return None, None
+    except subprocess.TimeoutExpired as exc:
+        if require_video:
+            raise ValueError('The uploaded video could not be inspected') from exc
+        return None, None
+    except OSError as exc:
+        if require_video:
+            raise RuntimeError(
+                f'Unable to inspect the uploaded video: {exc}'
+            ) from exc
+        return None, None
+
+    try:
+        payload = json.loads(result.stdout or '{}')
+        streams = payload.get('streams') or []
+        container = payload.get('format') or {}
+    except (AttributeError, json.JSONDecodeError) as exc:
+        if require_video:
+            raise ValueError('The uploaded file is not a supported video') from exc
+        return None, None
+    if result.returncode != 0 or not streams:
+        if require_video:
+            raise ValueError('The uploaded file does not contain a video stream')
+        return None, None
+
+    height = _finite_positive_number(streams[0].get('height'))
+    duration = _finite_positive_number(container.get('duration'))
+    if duration is None:
+        duration = _finite_positive_number(streams[0].get('duration'))
+    resolution = f'{int(height)}p' if height is not None else None
+    return resolution, duration
+
+
+def _cache_media_probe(path, resolution, duration):
+    with _media_probe_cache_lock:
+        _media_probe_cache[os.path.realpath(path)] = (resolution, duration)
+
+
+def _consume_media_probe(path, resolution):
+    with _media_probe_cache_lock:
+        cached = _media_probe_cache.pop(os.path.realpath(path), None)
+    if cached is None or cached[0] != resolution:
+        return None
+    return cached[1]
+
+
 def ffprobe_resolution(path):
     """Return e.g. '1080p' for the first video stream in `path`, or None."""
-    try:
-        out = subprocess.run(
-            ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
-             '-show_entries', 'stream=height', '-of', 'csv=p=0', path],
-            capture_output=True, text=True, timeout=10,
+    resolution, duration = ffprobe_media_metadata(path)
+    _cache_media_probe(path, resolution, duration)
+    return resolution
+
+
+def inspect_uploaded_video(path):
+    """Validate an upload with ffprobe and return its optional resolution."""
+    resolution, duration = ffprobe_media_metadata(
+        path, timeout=30, require_video=True
+    )
+    _cache_media_probe(path, resolution, duration)
+    return resolution
+
+
+def _validated_upload_filename(value):
+    """Return a safe basename while preserving the desktop filename."""
+    if not isinstance(value, str):
+        raise ValueError('Uploaded file must have a filename')
+    # Some clients still submit a browser-era C:\\fakepath prefix. Treat both
+    # separator styles as untrusted path components and retain only the leaf.
+    name = unicodedata.normalize(
+        'NFC', value.replace('\\', '/').rsplit('/', 1)[-1]
+    ).strip()
+    if (not name or name in ('.', '..') or '\x00' in name
+            or any(ord(character) < 32 for character in name)):
+        raise ValueError('Uploaded file must have a valid filename')
+    # Leave enough bytes for a collision suffix on filesystems with the usual
+    # 255-byte component limit instead of failing late after a large transfer.
+    if len(os.fsencode(name)) > 240:
+        raise ValueError('Uploaded filename is too long')
+    return name
+
+
+def _reserve_upload_path(directory, filename):
+    """Atomically reserve a collision-safe destination in the library."""
+    stem, extension = os.path.splitext(filename)
+    for suffix in range(10000):
+        candidate_name = (
+            filename if suffix == 0 else f'{stem} ({suffix}){extension}'
         )
-        h = out.stdout.strip()
-        if h.isdigit() and int(h) > 0:
-            return f"{int(h)}p"
-    except Exception:
+        candidate = os.path.join(directory, candidate_name)
+        try:
+            descriptor = os.open(
+                candidate,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+        except FileExistsError:
+            continue
+        os.close(descriptor)
+        return candidate
+    raise OSError('Unable to choose an unused filename for the upload')
+
+
+class IngestSourceChanged(Exception):
+    """The watched source stopped matching the settled scan candidate."""
+
+
+def _ingest_signature(metadata):
+    return (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+    )
+
+
+def _source_signature(path):
+    try:
+        metadata = os.stat(path, follow_symlinks=False)
+    except (FileNotFoundError, OSError) as exc:
+        raise IngestSourceChanged() from exc
+    if not stat.S_ISREG(metadata.st_mode):
+        raise IngestSourceChanged()
+    return _ingest_signature(metadata)
+
+
+def _ingest_watched_file(source_path, expected_signature):
+    """Copy one settled inbox file into the library without publishing early."""
+    source_path = os.path.abspath(source_path)
+    original_name = _validated_upload_filename(os.path.basename(source_path))
+    output_dir = os.path.abspath(_prepare_download_directory(
+        db_get_preferences().get('download_dir', '.')
+    ))
+    if os.path.realpath(output_dir) == os.path.dirname(source_path):
+        raise ValueError(
+            'The ingest folder and download directory must be different'
+        )
+
+    download_id = str(uuid.uuid4())[:8]
+    title = os.path.splitext(original_name)[0] or original_name
+    temporary_path = None
+    final_path = None
+    registered = False
+    received = 0
+    descriptor = None
+    try:
+        flags = os.O_RDONLY
+        if hasattr(os, 'O_NOFOLLOW'):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(source_path, flags)
+        with os.fdopen(descriptor, 'rb') as source:
+            descriptor = None
+            if _ingest_signature(os.fstat(source.fileno())) != expected_signature:
+                raise IngestSourceChanged()
+            with tempfile.NamedTemporaryFile(
+                    mode='wb', dir=output_dir,
+                    prefix=f'.vdl_{download_id}.', suffix='.ingest.part',
+                    delete=False) as temporary:
+                temporary_path = temporary.name
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    temporary.write(chunk)
+                    received += len(chunk)
+                temporary.flush()
+            if _ingest_signature(os.fstat(source.fileno())) != expected_signature:
+                raise IngestSourceChanged()
+
+        if received != expected_signature[2]:
+            raise IngestSourceChanged()
+        if _source_signature(source_path) != expected_signature:
+            raise IngestSourceChanged()
+        resolution = inspect_uploaded_video(temporary_path)
+        duration_seconds = _consume_media_probe(temporary_path, resolution)
+        # ffprobe is bounded, but a host writer can still resume while it runs.
+        # A final comparison prevents that changed source from being published.
+        if _source_signature(source_path) != expected_signature:
+            raise IngestSourceChanged()
+
+        with _upload_lock:
+            final_path = _reserve_upload_path(output_dir, original_name)
+            os.replace(temporary_path, final_path)
+            temporary_path = None
+
+        db_insert_ingested_video(
+            download_id,
+            source_path,
+            expected_signature,
+            original_name,
+            title,
+            received,
+            output_dir,
+            final_path,
+            resolution,
+            duration_seconds,
+        )
+        registered = True
+        print(
+            f'VDL ingest: added {original_name!r} as {download_id}',
+            flush=True,
+        )
+        return download_id
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        for path in (
+                temporary_path,
+                final_path if final_path and not registered else None):
+            if not path:
+                continue
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+
+
+_INGEST_TEMP_SUFFIXES = (
+    '.part', '.partial', '.tmp', '.crdownload', '.download',
+)
+
+
+class IngestFolderWatcher:
+    """Periodically reconcile a flat drop folder into the video library."""
+
+    def __init__(self, directory, scan_seconds=10.0, settle_seconds=60.0):
+        self.directory = os.path.realpath(directory)
+        self.scan_seconds = scan_seconds
+        self.settle_seconds = settle_seconds
+        self._candidates = {}
+
+    @staticmethod
+    def _eligible_name(name):
+        lowered = name.lower()
+        return (
+            not name.startswith('.')
+            and not lowered.endswith(_INGEST_TEMP_SUFFIXES)
+        )
+
+    def scan_once(self, now=None):
+        """Observe candidates once and import only settled regular files."""
+        now = time.monotonic() if now is None else now
+        receipts = db_get_ingest_receipts(self.directory)
+        visible_paths = set()
+        try:
+            with os.scandir(self.directory) as entries:
+                for entry in entries:
+                    if not self._eligible_name(entry.name):
+                        continue
+                    try:
+                        metadata = entry.stat(follow_symlinks=False)
+                    except (FileNotFoundError, OSError):
+                        continue
+                    if not stat.S_ISREG(metadata.st_mode):
+                        continue
+
+                    path = os.path.join(self.directory, entry.name)
+                    signature = _ingest_signature(metadata)
+                    visible_paths.add(path)
+                    if receipts.get(path) == signature:
+                        self._candidates.pop(path, None)
+                        continue
+
+                    candidate = self._candidates.get(path)
+                    if candidate is None or candidate['signature'] != signature:
+                        self._candidates[path] = {
+                            'signature': signature,
+                            'stable_since': now,
+                            'observations': 1,
+                            'failed': False,
+                        }
+                        continue
+
+                    candidate['observations'] += 1
+                    if (
+                        candidate['failed']
+                        or candidate['observations'] < 3
+                        or now - candidate['stable_since'] < self.settle_seconds
+                    ):
+                        continue
+
+                    try:
+                        _ingest_watched_file(path, signature)
+                    except IngestSourceChanged:
+                        # The next scan starts a fresh quiet period from a new
+                        # stat instead of treating a racing writer as an error.
+                        self._candidates.pop(path, None)
+                    except Exception as exc:
+                        # A malformed movie should not be copied and probed on
+                        # every pass. A modification or restart makes it
+                        # eligible again after the operator fixes the source.
+                        candidate['failed'] = True
+                        print(
+                            f'VDL ingest: could not add {entry.name!r}: {exc}',
+                            flush=True,
+                        )
+                    else:
+                        self._candidates.pop(path, None)
+        except OSError as exc:
+            print(
+                f'VDL ingest: unable to scan {self.directory!r}: {exc}',
+                flush=True,
+            )
+            return
+
+        for path in set(self._candidates).difference(visible_paths):
+            self._candidates.pop(path, None)
+        db_prune_ingest_receipts(self.directory, visible_paths)
+
+    def run(self, stop_event):
+        while not stop_event.is_set():
+            try:
+                self.scan_once()
+            except Exception as exc:
+                # One DB or filesystem failure must not permanently kill the
+                # only reconciliation thread.
+                print(f'VDL ingest: scan failed: {exc}', flush=True)
+            stop_event.wait(self.scan_seconds)
+
+
+def _thumbnail_path(entry, fallback_dir=None):
+    """Return the stable sidecar path for one download's generated preview."""
+    directory = entry.get('output_dir')
+    if not directory and entry.get('filename'):
+        directory = os.path.dirname(os.path.abspath(entry['filename']))
+    if not directory:
+        directory = fallback_dir
+    if not directory:
+        return None
+    return os.path.join(
+        os.path.abspath(directory),
+        f".vdl_{entry['id']}.thumbnail.jpg",
+    )
+
+
+_PREVIEW_CACHE_VERSION = 4
+_PREVIEW_FRAMES_PER_SECOND = 12
+
+
+def _preview_path(entry, fallback_dir=None):
+    """Return the stable sidecar path for one download's hover preview."""
+    directory = entry.get('output_dir')
+    if not directory and entry.get('filename'):
+        directory = os.path.dirname(os.path.abspath(entry['filename']))
+    if not directory:
+        directory = fallback_dir
+    if not directory:
+        return None
+    return os.path.join(
+        os.path.abspath(directory),
+        f".vdl_{entry['id']}.preview-v{_PREVIEW_CACHE_VERSION}.mp4",
+    )
+
+
+def generate_video_thumbnail(media_path, thumbnail_path):
+    """Extract a compact preview frame without making download success depend on it."""
+    for seek_time in ('1', '0'):
+        temporary_path = (
+            f"{thumbnail_path}.{uuid.uuid4().hex}.tmp.jpg"
+        )
+        try:
+            result = subprocess.run(
+                [
+                    'ffmpeg', '-v', 'error', '-ss', seek_time, '-i', media_path,
+                    '-map', '0:v:0', '-frames:v', '1', '-an', '-sn',
+                    '-vf', 'scale=480:-2:force_original_aspect_ratio=decrease',
+                    '-q:v', '4', '-f', 'image2', '-y', temporary_path,
+                ],
+                capture_output=True,
+                timeout=30,
+            )
+            if (result.returncode == 0
+                    and os.path.isfile(temporary_path)
+                    and os.path.getsize(temporary_path) > 0):
+                os.replace(temporary_path, thumbnail_path)
+                return True
+        except (OSError, subprocess.SubprocessError):
+            pass
+        finally:
+            try:
+                os.remove(temporary_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+    return False
+
+
+_PREVIEW_SEGMENT_COUNT = 7
+_PREVIEW_SEGMENT_SECONDS = 2.0
+_PREVIEW_TOTAL_SECONDS = _PREVIEW_SEGMENT_COUNT * _PREVIEW_SEGMENT_SECONDS
+_PREVIEW_EDGE_MARGIN_SECONDS = 5.0
+
+
+def ffprobe_video_duration(path):
+    """Return a finite duration for the first video stream, or None."""
+    try:
+        result = subprocess.run(
+            [
+                'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                '-show_entries', 'stream=duration:format=duration',
+                '-of', 'json', path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        data = json.loads(result.stdout or '{}')
+        streams = data.get('streams') or []
+        if not streams:
+            return None
+        value = (data.get('format') or {}).get('duration')
+        if value is None:
+            value = streams[0].get('duration')
+        duration = float(value)
+        if math.isfinite(duration) and duration > 0:
+            return duration
+    except (OSError, subprocess.SubprocessError, TypeError, ValueError,
+            json.JSONDecodeError):
         pass
     return None
+
+
+def _preview_segments(duration):
+    """Return equally spaced (start, length) excerpts for a hover preview."""
+    interior_duration = duration - (2 * _PREVIEW_EDGE_MARGIN_SECONDS)
+    if interior_duration <= 0:
+        return []
+    if interior_duration < _PREVIEW_TOTAL_SECONDS:
+        return [(_PREVIEW_EDGE_MARGIN_SECONDS, interior_duration)]
+    last_start = (
+        duration
+        - _PREVIEW_EDGE_MARGIN_SECONDS
+        - _PREVIEW_SEGMENT_SECONDS
+    )
+    spacing = (
+        last_start - _PREVIEW_EDGE_MARGIN_SECONDS
+    ) / (_PREVIEW_SEGMENT_COUNT - 1)
+    return [
+        (
+            _PREVIEW_EDGE_MARGIN_SECONDS + spacing * index,
+            _PREVIEW_SEGMENT_SECONDS,
+        )
+        for index in range(_PREVIEW_SEGMENT_COUNT)
+    ]
+
+
+def generate_video_preview(media_path, preview_path):
+    """Create a compact silent montage from evenly spaced video excerpts."""
+    duration = ffprobe_video_duration(media_path)
+    if duration is None:
+        return False
+    segments = _preview_segments(duration)
+    if not segments:
+        return False
+
+    temporary_path = f"{preview_path}.{uuid.uuid4().hex}.tmp.mp4"
+    command = ['ffmpeg', '-v', 'error']
+    for start, length in segments:
+        command.extend([
+            '-ss', f'{start:.3f}',
+            '-t', f'{length:.3f}',
+            '-i', media_path,
+        ])
+
+    filters = [
+        f'[{index}:v:0]fps={_PREVIEW_FRAMES_PER_SECOND},scale=480:-2,setsar=1,'
+        f'setpts=PTS-STARTPTS[v{index}]'
+        for index in range(len(segments))
+    ]
+    inputs = ''.join(f'[v{index}]' for index in range(len(segments)))
+    filters.append(
+        f'{inputs}concat=n={len(segments)}:v=1:a=0[outv]'
+    )
+    command.extend([
+        '-filter_complex', ';'.join(filters),
+        '-map', '[outv]',
+        '-an',
+        # concat uses a microsecond time base. Pinning the output cadence keeps
+        # x264 from declaring these tiny previews as unsupported level 6.2.
+        '-r', str(_PREVIEW_FRAMES_PER_SECOND),
+        '-c:v', 'libx264',
+        '-preset', 'veryfast',
+        '-crf', '28',
+        '-pix_fmt', 'yuv420p',
+        '-movflags', '+faststart',
+        '-f', 'mp4',
+        '-y', temporary_path,
+    ])
+
+    try:
+        result = subprocess.run(command, capture_output=True, timeout=180)
+        if (result.returncode == 0
+                and os.path.isfile(temporary_path)
+                and os.path.getsize(temporary_path) > 0):
+            os.replace(temporary_path, preview_path)
+            return True
+    except (OSError, subprocess.SubprocessError):
+        pass
+    finally:
+        try:
+            os.remove(temporary_path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1391,21 +4305,427 @@ def ffprobe_resolution(path):
 # Routes
 # ---------------------------------------------------------------------------
 
-@app.route('/')
-def index():
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    current_id = session.get('user_id')
+    current = db_get_user_by_id(current_id) if current_id is not None else None
+    if (current is not None and not current['suspended']
+            and current['password_hash'] is not None
+            and session.get('session_version') == current['session_version']):
+        return redirect(url_for('index'))
+
+    initial_admin = db_get_initial_admin()
+    error = None
+    if request.method == 'POST':
+        username = request.form.get('username', '')
+        password = request.form.get('password', '')
+        if initial_admin is not None:
+            confirmation = request.form.get('password_confirmation', '')
+            if username.casefold() != initial_admin['username'].casefold():
+                error = 'Complete the administrator setup first.'
+            elif password != confirmation:
+                error = 'Passwords do not match.'
+            else:
+                try:
+                    user = db_set_initial_admin_password(
+                        initial_admin['id'], password
+                    )
+                except ValueError as exc:
+                    error = str(exc)
+                else:
+                    if user is None:
+                        error = 'Administrator setup was already completed. Sign in.'
+                    else:
+                        _start_user_session(user)
+                        return redirect(url_for('index'))
+        else:
+            user = db_get_user_by_username(username)
+            if (user is None or user['password_hash'] is None
+                    or not check_password_hash(user['password_hash'], password)):
+                error = 'Invalid username or password.'
+            elif user['suspended']:
+                error = 'This account is suspended.'
+            else:
+                _start_user_session(user)
+                return redirect(url_for('index'))
+
     response = app.make_response(render_template(
-        'index.html',
+        'login.html',
         ui_version=APP_VERSION,
+        initial_admin=initial_admin,
+        error=error,
     ))
     response.headers['Cache-Control'] = 'no-store'
     return response
 
 
-@app.route('/api/health', methods=['GET'])
-def health():
-    response = jsonify({"ok": True, "version": APP_VERSION})
+@app.route('/logout', methods=['POST'])
+def logout():
+    _release_playback_sessions_for_user(session.get('user_id'))
+    session.clear()
+    return redirect(url_for('login'))
+
+
+@app.route('/')
+def index():
+    response = app.make_response(render_template(
+        'index.html',
+        ui_version=APP_VERSION,
+        current_user=_public_user(g.current_user),
+        is_admin='admin' in g.current_user['roles'],
+    ))
     response.headers['Cache-Control'] = 'no-store'
     return response
+
+
+@app.route('/browser-extension/vdl-companion-firefox.xpi', methods=['GET'])
+def browser_extension_package():
+    package = _bundled_extension()
+    if package is None:
+        return _companion_error(
+            500, 'extension_package_unavailable',
+            'Browser extension package is unavailable',
+        )
+    download = request.args.get('download') == '1'
+    response = send_file(
+        COMPANION_XPI_PATH,
+        mimetype='application/x-xpinstall',
+        as_attachment=download,
+        download_name=COMPANION_XPI_NAME,
+        conditional=False,
+    )
+    response.headers['Content-Disposition'] = (
+        f'{"attachment" if download else "inline"}; '
+        f'filename="{COMPANION_XPI_NAME}"'
+    )
+    response.headers['Cache-Control'] = 'no-store'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    return response
+
+
+@app.route('/api/extension/pairing-codes', methods=['POST'])
+def extension_pairing_codes():
+    origin = _companion_management_origin()
+    if origin is None:
+        return jsonify({
+            'error': 'Pairing requires HTTPS or an allowed private HTTP network',
+            'code': 'pairing_transport_not_allowed',
+        }), 403
+    code, expires_at = _new_pairing_code(g.current_user['id'], origin)
+    response = jsonify({'code': code, 'expires_at': int(expires_at)})
+    response.headers['Cache-Control'] = 'no-store'
+    return response, 201
+
+
+@app.route('/api/extension/pairing-codes/current', methods=['DELETE'])
+def extension_current_pairing_code():
+    with _pairing_lock:
+        _pairing_codes.pop(g.current_user['id'], None)
+    return '', 204
+
+
+@app.route('/api/extension/connections', methods=['GET'])
+def extension_connections():
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT id, device_label, extension_version, protocol_version, "
+            "created_at, last_used_at FROM extension_tokens "
+            "WHERE user_id = ? AND paired_session_version = ? "
+            "ORDER BY created_at DESC",
+            (g.current_user['id'], g.current_user['session_version']),
+        ).fetchall()
+    response = jsonify({
+        'connections': [dict(row) for row in rows],
+        'bundled_extension': _bundled_extension(),
+        'http_pairing_allowed': _companion_http_host_allowed(
+            urlsplit(request.host_url).hostname
+        ),
+    })
+    response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+@app.route('/api/extension/connections/<connection_id>', methods=['DELETE'])
+def extension_connection(connection_id):
+    with _db_lock, db() as conn:
+        cursor = conn.execute(
+            "DELETE FROM extension_tokens WHERE id = ? AND user_id = ?",
+            (connection_id, g.current_user['id']),
+        )
+        removed = cursor.rowcount == 1
+    if not removed:
+        return jsonify({'error': 'Unknown companion connection'}), 404
+    return '', 204
+
+
+def _companion_preflight(method):
+    origin = request.headers.get('Origin')
+    if not _is_extension_origin(origin):
+        return _companion_error(400, 'invalid_request', 'Invalid extension origin')
+    response = app.make_response(('', 204))
+    response.headers['Access-Control-Allow-Methods'] = method
+    response.headers['Access-Control-Allow-Headers'] = (
+        'Authorization, Content-Type, X-VDL-Companion-Protocol, '
+        'X-VDL-Companion-Version'
+    )
+    response.headers['Access-Control-Max-Age'] = '600'
+    if request.headers.get(
+            'Access-Control-Request-Private-Network', ''
+    ).lower() == 'true':
+        response.headers['Access-Control-Allow-Private-Network'] = 'true'
+    return response
+
+
+@app.route('/api/extension/pair', methods=['POST', 'OPTIONS'])
+def extension_pair():
+    if request.method == 'OPTIONS':
+        return _companion_preflight('POST')
+    protocol_error = _require_companion_protocol()
+    if protocol_error:
+        return protocol_error
+    if _failed_pair_rate_limited(request.remote_addr):
+        return _companion_error(429, 'rate_limited', 'Try pairing again later')
+    data, error = _read_json_body(16 * 1024)
+    if error:
+        return error
+    if set(data) != {
+        'code', 'origin', 'device_label', 'extension_version', 'protocol_version',
+    }:
+        _record_failed_pair(request.remote_addr)
+        return _companion_error(400, 'invalid_request', 'Invalid pairing request')
+    if data.get('protocol_version') != COMPANION_PROTOCOL:
+        return _companion_protocol_error()
+    try:
+        origin = data.get('origin')
+        parsed_origin = _normalized_http_origin(origin)
+        if parsed_origin is None or _canonical_page_url(origin) != origin + '/':
+            raise ValueError
+        label = _validated_device_label(data.get('device_label'))
+        extension_version = _validated_extension_version(
+            data.get('extension_version')
+        )
+        if extension_version != request.headers.get('X-VDL-Companion-Version'):
+            raise ValueError
+    except ValueError:
+        _record_failed_pair(request.remote_addr)
+        return _companion_error(400, 'invalid_request', 'Invalid pairing request')
+
+    user_id = _consume_pairing_code(data.get('code'), origin)
+    user = db_get_user_by_id(user_id) if user_id is not None else None
+    if (user is None or user['suspended'] or user['password_hash'] is None):
+        _record_failed_pair(request.remote_addr)
+        return _companion_error(
+            401, 'companion_auth_failed', 'Companion authentication failed'
+        )
+    token_id, token = _new_companion_token(user, label, extension_version)
+    return jsonify({
+        'token': token,
+        'connection_id': token_id,
+        'user': {'username': user['username']},
+        'protocol_version': COMPANION_PROTOCOL,
+        'server_version': APP_VERSION,
+        'bundled_extension_version': COMPANION_PACKAGE_VERSION,
+    }), 201
+
+
+@app.route('/api/extension/status', methods=['GET', 'OPTIONS'])
+def extension_status():
+    if request.method == 'OPTIONS':
+        return _companion_preflight('GET')
+    protocol_error = _require_companion_protocol()
+    if protocol_error:
+        return protocol_error
+    auth = _companion_authenticate()
+    if auth is None:
+        return _companion_error(
+            401, 'companion_auth_failed', 'Companion authentication failed'
+        )
+    return jsonify({
+        'paired': True,
+        'user': {'username': auth['user']['username']},
+        'protocol_version': COMPANION_PROTOCOL,
+        'server_version': APP_VERSION,
+        'bundled_extension': _bundled_extension(),
+    })
+
+
+@app.route('/api/extension/downloads', methods=['POST', 'OPTIONS'])
+def extension_downloads():
+    if request.method == 'OPTIONS':
+        return _companion_preflight('POST')
+    protocol_error = _require_companion_protocol()
+    if protocol_error:
+        return protocol_error
+    auth = _companion_authenticate()
+    if auth is None:
+        return _companion_error(
+            401, 'companion_auth_failed', 'Companion authentication failed'
+        )
+    data, error = _read_json_body(256 * 1024, require_length=True)
+    if error:
+        return error
+    if set(data) != {
+        'schema', 'request_id', 'page_url', 'captured_at', 'cookies',
+    } or data.get('schema') != 1:
+        return _companion_error(400, 'invalid_request', 'Invalid download request')
+    request_id = data.get('request_id')
+    try:
+        parsed_id = uuid.UUID(request_id)
+        if (str(parsed_id) != request_id or parsed_id.version != 4):
+            raise ValueError
+        captured_at = data.get('captured_at')
+        if (isinstance(captured_at, bool) or not isinstance(captured_at, int)
+                or captured_at < 0 or abs(time.time() - captured_at) > 600):
+            raise ValueError
+        canonical_url = _canonical_page_url(data.get('page_url'))
+        cookies = _validated_cookies(data.get('cookies'), canonical_url)
+    except (TypeError, ValueError):
+        return _companion_error(400, 'invalid_request', 'Invalid download request')
+
+    if _token_rate_limited(auth['id'], request_id):
+        return _companion_error(429, 'rate_limited', 'Try downloading again later')
+    row, action, event_reason = _resolve_companion_download(
+        auth['user'], request_id, canonical_url
+    )
+    if action == 'conflict':
+        return _companion_error(
+            409, 'request_id_conflict',
+            'Request ID was already used for another URL',
+        )
+    if event_reason:
+        event_bus.publish('change', {'reason': event_reason, 'id': row['id']})
+    if action in ('started', 'resumed'):
+        with _cancel_lock:
+            _cancel_flags.pop(row['id'], None)
+            _pause_flags.pop(row['id'], None)
+        thread = threading.Thread(
+            target=background_download,
+            args=(canonical_url, row['id'], cookies),
+            daemon=True,
+        )
+        thread.start()
+    response_action = 'already_active' if action in ('existing', 'already_active') else action
+    return jsonify({
+        'id': row['id'],
+        'action': response_action,
+        'status': row['status'],
+        'visibility': row['visibility'],
+    }), (201 if action == 'started' else 200)
+
+
+@app.route('/api/extension/token', methods=['DELETE', 'OPTIONS'])
+def extension_token():
+    if request.method == 'OPTIONS':
+        return _companion_preflight('DELETE')
+    protocol_error = _require_companion_protocol()
+    if protocol_error:
+        return protocol_error
+    auth = _companion_authenticate()
+    if auth is None:
+        return _companion_error(
+            401, 'companion_auth_failed', 'Companion authentication failed'
+        )
+    with _db_lock, db() as conn:
+        conn.execute("DELETE FROM extension_tokens WHERE id = ?", (auth['id'],))
+    return '', 204
+
+
+@app.route('/api/users', methods=['GET', 'POST'])
+@admin_required
+def users():
+    if request.method == 'GET':
+        return jsonify({
+            'users': db_list_users(),
+            'roles': db_list_roles(),
+            'current_user_id': g.current_user['id'],
+        })
+
+    data = request.get_json(silent=True) or {}
+    try:
+        user = db_create_user(
+            data.get('username'),
+            data.get('password'),
+            data.get('role', 'normal'),
+            data.get('name'),
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify(user), 201
+
+
+@app.route('/api/users/<int:user_id>', methods=['PATCH', 'DELETE'])
+@admin_required
+def user(user_id):
+    if request.method == 'DELETE':
+        if user_id == g.current_user['id']:
+            return jsonify({"error": "You cannot remove your own account"}), 400
+        try:
+            removed = db_delete_user(user_id)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        if not removed:
+            return jsonify({"error": "Unknown user"}), 404
+        return jsonify({"message": "User removed", "id": user_id})
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "A JSON object is required"}), 400
+    allowed = {'username', 'name', 'password', 'role', 'suspended'}
+    if not any(key in data for key in allowed):
+        return jsonify({"error": "No user changes provided"}), 400
+    if user_id == g.current_user['id'] and data.get('suspended') is True:
+        return jsonify({"error": "You cannot suspend your own account"}), 400
+
+    try:
+        updated = db_update_user(
+            user_id,
+            username=data.get('username') if 'username' in data else None,
+            name=data.get('name') if 'name' in data else None,
+            password=data.get('password') if 'password' in data else None,
+            role_name=data.get('role') if 'role' in data else None,
+            suspended=data.get('suspended') if 'suspended' in data else None,
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    if updated is None:
+        return jsonify({"error": "Unknown user"}), 404
+
+    if user_id == g.current_user['id']:
+        refreshed = db_get_user_by_id(user_id)
+        session['session_version'] = refreshed['session_version']
+    return jsonify(updated)
+
+
+@app.route('/api/health', methods=['GET'])
+def health():
+    response = jsonify({
+        "ok": True,
+        "uptime_seconds": _get_uptime_seconds(),
+        "version": APP_VERSION,
+    })
+    response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+def _visible_download(download_id):
+    """Return a row the signed-in user may see, hiding private ids as 404."""
+    entry = db_get_download(download_id)
+    if entry is None:
+        return None
+    if (
+        entry.get('visibility') == 'public'
+        or entry.get('owner_user_id') == g.current_user['id']
+        or 'admin' in g.current_user['roles']
+    ):
+        return entry
+    return None
+
+
+def _can_manage_download_visibility(entry):
+    return (
+        entry.get('owner_user_id') == g.current_user['id']
+        or 'admin' in g.current_user['roles']
+    )
 
 
 @app.route('/api/download', methods=['POST'])
@@ -1423,7 +4743,12 @@ def add_download():
             return jsonify({"error": str(exc)}), 400
 
     download_id = str(uuid.uuid4())[:8]
-    db_insert_download(download_id, url)
+    db_insert_download(
+        download_id,
+        url,
+        g.current_user['id'],
+        g.current_user['username'],
+    )
 
     # Store per-download format override if provided (selected quality)
     format_override = data.get('format')
@@ -1437,6 +4762,214 @@ def add_download():
     thread.start()
 
     return jsonify({"message": "Download started", "id": download_id})
+
+
+@app.route('/api/upload', methods=['POST'])
+def start_video_upload():
+    """Register a dropped video so it is visible before transfer begins."""
+    data = request.get_json(silent=True) or {}
+    try:
+        original_name = _validated_upload_filename(data.get('filename'))
+        filesize = data.get('filesize')
+        if (isinstance(filesize, bool) or not isinstance(filesize, int)
+                or filesize <= 0):
+            raise ValueError('Uploaded video size must be a positive integer')
+        output_dir = _prepare_download_directory(
+            db_get_preferences().get('download_dir', '.')
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    download_id = str(uuid.uuid4())[:8]
+    output_dir = os.path.abspath(output_dir)
+    title = os.path.splitext(original_name)[0] or original_name
+    try:
+        db_insert_upload(
+            download_id,
+            original_name,
+            title,
+            filesize,
+            output_dir,
+            g.current_user['id'],
+            g.current_user['username'],
+        )
+    except sqlite3.Error:
+        return jsonify({"error": "Unable to start the video upload"}), 500
+    return jsonify({
+        "message": "Video upload registered",
+        "id": download_id,
+    }), 202
+
+
+@app.route('/api/upload/<download_id>', methods=['PUT'])
+def receive_video_upload(download_id):
+    """Stream one registered upload to disk while publishing byte progress."""
+    entry = _visible_download(download_id)
+    if entry is None:
+        return jsonify({"error": "Unknown upload id"}), 404
+    if entry.get('source_type') != 'upload':
+        return jsonify({"error": "Entry is not a local upload"}), 409
+    if entry.get('status') != 'starting':
+        return jsonify({
+            "error": f"Cannot upload from status '{entry.get('status')}'"
+        }), 409
+
+    with _worker_condition:
+        if download_id in _live_worker_ids:
+            return jsonify({"error": "Upload is already active"}), 409
+        _live_worker_ids.add(download_id)
+
+    original_name = entry.get('requested_filename')
+    expected_size = int(entry.get('total_bytes') or 0)
+    output_dir = entry.get('output_dir')
+    temporary_path = None
+    final_path = None
+    registered = False
+    received = 0
+    try:
+        if is_cancel_requested(download_id):
+            raise DownloadCancelled()
+        output_dir = os.path.abspath(_prepare_download_directory(output_dir))
+        db_update_download(
+            download_id,
+            status='downloading',
+            progress='0%',
+            downloaded_bytes=0,
+            total_bytes=expected_size,
+        )
+        with tempfile.NamedTemporaryFile(
+                mode='wb', dir=output_dir,
+                prefix=f'.vdl_{download_id}.', suffix='.upload.part',
+                delete=False) as temporary:
+            temporary_path = temporary.name
+            while True:
+                if is_cancel_requested(download_id):
+                    raise DownloadCancelled()
+                chunk = request.stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                received += len(chunk)
+                if received > expected_size:
+                    raise ValueError('Uploaded video is larger than declared')
+                temporary.write(chunk)
+                percent = (received / expected_size) * 100
+                db_update_download(
+                    download_id,
+                    status='downloading',
+                    progress=f'{percent:.1f}%',
+                    downloaded_bytes=received,
+                    total_bytes=expected_size,
+                )
+
+        if is_cancel_requested(download_id):
+            raise DownloadCancelled()
+        if received != expected_size:
+            raise ValueError('Uploaded video ended before all bytes arrived')
+        try:
+            resolution = inspect_uploaded_video(temporary_path)
+            duration_seconds = _consume_media_probe(
+                temporary_path, resolution
+            )
+        except ValueError as exc:
+            db_update_download(
+                download_id, status='error', progress=str(exc),
+                finished_at=time.time(),
+            )
+            return jsonify({"error": str(exc)}), 415
+        except RuntimeError as exc:
+            db_update_download(
+                download_id, status='error', progress=str(exc),
+                finished_at=time.time(),
+            )
+            return jsonify({"error": str(exc)}), 503
+
+        if is_cancel_requested(download_id):
+            raise DownloadCancelled()
+
+        with _upload_lock:
+            final_path = _reserve_upload_path(output_dir, original_name)
+            os.replace(temporary_path, final_path)
+            temporary_path = None
+        if is_cancel_requested(download_id):
+            raise DownloadCancelled()
+
+        db_update_download(
+            download_id,
+            status='finished',
+            progress='100%',
+            filename=final_path,
+            filesize=received,
+            resolution=resolution,
+            duration_seconds=duration_seconds,
+            media_metadata_probed=True,
+            speed=0.0,
+            eta=0,
+            finished_at=time.time(),
+            downloaded_bytes=received,
+            total_bytes=received,
+        )
+        registered = True
+        return jsonify({
+            "message": "Video added to library",
+            "id": download_id,
+            "filename": os.path.basename(final_path),
+        })
+    except DownloadCancelled:
+        db_update_download(
+            download_id,
+            status='cancelled',
+            progress='Cancelled',
+            downloaded_bytes=received,
+            total_bytes=expected_size,
+            finished_at=time.time(),
+        )
+        return jsonify({"error": "Upload cancelled"}), 409
+    except ValueError as exc:
+        db_update_download(
+            download_id, status='error', progress=str(exc),
+            downloaded_bytes=received, total_bytes=expected_size,
+            finished_at=time.time(),
+        )
+        return jsonify({"error": str(exc)}), 400
+    except (OSError, sqlite3.Error) as exc:
+        message = f'Unable to store the uploaded video: {exc}'
+        db_update_download(
+            download_id, status='error', progress=message,
+            downloaded_bytes=received, total_bytes=expected_size,
+            finished_at=time.time(),
+        )
+        return jsonify({"error": message}), 500
+    except Exception as exc:
+        if is_cancel_requested(download_id):
+            db_update_download(
+                download_id, status='cancelled', progress='Cancelled',
+                downloaded_bytes=received, total_bytes=expected_size,
+                finished_at=time.time(),
+            )
+            return jsonify({"error": "Upload cancelled"}), 409
+        message = f'Upload failed: {exc}'
+        db_update_download(
+            download_id, status='error', progress=message,
+            downloaded_bytes=received, total_bytes=expected_size,
+            finished_at=time.time(),
+        )
+        return jsonify({"error": message}), 500
+    finally:
+        for path in (
+                temporary_path,
+                final_path if final_path and not registered else None):
+            if not path:
+                continue
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+        clear_cancel(download_id)
+        with _worker_condition:
+            _live_worker_ids.discard(download_id)
+            _worker_condition.notify_all()
 
 
 @app.route('/api/probe', methods=['POST'])
@@ -1508,11 +5041,16 @@ def resume_download(download_id):
     """Restart the worker for a cancelled or interrupted download, keeping the
     same id so yt-dlp's continuedl logic finds and reuses the existing .part
     file."""
-    entry = db_get_download(download_id)
+    entry = _visible_download(download_id)
     if entry is None:
         return jsonify({"error": "Unknown download id"}), 404
     if entry['status'] not in ('cancelled', 'interrupted'):
         return jsonify({"error": f"Cannot resume from status '{entry['status']}'"}), 409
+    if entry.get('browser_authenticated'):
+        return jsonify({
+            "error": "Fresh browser cookies are required; re-send this page from Firefox",
+            "code": "fresh_browser_cookies_required",
+        }), 409
 
     # The conditional write is the ownership hand-off: only its winner may
     # clear stale cancellation state and touch the shared partial files.
@@ -1537,7 +5075,7 @@ def resume_download(download_id):
 
 @app.route('/api/stop/<download_id>', methods=['POST'])
 def stop_download(download_id):
-    entry = db_get_download(download_id)
+    entry = _visible_download(download_id)
     if entry is None:
         return jsonify({"error": "Unknown download id"}), 404
     # Stopping a paused download is also valid -- request_cancel() drops the
@@ -1550,7 +5088,7 @@ def stop_download(download_id):
 
 @app.route('/api/pause/<download_id>', methods=['POST'])
 def pause_download(download_id):
-    entry = db_get_download(download_id)
+    entry = _visible_download(download_id)
     if entry is None:
         return jsonify({"error": "Unknown download id"}), 404
     if entry['status'] not in ('starting', 'downloading'):
@@ -1564,7 +5102,7 @@ def unpause_download(download_id):
     """Wake a paused worker. Distinct from /api/resume, which restarts the
     worker thread for cancelled/interrupted rows -- here the worker is still
     alive, so we just clear the flag and the progress_hook loop exits."""
-    entry = db_get_download(download_id)
+    entry = _visible_download(download_id)
     if entry is None:
         return jsonify({"error": "Unknown download id"}), 404
     if entry['status'] != 'paused':
@@ -1582,7 +5120,7 @@ def rename_download(download_id):
     extension is preserved automatically: if the user typed a basename
     without (or with a different) extension we re-append the original one.
     """
-    entry = db_get_download(download_id)
+    entry = _visible_download(download_id)
     if entry is None:
         return jsonify({"error": "Unknown download id"}), 404
     if entry.get('status') != 'finished':
@@ -1632,7 +5170,7 @@ def rename_download(download_id):
 
 @app.route('/api/remove/<download_id>', methods=['POST'])
 def remove_download(download_id):
-    entry = db_get_download(download_id)
+    entry = _visible_download(download_id)
     if entry is None:
         return jsonify({"error": "Unknown download id"}), 404
     fallback_dir = db_get_preferences().get("download_dir", ".")
@@ -1643,11 +5181,14 @@ def remove_download(download_id):
     if entry is None:
         return jsonify({"error": "Unknown download id"}), 404
     if not removed:
-        return jsonify({"error": "Cannot remove an active download. Stop it first."}), 409
+        return jsonify({
+            "error": "Cannot remove a download until its worker has fully stopped."
+        }), 409
     return jsonify({"message": "Removed", "id": download_id})
 
 
 @app.route('/api/clear/preview', methods=['GET'])
+@admin_required
 def clear_history_preview():
     placeholders = ",".join("?" * len(HISTORY_STATUSES))
     with db() as conn:
@@ -1659,6 +5200,7 @@ def clear_history_preview():
 
 
 @app.route('/api/clear', methods=['POST'])
+@admin_required
 def clear_history():
     try:
         removed, files_deleted = db_clear_history()
@@ -1669,11 +5211,598 @@ def clear_history():
 
 @app.route('/api/history', methods=['GET'])
 def get_history():
-    return jsonify(db_list_downloads())
+    return jsonify(db_list_downloads(
+        g.current_user['id'],
+        is_admin='admin' in g.current_user['roles'],
+    ))
+
+
+def _playlist_error_response(exc):
+    if isinstance(exc, PlaylistNotFound):
+        return jsonify({'error': 'Unknown playlist'}), 404
+    if isinstance(exc, PlaylistRevisionConflict):
+        if exc.args and exc.args[0] == 'completed':
+            return jsonify({
+                'code': 'playlist_completed',
+                'error': 'This playlist is complete. Replay it from the beginning.',
+            }), 409
+        return jsonify({'error': 'Playlist state changed'}), 409
+    return jsonify({'error': str(exc)}), 400
+
+
+@app.route('/api/playlists', methods=['GET', 'POST'])
+def playlist_collection():
+    user_id = g.current_user['id']
+    is_admin = 'admin' in g.current_user['roles']
+    if request.method == 'GET':
+        return jsonify(playlists.list_summaries(user_id, is_admin))
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({'error': 'A JSON object is required'}), 400
+    try:
+        result = playlists.create(
+            user_id, payload.get('name'), payload.get('download_id'), is_admin,
+            payload.get('download_ids'),
+        )
+    except (ValueError, PlaylistNotFound,
+            PlaylistRevisionConflict) as exc:
+        return _playlist_error_response(exc)
+    return jsonify(result), 201
+
+
+@app.route('/api/playlists/<playlist_id>',
+           methods=['GET', 'PUT', 'DELETE'])
+def playlist_resource(playlist_id):
+    user_id = g.current_user['id']
+    is_admin = 'admin' in g.current_user['roles']
+    try:
+        if request.method == 'GET':
+            return jsonify(playlists.get(playlist_id, user_id, is_admin))
+        if request.method == 'DELETE':
+            playlists.delete(playlist_id, user_id)
+            return '', 204
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify({'error': 'A JSON object is required'}), 400
+        result = playlists.replace(
+            playlist_id,
+            user_id,
+            payload.get('name'),
+            payload.get('download_ids'),
+            payload.get('expected_revision'),
+            is_admin,
+        )
+        return jsonify(result)
+    except (ValueError, PlaylistNotFound,
+            PlaylistRevisionConflict) as exc:
+        return _playlist_error_response(exc)
+
+
+@app.route('/api/playlists/<playlist_id>/items', methods=['POST'])
+def playlist_items(playlist_id):
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({'error': 'A JSON object is required'}), 400
+    try:
+        result = playlists.add(
+            playlist_id,
+            g.current_user['id'],
+            payload.get('download_id'),
+            'admin' in g.current_user['roles'],
+        )
+        return jsonify(result)
+    except (ValueError, PlaylistNotFound,
+            PlaylistRevisionConflict) as exc:
+        return _playlist_error_response(exc)
+
+
+@app.route('/api/playlists/<playlist_id>/progress', methods=['PUT'])
+def playlist_progress(playlist_id):
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({'error': 'A JSON object is required'}), 400
+    try:
+        playlists.save_progress(
+            playlist_id,
+            g.current_user['id'],
+            payload.get('download_id'),
+            payload.get('position_seconds'),
+            payload.get('completed'),
+            payload.get('write_sequence'),
+        )
+    except (ValueError, PlaylistNotFound,
+            PlaylistRevisionConflict) as exc:
+        return _playlist_error_response(exc)
+    return '', 204
+
+
+def _playback_integer(payload, key, minimum, maximum):
+    value = payload.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f'{key} must be an integer')
+    if value < minimum or value > maximum:
+        raise ValueError(f'{key} is outside the allowed range')
+    return value
+
+
+@app.route('/api/playback-sessions', methods=['POST'])
+def create_playback_session():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({'error': 'A JSON object is required'}), 400
+    mode = payload.get('mode', 'sequential')
+    if mode not in ('sequential', 'shuffle', 'playlist'):
+        return jsonify({'error': 'Unknown playback mode'}), 400
+    user_id = g.current_user['id']
+    is_admin = 'admin' in g.current_user['roles']
+    if mode == 'playlist':
+        playlist_id = payload.get('playlist_id')
+        start_download_id = payload.get('start_download_id')
+        restart = payload.get('restart', False)
+        if (not isinstance(playlist_id, str) or not playlist_id
+                or len(playlist_id) > 128):
+            return jsonify({'error': 'playlist_id is invalid'}), 400
+        if start_download_id is not None and (
+                not isinstance(start_download_id, str)
+                or not start_download_id
+                or len(start_download_id) > 128):
+            return jsonify({'error': 'start_download_id is invalid'}), 400
+        if not isinstance(restart, bool):
+            return jsonify({'error': 'restart must be true or false'}), 400
+        try:
+            (playlist, queue_items, snapshot_ids, entry,
+             playlist_position, resume_seconds) = playlists.playback_snapshot(
+                playlist_id, user_id, restart, start_download_id, is_admin
+            )
+        except (ValueError, PlaylistNotFound,
+                PlaylistRevisionConflict) as exc:
+            return _playlist_error_response(exc)
+        if entry is None:
+            return '', 204
+        progress = playlist.get('progress') or {}
+        state_fields = {
+            'mode': mode,
+            'playlist_id': playlist_id,
+            'playlist_revision': playlist['revision'],
+            'playlist_order': snapshot_ids,
+            'playlist_queue': queue_items,
+            'playlist_position': playlist_position,
+            'resume_seconds': resume_seconds,
+            'progress_sequence': int(progress.get('write_sequence') or 0),
+            'page': None,
+            'position': None,
+        }
+        progress_needs_repair = bool(progress) and (
+            progress.get('download_id') != entry['id']
+            or not math.isclose(
+                float(progress.get('position_seconds') or 0),
+                float(resume_seconds), abs_tol=0.001,
+            )
+        )
+        if restart or start_download_id is not None or progress_needs_repair:
+            state_fields['progress_sequence'] += 1
+            try:
+                playlists.save_progress(
+                    playlist_id, user_id, entry['id'], 0, False,
+                    state_fields['progress_sequence'],
+                )
+            except PlaylistRevisionConflict:
+                return jsonify({'error': 'Playlist progress changed'}), 409
+    elif mode == 'shuffle':
+        try:
+            minimum_height, minimum_duration = _shuffle_preferences(
+                db_get_preferences()
+            )
+        except ValueError as exc:
+            return jsonify({'error': str(exc)}), 400
+        selection, metadata_pending = resolve_shuffle_pool(
+            user_id, is_admin, minimum_height, minimum_duration
+        )
+        if not selection:
+            if metadata_pending:
+                return jsonify({
+                    'code': 'shuffle_metadata_pending',
+                    'error': 'Older videos are still being prepared for Shuffle.',
+                }), 409
+            return jsonify({
+                'code': 'no_shuffle_candidates',
+                'error': (
+                    'No videos match your Shuffle preferences. Change the '
+                    'minimum quality or length in Playback settings.'
+                ),
+                'minimum_height': minimum_height,
+                'minimum_duration_minutes': minimum_duration // 60,
+            }), 409
+        entry = _shuffle_choice(selection)
+        state_fields = {
+            'mode': mode,
+            'minimum_height': minimum_height,
+            'minimum_duration_seconds': minimum_duration,
+            'page': None,
+            'position': None,
+        }
+    else:
+        try:
+            normalized_filter = _normalize_history_filter(
+                payload.get('filter', '')
+            )
+            ordering = payload.get('ordering', 'newest')
+            if ordering not in PLAYBACK_SESSION_ORDERINGS:
+                raise ValueError('Unknown playback ordering')
+            page_size = _playback_integer(
+                payload, 'page_size', 1, PLAYBACK_SESSION_MAX_PAGE_SIZE
+            )
+            page = _playback_integer(
+                payload, 'page', 0, PLAYBACK_SESSION_MAX_COORDINATE
+            )
+            position = _playback_integer(
+                payload, 'position', 0, page_size - 1
+            )
+            start_download_id = payload.get('start_download_id')
+            if start_download_id is not None and (
+                    not isinstance(start_download_id, str)
+                    or not start_download_id
+                    or len(start_download_id) > 128):
+                raise ValueError('start_download_id is invalid')
+        except ValueError as exc:
+            return jsonify({'error': str(exc)}), 400
+
+        selection = resolve_library_selection(
+            user_id, is_admin, normalized_filter, ordering
+        )
+        if start_download_id is not None:
+            start_index = next(
+                (index for index, candidate in enumerate(selection)
+                 if str(candidate['id']) == start_download_id),
+                None,
+            )
+            if start_index is None:
+                return jsonify({
+                    'error': 'The requested starting video is no longer available'
+                }), 409
+        elif selection:
+            requested_index = page * page_size + position
+            start_index = requested_index if requested_index < len(selection) else 0
+        else:
+            return '', 204
+        entry = selection[start_index]
+        state_fields = {
+            'mode': mode,
+            'filter': normalized_filter,
+            'ordering': ordering,
+            'page_size': page_size,
+            'page': start_index // page_size,
+            'position': start_index % page_size,
+        }
+
+    now = time.monotonic()
+    session_id = secrets.token_urlsafe(32)
+    state = {
+        'session_id': session_id,
+        'owner_user_id': user_id,
+        **state_fields,
+        'current_download_id': str(entry['id']),
+        'sequence': 0,
+        'last_response': None,
+        'last_expected_download_id': None,
+        'created_at': now,
+        'last_activity': now,
+    }
+    with _playback_sessions_lock:
+        _prune_playback_sessions_locked(now)
+        owned = sorted(
+            (
+                candidate for candidate in _playback_sessions.values()
+                if candidate['owner_user_id'] == user_id
+            ),
+            key=lambda candidate: candidate['last_activity'],
+        )
+        while len(owned) >= PLAYBACK_SESSION_MAX_PER_USER:
+            oldest = owned.pop(0)
+            _playback_sessions.pop(oldest['session_id'], None)
+        _playback_sessions[session_id] = state
+    return jsonify(_playback_session_response(state, entry)), 201
+
+
+@app.route('/api/playback-sessions/<session_id>/advance', methods=['POST'])
+def advance_playback_session(session_id):
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({'error': 'A JSON object is required'}), 400
+    expected_download_id = payload.get('expected_download_id')
+    if (not isinstance(expected_download_id, str)
+            or not expected_download_id
+            or len(expected_download_id) > 128):
+        return jsonify({'error': 'expected_download_id is invalid'}), 400
+    try:
+        sequence = _playback_integer(
+            payload, 'sequence', 1, PLAYBACK_SESSION_MAX_COORDINATE
+        )
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+
+    now = time.monotonic()
+    user_id = g.current_user['id']
+    is_admin = 'admin' in g.current_user['roles']
+    with _playback_sessions_lock:
+        _prune_playback_sessions_locked(now)
+        state = _playback_sessions.get(session_id)
+        if state is None or state['owner_user_id'] != user_id:
+            return jsonify({'error': 'Unknown playback session'}), 404
+        if (sequence == state['sequence']
+                and state.get('last_status') == 204):
+            if expected_download_id != state['last_expected_download_id']:
+                return jsonify({'error': 'Playback position changed'}), 409
+            state['last_activity'] = now
+            return '', 204
+        if sequence == state['sequence'] and state['last_response'] is not None:
+            if expected_download_id != state['last_expected_download_id']:
+                return jsonify({'error': 'Playback position changed'}), 409
+            state['last_activity'] = now
+            return jsonify(state['last_response'])
+        if sequence != state['sequence'] + 1:
+            return jsonify({'error': 'Playback sequence is out of order'}), 409
+        if expected_download_id != state['current_download_id']:
+            return jsonify({'error': 'Playback position changed'}), 409
+
+        if state['mode'] == 'playlist':
+            completed = payload.get('completed', False)
+            if not isinstance(completed, bool):
+                return jsonify({'error': 'completed must be true or false'}), 400
+            try:
+                playlist = playlists.get(
+                    state['playlist_id'], user_id, is_admin
+                )
+            except PlaylistNotFound:
+                _playback_sessions.pop(session_id, None)
+                return jsonify({'error': 'Unknown playback session'}), 404
+            if state['playlist_revision'] != playlist['revision']:
+                return jsonify({'error': 'Playlist state changed'}), 409
+            next_entry = None
+            next_position = None
+            with db() as conn:
+                for position in range(
+                        state['playlist_position'] + 1,
+                        len(state['playlist_order'])):
+                    candidate = _playlist_download_row(
+                        conn, state['playlist_order'][position]
+                    )
+                    if _playlist_download_playable(candidate, user_id, is_admin):
+                        next_entry = candidate
+                        next_position = position
+                        break
+            current_progress = playlist.get('progress') or {}
+            progress_sequence = int(
+                current_progress.get('write_sequence') or 0
+            ) + 1
+            if next_entry is None:
+                if completed:
+                    playlists.save_progress(
+                        state['playlist_id'], user_id,
+                        state['current_download_id'], 0, True,
+                        progress_sequence,
+                    )
+                    state['progress_sequence'] = progress_sequence
+                state['sequence'] = sequence
+                state['last_expected_download_id'] = expected_download_id
+                state['last_status'] = 204
+                state['last_activity'] = now
+                return '', 204
+            playlists.save_progress(
+                state['playlist_id'], user_id, next_entry['id'], 0, False,
+                progress_sequence,
+            )
+            state['progress_sequence'] = progress_sequence
+            state['playlist_position'] = next_position
+            state['resume_seconds'] = 0
+            entry = next_entry
+        elif state['mode'] == 'shuffle':
+            selection, metadata_pending = resolve_shuffle_pool(
+                user_id,
+                is_admin,
+                state['minimum_height'],
+                state['minimum_duration_seconds'],
+            )
+            if len(selection) > 1:
+                selection = [
+                    entry for entry in selection
+                    if str(entry['id']) != state['current_download_id']
+                ]
+            if not selection and metadata_pending:
+                state['last_activity'] = now
+                return jsonify({
+                    'code': 'shuffle_metadata_pending',
+                    'error': 'Older videos are still being prepared for Shuffle.',
+                }), 409
+            if not selection:
+                _playback_sessions.pop(session_id, None)
+                return '', 204
+            entry = _shuffle_choice(selection)
+        else:
+            selection = resolve_library_selection(
+                user_id, is_admin, state['filter'], state['ordering']
+            )
+        if state['mode'] != 'playlist' and not selection:
+            _playback_sessions.pop(session_id, None)
+            return '', 204
+        if state['mode'] == 'sequential':
+            next_index = (
+                state['page'] * state['page_size'] + state['position'] + 1
+            ) % len(selection)
+            entry = selection[next_index]
+            state['page'] = next_index // state['page_size']
+            state['position'] = next_index % state['page_size']
+        state['current_download_id'] = str(entry['id'])
+        state['sequence'] = sequence
+        state['last_expected_download_id'] = expected_download_id
+        state['last_activity'] = now
+        state['last_status'] = 200
+        response = _playback_session_response(state, entry)
+        state['last_response'] = response
+        return jsonify(response)
+
+
+@app.route('/api/playback-sessions/<session_id>/select', methods=['POST'])
+def select_playback_session_item(session_id):
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({'error': 'A JSON object is required'}), 400
+    expected_download_id = payload.get('expected_download_id')
+    selected_download_id = payload.get('download_id')
+    if any(not isinstance(value, str) or not value or len(value) > 128
+           for value in (expected_download_id, selected_download_id)):
+        return jsonify({'error': 'Playback download ids are invalid'}), 400
+    try:
+        sequence = _playback_integer(
+            payload, 'sequence', 1, PLAYBACK_SESSION_MAX_COORDINATE
+        )
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+
+    now = time.monotonic()
+    user_id = g.current_user['id']
+    is_admin = 'admin' in g.current_user['roles']
+    with _playback_sessions_lock:
+        _prune_playback_sessions_locked(now)
+        state = _playback_sessions.get(session_id)
+        if (state is None or state['owner_user_id'] != user_id
+                or state['mode'] != 'playlist'):
+            return jsonify({'error': 'Unknown playback session'}), 404
+        if sequence == state['sequence'] and state['last_response'] is not None:
+            if (expected_download_id != state['last_expected_download_id']
+                    or selected_download_id != state.get(
+                        'last_selected_download_id')):
+                return jsonify({'error': 'Playback position changed'}), 409
+            state['last_activity'] = now
+            return jsonify(state['last_response'])
+        if sequence != state['sequence'] + 1:
+            return jsonify({'error': 'Playback sequence is out of order'}), 409
+        if expected_download_id != state['current_download_id']:
+            return jsonify({'error': 'Playback position changed'}), 409
+        try:
+            detail = playlists.get(state['playlist_id'], user_id, is_admin)
+        except PlaylistNotFound:
+            return jsonify({'error': 'Unknown playback session'}), 404
+        if detail['revision'] != state['playlist_revision']:
+            return jsonify({'error': 'Playlist state changed'}), 409
+        state['progress_sequence'] = int(
+            (detail.get('progress') or {}).get('write_sequence') or 0
+        )
+        try:
+            selected_position = state['playlist_order'].index(
+                selected_download_id
+            )
+        except ValueError:
+            return jsonify({'error': 'Playback position changed'}), 409
+        with db() as conn:
+            entry = _playlist_download_row(conn, selected_download_id)
+        if not _playlist_download_playable(entry, user_id, is_admin):
+            return jsonify({'error': 'The selected video is unavailable'}), 409
+        state['playlist_position'] = selected_position
+        state['current_download_id'] = selected_download_id
+        state['sequence'] = sequence
+        state['resume_seconds'] = 0
+        state['last_expected_download_id'] = expected_download_id
+        state['last_selected_download_id'] = selected_download_id
+        state['last_activity'] = now
+        state['last_status'] = 200
+        response = _playback_session_response(state, entry)
+        state['last_response'] = response
+        return jsonify(response)
+
+
+@app.route('/api/playback-sessions/<session_id>/keepalive', methods=['POST'])
+def keepalive_playback_session(session_id):
+    now = time.monotonic()
+    with _playback_sessions_lock:
+        _prune_playback_sessions_locked(now)
+        state = _playback_sessions.get(session_id)
+        if (state is None
+                or state['owner_user_id'] != g.current_user['id']):
+            return jsonify({'error': 'Unknown playback session'}), 404
+        state['last_activity'] = now
+    return '', 204
+
+
+@app.route('/api/playback-sessions/<session_id>', methods=['DELETE'])
+def release_playback_session(session_id):
+    with _playback_sessions_lock:
+        state = _playback_sessions.get(session_id)
+        if (state is not None
+                and state['owner_user_id'] == g.current_user['id']):
+            _playback_sessions.pop(session_id, None)
+    # Releasing an already-expired lease is intentionally harmless. Returning
+    # the same response for foreign IDs also avoids exposing their existence.
+    return '', 204
+
+
+@app.route('/api/visibility/<download_id>', methods=['POST'])
+def set_download_visibility(download_id):
+    entry = _visible_download(download_id)
+    if entry is None:
+        return jsonify({"error": "Unknown download id"}), 404
+    if not _can_manage_download_visibility(entry):
+        return jsonify({
+            "error": (
+                "Only the downloader or an administrator can change "
+                "visibility"
+            )
+        }), 403
+
+    payload = request.get_json(silent=True) or {}
+    visibility = payload.get('visibility')
+    try:
+        changed = db_set_download_visibility(download_id, visibility)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({
+        "id": download_id,
+        "visibility": visibility,
+        "changed": changed,
+    })
+
+
+@app.route('/api/favorite/<download_id>', methods=['POST'])
+def set_download_favorite(download_id):
+    if _visible_download(download_id) is None:
+        return jsonify({"error": "Unknown download id"}), 404
+    payload = request.get_json(silent=True) or {}
+    favorite = payload.get('favorite')
+    if not isinstance(favorite, bool):
+        return jsonify({"error": "Favorite must be true or false"}), 400
+
+    changed = db_set_download_favorite(download_id, favorite)
+    if changed is None:
+        return jsonify({"error": "Unknown download id"}), 404
+    return jsonify({
+        "id": download_id,
+        "favorite": favorite,
+        "changed": changed,
+    })
+
+
+@app.route('/api/view/<download_id>', methods=['POST'])
+def record_download_view(download_id):
+    entry = _visible_download(download_id)
+    if entry is None or entry.get('status') != 'finished':
+        return jsonify({"error": "Video is not available"}), 404
+    path = entry.get('filename')
+    if not path or not os.path.isfile(path):
+        return jsonify({"error": "Video is not available"}), 404
+    real = os.path.realpath(path)
+    if not _is_allowed_download_path(real):
+        abort(403)
+
+    view_count = db_increment_view_count(download_id)
+    if view_count is None:
+        return jsonify({"error": "Video is not available"}), 404
+    return jsonify({"id": download_id, "view_count": view_count})
 
 
 @app.route('/api/tags/<download_id>', methods=['POST', 'DELETE'])
 def download_tags(download_id):
+    if _visible_download(download_id) is None:
+        return jsonify({"error": "Unknown download id"}), 404
     payload = request.get_json(silent=True) or {}
     try:
         if request.method == 'POST':
@@ -1688,7 +5817,10 @@ def download_tags(download_id):
     return jsonify({
         "id": download_id,
         "tags": tags,
-        "available_tags": db_list_tags(),
+        "available_tags": db_list_tags(
+            g.current_user['id'],
+            is_admin='admin' in g.current_user['roles'],
+        ),
         "changed": changed,
     })
 
@@ -1704,9 +5836,10 @@ def events():
     and the browser don't time the connection out during idle periods.
     """
     KEEPALIVE_SECS = 15
+    user_id = g.current_user['id']
 
     def stream():
-        q = event_bus.subscribe()
+        q = event_bus.subscribe(user_id)
         try:
             # Greet the client so it knows the stream is live; also nudges it
             # to do an initial reconcile against /api/history.
@@ -1731,35 +5864,16 @@ def events():
     return resp
 
 
-@app.route('/api/file/<download_id>', methods=['GET'])
-def stream_file(download_id):
-    """Serve a finished download to the in-app player. Uses send_file's
-    conditional/range response so the <video> element can seek.
-
-    The absolute path captured by yt-dlp at download time is stored in the
-    `filename` column. We trust that path (rather than rebuilding it from
-    the *current* download_dir preference) so playback keeps working after
-    the user changes the download directory mid-history.
-
-    Path-traversal protection: instead of confining to the current
-    `download_dir`, we confine to the union of directories captured when
-    workers start. A tampered filename cannot make its own parent trusted.
-    """
-    entry = db_get_download(download_id)
-    if entry is None or entry.get('status') != 'finished':
-        abort(404)
-    path = entry.get('filename')
-    if not path or not os.path.isfile(path):
-        abort(404)
+def _is_allowed_download_path(path):
+    """Confine media and previews to directories captured by download workers."""
     real = os.path.realpath(path)
-
     # Worker snapshots are independent of the later filename reported by
     # yt-dlp, so a corrupted filename cannot authorize its own directory.
     # Retaining every snapshot keeps old downloads playable after preferences
     # change, including rows whose worker did not reach a finished state.
     prefs = db_get_preferences()
     allowed_bases = {os.path.realpath(prefs.get('download_dir', '.'))}
-    with _db_lock, sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
             "SELECT DISTINCT output_dir FROM downloads "
             "WHERE output_dir IS NOT NULL"
@@ -1770,10 +5884,26 @@ def stream_file(download_id):
         except (TypeError, ValueError):
             continue
 
-    if not any(
-        os.path.commonpath([real, base]) == base
-        for base in allowed_bases
-    ):
+    try:
+        return any(
+            os.path.commonpath([real, base]) == base
+            for base in allowed_bases
+        )
+    except ValueError:
+        return False
+
+
+@app.route('/api/file/<download_id>', methods=['GET'])
+def stream_file(download_id):
+    """Serve a finished download for playback or browser download."""
+    entry = _visible_download(download_id)
+    if entry is None or entry.get('status') != 'finished':
+        abort(404)
+    path = entry.get('filename')
+    if not path or not os.path.isfile(path):
+        abort(404)
+    real = os.path.realpath(path)
+    if not _is_allowed_download_path(real):
         abort(403)
     # Resolve MIME type for the browser's <video> element. mimetypes.guess_type
     # relies on the OS MIME database, which may lack entries for .webm or .mkv
@@ -1797,7 +5927,71 @@ def stream_file(download_id):
     }
     ext = os.path.splitext(real)[1].lower()
     mimetype = _MIME_MAP.get(ext) or mimetypes.guess_type(real)[0] or 'application/octet-stream'
-    return send_file(real, mimetype=mimetype, conditional=True)
+    as_attachment = request.args.get('download') == '1'
+    return send_file(
+        real,
+        mimetype=mimetype,
+        conditional=True,
+        as_attachment=as_attachment,
+        download_name=os.path.basename(real) if as_attachment else None,
+    )
+
+
+@app.route('/api/thumbnail/<download_id>', methods=['GET'])
+def stream_thumbnail(download_id):
+    """Serve a cached local preview, generating one for older video rows."""
+    entry = _visible_download(download_id)
+    if entry is None or entry.get('status') != 'finished':
+        abort(404)
+    media_path = entry.get('filename')
+    if not media_path or not os.path.isfile(media_path):
+        abort(404)
+    if not _is_allowed_download_path(media_path):
+        abort(403)
+
+    fallback_dir = db_get_preferences().get('download_dir', '.')
+    thumbnail_path = _thumbnail_path(entry, fallback_dir)
+    if not thumbnail_path or not _is_allowed_download_path(thumbnail_path):
+        abort(403)
+    if (not os.path.isfile(thumbnail_path)
+            and not generate_video_thumbnail(media_path, thumbnail_path)):
+        abort(404)
+    return send_file(
+        thumbnail_path,
+        mimetype='image/jpeg',
+        conditional=True,
+        max_age=86400,
+    )
+
+
+@app.route('/api/preview/<download_id>', methods=['GET'])
+def stream_preview(download_id):
+    """Serve a cached hover montage, generating it on first use."""
+    entry = _visible_download(download_id)
+    if entry is None or entry.get('status') != 'finished':
+        abort(404)
+    media_path = entry.get('filename')
+    if not media_path or not os.path.isfile(media_path):
+        abort(404)
+    if not _is_allowed_download_path(media_path):
+        abort(403)
+
+    fallback_dir = db_get_preferences().get('download_dir', '.')
+    preview_path = _preview_path(entry, fallback_dir)
+    if not preview_path or not _is_allowed_download_path(preview_path):
+        abort(403)
+    if not os.path.isfile(preview_path):
+        with _preview_generation_lock:
+            # Another request may have filled the cache while this one waited.
+            if (not os.path.isfile(preview_path)
+                    and not generate_video_preview(media_path, preview_path)):
+                abort(404)
+    return send_file(
+        preview_path,
+        mimetype='video/mp4',
+        conditional=True,
+        max_age=86400,
+    )
 
 
 @app.route('/api/preferences', methods=['GET', 'POST'])
@@ -1805,7 +5999,11 @@ def preferences():
     if request.method == 'GET':
         return jsonify(db_get_preferences())
     data = request.json or {}
-    allowed = {'download_dir', 'format', 'max_concurrent', 'player_mode', 'theme'}
+    allowed = {
+        'download_dir', 'format', 'history_page_size', 'max_concurrent', 'player_mode',
+        'start_fullscreen', 'theme', 'shuffle_min_height',
+        'shuffle_min_duration_minutes',
+    }
     updates = {k: v for k, v in data.items() if k in allowed and v is not None}
     if not updates:
         return jsonify({"error": "No valid preference fields provided"}), 400
@@ -1816,6 +6014,34 @@ def preferences():
             )
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
+    if "history_page_size" in updates:
+        updates["history_page_size"] = str(updates["history_page_size"])
+        if updates["history_page_size"] not in {'5', '10', '20', '50', 'endless'}:
+            return jsonify({
+                "error": "Videos per page must be 5, 10, 20, 50, or endless"
+            }), 400
+    if 'shuffle_min_height' in updates:
+        value = updates['shuffle_min_height']
+        if (isinstance(value, bool)
+                or not isinstance(value, (str, int))
+                or not str(value).isascii()
+                or not str(value).isdigit()
+                or int(str(value), 10) not in SHUFFLE_MIN_HEIGHTS):
+            return jsonify({
+                'error': 'Shuffle minimum quality is invalid'
+            }), 400
+        updates['shuffle_min_height'] = str(int(str(value), 10))
+    if 'shuffle_min_duration_minutes' in updates:
+        value = updates['shuffle_min_duration_minutes']
+        if (isinstance(value, bool)
+                or not isinstance(value, (str, int))
+                or not str(value).isascii()
+                or not str(value).isdigit()
+                or not 0 <= int(str(value), 10) <= 1440):
+            return jsonify({
+                'error': 'Shuffle minimum length must be a whole number from 0 through 1440'
+            }), 400
+        updates['shuffle_min_duration_minutes'] = str(int(str(value), 10))
     db_set_preferences(updates)
     return jsonify(db_get_preferences())
 
@@ -1825,6 +6051,189 @@ def preferences():
 # ---------------------------------------------------------------------------
 
 init_db()
+
+_ingest_service_lock = threading.Lock()
+_ingest_thread = None
+_ingest_stop_event = None
+_metadata_service_lock = threading.Lock()
+_metadata_thread = None
+_metadata_stop_event = None
+
+
+def _metadata_backfill(stop_event):
+    """Probe legacy final files serially without holding the database lock."""
+    with db() as conn:
+        rows = [dict(row) for row in conn.execute(
+            "SELECT id, filename FROM downloads "
+            "WHERE status = 'finished' AND filename IS NOT NULL "
+            "AND media_metadata_probed = 0 ORDER BY created_at"
+        ).fetchall()]
+
+    changed = False
+    for candidate in rows:
+        if stop_event.is_set():
+            break
+        download_id = candidate['id']
+        filename = candidate['filename']
+        current = db_get_download(download_id)
+        if (current is None or current.get('status') != 'finished'
+                or current.get('filename') != filename
+                or not os.path.isfile(filename)):
+            continue
+        real_path = os.path.realpath(filename)
+        if not _is_allowed_download_path(real_path):
+            continue
+
+        resolution, duration = ffprobe_media_metadata(filename)
+        if stop_event.is_set():
+            break
+        current = db_get_download(download_id)
+        if (current is None or current.get('status') != 'finished'
+                or current.get('filename') != filename
+                or not os.path.isfile(filename)
+                or os.path.realpath(filename) != real_path
+                or not _is_allowed_download_path(real_path)):
+            continue
+        with _db_lock, db() as conn:
+            updated = conn.execute(
+                "UPDATE downloads SET resolution = ?, duration_seconds = ?, "
+                "media_metadata_probed = 1 WHERE id = ? AND status = 'finished' "
+                "AND filename = ? AND media_metadata_probed = 0",
+                (resolution, duration, download_id, filename),
+            ).rowcount == 1
+        changed = changed or updated
+    if changed:
+        event_bus.publish('change', {'reason': 'metadata'})
+
+
+def start_metadata_backfill():
+    """Start the one low-priority legacy metadata worker exactly once."""
+    global _metadata_thread, _metadata_stop_event
+    with _metadata_service_lock:
+        if _metadata_thread is not None and _metadata_thread.is_alive():
+            return _metadata_thread
+        _metadata_stop_event = threading.Event()
+        _metadata_thread = threading.Thread(
+            target=_metadata_backfill,
+            args=(_metadata_stop_event,),
+            name='vdl-metadata',
+            daemon=True,
+        )
+        _metadata_thread.start()
+        return _metadata_thread
+
+
+def stop_metadata_backfill():
+    """Signal the metadata worker and wait briefly for its bounded probe."""
+    global _metadata_thread, _metadata_stop_event
+    with _metadata_service_lock:
+        thread = _metadata_thread
+        stop_event = _metadata_stop_event
+        _metadata_thread = None
+        _metadata_stop_event = None
+    if stop_event is not None:
+        stop_event.set()
+    if thread is not None and thread is not threading.current_thread():
+        thread.join(timeout=5)
+
+
+def _positive_seconds_from_env(name, default):
+    value = os.environ.get(name, str(default))
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f'{name} must be a positive number') from exc
+    if not math.isfinite(seconds) or seconds < 1:
+        raise RuntimeError(f'{name} must be at least 1 second')
+    return seconds
+
+
+def _remove_stale_ingest_partials(directory):
+    """Discard unpublished copies left by an interrupted ingest process."""
+    pattern = re.compile(r'^\.vdl_[0-9a-f]{8}\..+\.ingest\.part$')
+    try:
+        with os.scandir(directory) as entries:
+            paths = [
+                entry.path for entry in entries
+                if pattern.fullmatch(entry.name)
+                and entry.is_file(follow_symlinks=False)
+            ]
+    except OSError:
+        return
+    for path in paths:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def start_ingest_watcher():
+    """Start the optional watched-folder importer exactly once."""
+    global _ingest_thread, _ingest_stop_event
+    configured_dir = os.environ.get('VDL_INGEST_DIR', '').strip()
+    if not configured_dir:
+        return None
+
+    directory = os.path.realpath(os.path.abspath(configured_dir))
+    if not os.path.isdir(directory):
+        raise RuntimeError(
+            f'VDL_INGEST_DIR is not a directory: {configured_dir}'
+        )
+    if not os.access(directory, os.R_OK | os.X_OK):
+        raise RuntimeError(
+            f'VDL_INGEST_DIR is not readable: {configured_dir}'
+        )
+    scan_seconds = _positive_seconds_from_env(
+        'VDL_INGEST_SCAN_SECONDS', 10
+    )
+    settle_seconds = _positive_seconds_from_env(
+        'VDL_INGEST_SETTLE_SECONDS', 60
+    )
+    output_dir = os.path.realpath(os.path.abspath(_prepare_download_directory(
+        db_get_preferences().get('download_dir', '.')
+    )))
+    if directory == output_dir:
+        raise RuntimeError(
+            'VDL_INGEST_DIR and the download directory must be different'
+        )
+
+    with _ingest_service_lock:
+        if _ingest_thread is not None and _ingest_thread.is_alive():
+            return _ingest_thread
+        _remove_stale_ingest_partials(output_dir)
+        watcher = IngestFolderWatcher(
+            directory,
+            scan_seconds=scan_seconds,
+            settle_seconds=settle_seconds,
+        )
+        _ingest_stop_event = threading.Event()
+        _ingest_thread = threading.Thread(
+            target=watcher.run,
+            args=(_ingest_stop_event,),
+            name='vdl-ingest',
+            daemon=True,
+        )
+        _ingest_thread.start()
+        print(
+            f'VDL ingest: watching {directory!r} every {scan_seconds:g}s '
+            f'(settle {settle_seconds:g}s)',
+            flush=True,
+        )
+        return _ingest_thread
+
+
+def stop_ingest_watcher():
+    """Stop the optional importer after the HTTP server exits."""
+    global _ingest_thread, _ingest_stop_event
+    with _ingest_service_lock:
+        thread = _ingest_thread
+        stop_event = _ingest_stop_event
+        _ingest_thread = None
+        _ingest_stop_event = None
+    if stop_event is not None:
+        stop_event.set()
+    if thread is not None and thread is not threading.current_thread():
+        thread.join(timeout=5)
 
 
 def _port_number(value):
@@ -1864,11 +6273,24 @@ def main(argv=None):
     # /api/events doesn't block other requests.
     host  = os.environ.get("HOST", "127.0.0.1")
     debug = os.environ.get("FLASK_DEBUG", "1") == "1"
+    # Werkzeug executes main once in its debug parent and again in the serving
+    # child. Only the child may own the singleton ingest thread.
+    owns_ingest_watcher = (
+        not debug or os.environ.get('WERKZEUG_RUN_MAIN') == 'true'
+    )
+    ingest_thread = start_ingest_watcher() if owns_ingest_watcher else None
+    metadata_thread = start_metadata_backfill() if owns_ingest_watcher else None
     print(
         f'VDL startup: UI v{APP_VERSION} | API v{APP_VERSION}',
         flush=True,
     )
-    app.run(host=host, port=args.port, debug=debug, threaded=True)
+    try:
+        app.run(host=host, port=args.port, debug=debug, threaded=True)
+    finally:
+        if ingest_thread is not None:
+            stop_ingest_watcher()
+        if metadata_thread is not None:
+            stop_metadata_backfill()
 
 
 if __name__ == '__main__':
