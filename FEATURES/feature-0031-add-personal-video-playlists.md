@@ -1,7 +1,7 @@
 # Add personal video playlists with durable resume progress
 
 **Source:** User-requested feature  
-**Status:** Proposed  
+**Status:** Implemented
 **Last refined:** 2026-10-10  
 **Extends:** Feature 0017, Make Download History the primary thumbnail library;
 Feature 0023, Require authentication and manage users; Feature 0025, Track
@@ -489,4 +489,3 @@ This feature does not include:
 - uploading or selecting custom playlist artwork;
 - shuffling within a playlist; or
 - saving independent resume bookmarks for ordinary single-video playback.
-
