@@ -40,6 +40,7 @@ def test_reset():
         if row["status"] in ("starting", "downloading", "paused"):
             vdl.request_cancel(row["id"])
     with vdl._db_lock, vdl.db() as connection:
+        connection.execute("DELETE FROM playlists")
         connection.execute("DELETE FROM downloads")
         connection.execute("DELETE FROM preferences")
     with vdl._cancel_lock:

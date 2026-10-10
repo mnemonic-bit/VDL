@@ -856,6 +856,7 @@ function applyHistorySearch() {
     searchTerms = parseSearchTerms(input.value);
     historyPage = 0;
     historyEndlessVisibleCount = HISTORY_ENDLESS_BATCH_SIZE;
+    renderPlaylists();
     fetchHistory({ sortFavorites: true });
 }
 
@@ -1766,6 +1767,13 @@ document.addEventListener('click', (ev) => {
     const favoriteAction = ev.target.closest('[data-favorite-action]');
     if (favoriteAction) toggleFavorite(favoriteAction);
 
+    const playlistAddAction = ev.target.closest('[data-playlist-add-action]');
+    if (playlistAddAction) {
+        openPlaylistChooser(
+            playlistAddAction.dataset.downloadId, playlistAddAction,
+        );
+    }
+
     const endlessAction = ev.target.closest('[data-endless-action]');
     if (endlessAction) {
         closeAllMenus();
@@ -1960,6 +1968,354 @@ function fallback(text, done) {
     document.body.removeChild(ta);
 }
 
+const PLAYLIST_VIDEO_EXTENSIONS = new Set([
+    'mp4', 'm4v', 'webm', 'mkv', 'ogg', 'ogv', 'mov', 'avi',
+]);
+let playlistSummaries = [];
+let libraryEntries = [];
+let playlistEditorDraft = null;
+let playlistEditorBaseline = '';
+let playlistEditorReturnFocus = null;
+let playlistChooserDownloadId = null;
+let playlistChooserReturnFocus = null;
+
+function libraryTitle(info) {
+    if (info && info.title) return info.title;
+    if (info && info.filename) {
+        return info.filename.split('/').pop().split('\\').pop().replace(/\.[^.]+$/, '');
+    }
+    return 'Untitled download';
+}
+
+function playlistMatchesSearch(playlist) {
+    const freeText = searchTerms.filter(term => !/^(quality|user|starred?|views):/i.test(term));
+    if (!freeText.length) return true;
+    const name = tagSearchKey(playlist.name);
+    return freeText.some(term => name.includes(tagSearchKey(term)));
+}
+
+function playlistProgressText(playlist) {
+    if (playlist.progress && playlist.progress.completed) return 'Completed';
+    if (!playlist.item_count) return 'Empty playlist';
+    const item = Math.min(playlist.item_count, Number(playlist.resume_position || 0) + 1);
+    const seconds = playlist.progress ? playlist.progress.position_seconds : 0;
+    const position = seconds >= 1 ? ` · ${formatMediaDuration(seconds) || '0:00'}` : '';
+    return `Episode ${item} of ${playlist.item_count}${position}`;
+}
+
+function renderPlaylistMosaic(playlist) {
+    const ids = Array.isArray(playlist.mosaic_ids) ? playlist.mosaic_ids : [];
+    if (!ids.length) {
+        return '<div class="playlist-mosaic-empty"><svg aria-hidden="true"><use href="#i-playlist"/></svg><span>No videos yet</span></div>';
+    }
+    return ids.map(id => `<img src="/api/thumbnail/${encodeURIComponent(id)}" alt="" loading="lazy" onerror="this.classList.add('thumbnail-unavailable')">`).join('');
+}
+
+function renderPlaylistCard(playlist) {
+    const id = escapeAttr(playlist.id);
+    const duration = formatMediaDuration(playlist.duration_seconds);
+    const meta = `${playlist.item_count} ${playlist.item_count === 1 ? 'video' : 'videos'}${duration ? ` · ${duration}` : ''}`;
+    const completed = Boolean(playlist.progress && playlist.progress.completed);
+    const primary = completed ? 'Replay playlist' : 'Resume playlist';
+    return `<article class="playlist-card" data-playlist-id="${id}">
+        <button class="playlist-card-primary" type="button" onclick="startPlaylistPlayback('${id}', ${completed})" ${playlist.item_count ? '' : 'disabled'} aria-label="${primary}: ${escapeAttr(playlist.name)}">
+            <span class="playlist-mosaic count-${Math.min(4, playlist.mosaic_ids.length)}">${renderPlaylistMosaic(playlist)}</span>
+            <span class="playlist-marker"><svg aria-hidden="true"><use href="#i-playlist"/></svg>Playlist</span>
+            <span class="playlist-preview-meta">${escapeHtml(meta)}</span>
+        </button>
+        <div class="playlist-card-caption">
+            <div><strong title="${escapeAttr(playlist.name)}">${escapeHtml(playlist.name)}</strong><span class="playlist-resume">${escapeHtml(playlistProgressText(playlist))}</span></div>
+            <div class="menu-wrap">
+                <button class="kebab-btn" type="button" onclick="togglePlaylistMenu('${id}', event)" aria-label="More actions for ${escapeAttr(playlist.name)}"><svg class="icon"><use href="#i-kebab"/></svg></button>
+                <div id="playlist-menu-${id}" class="kebab-menu playlist-card-menu">
+                    <button type="button" onclick="startPlaylistPlayback('${id}', true)"><svg class="menu-icon"><use href="#i-play"/></svg>Play from beginning</button>
+                    <button type="button" onclick="openPlaylistEditor('${id}')"><svg class="menu-icon"><use href="#i-playlist"/></svg>Edit playlist</button>
+                    <button type="button" class="danger" onclick="deletePlaylist('${id}')"><svg class="menu-icon"><use href="#i-trash"/></svg>Delete playlist</button>
+                </div>
+            </div>
+        </div>
+    </article>`;
+}
+
+function renderPlaylists() {
+    const shelf = document.getElementById('playlistShelf');
+    const visible = playlistSummaries.filter(playlistMatchesSearch);
+    shelf.hidden = playlistSummaries.length === 0;
+    document.getElementById('playlistShelfCount').textContent =
+        `${visible.length} ${visible.length === 1 ? 'playlist' : 'playlists'}`;
+    document.getElementById('playlistList').innerHTML = visible.length
+        ? visible.map(renderPlaylistCard).join('')
+        : '<p class="playlist-no-match">No playlist names match this search.</p>';
+}
+
+function fetchPlaylists() {
+    return apiFetch('/api/playlists').then(response => response.json()).then(data => {
+        playlistSummaries = Array.isArray(data) ? data : [];
+        renderPlaylists();
+    });
+}
+
+function togglePlaylistMenu(id, event) {
+    event.stopPropagation();
+    const menu = document.getElementById('playlist-menu-' + id);
+    const open = menu.classList.contains('open');
+    closeAllMenus();
+    if (!open) menu.classList.add('open');
+}
+
+function playlistEditorSnapshot() {
+    if (!playlistEditorDraft) return '';
+    return JSON.stringify({
+        name: playlistEditorDraft.name,
+        ids: playlistEditorDraft.items.map(item => item.id),
+    });
+}
+
+function markPlaylistEditorDirty() {
+    if (!playlistEditorDraft) return;
+    playlistEditorDraft.name = document.getElementById('playlistName').value;
+    const dirty = playlistEditorSnapshot() !== playlistEditorBaseline;
+    document.getElementById('playlistEditorDirty').hidden = !dirty;
+}
+
+function playableLibraryEntries() {
+    return libraryEntries.filter(info => {
+        if (info.status !== 'finished' || !info.filename) return false;
+        const extension = info.filename.split('.').pop().toLowerCase();
+        return PLAYLIST_VIDEO_EXTENSIONS.has(extension);
+    });
+}
+
+function renderPlaylistEditor() {
+    if (!playlistEditorDraft) return;
+    const selectedIds = new Set(
+        playlistEditorDraft.items.map(item => item.id).filter(Boolean),
+    );
+    const query = tagSearchKey(document.getElementById('playlistVideoSearch').value);
+    const available = playableLibraryEntries().filter(info => (
+        !selectedIds.has(String(info.id))
+        && (!query || tagSearchKey(libraryTitle(info)).includes(query))
+    ));
+    document.getElementById('playlistAvailable').innerHTML = available.length
+        ? available.map(info => `<button type="button" class="playlist-picker-row" onclick="playlistEditorAdd('${escapeAttr(info.id)}')"><img src="/api/thumbnail/${encodeURIComponent(info.id)}" alt=""><span>${escapeHtml(libraryTitle(info))}</span><svg aria-hidden="true"><use href="#i-plus"/></svg></button>`).join('')
+        : '<p>No available videos match.</p>';
+    document.getElementById('playlistSelected').innerHTML = playlistEditorDraft.items.length
+        ? playlistEditorDraft.items.map((item, index) => `<div class="playlist-selected-row${item.unavailable ? ' is-unavailable' : ''}" draggable="${!item.unavailable}" data-playlist-index="${index}">
+            <span class="playlist-drag-handle" aria-hidden="true">⋮⋮</span>
+            ${item.id ? `<img src="/api/thumbnail/${encodeURIComponent(item.id)}" alt="">` : '<span class="playlist-unavailable-thumb"><svg><use href="#i-camera"/></svg></span>'}
+            <span class="playlist-selected-title"><span>${index + 1}</span>${escapeHtml(item.title || 'Unavailable video')}</span>
+            <span class="playlist-order-actions">
+                <button type="button" onclick="playlistEditorMove(${index}, -1)" ${index === 0 ? 'disabled' : ''} aria-label="Move ${escapeAttr(item.title || 'video')} up">↑</button>
+                <button type="button" onclick="playlistEditorMove(${index}, 1)" ${index === playlistEditorDraft.items.length - 1 ? 'disabled' : ''} aria-label="Move ${escapeAttr(item.title || 'video')} down">↓</button>
+                <button type="button" onclick="playlistEditorRemove(${index})" aria-label="Remove ${escapeAttr(item.title || 'video')}"><svg><use href="#i-x"/></svg></button>
+            </span>
+        </div>`).join('')
+        : '<p>No videos selected.</p>';
+    bindPlaylistDragging();
+    markPlaylistEditorDirty();
+}
+
+function showPlaylistEditorError(message) {
+    const error = document.getElementById('playlistEditorError');
+    error.textContent = message || '';
+    error.hidden = !message;
+}
+
+async function openPlaylistEditor(id = null, initialDownloadId = null) {
+    closeAllMenus();
+    playlistEditorReturnFocus = document.activeElement;
+    showPlaylistEditorError('');
+    let detail = null;
+    if (id) {
+        const response = await apiFetch('/api/playlists/' + encodeURIComponent(id));
+        if (!response.ok) {
+            showActionError('The playlist could not be opened.');
+            return;
+        }
+        detail = await response.json();
+    }
+    const initial = initialDownloadId
+        ? playableLibraryEntries().find(item => String(item.id) === String(initialDownloadId))
+        : null;
+    playlistEditorDraft = {
+        id: detail ? detail.id : null,
+        revision: detail ? detail.revision : null,
+        name: detail ? detail.name : '',
+        items: detail ? detail.items.map(item => ({ ...item }))
+            : (initial ? [{
+                id: String(initial.id), title: libraryTitle(initial), unavailable: false,
+            }] : []),
+    };
+    document.getElementById('playlistEditorTitle').textContent =
+        detail ? 'Edit playlist' : 'Create playlist';
+    document.getElementById('playlistName').value = playlistEditorDraft.name;
+    document.getElementById('playlistVideoSearch').value = '';
+    playlistEditorBaseline = playlistEditorSnapshot();
+    renderPlaylistEditor();
+    const dialog = document.getElementById('playlistEditorDialog');
+    dialog.showModal();
+    document.getElementById('playlistName').focus();
+}
+
+function closePlaylistEditor(force = false) {
+    const dialog = document.getElementById('playlistEditorDialog');
+    if (!dialog.open) return;
+    markPlaylistEditorDirty();
+    if (!force && !document.getElementById('playlistEditorDirty').hidden
+            && !window.confirm('Discard unsaved playlist changes?')) return;
+    dialog.close();
+    playlistEditorDraft = null;
+    if (playlistEditorReturnFocus && playlistEditorReturnFocus.isConnected) {
+        playlistEditorReturnFocus.focus();
+    }
+}
+
+function playlistEditorAdd(id) {
+    const info = playableLibraryEntries().find(item => String(item.id) === String(id));
+    if (!info || !playlistEditorDraft) return;
+    playlistEditorDraft.items.push({
+        id: String(info.id), title: libraryTitle(info), unavailable: false,
+    });
+    renderPlaylistEditor();
+}
+
+function playlistEditorRemove(index) {
+    if (!playlistEditorDraft) return;
+    playlistEditorDraft.items.splice(index, 1);
+    renderPlaylistEditor();
+}
+
+function playlistEditorMove(index, delta) {
+    if (!playlistEditorDraft) return;
+    const next = index + delta;
+    if (next < 0 || next >= playlistEditorDraft.items.length) return;
+    const [item] = playlistEditorDraft.items.splice(index, 1);
+    playlistEditorDraft.items.splice(next, 0, item);
+    renderPlaylistEditor();
+    const rows = document.querySelectorAll('#playlistSelected .playlist-selected-row');
+    const focus = rows[next] && rows[next].querySelector('button:not(:disabled)');
+    if (focus) focus.focus();
+    document.getElementById('playlistMoveStatus').textContent =
+        `${item.title || 'Video'} moved to position ${next + 1}.`;
+}
+
+function bindPlaylistDragging() {
+    let dragged = null;
+    document.querySelectorAll('#playlistSelected .playlist-selected-row').forEach(row => {
+        row.addEventListener('dragstart', event => {
+            dragged = Number(row.dataset.playlistIndex);
+            event.dataTransfer.effectAllowed = 'move';
+        });
+        row.addEventListener('dragover', event => event.preventDefault());
+        row.addEventListener('drop', event => {
+            event.preventDefault();
+            const target = Number(row.dataset.playlistIndex);
+            if (dragged === null || dragged === target) return;
+            const [item] = playlistEditorDraft.items.splice(dragged, 1);
+            playlistEditorDraft.items.splice(target, 0, item);
+            renderPlaylistEditor();
+            document.getElementById('playlistMoveStatus').textContent =
+                `${item.title || 'Video'} moved to position ${target + 1}.`;
+        });
+    });
+}
+
+async function savePlaylistEditor(event) {
+    event.preventDefault();
+    if (!playlistEditorDraft) return;
+    playlistEditorDraft.name = document.getElementById('playlistName').value;
+    const unavailable = playlistEditorDraft.items.some(item => !item.id);
+    if (unavailable) {
+        showPlaylistEditorError('Remove unavailable videos before saving this playlist.');
+        return;
+    }
+    const editing = Boolean(playlistEditorDraft.id);
+    const url = editing
+        ? '/api/playlists/' + encodeURIComponent(playlistEditorDraft.id)
+        : '/api/playlists';
+    const body = editing ? {
+        name: playlistEditorDraft.name,
+        download_ids: playlistEditorDraft.items.map(item => item.id),
+        expected_revision: playlistEditorDraft.revision,
+    } : {
+        name: playlistEditorDraft.name,
+        download_ids: playlistEditorDraft.items.map(item => item.id),
+    };
+    const response = await apiFetch(url, {
+        method: editing ? 'PUT' : 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        showPlaylistEditorError(data.error || 'The playlist could not be saved.');
+        return;
+    }
+    await response.json();
+    playlistEditorBaseline = playlistEditorSnapshot();
+    closePlaylistEditor(true);
+    await fetchPlaylists();
+}
+
+function openPlaylistChooser(downloadId, opener = null) {
+    closeAllMenus();
+    playlistChooserDownloadId = String(downloadId);
+    playlistChooserReturnFocus = opener || document.activeElement;
+    const list = document.getElementById('playlistChooserList');
+    list.innerHTML = playlistSummaries.length
+        ? playlistSummaries.map(playlist => {
+            const included = (playlist.member_ids || []).includes(playlistChooserDownloadId);
+            return `<button type="button" onclick="quickAddToPlaylist('${escapeAttr(playlist.id)}')" ${included ? 'disabled' : ''}><span>${escapeHtml(playlist.name)}</span><span>${included ? 'Already added' : `${playlist.item_count} videos`}</span></button>`;
+        }).join('')
+        : '<p>You have no playlists yet.</p>';
+    document.getElementById('playlistChooserDialog').showModal();
+}
+
+function closePlaylistChooser() {
+    const dialog = document.getElementById('playlistChooserDialog');
+    if (dialog.open) dialog.close();
+    if (playlistChooserReturnFocus && playlistChooserReturnFocus.isConnected) {
+        playlistChooserReturnFocus.focus();
+    }
+}
+
+async function quickAddToPlaylist(playlistId) {
+    const response = await apiFetch(
+        '/api/playlists/' + encodeURIComponent(playlistId) + '/items', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ download_id: playlistChooserDownloadId }),
+        },
+    );
+    if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        showActionError(data.error || 'The video could not be added.');
+        return;
+    }
+    closePlaylistChooser();
+    await fetchPlaylists();
+}
+
+function createPlaylistFromChooser() {
+    const downloadId = playlistChooserDownloadId;
+    closePlaylistChooser();
+    openPlaylistEditor(null, downloadId);
+}
+
+async function deletePlaylist(id) {
+    closeAllMenus();
+    if (!window.confirm('Delete this playlist? Its videos will remain in your library.')) return;
+    const response = await apiFetch('/api/playlists/' + encodeURIComponent(id), {
+        method: 'DELETE',
+    });
+    if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        showActionError(data.error || 'The playlist could not be deleted.');
+        return;
+    }
+    await fetchPlaylists();
+}
+
 function renderHistoryCard(info) {
     const id = String(info.id);
     const isFinished = info.status === 'finished';
@@ -1985,6 +2341,9 @@ function renderHistoryCard(info) {
         const playLabel = info.filename.split('/').pop().split('\\').pop();
         const playExt = info.filename.split('.').pop().toLowerCase();
         menuItems.push(`<button data-endless-action data-download-id="${escapeAttr(id)}" data-play-label="${escapeAttr(playLabel)}" data-play-ext="${escapeAttr(playExt)}"><svg class="menu-icon"><use href="#i-play"/></svg>Play All</button>`);
+        if (PLAYLIST_VIDEO_EXTENSIONS.has(playExt)) {
+            menuItems.push(`<button data-playlist-add-action data-download-id="${escapeAttr(id)}"><svg class="menu-icon"><use href="#i-playlist"/></svg>Add to playlist…</button>`);
+        }
         menuItems.push(`<button data-file-download-action data-download-id="${escapeAttr(id)}"><svg class="menu-icon"><use href="#i-download"/></svg>Download</button>`);
     }
     if (!isFinished) {
@@ -2451,6 +2810,7 @@ function fetchHistory({ sortFavorites = false } = {}) {
         updateProgressIndicators(data);
         const active = data.filter(i => CURRENT_TAB_STATUSES.has(i.status));
         let historyEntries = data.filter(i => HISTORY_TAB_STATUSES.has(i.status));
+        libraryEntries = historyEntries.slice();
         if (sortFavorites) {
             historyOrdering = 'favorites_first';
             // The API is newest-first, and modern stable sorting preserves
@@ -2648,6 +3008,7 @@ const _VIDEO_MIME = {
 const PLAYER_CONTROLS_IDLE_MS = 2000;
 const PLAYER_HANDOFF_TIMEOUT_MS = 20_000;
 const PLAYBACK_KEEPALIVE_MS = 5 * 60 * 1000;
+const PLAYLIST_PROGRESS_SAVE_MS = 10 * 1000;
 const MAX_AUTOMATIC_SKIPS = 10;
 let playerControlsTimer = null;
 let playerMediaCleanup = null;
@@ -2671,6 +3032,13 @@ const endlessPlayback = {
     failedGeneration: null,
     watchdogTimer: null,
     keepaliveTimer: null,
+    playlistId: null,
+    playlistRevision: null,
+    playlistQueue: [],
+    playlistPosition: null,
+    progressSequence: 0,
+    progressTimer: null,
+    lastSavedPosition: null,
 };
 
 function hidePlayerControls() {
@@ -2767,7 +3135,10 @@ function handlePlaybackFailure(generation, message) {
     endlessPlayback.phase = 'failed';
     endlessPlayback.handoffInProgress = false;
     endlessPlayback.failureCount += 1;
-    const currentLimit = Math.max(1, Math.min(MAX_AUTOMATIC_SKIPS, historyTotal || 1));
+    const selectionSize = endlessPlayback.mode === 'playlist'
+        ? endlessPlayback.playlistQueue.length
+        : historyTotal;
+    const currentLimit = Math.max(1, Math.min(MAX_AUTOMATIC_SKIPS, selectionSize || 1));
     if (endlessPlayback.failureCount >= currentLimit) {
         showPlayerTransition(
             message,
@@ -2806,7 +3177,7 @@ function observePlaybackPromise(playback, generation) {
     );
 }
 
-function loadPlaybackItem(item, { automatic = false } = {}) {
+function loadPlaybackItem(item, { automatic = false, seekSeconds = null } = {}) {
     const video = document.getElementById('playerVideo');
     clearPlayerMediaCallbacks();
     const generation = ++endlessPlayback.loadGeneration;
@@ -2823,6 +3194,13 @@ function loadPlaybackItem(item, { automatic = false } = {}) {
                 && generation === endlessPlayback.loadGeneration) callback(event);
     };
     const onMetadata = current(() => {
+        if (Number.isFinite(Number(seekSeconds))) {
+            const requested = Math.max(0, Number(seekSeconds));
+            const duration = Number(video.duration);
+            video.currentTime = Number.isFinite(duration)
+                ? Math.min(requested, duration)
+                : requested;
+        }
         applyOriginalPlayerSize(generation);
         armPlaybackWatchdog(generation);
     });
@@ -2934,6 +3312,8 @@ function deactivateEndlessPlayback({ release = true } = {}) {
     const sessionId = endlessPlayback.sessionId;
     clearInterval(endlessPlayback.keepaliveTimer);
     endlessPlayback.keepaliveTimer = null;
+    clearInterval(endlessPlayback.progressTimer);
+    endlessPlayback.progressTimer = null;
     endlessPlayback.active = false;
     endlessPlayback.sessionId = null;
     endlessPlayback.sequence = 0;
@@ -2951,7 +3331,10 @@ function playVideo(id, label, ext) {
     }
     endlessPlayback.epoch += 1;
     deactivateEndlessPlayback();
+    endlessPlayback.mode = 'sequential';
     endlessPlayback.phase = 'loading';
+    document.getElementById('playlistQueue').hidden = true;
+    document.querySelector('.player-box').classList.remove('playlist-player');
     openBuiltInPlayer({
         fullscreen: startVideosFullscreen,
         requestFullscreen: false,
@@ -2971,6 +3354,9 @@ function closePlayer() {
     const backdrop = document.getElementById('playerBackdrop');
     const video = document.getElementById('playerVideo');
     const closeButton = backdrop.querySelector('.player-close');
+    if (endlessPlayback.active && endlessPlayback.mode === 'playlist') {
+        savePlaylistProgress({ force: true, keepalive: true });
+    }
     endlessPlayback.epoch += 1;
     endlessPlayback.loadGeneration += 1;
     deactivateEndlessPlayback();
@@ -2978,6 +3364,14 @@ function closePlayer() {
     endlessPlayback.phase = 'idle';
     endlessPlayback.currentDownloadId = null;
     endlessPlayback.currentItem = null;
+    endlessPlayback.playlistId = null;
+    endlessPlayback.playlistRevision = null;
+    endlessPlayback.playlistQueue = [];
+    endlessPlayback.playlistPosition = null;
+    endlessPlayback.progressSequence = 0;
+    endlessPlayback.lastSavedPosition = null;
+    clearInterval(endlessPlayback.progressTimer);
+    endlessPlayback.progressTimer = null;
     playerStartedFullscreen = false;
     hidePlayerControls();
     showPlayerTransition('', []);
@@ -2989,6 +3383,8 @@ function closePlayer() {
     video.innerHTML = '';
     video.load();
     backdrop.classList.remove('open');
+    backdrop.querySelector('.player-box').classList.remove('playlist-player');
+    document.getElementById('playlistQueue').hidden = true;
 }
 
 async function playbackResponseError(response) {
@@ -3047,6 +3443,183 @@ function startShufflePlayback() {
     startEndlessPlayback(null, '', '', 'shuffle');
 }
 
+function renderPlaylistQueue() {
+    const queue = document.getElementById('playlistQueueItems');
+    queue.innerHTML = endlessPlayback.playlistQueue.map((item, index) => {
+        const active = index === endlessPlayback.playlistPosition;
+        const duration = formatMediaDuration(item.duration_seconds);
+        if (item.unavailable || !item.id) {
+            return `<div class="playlist-queue-row is-unavailable" data-queue-position="${index}"><span class="playlist-queue-number">${index + 1}</span><span class="playlist-queue-thumb"><svg><use href="#i-camera"/></svg></span><span><strong>Unavailable video</strong><small>Skipped during playback</small></span></div>`;
+        }
+        return `<button type="button" class="playlist-queue-row${active ? ' is-active' : ''}" data-queue-position="${index}" onclick="selectPlaylistQueueItem('${escapeAttr(item.id)}')" ${active ? 'aria-current="true"' : ''}>
+            <span class="playlist-queue-number">${index + 1}</span>
+            <img src="/api/thumbnail/${encodeURIComponent(item.id)}" alt="">
+            <span><strong>${escapeHtml(item.title || 'Untitled video')}</strong>${duration ? `<small>${duration}</small>` : ''}</span>
+        </button>`;
+    }).join('');
+    requestAnimationFrame(() => {
+        const active = queue.querySelector('[aria-current="true"]');
+        if (active) active.scrollIntoView({ block: 'nearest' });
+    });
+}
+
+function savePlaylistProgress({ force = false, keepalive = false } = {}) {
+    if (!endlessPlayback.active || endlessPlayback.mode !== 'playlist'
+            || !endlessPlayback.playlistId
+            || !endlessPlayback.currentDownloadId) return Promise.resolve();
+    const video = document.getElementById('playerVideo');
+    const position = Math.max(0, Number(video.currentTime) || 0);
+    if (!force && endlessPlayback.lastSavedPosition !== null
+            && Math.abs(position - endlessPlayback.lastSavedPosition) < 1) {
+        return Promise.resolve();
+    }
+    endlessPlayback.progressSequence += 1;
+    const sequence = endlessPlayback.progressSequence;
+    endlessPlayback.lastSavedPosition = position;
+    return fetch(
+        '/api/playlists/' + encodeURIComponent(endlessPlayback.playlistId) + '/progress',
+        {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                download_id: endlessPlayback.currentDownloadId,
+                position_seconds: position,
+                completed: false,
+                write_sequence: sequence,
+            }),
+            keepalive,
+        },
+    ).then(response => {
+        if (!response.ok && !keepalive) {
+            return playbackResponseError(response).then(error => { throw error; });
+        }
+        return response.ok;
+    }).catch(error => {
+        if (!keepalive) showPlayerTransition(
+            error.message || 'Playlist progress could not be saved.',
+            ['retry', 'close'],
+        );
+        return false;
+    });
+}
+
+function startPlaylistProgressTimer() {
+    clearInterval(endlessPlayback.progressTimer);
+    endlessPlayback.progressTimer = setInterval(() => {
+        const video = document.getElementById('playerVideo');
+        if (!video.paused && !video.ended) savePlaylistProgress();
+    }, PLAYLIST_PROGRESS_SAVE_MS);
+}
+
+function startPlaylistPlayback(playlistId, restart = false) {
+    closeAllMenus();
+    endlessPlayback.epoch += 1;
+    const epoch = endlessPlayback.epoch;
+    deactivateEndlessPlayback();
+    endlessPlayback.active = true;
+    endlessPlayback.mode = 'playlist';
+    endlessPlayback.phase = 'opening';
+    endlessPlayback.failureCount = 0;
+    endlessPlayback.playlistId = String(playlistId);
+    endlessPlayback.returnFullscreenNeeded = false;
+    openBuiltInPlayer({ fullscreen: startVideosFullscreen, requestFullscreen: false });
+    document.querySelector('.player-box').classList.add('playlist-player');
+    document.getElementById('playlistQueue').hidden = false;
+    document.getElementById('playlistQueueItems').innerHTML = '';
+    showPlayerTransition('Opening playlist…', []);
+    if (startVideosFullscreen) requestPlayerFullscreen({ launch: true });
+
+    apiFetch('/api/playback-sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            mode: 'playlist', playlist_id: String(playlistId), restart,
+        }),
+    }).then(async response => {
+        if (epoch !== endlessPlayback.epoch || !endlessPlayback.active) return;
+        if (response.status === 204) {
+            deactivateEndlessPlayback({ release: false });
+            showPlayerTransition('This playlist has no playable videos.', ['close']);
+            return;
+        }
+        if (!response.ok) throw await playbackResponseError(response);
+        const data = await response.json();
+        if (epoch !== endlessPlayback.epoch || !endlessPlayback.active) {
+            releasePlaybackLease(data.session_id);
+            return;
+        }
+        endlessPlayback.sessionId = data.session_id;
+        endlessPlayback.sequence = data.sequence;
+        endlessPlayback.playlistRevision = data.playlist_revision;
+        endlessPlayback.playlistQueue = data.queue || [];
+        endlessPlayback.playlistPosition = data.queue_position;
+        endlessPlayback.progressSequence = data.progress_sequence || 0;
+        endlessPlayback.currentDownloadId = String(data.item.id);
+        endlessPlayback.lastSavedPosition = Number(data.resume_seconds) || 0;
+        renderPlaylistQueue();
+        loadPlaybackItem(data.item, {
+            automatic: true,
+            seekSeconds: data.resume_seconds,
+        });
+        recordView(data.item.id);
+        startPlaybackKeepalive(epoch);
+        startPlaylistProgressTimer();
+    }).catch(error => {
+        if (epoch !== endlessPlayback.epoch || !endlessPlayback.active) return;
+        deactivateEndlessPlayback({ release: false });
+        showPlayerTransition(
+            error.message || 'The playlist could not be opened.', ['close'],
+        );
+    });
+}
+
+async function selectPlaylistQueueItem(downloadId) {
+    if (endlessPlayback.mode !== 'playlist' || !endlessPlayback.sessionId
+            || endlessPlayback.advancePending
+            || String(downloadId) === endlessPlayback.currentDownloadId) return;
+    const saved = await savePlaylistProgress({ force: true });
+    if (!saved) return;
+    const epoch = endlessPlayback.epoch;
+    const sequence = endlessPlayback.sequence + 1;
+    const expectedId = endlessPlayback.currentDownloadId;
+    endlessPlayback.advancePending = true;
+    showPlayerTransition('Loading selected video…', []);
+    try {
+        const response = await apiFetch(
+            '/api/playback-sessions/' + encodeURIComponent(endlessPlayback.sessionId)
+                + '/select', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    expected_download_id: expectedId,
+                    download_id: String(downloadId),
+                    sequence,
+                }),
+            },
+        );
+        if (!response.ok) throw await playbackResponseError(response);
+        const data = await response.json();
+        if (epoch !== endlessPlayback.epoch || !endlessPlayback.active) return;
+        endlessPlayback.sequence = data.sequence;
+        endlessPlayback.currentDownloadId = String(data.item.id);
+        endlessPlayback.playlistPosition = data.queue_position;
+        endlessPlayback.progressSequence = Math.max(
+            endlessPlayback.progressSequence, data.progress_sequence || 0,
+        );
+        endlessPlayback.lastSavedPosition = 0;
+        renderPlaylistQueue();
+        loadPlaybackItem(data.item, { automatic: true });
+        recordView(data.item.id);
+    } catch (error) {
+        if (epoch === endlessPlayback.epoch) showPlayerTransition(
+            error.message || 'The selected video could not be loaded.',
+            ['retry', 'close'],
+        );
+    } finally {
+        if (epoch === endlessPlayback.epoch) endlessPlayback.advancePending = false;
+    }
+}
+
 function startEndlessPlayback(id = null, label = '', extension = '', mode = 'sequential') {
     if (mode === 'sequential' && !id && historyTotal === 0) return;
     endlessPlayback.epoch += 1;
@@ -3057,6 +3630,8 @@ function startEndlessPlayback(id = null, label = '', extension = '', mode = 'seq
     endlessPlayback.phase = 'opening';
     endlessPlayback.failureCount = 0;
     endlessPlayback.returnFullscreenNeeded = false;
+    document.getElementById('playlistQueue').hidden = true;
+    document.querySelector('.player-box').classList.remove('playlist-player');
     openBuiltInPlayer({
         fullscreen: startVideosFullscreen,
         requestFullscreen: false,
@@ -3147,7 +3722,7 @@ function startEndlessPlayback(id = null, label = '', extension = '', mode = 'seq
     });
 }
 
-function advanceEndlessPlayback() {
+function advanceEndlessPlayback(completed = false) {
     if (!endlessPlayback.active || !endlessPlayback.sessionId
             || endlessPlayback.advancePending) return;
     const epoch = endlessPlayback.epoch;
@@ -3172,6 +3747,7 @@ function advanceEndlessPlayback() {
             body: JSON.stringify({
                 expected_download_id: expectedId,
                 sequence: nextSequence,
+                completed: endlessPlayback.mode === 'playlist' && completed,
             }),
         },
     ).then(async response => {
@@ -3180,7 +3756,9 @@ function advanceEndlessPlayback() {
             const mode = endlessPlayback.mode;
             deactivateEndlessPlayback({ release: false });
             showPlayerTransition(
-                mode === 'shuffle'
+                mode === 'playlist'
+                    ? (completed ? 'Playlist complete.' : 'No playable videos remain in this playlist.')
+                    : mode === 'shuffle'
                     ? 'No eligible videos remain.'
                     : 'No playable videos remain in this selection.',
                 ['close'],
@@ -3201,6 +3779,13 @@ function advanceEndlessPlayback() {
         if (epoch !== endlessPlayback.epoch || !endlessPlayback.active) return;
         endlessPlayback.sequence = data.sequence;
         endlessPlayback.currentDownloadId = String(data.item.id);
+        if (endlessPlayback.mode === 'playlist') {
+            endlessPlayback.playlistPosition = data.queue_position;
+            endlessPlayback.progressSequence = data.progress_sequence;
+            endlessPlayback.lastSavedPosition = 0;
+            renderPlaylistQueue();
+            recordView(data.item.id);
+        }
         loadPlaybackItem(data.item, { automatic: true });
     }).catch(error => {
         if (epoch !== endlessPlayback.epoch || !endlessPlayback.active) return;
@@ -3225,6 +3810,10 @@ function continueEndlessPlayback() {
 function restartEndlessPlayback() {
     if (endlessPlayback.mode === 'shuffle') {
         startShufflePlayback();
+        return;
+    }
+    if (endlessPlayback.mode === 'playlist' && endlessPlayback.playlistId) {
+        startPlaylistPlayback(endlessPlayback.playlistId);
         return;
     }
     const item = endlessPlayback.currentItem;
@@ -3324,7 +3913,18 @@ playerVideo.addEventListener('webkitbeginfullscreen', () => {
 playerVideo.addEventListener('webkitendfullscreen', handleFullscreenExit);
 playerVideo.addEventListener('ended', () => {
     if (endlessPlayback.active && endlessPlayback.phase === 'playing') {
-        advanceEndlessPlayback();
+        advanceEndlessPlayback(endlessPlayback.mode === 'playlist');
+    }
+});
+playerVideo.addEventListener('pause', () => {
+    if (endlessPlayback.active && endlessPlayback.mode === 'playlist'
+            && !playerVideo.ended) {
+        savePlaylistProgress({ force: true });
+    }
+});
+window.addEventListener('pagehide', () => {
+    if (endlessPlayback.active && endlessPlayback.mode === 'playlist') {
+        savePlaylistProgress({ force: true, keepalive: true });
     }
 });
 
@@ -3396,6 +3996,12 @@ document.addEventListener('keydown', (ev) => {
     if (ev.defaultPrevented) return;
     if (ev.key === 'Escape' && document.getElementById('playerBackdrop').classList.contains('open')) {
         closePlayer();
+    } else if (ev.key === 'Escape' && document.getElementById('playlistEditorDialog').open) {
+        ev.preventDefault();
+        closePlaylistEditor();
+    } else if (ev.key === 'Escape' && document.getElementById('playlistChooserDialog').open) {
+        ev.preventDefault();
+        closePlaylistChooser();
     } else if (ev.key === 'Escape' && document.getElementById('newDownloadDialog').open) {
         ev.preventDefault();
         closeNewDownload();
@@ -4299,6 +4905,7 @@ function scheduleFetch({ sortFavorites = false } = {}) {
         const applyFavoriteSort = pendingFavoriteSort;
         pendingFavoriteSort = false;
         fetchHistory({ sortFavorites: applyFavoriteSort });
+        fetchPlaylists();
     }, 0);
 }
 
@@ -4306,6 +4913,7 @@ function connectEventStream() {
     const es = new EventSource('/api/events');
     es.addEventListener('ready', scheduleFetch);
     es.addEventListener('change', scheduleFetch);
+    es.addEventListener('playlist-progress', fetchPlaylists);
     es.addEventListener('error', () => {
         showServerStatus();
     });
@@ -4316,3 +4924,19 @@ connectEventStream();
 // A fresh page has no visual order to preserve, so establish favorite-first
 // ordering once. Later reconciliations keep that order until a filter runs.
 fetchHistory({ sortFavorites: true });
+fetchPlaylists();
+
+document.getElementById('playlistName').addEventListener(
+    'input', markPlaylistEditorDirty,
+);
+document.getElementById('playlistVideoSearch').addEventListener(
+    'input', renderPlaylistEditor,
+);
+document.getElementById('playlistEditorDialog').addEventListener('cancel', event => {
+    event.preventDefault();
+    closePlaylistEditor();
+});
+document.getElementById('playlistChooserDialog').addEventListener('cancel', event => {
+    event.preventDefault();
+    closePlaylistChooser();
+});

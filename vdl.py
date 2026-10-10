@@ -365,27 +365,30 @@ def _start_user_session(user):
 
 class EventBus:
     def __init__(self):
-        self._subs = set()
+        self._subs = {}
         self._lock = threading.Lock()
 
-    def subscribe(self):
+    def subscribe(self, user_id=None):
         # maxsize keeps a stuck/disconnected client from ballooning memory.
         # If full, we drop the oldest event for that subscriber -- stale clients
         # always reconcile by refetching /api/history on the next event anyway.
         q = queue.Queue(maxsize=64)
         with self._lock:
-            self._subs.add(q)
+            self._subs[q] = user_id
         return q
 
     def unsubscribe(self, q):
         with self._lock:
-            self._subs.discard(q)
+            self._subs.pop(q, None)
 
-    def publish(self, kind, payload=None):
+    def publish(self, kind, payload=None, owner_user_id=None):
         msg = (kind, payload)
         with self._lock:
-            subs = list(self._subs)
-        for q in subs:
+            subs = list(self._subs.items())
+        for q, subscriber_user_id in subs:
+            if (owner_user_id is not None
+                    and subscriber_user_id != owner_user_id):
+                continue
             try:
                 q.put_nowait(msg)
             except queue.Full:
@@ -431,6 +434,8 @@ PLAYBACK_SESSION_MAX_PAGE_SIZE = 100
 PLAYBACK_SESSION_MAX_COORDINATE = 1_000_000
 PLAYBACK_SESSION_ORDERINGS = ('newest', 'favorites_first')
 SHUFFLE_MIN_HEIGHTS = (0, 360, 480, 720, 1080, 1440, 2160, 4320)
+PLAYLIST_MAX_ITEMS = 10_000
+PLAYLIST_MAX_POSITION_SECONDS = 31 * 24 * 60 * 60
 BROWSER_VIDEO_EXTENSIONS = {
     '.mp4', '.m4v', '.webm', '.mkv', '.ogg', '.ogv', '.mov', '.avi',
 }
@@ -533,6 +538,39 @@ def init_db():
                 created_at  REAL NOT NULL,
                 PRIMARY KEY (download_id, tag_id)
             );
+            CREATE TABLE IF NOT EXISTS playlists (
+                id                 TEXT PRIMARY KEY,
+                owner_user_id      INTEGER NOT NULL
+                                         REFERENCES users(id) ON DELETE CASCADE,
+                name               TEXT NOT NULL,
+                revision           INTEGER NOT NULL DEFAULT 1,
+                created_at         REAL NOT NULL,
+                content_updated_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS playlist_items (
+                playlist_id TEXT NOT NULL
+                                 REFERENCES playlists(id) ON DELETE CASCADE,
+                download_id TEXT NOT NULL
+                                 REFERENCES downloads(id) ON DELETE CASCADE,
+                position    INTEGER NOT NULL CHECK (position >= 0),
+                added_at    REAL NOT NULL,
+                PRIMARY KEY (playlist_id, download_id),
+                UNIQUE (playlist_id, position)
+            );
+            CREATE TABLE IF NOT EXISTS playlist_progress (
+                playlist_id     TEXT PRIMARY KEY
+                                     REFERENCES playlists(id) ON DELETE CASCADE,
+                download_id     TEXT REFERENCES downloads(id) ON DELETE SET NULL,
+                position_seconds REAL NOT NULL DEFAULT 0,
+                completed       INTEGER NOT NULL DEFAULT 0
+                                      CHECK (completed IN (0, 1)),
+                write_sequence  INTEGER NOT NULL DEFAULT 0,
+                updated_at      REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS playlists_owner_updated
+                ON playlists(owner_user_id, content_updated_at DESC, id);
+            CREATE INDEX IF NOT EXISTS playlist_items_download
+                ON playlist_items(download_id);
             CREATE TABLE IF NOT EXISTS ingest_receipts (
                 source_path TEXT PRIMARY KEY,
                 device      INTEGER NOT NULL,
@@ -648,6 +686,16 @@ def init_db():
         conn.execute(
             "UPDATE users SET name = username WHERE name = ''"
         )
+
+        existing_progress_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(playlist_progress)")
+        }
+        if "write_sequence" not in existing_progress_cols:
+            conn.execute(
+                "ALTER TABLE playlist_progress ADD COLUMN "
+                "write_sequence INTEGER NOT NULL DEFAULT 0"
+            )
 
         # Roles are rows rather than a users-table enum so deployments can add
         # role names later without another schema migration. The join table is
@@ -1168,6 +1216,69 @@ def delete_download_artifacts(entry, fallback_dir=None):
     return removed
 
 
+def _db_remove_download_from_playlists(conn, download_id):
+    """Remove one membership everywhere and repair order/progress atomically."""
+    affected = conn.execute(
+        "SELECT playlist_items.playlist_id, playlist_items.position, "
+        "playlist_progress.download_id AS progress_download_id "
+        "FROM playlist_items "
+        "LEFT JOIN playlist_progress "
+        "ON playlist_progress.playlist_id = playlist_items.playlist_id "
+        "WHERE playlist_items.download_id = ?",
+        (download_id,),
+    ).fetchall()
+    now = time.time()
+    for row in affected:
+        playlist_id = row['playlist_id']
+        removed_position = row['position']
+        conn.execute(
+            "DELETE FROM playlist_items "
+            "WHERE playlist_id = ? AND download_id = ?",
+            (playlist_id, download_id),
+        )
+        # The removed position is now free. Moving later rows in ascending
+        # order keeps every intermediate state valid under the UNIQUE key.
+        shifted = conn.execute(
+            "SELECT download_id, position FROM playlist_items "
+            "WHERE playlist_id = ? AND position > ? ORDER BY position",
+            (playlist_id, removed_position),
+        ).fetchall()
+        for item in shifted:
+            conn.execute(
+                "UPDATE playlist_items SET position = ? "
+                "WHERE playlist_id = ? AND download_id = ?",
+                (item['position'] - 1, playlist_id, item['download_id']),
+            )
+        if row['progress_download_id'] == download_id:
+            target = conn.execute(
+                "SELECT download_id FROM playlist_items "
+                "WHERE playlist_id = ? ORDER BY "
+                "CASE WHEN position >= ? THEN 0 ELSE 1 END, "
+                "CASE WHEN position >= ? THEN position ELSE -position END "
+                "LIMIT 1",
+                (playlist_id, removed_position, removed_position),
+            ).fetchone()
+            if target is None:
+                conn.execute(
+                    "DELETE FROM playlist_progress WHERE playlist_id = ?",
+                    (playlist_id,),
+                )
+            else:
+                conn.execute(
+                    "UPDATE playlist_progress SET download_id = ?, "
+                    "position_seconds = 0, completed = 0, "
+                    "write_sequence = write_sequence + 1, updated_at = ? "
+                    "WHERE playlist_id = ?",
+                    (target['download_id'], now, playlist_id),
+                )
+        conn.execute(
+            "UPDATE playlists SET revision = revision + 1, "
+            "content_updated_at = ? WHERE id = ?",
+            (now, playlist_id),
+        )
+    return len(affected)
+
+
 def db_remove_download_if_inactive(download_id, fallback_dir=None):
     """Atomically remove a non-active, fully stopped download row."""
     with _db_lock, db() as conn:
@@ -1185,6 +1296,7 @@ def db_remove_download_if_inactive(download_id, fallback_dir=None):
         # the state lock also prevents Resume from claiming the same partial
         # files while they are being removed.
         delete_download_artifacts(entry, fallback_dir)
+        _db_remove_download_from_playlists(conn, download_id)
         cur = conn.execute(
             "DELETE FROM downloads WHERE id = ? "
             "AND status NOT IN ('starting', 'downloading', 'paused')",
@@ -1211,6 +1323,8 @@ def db_clear_history():
         files_deleted = sum(
             delete_download_artifacts(entry, fallback_dir) for entry in entries
         )
+        for entry in entries:
+            _db_remove_download_from_playlists(conn, entry['id'])
         cur = conn.execute(
             f"DELETE FROM downloads WHERE status IN ({placeholders})",
             HISTORY_STATUSES,
@@ -1543,7 +1657,7 @@ def _release_playback_sessions_for_user(user_id):
 
 
 def _playback_session_response(state, entry):
-    return {
+    response = {
         'session_id': state['session_id'],
         'mode': state['mode'],
         'sequence': state['sequence'],
@@ -1551,6 +1665,510 @@ def _playback_session_response(state, entry):
         'position': state.get('position'),
         'item': _playback_item(entry),
     }
+    if state['mode'] == 'playlist':
+        response.update({
+            'playlist_id': state['playlist_id'],
+            'playlist_revision': state['playlist_revision'],
+            'queue_position': state['playlist_position'],
+            'queue': state['playlist_queue'],
+            'resume_seconds': state.get('resume_seconds', 0),
+            'progress_sequence': state.get('progress_sequence', 0),
+        })
+    return response
+
+
+class PlaylistNotFound(Exception):
+    """Hide unknown and foreign playlist identifiers behind one response."""
+
+
+class PlaylistRevisionConflict(Exception):
+    """An editor or playback request used stale playlist state."""
+
+
+def _validated_playlist_name(value):
+    if not isinstance(value, str):
+        raise ValueError('Playlist name is required')
+    name = unicodedata.normalize('NFC', value).strip()
+    if (not name or len(name) > 120
+            or any(unicodedata.category(character).startswith('C')
+                   for character in name)):
+        raise ValueError(
+            'Playlist name must be between 1 and 120 visible characters'
+        )
+    return name
+
+
+def _validated_playlist_download_ids(value):
+    if not isinstance(value, list):
+        raise ValueError('download_ids must be an array')
+    if len(value) > PLAYLIST_MAX_ITEMS:
+        raise ValueError(
+            f'A playlist may contain at most {PLAYLIST_MAX_ITEMS} videos'
+        )
+    if any(not isinstance(item, str) or not item or len(item) > 128
+           for item in value):
+        raise ValueError('Every download id must be a non-empty string')
+    if len(set(value)) != len(value):
+        raise ValueError('A video may occur only once in a playlist')
+    return value
+
+
+def _playlist_download_visible(entry, user_id, is_admin):
+    return bool(entry) and (
+        entry.get('visibility') == 'public'
+        or entry.get('owner_user_id') == user_id
+        or is_admin
+    )
+
+
+def _playlist_download_playable(entry, user_id, is_admin):
+    if (not _playlist_download_visible(entry, user_id, is_admin)
+            or entry.get('status') != 'finished'):
+        return False
+    filename = entry.get('filename')
+    if (not filename or Path(filename).suffix.lower()
+            not in BROWSER_VIDEO_EXTENSIONS or not os.path.isfile(filename)):
+        return False
+    return _is_allowed_download_path(os.path.realpath(filename))
+
+
+def _playlist_download_row(conn, download_id):
+    row = conn.execute(
+        "SELECT id, status, filename, title, duration_seconds, visibility, "
+        "owner_user_id FROM downloads WHERE id = ?",
+        (download_id,),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def _playlist_item(entry, position):
+    if entry is None:
+        return {
+            'id': None,
+            'position': position,
+            'unavailable': True,
+            'title': 'Unavailable video',
+            'extension': '',
+            'duration_seconds': None,
+        }
+    item = _playback_item(entry)
+    item.update({
+        'position': position,
+        'unavailable': False,
+        'duration_seconds': _finite_positive_number(
+            entry.get('duration_seconds')
+        ),
+        'thumbnail_url': f"/api/thumbnail/{entry['id']}",
+    })
+    return item
+
+
+class PlaylistService:
+    """Own playlist authorization, validation, repair, and transactions."""
+
+    @staticmethod
+    def _owned(conn, playlist_id, user_id):
+        row = conn.execute(
+            "SELECT id, owner_user_id, name, revision, created_at, "
+            "content_updated_at FROM playlists "
+            "WHERE id = ? AND owner_user_id = ?",
+            (playlist_id, user_id),
+        ).fetchone()
+        if row is None:
+            raise PlaylistNotFound()
+        return dict(row)
+
+    @staticmethod
+    def _members(conn, playlist_id):
+        return conn.execute(
+            "SELECT playlist_items.download_id, downloads.id AS id, "
+            "playlist_items.position, "
+            "playlist_items.added_at, downloads.status, downloads.filename, "
+            "downloads.title, downloads.duration_seconds, "
+            "downloads.visibility, downloads.owner_user_id "
+            "FROM playlist_items "
+            "LEFT JOIN downloads ON downloads.id = playlist_items.download_id "
+            "WHERE playlist_items.playlist_id = ? "
+            "ORDER BY playlist_items.position",
+            (playlist_id,),
+        ).fetchall()
+
+    @staticmethod
+    def _progress(conn, playlist_id):
+        row = conn.execute(
+            "SELECT playlist_id, download_id, position_seconds, completed, "
+            "write_sequence, updated_at FROM playlist_progress "
+            "WHERE playlist_id = ?",
+            (playlist_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        progress = dict(row)
+        progress['completed'] = bool(progress['completed'])
+        return progress
+
+    def _validated_downloads(self, conn, download_ids, user_id, is_admin):
+        entries = []
+        for download_id in _validated_playlist_download_ids(download_ids):
+            entry = _playlist_download_row(conn, download_id)
+            if not _playlist_download_playable(entry, user_id, is_admin):
+                raise ValueError(
+                    'Every playlist video must be visible, finished, present, '
+                    'safe, and browser-playable'
+                )
+            entries.append(entry)
+        return entries
+
+    def _repair_progress(self, conn, playlist_id, members, old_position=None):
+        progress = self._progress(conn, playlist_id)
+        if not members:
+            conn.execute(
+                "DELETE FROM playlist_progress WHERE playlist_id = ?",
+                (playlist_id,),
+            )
+            return None
+        member_ids = [row['download_id'] for row in members]
+        if progress is None or progress['download_id'] in member_ids:
+            return progress
+        target_position = min(
+            max(0, int(old_position or 0)), len(member_ids) - 1
+        )
+        now = time.time()
+        conn.execute(
+            "UPDATE playlist_progress SET download_id = ?, "
+            "position_seconds = 0, completed = 0, "
+            "write_sequence = write_sequence + 1, updated_at = ? "
+            "WHERE playlist_id = ?",
+            (member_ids[target_position], now, playlist_id),
+        )
+        return self._progress(conn, playlist_id)
+
+    def list_summaries(self, user_id, is_admin=False):
+        with _db_lock, db() as conn:
+            rows = conn.execute(
+                "SELECT id, owner_user_id, name, revision, created_at, "
+                "content_updated_at FROM playlists WHERE owner_user_id = ? "
+                "ORDER BY content_updated_at DESC, id ASC",
+                (user_id,),
+            ).fetchall()
+            summaries = []
+            for raw in rows:
+                playlist = dict(raw)
+                members = self._members(conn, playlist['id'])
+                progress = self._repair_progress(
+                    conn, playlist['id'], members,
+                    next((row['position'] for row in members
+                          if row['download_id'] == (
+                              self._progress(conn, playlist['id']) or {}
+                          ).get('download_id')), 0),
+                )
+                visible = []
+                duration = 0.0
+                for row in members:
+                    entry = dict(row)
+                    if _playlist_download_visible(entry, user_id, is_admin):
+                        visible.append(entry)
+                        known = _finite_positive_number(
+                            entry.get('duration_seconds')
+                        )
+                        if known is not None:
+                            duration += known
+                resume_position = next(
+                    (row['position'] for row in members
+                     if progress and row['download_id'] == progress['download_id']),
+                    0,
+                )
+                playlist.update({
+                    'item_count': len(members),
+                    'duration_seconds': duration or None,
+                    'mosaic_ids': [row['download_id'] for row in visible[:4]],
+                    'member_ids': [row['download_id'] for row in members],
+                    'progress': progress,
+                    'resume_position': resume_position,
+                })
+                summaries.append(playlist)
+            return summaries
+
+    def get(self, playlist_id, user_id, is_admin=False):
+        with _db_lock, db() as conn:
+            playlist = self._owned(conn, playlist_id, user_id)
+            members = self._members(conn, playlist_id)
+            progress = self._progress(conn, playlist_id)
+            old_position = next(
+                (row['position'] for row in members
+                 if progress and row['download_id'] == progress['download_id']),
+                0,
+            )
+            progress = self._repair_progress(
+                conn, playlist_id, members, old_position
+            )
+            items = []
+            for row in members:
+                entry = dict(row)
+                visible = _playlist_download_visible(entry, user_id, is_admin)
+                items.append(_playlist_item(entry if visible else None,
+                                            row['position']))
+            playlist.update({'items': items, 'progress': progress})
+            return playlist
+
+    def create(self, user_id, name, download_id=None, is_admin=False,
+               download_ids=None):
+        name = _validated_playlist_name(name)
+        if download_ids is None:
+            download_ids = [] if download_id is None else [download_id]
+        elif download_id is not None:
+            raise ValueError('Use download_id or download_ids, not both')
+        playlist_id = str(uuid.uuid4())
+        now = time.time()
+        with _db_lock, db() as conn:
+            entries = self._validated_downloads(
+                conn, download_ids, user_id, is_admin
+            )
+            conn.execute(
+                "INSERT INTO playlists(id, owner_user_id, name, revision, "
+                "created_at, content_updated_at) VALUES (?, ?, ?, 1, ?, ?)",
+                (playlist_id, user_id, name, now, now),
+            )
+            for position, entry in enumerate(entries):
+                conn.execute(
+                    "INSERT INTO playlist_items(playlist_id, download_id, "
+                    "position, added_at) VALUES (?, ?, ?, ?)",
+                    (playlist_id, entry['id'], position, now),
+                )
+        event_bus.publish('change', {
+            'reason': 'playlist-create', 'playlist_id': playlist_id,
+        }, owner_user_id=user_id)
+        return self.get(playlist_id, user_id, is_admin)
+
+    def replace(self, playlist_id, user_id, name, download_ids,
+                expected_revision, is_admin=False):
+        name = _validated_playlist_name(name)
+        if (isinstance(expected_revision, bool)
+                or not isinstance(expected_revision, int)
+                or expected_revision < 1):
+            raise ValueError('expected_revision must be a positive integer')
+        now = time.time()
+        with _db_lock, db() as conn:
+            playlist = self._owned(conn, playlist_id, user_id)
+            if playlist['revision'] != expected_revision:
+                raise PlaylistRevisionConflict()
+            entries = self._validated_downloads(
+                conn, download_ids, user_id, is_admin
+            )
+            old_members = self._members(conn, playlist_id)
+            old_added = {
+                row['download_id']: row['added_at'] for row in old_members
+            }
+            progress = self._progress(conn, playlist_id)
+            old_position = next(
+                (row['position'] for row in old_members
+                 if progress and row['download_id'] == progress['download_id']),
+                0,
+            )
+            conn.execute(
+                "DELETE FROM playlist_items WHERE playlist_id = ?",
+                (playlist_id,),
+            )
+            for position, entry in enumerate(entries):
+                conn.execute(
+                    "INSERT INTO playlist_items(playlist_id, download_id, "
+                    "position, added_at) VALUES (?, ?, ?, ?)",
+                    (playlist_id, entry['id'], position,
+                     old_added.get(entry['id'], now)),
+                )
+            conn.execute(
+                "UPDATE playlists SET name = ?, revision = revision + 1, "
+                "content_updated_at = ? WHERE id = ?",
+                (name, now, playlist_id),
+            )
+            self._repair_progress(
+                conn, playlist_id, self._members(conn, playlist_id), old_position
+            )
+        event_bus.publish('change', {
+            'reason': 'playlist-edit', 'playlist_id': playlist_id,
+        }, owner_user_id=user_id)
+        return self.get(playlist_id, user_id, is_admin)
+
+    def add(self, playlist_id, user_id, download_id, is_admin=False):
+        if not isinstance(download_id, str) or not download_id:
+            raise ValueError('download_id is required')
+        now = time.time()
+        changed = False
+        with _db_lock, db() as conn:
+            self._owned(conn, playlist_id, user_id)
+            entry = self._validated_downloads(
+                conn, [download_id], user_id, is_admin
+            )[0]
+            existing = conn.execute(
+                "SELECT 1 FROM playlist_items "
+                "WHERE playlist_id = ? AND download_id = ?",
+                (playlist_id, download_id),
+            ).fetchone()
+            if existing is None:
+                count = conn.execute(
+                    "SELECT COUNT(*) FROM playlist_items WHERE playlist_id = ?",
+                    (playlist_id,),
+                ).fetchone()[0]
+                if count >= PLAYLIST_MAX_ITEMS:
+                    raise ValueError(
+                        f'A playlist may contain at most {PLAYLIST_MAX_ITEMS} videos'
+                    )
+                conn.execute(
+                    "INSERT INTO playlist_items(playlist_id, download_id, "
+                    "position, added_at) VALUES (?, ?, ?, ?)",
+                    (playlist_id, entry['id'], count, now),
+                )
+                conn.execute(
+                    "UPDATE playlists SET revision = revision + 1, "
+                    "content_updated_at = ? WHERE id = ?",
+                    (now, playlist_id),
+                )
+                changed = True
+        if changed:
+            event_bus.publish('change', {
+                'reason': 'playlist-add', 'playlist_id': playlist_id,
+            }, owner_user_id=user_id)
+        result = self.get(playlist_id, user_id, is_admin)
+        result['changed'] = changed
+        return result
+
+    def delete(self, playlist_id, user_id):
+        with _db_lock, db() as conn:
+            self._owned(conn, playlist_id, user_id)
+            conn.execute("DELETE FROM playlists WHERE id = ?", (playlist_id,))
+        event_bus.publish('change', {
+            'reason': 'playlist-delete', 'playlist_id': playlist_id,
+        }, owner_user_id=user_id)
+
+    def save_progress(self, playlist_id, user_id, download_id, seconds,
+                      completed, write_sequence):
+        if (isinstance(seconds, bool) or not isinstance(seconds, (int, float))
+                or not math.isfinite(seconds) or seconds < 0
+                or seconds > PLAYLIST_MAX_POSITION_SECONDS):
+            raise ValueError('position_seconds must be a finite nonnegative number')
+        if not isinstance(completed, bool):
+            raise ValueError('completed must be true or false')
+        if (isinstance(write_sequence, bool)
+                or not isinstance(write_sequence, int)
+                or not 0 <= write_sequence <= PLAYBACK_SESSION_MAX_COORDINATE):
+            raise ValueError('write_sequence is outside the allowed range')
+        if download_id is not None and (
+                not isinstance(download_id, str) or not download_id):
+            raise ValueError('download_id must be a string or null')
+        if download_id is None and not completed:
+            raise ValueError('An incomplete playlist requires a current video')
+
+        changed = False
+        with _db_lock, db() as conn:
+            self._owned(conn, playlist_id, user_id)
+            if download_id is not None:
+                member = conn.execute(
+                    "SELECT 1 FROM playlist_items "
+                    "WHERE playlist_id = ? AND download_id = ?",
+                    (playlist_id, download_id),
+                ).fetchone()
+                if member is None:
+                    raise PlaylistRevisionConflict()
+            current = self._progress(conn, playlist_id)
+            if current is not None and write_sequence < current['write_sequence']:
+                return False
+            if current is not None and write_sequence == current['write_sequence']:
+                same = (
+                    current['download_id'] == download_id
+                    and math.isclose(current['position_seconds'], float(seconds),
+                                     abs_tol=0.001)
+                    and current['completed'] == completed
+                )
+                if not same:
+                    raise PlaylistRevisionConflict()
+                return False
+            conn.execute(
+                "INSERT INTO playlist_progress(playlist_id, download_id, "
+                "position_seconds, completed, write_sequence, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(playlist_id) DO UPDATE SET "
+                "download_id = excluded.download_id, "
+                "position_seconds = excluded.position_seconds, "
+                "completed = excluded.completed, "
+                "write_sequence = excluded.write_sequence, "
+                "updated_at = excluded.updated_at",
+                (playlist_id, download_id, float(seconds), int(completed),
+                 write_sequence, time.time()),
+            )
+            changed = True
+        if changed:
+            event_bus.publish('playlist-progress', {
+                'reason': 'playlist-progress', 'playlist_id': playlist_id,
+            }, owner_user_id=user_id)
+        return changed
+
+    def playback_snapshot(self, playlist_id, user_id, restart=False,
+                          start_download_id=None, is_admin=False):
+        detail = self.get(playlist_id, user_id, is_admin)
+        with db() as conn:
+            members = self._members(conn, playlist_id)
+            snapshot_ids = [row['download_id'] for row in members]
+            queue_items = []
+            playable = {}
+            for row in members:
+                entry = dict(row)
+                if _playlist_download_playable(entry, user_id, is_admin):
+                    playable[row['position']] = entry
+                    queue_items.append(_playlist_item(entry, row['position']))
+                else:
+                    queue_items.append(_playlist_item(None, row['position']))
+        if not playable:
+            return detail, queue_items, snapshot_ids, None, 0, 0
+        progress = detail.get('progress')
+        if progress and progress['completed'] and not restart:
+            raise PlaylistRevisionConflict('completed')
+        if start_download_id is not None:
+            start_position = next(
+                (position for position, entry in playable.items()
+                 if entry['id'] == start_download_id), None
+            )
+            if start_position is None:
+                raise PlaylistRevisionConflict()
+            resume_seconds = 0
+        elif restart or not progress:
+            start_position = min(playable)
+            resume_seconds = 0
+        else:
+            start_position = next(
+                (position for position, entry in playable.items()
+                 if entry['id'] == progress['download_id']), None
+            )
+            if start_position is None:
+                start_position = min(playable)
+                resume_seconds = 0
+            else:
+                resume_seconds = float(progress['position_seconds'])
+                if resume_seconds < 5:
+                    resume_seconds = 0
+                duration = _finite_positive_number(
+                    playable[start_position].get('duration_seconds')
+                )
+                if (duration is not None
+                        and duration - min(duration, resume_seconds)
+                        <= max(30, duration * 0.05)):
+                    next_positions = [
+                        position for position in playable
+                        if position > start_position
+                    ]
+                    if next_positions:
+                        start_position = min(next_positions)
+                        resume_seconds = 0
+                    else:
+                        self.save_progress(
+                            playlist_id, user_id, progress['download_id'], 0,
+                            True, int(progress.get('write_sequence') or 0) + 1,
+                        )
+                        raise PlaylistRevisionConflict('completed')
+        return (detail, queue_items, snapshot_ids, playable[start_position],
+                start_position, resume_seconds)
+
+
+playlists = PlaylistService()
 
 
 def db_get_preferences():
@@ -4592,6 +5210,105 @@ def get_history():
     ))
 
 
+def _playlist_error_response(exc):
+    if isinstance(exc, PlaylistNotFound):
+        return jsonify({'error': 'Unknown playlist'}), 404
+    if isinstance(exc, PlaylistRevisionConflict):
+        if exc.args and exc.args[0] == 'completed':
+            return jsonify({
+                'code': 'playlist_completed',
+                'error': 'This playlist is complete. Replay it from the beginning.',
+            }), 409
+        return jsonify({'error': 'Playlist state changed'}), 409
+    return jsonify({'error': str(exc)}), 400
+
+
+@app.route('/api/playlists', methods=['GET', 'POST'])
+def playlist_collection():
+    user_id = g.current_user['id']
+    is_admin = 'admin' in g.current_user['roles']
+    if request.method == 'GET':
+        return jsonify(playlists.list_summaries(user_id, is_admin))
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({'error': 'A JSON object is required'}), 400
+    try:
+        result = playlists.create(
+            user_id, payload.get('name'), payload.get('download_id'), is_admin,
+            payload.get('download_ids'),
+        )
+    except (ValueError, PlaylistNotFound,
+            PlaylistRevisionConflict) as exc:
+        return _playlist_error_response(exc)
+    return jsonify(result), 201
+
+
+@app.route('/api/playlists/<playlist_id>',
+           methods=['GET', 'PUT', 'DELETE'])
+def playlist_resource(playlist_id):
+    user_id = g.current_user['id']
+    is_admin = 'admin' in g.current_user['roles']
+    try:
+        if request.method == 'GET':
+            return jsonify(playlists.get(playlist_id, user_id, is_admin))
+        if request.method == 'DELETE':
+            playlists.delete(playlist_id, user_id)
+            return '', 204
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify({'error': 'A JSON object is required'}), 400
+        result = playlists.replace(
+            playlist_id,
+            user_id,
+            payload.get('name'),
+            payload.get('download_ids'),
+            payload.get('expected_revision'),
+            is_admin,
+        )
+        return jsonify(result)
+    except (ValueError, PlaylistNotFound,
+            PlaylistRevisionConflict) as exc:
+        return _playlist_error_response(exc)
+
+
+@app.route('/api/playlists/<playlist_id>/items', methods=['POST'])
+def playlist_items(playlist_id):
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({'error': 'A JSON object is required'}), 400
+    try:
+        result = playlists.add(
+            playlist_id,
+            g.current_user['id'],
+            payload.get('download_id'),
+            'admin' in g.current_user['roles'],
+        )
+        return jsonify(result)
+    except (ValueError, PlaylistNotFound,
+            PlaylistRevisionConflict) as exc:
+        return _playlist_error_response(exc)
+
+
+@app.route('/api/playlists/<playlist_id>/progress', methods=['PUT'])
+def playlist_progress(playlist_id):
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({'error': 'A JSON object is required'}), 400
+    try:
+        playlists.save_progress(
+            playlist_id,
+            g.current_user['id'],
+            payload.get('download_id'),
+            payload.get('position_seconds'),
+            payload.get('completed'),
+            payload.get('write_sequence'),
+        )
+    except (ValueError, PlaylistNotFound,
+            PlaylistRevisionConflict) as exc:
+        return _playlist_error_response(exc)
+    return '', 204
+
+
 def _playback_integer(payload, key, minimum, maximum):
     value = payload.get(key)
     if isinstance(value, bool) or not isinstance(value, int):
@@ -4607,11 +5324,64 @@ def create_playback_session():
     if not isinstance(payload, dict):
         return jsonify({'error': 'A JSON object is required'}), 400
     mode = payload.get('mode', 'sequential')
-    if mode not in ('sequential', 'shuffle'):
+    if mode not in ('sequential', 'shuffle', 'playlist'):
         return jsonify({'error': 'Unknown playback mode'}), 400
     user_id = g.current_user['id']
     is_admin = 'admin' in g.current_user['roles']
-    if mode == 'shuffle':
+    if mode == 'playlist':
+        playlist_id = payload.get('playlist_id')
+        start_download_id = payload.get('start_download_id')
+        restart = payload.get('restart', False)
+        if (not isinstance(playlist_id, str) or not playlist_id
+                or len(playlist_id) > 128):
+            return jsonify({'error': 'playlist_id is invalid'}), 400
+        if start_download_id is not None and (
+                not isinstance(start_download_id, str)
+                or not start_download_id
+                or len(start_download_id) > 128):
+            return jsonify({'error': 'start_download_id is invalid'}), 400
+        if not isinstance(restart, bool):
+            return jsonify({'error': 'restart must be true or false'}), 400
+        try:
+            (playlist, queue_items, snapshot_ids, entry,
+             playlist_position, resume_seconds) = playlists.playback_snapshot(
+                playlist_id, user_id, restart, start_download_id, is_admin
+            )
+        except (ValueError, PlaylistNotFound,
+                PlaylistRevisionConflict) as exc:
+            return _playlist_error_response(exc)
+        if entry is None:
+            return '', 204
+        progress = playlist.get('progress') or {}
+        state_fields = {
+            'mode': mode,
+            'playlist_id': playlist_id,
+            'playlist_revision': playlist['revision'],
+            'playlist_order': snapshot_ids,
+            'playlist_queue': queue_items,
+            'playlist_position': playlist_position,
+            'resume_seconds': resume_seconds,
+            'progress_sequence': int(progress.get('write_sequence') or 0),
+            'page': None,
+            'position': None,
+        }
+        progress_needs_repair = bool(progress) and (
+            progress.get('download_id') != entry['id']
+            or not math.isclose(
+                float(progress.get('position_seconds') or 0),
+                float(resume_seconds), abs_tol=0.001,
+            )
+        )
+        if restart or start_download_id is not None or progress_needs_repair:
+            state_fields['progress_sequence'] += 1
+            try:
+                playlists.save_progress(
+                    playlist_id, user_id, entry['id'], 0, False,
+                    state_fields['progress_sequence'],
+                )
+            except PlaylistRevisionConflict:
+                return jsonify({'error': 'Playlist progress changed'}), 409
+    elif mode == 'shuffle':
         try:
             minimum_height, minimum_duration = _shuffle_preferences(
                 db_get_preferences()
@@ -4752,6 +5522,12 @@ def advance_playback_session(session_id):
         state = _playback_sessions.get(session_id)
         if state is None or state['owner_user_id'] != user_id:
             return jsonify({'error': 'Unknown playback session'}), 404
+        if (sequence == state['sequence']
+                and state.get('last_status') == 204):
+            if expected_download_id != state['last_expected_download_id']:
+                return jsonify({'error': 'Playback position changed'}), 409
+            state['last_activity'] = now
+            return '', 204
         if sequence == state['sequence'] and state['last_response'] is not None:
             if expected_download_id != state['last_expected_download_id']:
                 return jsonify({'error': 'Playback position changed'}), 409
@@ -4762,7 +5538,58 @@ def advance_playback_session(session_id):
         if expected_download_id != state['current_download_id']:
             return jsonify({'error': 'Playback position changed'}), 409
 
-        if state['mode'] == 'shuffle':
+        if state['mode'] == 'playlist':
+            completed = payload.get('completed', False)
+            if not isinstance(completed, bool):
+                return jsonify({'error': 'completed must be true or false'}), 400
+            try:
+                playlist = playlists.get(
+                    state['playlist_id'], user_id, is_admin
+                )
+            except PlaylistNotFound:
+                _playback_sessions.pop(session_id, None)
+                return jsonify({'error': 'Unknown playback session'}), 404
+            if state['playlist_revision'] != playlist['revision']:
+                return jsonify({'error': 'Playlist state changed'}), 409
+            next_entry = None
+            next_position = None
+            with db() as conn:
+                for position in range(
+                        state['playlist_position'] + 1,
+                        len(state['playlist_order'])):
+                    candidate = _playlist_download_row(
+                        conn, state['playlist_order'][position]
+                    )
+                    if _playlist_download_playable(candidate, user_id, is_admin):
+                        next_entry = candidate
+                        next_position = position
+                        break
+            current_progress = playlist.get('progress') or {}
+            progress_sequence = int(
+                current_progress.get('write_sequence') or 0
+            ) + 1
+            if next_entry is None:
+                if completed:
+                    playlists.save_progress(
+                        state['playlist_id'], user_id,
+                        state['current_download_id'], 0, True,
+                        progress_sequence,
+                    )
+                    state['progress_sequence'] = progress_sequence
+                state['sequence'] = sequence
+                state['last_expected_download_id'] = expected_download_id
+                state['last_status'] = 204
+                state['last_activity'] = now
+                return '', 204
+            playlists.save_progress(
+                state['playlist_id'], user_id, next_entry['id'], 0, False,
+                progress_sequence,
+            )
+            state['progress_sequence'] = progress_sequence
+            state['playlist_position'] = next_position
+            state['resume_seconds'] = 0
+            entry = next_entry
+        elif state['mode'] == 'shuffle':
             selection, metadata_pending = resolve_shuffle_pool(
                 user_id,
                 is_admin,
@@ -4788,7 +5615,7 @@ def advance_playback_session(session_id):
             selection = resolve_library_selection(
                 user_id, is_admin, state['filter'], state['ordering']
             )
-        if not selection:
+        if state['mode'] != 'playlist' and not selection:
             _playback_sessions.pop(session_id, None)
             return '', 204
         if state['mode'] == 'sequential':
@@ -4802,6 +5629,76 @@ def advance_playback_session(session_id):
         state['sequence'] = sequence
         state['last_expected_download_id'] = expected_download_id
         state['last_activity'] = now
+        state['last_status'] = 200
+        response = _playback_session_response(state, entry)
+        state['last_response'] = response
+        return jsonify(response)
+
+
+@app.route('/api/playback-sessions/<session_id>/select', methods=['POST'])
+def select_playback_session_item(session_id):
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({'error': 'A JSON object is required'}), 400
+    expected_download_id = payload.get('expected_download_id')
+    selected_download_id = payload.get('download_id')
+    if any(not isinstance(value, str) or not value or len(value) > 128
+           for value in (expected_download_id, selected_download_id)):
+        return jsonify({'error': 'Playback download ids are invalid'}), 400
+    try:
+        sequence = _playback_integer(
+            payload, 'sequence', 1, PLAYBACK_SESSION_MAX_COORDINATE
+        )
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+
+    now = time.monotonic()
+    user_id = g.current_user['id']
+    is_admin = 'admin' in g.current_user['roles']
+    with _playback_sessions_lock:
+        _prune_playback_sessions_locked(now)
+        state = _playback_sessions.get(session_id)
+        if (state is None or state['owner_user_id'] != user_id
+                or state['mode'] != 'playlist'):
+            return jsonify({'error': 'Unknown playback session'}), 404
+        if sequence == state['sequence'] and state['last_response'] is not None:
+            if (expected_download_id != state['last_expected_download_id']
+                    or selected_download_id != state.get(
+                        'last_selected_download_id')):
+                return jsonify({'error': 'Playback position changed'}), 409
+            state['last_activity'] = now
+            return jsonify(state['last_response'])
+        if sequence != state['sequence'] + 1:
+            return jsonify({'error': 'Playback sequence is out of order'}), 409
+        if expected_download_id != state['current_download_id']:
+            return jsonify({'error': 'Playback position changed'}), 409
+        try:
+            detail = playlists.get(state['playlist_id'], user_id, is_admin)
+        except PlaylistNotFound:
+            return jsonify({'error': 'Unknown playback session'}), 404
+        if detail['revision'] != state['playlist_revision']:
+            return jsonify({'error': 'Playlist state changed'}), 409
+        state['progress_sequence'] = int(
+            (detail.get('progress') or {}).get('write_sequence') or 0
+        )
+        try:
+            selected_position = state['playlist_order'].index(
+                selected_download_id
+            )
+        except ValueError:
+            return jsonify({'error': 'Playback position changed'}), 409
+        with db() as conn:
+            entry = _playlist_download_row(conn, selected_download_id)
+        if not _playlist_download_playable(entry, user_id, is_admin):
+            return jsonify({'error': 'The selected video is unavailable'}), 409
+        state['playlist_position'] = selected_position
+        state['current_download_id'] = selected_download_id
+        state['sequence'] = sequence
+        state['resume_seconds'] = 0
+        state['last_expected_download_id'] = expected_download_id
+        state['last_selected_download_id'] = selected_download_id
+        state['last_activity'] = now
+        state['last_status'] = 200
         response = _playback_session_response(state, entry)
         state['last_response'] = response
         return jsonify(response)
@@ -4932,9 +5829,10 @@ def events():
     and the browser don't time the connection out during idle periods.
     """
     KEEPALIVE_SECS = 15
+    user_id = g.current_user['id']
 
     def stream():
-        q = event_bus.subscribe()
+        q = event_bus.subscribe(user_id)
         try:
             # Greet the client so it knows the stream is live; also nudges it
             # to do an initial reconcile against /api/history.
@@ -4968,7 +5866,7 @@ def _is_allowed_download_path(path):
     # change, including rows whose worker did not reach a finished state.
     prefs = db_get_preferences()
     allowed_bases = {os.path.realpath(prefs.get('download_dir', '.'))}
-    with _db_lock, sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
             "SELECT DISTINCT output_dir FROM downloads "
             "WHERE output_dir IS NOT NULL"

@@ -119,6 +119,12 @@
                     <path d="M11.5 1.5L14 4l-2.5 2.5"/>
                 </g>
             </symbol>
+            <symbol id="i-playlist" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M2 3h8M2 7h8M2 11h5"/>
+                    <path d="M11 9v5l3-2.5z" fill="currentColor" stroke="none"/>
+                </g>
+            </symbol>
             <symbol id="i-sync" viewBox="0 0 16 16">
                 <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9"/>
@@ -231,6 +237,12 @@
                     </button>
                 </div>
             </div>
+            <button id="createPlaylistButton" class="create-playlist-button" type="button"
+                    onclick="openPlaylistEditor()" aria-label="Create playlist"
+                    aria-haspopup="dialog" aria-controls="playlistEditorDialog">
+                <svg aria-hidden="true"><use href="#i-playlist"/></svg>
+                <span>Create playlist</span>
+            </button>
             <button id="newDownloadButton" class="new-download-button" type="button"
                     onclick="openNewDownload()" aria-label="New download"
                     aria-haspopup="dialog" aria-controls="newDownloadDialog" aria-expanded="false">
@@ -267,6 +279,13 @@
     </header>
 
     <section id="tab-history" class="history-panel" aria-label="Download history">
+        <section id="playlistShelf" class="playlist-shelf" aria-labelledby="playlistShelfTitle" hidden>
+            <div class="playlist-shelf-heading">
+                <h2 id="playlistShelfTitle">Playlists</h2>
+                <span id="playlistShelfCount"></span>
+            </div>
+            <div id="playlistList" class="playlist-list"></div>
+        </section>
         <div id="historyList"></div>
         <div id="historyPager" class="pager" style="display:none;">
             <button id="pagerFirst" onclick="goToPage(0)" aria-label="Jump to first page">«</button>
@@ -658,22 +677,77 @@
         </div>
     </dialog>
 
+    <dialog id="playlistEditorDialog" class="playlist-editor-dialog" aria-labelledby="playlistEditorTitle">
+        <form method="dialog" class="playlist-editor-shell" onsubmit="savePlaylistEditor(event)">
+            <div class="playlist-editor-header">
+                <div>
+                    <h2 id="playlistEditorTitle">Create playlist</h2>
+                    <span id="playlistEditorDirty" class="playlist-dirty" hidden>Unsaved changes</span>
+                </div>
+                <button type="button" class="playlist-dialog-close" onclick="closePlaylistEditor()" aria-label="Close playlist editor"><svg aria-hidden="true"><use href="#i-x"/></svg></button>
+            </div>
+            <div class="playlist-editor-body">
+                <div id="playlistEditorError" class="action-error" role="alert" aria-live="assertive" hidden></div>
+                <label class="playlist-field">Playlist name
+                    <input id="playlistName" type="text" maxlength="120" required autocomplete="off">
+                </label>
+                <label class="playlist-field">Find videos
+                    <input id="playlistVideoSearch" type="text" placeholder="Search finished videos" autocomplete="off">
+                </label>
+                <div class="playlist-editor-columns">
+                    <section aria-labelledby="playlistAvailableTitle">
+                        <h3 id="playlistAvailableTitle">Available videos</h3>
+                        <div id="playlistAvailable" class="playlist-picker-list"></div>
+                    </section>
+                    <section aria-labelledby="playlistSelectedTitle">
+                        <h3 id="playlistSelectedTitle">Playlist order</h3>
+                        <div id="playlistSelected" class="playlist-selected-list"></div>
+                    </section>
+                </div>
+                <div id="playlistMoveStatus" class="visually-hidden" role="status" aria-live="polite"></div>
+            </div>
+            <div class="playlist-editor-actions">
+                <button type="button" onclick="closePlaylistEditor()">Cancel</button>
+                <button id="playlistSaveButton" type="submit">Save playlist</button>
+            </div>
+        </form>
+    </dialog>
+
+    <dialog id="playlistChooserDialog" class="playlist-chooser-dialog" aria-labelledby="playlistChooserTitle">
+        <div class="playlist-chooser-shell">
+            <div class="playlist-editor-header">
+                <h2 id="playlistChooserTitle">Add to playlist</h2>
+                <button type="button" class="playlist-dialog-close" onclick="closePlaylistChooser()" aria-label="Close playlist chooser"><svg aria-hidden="true"><use href="#i-x"/></svg></button>
+            </div>
+            <div id="playlistChooserList" class="playlist-chooser-list"></div>
+            <button type="button" class="playlist-new-choice" onclick="createPlaylistFromChooser()"><svg aria-hidden="true"><use href="#i-plus"/></svg>New playlist…</button>
+        </div>
+    </dialog>
+
     <div id="playerBackdrop" class="player-backdrop" onclick="closePlayer(event)">
         <div class="player-box player-original-size" onclick="event.stopPropagation()">
             <button class="player-close" type="button" onclick="closePlayer()" aria-label="Close player"><svg aria-hidden="true"><use href="#i-x"/></svg></button>
-            <video id="playerVideo" controls autoplay></video>
-            <div id="playerTransition" class="player-transition" hidden>
-                <span id="playerStatus" role="status" aria-live="polite"></span>
-                <div class="player-transition-actions">
-                    <button id="playerContinue" type="button" onclick="continueEndlessPlayback()" hidden>Continue playback</button>
-                    <button id="playerReturnFullscreen" type="button" onclick="returnEndlessFullscreen()" hidden>Return to fullscreen</button>
-                    <button id="playerRetry" type="button" onclick="retryEndlessPlayback()" hidden>Retry</button>
-                    <button id="playerRestart" type="button" onclick="restartEndlessPlayback()" hidden>Start a new session</button>
-                    <button id="playerSkip" type="button" onclick="skipEndlessPlayback()" hidden>Skip</button>
-                    <button id="playerStopEndless" type="button" onclick="stopEndlessPlayback()" hidden>Stop endless playback</button>
-                    <button id="playerPlaybackSettings" type="button" onclick="openPlaybackSettingsFromPlayer()" hidden>Open Playback settings</button>
-                    <button id="playerTransitionClose" type="button" onclick="closePlayer()" hidden>Close</button>
+            <div class="player-layout">
+                <div class="player-media-column">
+                    <video id="playerVideo" controls autoplay></video>
+                    <div id="playerTransition" class="player-transition" hidden>
+                        <span id="playerStatus" role="status" aria-live="polite"></span>
+                        <div class="player-transition-actions">
+                            <button id="playerContinue" type="button" onclick="continueEndlessPlayback()" hidden>Continue playback</button>
+                            <button id="playerReturnFullscreen" type="button" onclick="returnEndlessFullscreen()" hidden>Return to fullscreen</button>
+                            <button id="playerRetry" type="button" onclick="retryEndlessPlayback()" hidden>Retry</button>
+                            <button id="playerRestart" type="button" onclick="restartEndlessPlayback()" hidden>Start a new session</button>
+                            <button id="playerSkip" type="button" onclick="skipEndlessPlayback()" hidden>Skip</button>
+                            <button id="playerStopEndless" type="button" onclick="stopEndlessPlayback()" hidden>Stop endless playback</button>
+                            <button id="playerPlaybackSettings" type="button" onclick="openPlaybackSettingsFromPlayer()" hidden>Open Playback settings</button>
+                            <button id="playerTransitionClose" type="button" onclick="closePlayer()" hidden>Close</button>
+                        </div>
+                    </div>
                 </div>
+                <aside id="playlistQueue" class="playlist-queue" aria-labelledby="playlistQueueTitle" hidden>
+                    <h2 id="playlistQueueTitle">Playlist queue</h2>
+                    <div id="playlistQueueItems" class="playlist-queue-items"></div>
+                </aside>
             </div>
         </div>
     </div>

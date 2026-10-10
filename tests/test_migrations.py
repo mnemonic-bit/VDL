@@ -31,6 +31,13 @@ class SchemaMigrationTest(unittest.TestCase):
                         session_version INTEGER NOT NULL DEFAULT 0,
                         created_at REAL NOT NULL
                     );
+                    CREATE TABLE playlist_progress (
+                        playlist_id TEXT PRIMARY KEY,
+                        download_id TEXT,
+                        position_seconds REAL NOT NULL DEFAULT 0,
+                        completed INTEGER NOT NULL DEFAULT 0,
+                        updated_at REAL NOT NULL
+                    );
                     INSERT INTO downloads(id, url, status, progress, created_at)
                     VALUES ('legacy1', 'https://fixture.invalid/legacy',
                             'downloading', '31%', 1);
@@ -59,6 +66,11 @@ class SchemaMigrationTest(unittest.TestCase):
                             "PRAGMA table_info(users)"
                         )
                     }
+                    playlist_progress_columns = {
+                        row[1] for row in connection.execute(
+                            "PRAGMA table_info(playlist_progress)"
+                        )
+                    }
                     tables = {
                         row[0] for row in connection.execute(
                             "SELECT name FROM sqlite_master WHERE type = 'table'"
@@ -79,8 +91,10 @@ class SchemaMigrationTest(unittest.TestCase):
                 self.assertTrue({
                     "tags", "download_tags", "app_config", "roles", "users",
                     "user_roles", "ingest_receipts",
-                    "extension_tokens",
+                    "extension_tokens", "playlists", "playlist_items",
+                    "playlist_progress",
                 }.issubset(tables))
+                self.assertIn("write_sequence", playlist_progress_columns)
                 self.assertIn("name", user_columns)
                 admin = vdl.db_get_user_by_username("admin")
                 self.assertEqual(admin["roles"], ["admin"])
