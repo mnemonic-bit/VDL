@@ -121,6 +121,76 @@ test('settings sections navigate and search across General and Playback', async 
     await expect(page.getByText('No settings match your search.')).toBeVisible();
 });
 
+test('Settings keeps its header available and aligns search with its options', async ({ page }) => {
+    await page.setViewportSize({ width: 1000, height: 500 });
+    await openSettings(page);
+
+    await expect(page.getByText('Choose how downloads and playback work.')).toHaveCount(0);
+    const geometry = await page.evaluate(() => {
+        const header = document.querySelector('.settings-page-header').getBoundingClientRect();
+        const nav = document.querySelector('.settings-nav').getBoundingClientRect();
+        const search = document.querySelector('.settings-search').getBoundingClientRect();
+        const content = document.querySelector('.settings-content').getBoundingClientRect();
+        return {
+            headerBottom: header.bottom,
+            headerRight: header.right,
+            headerTop: header.top,
+            headerWidth: header.width,
+            navTop: nav.top,
+            navWidth: nav.width,
+            searchHeight: search.height,
+            searchLeft: search.left,
+            searchRight: search.right,
+            contentLeft: content.left,
+            contentRight: content.right,
+        };
+    });
+    expect(Math.abs(geometry.searchLeft - geometry.contentLeft)).toBeLessThan(1);
+    expect(Math.abs(geometry.searchRight - geometry.contentRight)).toBeLessThan(1);
+    expect(Math.abs(geometry.headerWidth - geometry.navWidth)).toBeLessThan(1);
+    expect(geometry.headerRight).toBeLessThanOrEqual(geometry.contentLeft);
+    expect(geometry.navTop - geometry.headerBottom)
+        .toBeGreaterThanOrEqual(geometry.searchHeight);
+
+    const scrollOwners = await page.evaluate(() => ({
+        documentOverflow: getComputedStyle(document.body).overflowY,
+        settingsOverflow: getComputedStyle(
+            document.querySelector('.settings-page-body'),
+        ).overflowY,
+    }));
+    expect(scrollOwners.documentOverflow).not.toBe('hidden');
+    expect(scrollOwners.settingsOverflow).toBe('visible');
+
+    await page.evaluate(() => {
+        const search = document.querySelector('.settings-search').getBoundingClientRect();
+        const appHeader = document.querySelector('.app-header').getBoundingClientRect();
+        window.scrollBy(0, search.bottom - appHeader.bottom);
+    });
+    await expect.poll(() => page.evaluate(() => {
+        const search = document.querySelector('.settings-search').getBoundingClientRect();
+        const appHeader = document.querySelector('.app-header').getBoundingClientRect();
+        return search.bottom <= appHeader.bottom + 1;
+    })).toBe(true);
+    const collapsedGap = await page.evaluate(() => {
+        const header = document.querySelector('.settings-page-header').getBoundingClientRect();
+        const nav = document.querySelector('.settings-nav').getBoundingClientRect();
+        return nav.top - header.bottom;
+    });
+    expect(collapsedGap).toBeGreaterThanOrEqual(0);
+    expect(collapsedGap).toBeLessThan(geometry.searchHeight);
+
+    await page.evaluate(() => window.scrollTo(0, document.scrollingElement.scrollHeight));
+    await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(0);
+    await expect(page.getByRole('button', { name: 'Back to videos' })).toBeVisible();
+    const stickyPosition = await page.evaluate(() => ({
+        appHeaderBottom: document.querySelector('.app-header').getBoundingClientRect().bottom,
+        settingsHeaderTop: document.querySelector('.settings-page-header')
+            .getBoundingClientRect().top,
+    }));
+    expect(Math.abs(stickyPosition.settingsHeaderTop - stickyPosition.appHeaderBottom))
+        .toBeLessThan(1);
+});
+
 test('Clear History is grouped in the Danger Zone section', async ({ page }) => {
     await openSettings(page);
     const dangerZone = page.locator('#settings-danger');

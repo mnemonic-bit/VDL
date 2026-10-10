@@ -253,7 +253,7 @@
                     <button id="settingsButton" class="account-menu-item" type="button"
                             onclick="openSettings()" role="menuitem" aria-controls="settingsPage">
                         <svg aria-hidden="true"><use href="#i-cog"/></svg>
-                        <span>Preferences</span>
+                        <span>Settings</span>
                     </button>
                     <form method="post" action="{{ url_for('logout') }}" class="logout-form" role="none">
                         <button class="account-menu-item logout-button" type="submit" role="menuitem">
@@ -275,6 +275,9 @@
             <button id="pagerNext" onclick="changePage(1)" aria-label="Next page">›</button>
             <button id="pagerLast" onclick="goToPage(Infinity)" aria-label="Jump to last page">»</button>
         </div>
+        <div id="historyEndlessSentinel" class="history-endless-sentinel" role="status" hidden>
+            Loading more videos…
+        </div>
         <div id="historyEmpty" class="history-empty">
             <strong id="historyEmptyTitle">No downloads yet</strong>
             <span id="historyEmptyMessage">Add a video URL or drop a local video here to get started.</span>
@@ -287,212 +290,212 @@
             <button class="settings-back" type="button" onclick="closeSettings()" aria-label="Back to videos">
                 <svg aria-hidden="true"><use href="#i-chevron"/></svg>
             </button>
-            <div>
-                <h1 id="settingsTitle">Settings</h1>
-                <p>Choose how downloads and playback work.</p>
+            <h1 id="settingsTitle">Settings</h1>
+        </div>
+        <div class="settings-page-body">
+            <div class="settings-search" role="search">
+                <svg aria-hidden="true"><use href="#i-search"/></svg>
+                <label for="settingsSearchInput" class="visually-hidden">Search settings</label>
+                <input id="settingsSearchInput" type="search" placeholder="Search settings" autocomplete="off">
             </div>
-        </div>
-        <div class="settings-search" role="search">
-            <svg aria-hidden="true"><use href="#i-search"/></svg>
-            <label for="settingsSearchInput" class="visually-hidden">Search settings</label>
-            <input id="settingsSearchInput" type="search" placeholder="Search settings" autocomplete="off">
-        </div>
-        <div class="settings-layout">
-            <nav class="settings-nav" aria-label="Settings sections">
-                <button type="button" class="active" data-settings-section="general" aria-current="page">General</button>
-                <button type="button" data-settings-section="playback">Playback</button>
-                <button type="button" data-settings-section="browser-extension">Browser Extension</button>
-                {% if is_admin %}
-                <button type="button" data-settings-section="users">Users</button>
-                <button type="button" class="danger" data-settings-section="danger">Danger Zone</button>
-                {% endif %}
-            </nav>
-            <div class="settings-content">
-                <div id="settingsError" class="action-error settings-error" role="alert" aria-live="assertive" hidden>
-                    <span id="settingsErrorMessage"></span>
-                    <button type="button" class="action-error-close" onclick="hideActionError()" aria-label="Dismiss error"><svg width="14" height="14"><use href="#i-x"/></svg></button>
-                </div>
+            <div class="settings-layout">
+                <nav class="settings-nav" aria-label="Settings sections">
+                    <button type="button" class="active" data-settings-section="general" aria-current="page">General</button>
+                    <button type="button" data-settings-section="playback">Playback</button>
+                    <button type="button" data-settings-section="browser-extension">Browser Extension</button>
+                    {% if is_admin %}
+                    <button type="button" data-settings-section="users">Users</button>
+                    <button type="button" class="danger" data-settings-section="danger">Danger Zone</button>
+                    {% endif %}
+                </nav>
+                <div class="settings-content">
+                    <div id="settingsError" class="action-error settings-error" role="alert" aria-live="assertive" hidden>
+                        <span id="settingsErrorMessage"></span>
+                        <button type="button" class="action-error-close" onclick="hideActionError()" aria-label="Dismiss error"><svg width="14" height="14"><use href="#i-x"/></svg></button>
+                    </div>
 
-                <section id="settings-general" class="settings-section" data-settings-name="general" tabindex="-1">
-                    <h2>General</h2>
-                    <div class="setting-item" data-setting-keywords="download directory folder location path">
-                        <div class="setting-copy">
-                            <label for="prefDir">Download directory</label>
-                            <span>Where completed videos and partial downloads are stored.</span>
+                    <section id="settings-general" class="settings-section" data-settings-name="general" tabindex="-1">
+                        <h2>General</h2>
+                        <div class="setting-item" data-setting-keywords="download directory folder location path">
+                            <div class="setting-copy">
+                                <label for="prefDir">Download directory</label>
+                                <span>Where completed videos and partial downloads are stored.</span>
+                            </div>
+                            <input type="text" id="prefDir">
                         </div>
-                        <input type="text" id="prefDir">
-                    </div>
-                    <div class="setting-item" data-setting-keywords="quality format resolution audio video default">
-                        <div class="setting-copy">
-                            <label for="prefFormat">Quality</label>
-                            <span>The default format used for new downloads.</span>
+                        <div class="setting-item" data-setting-keywords="quality format resolution audio video default">
+                            <div class="setting-copy">
+                                <label for="prefFormat">Quality</label>
+                                <span>The default format used for new downloads.</span>
+                            </div>
+                            <select id="prefFormat">
+                                <option value="bestvideo+bestaudio/best">Best available (video + audio merged)</option>
+                                <option value="best">Best single file (no merge needed)</option>
+                                <option value="bestvideo[height<=2160]+bestaudio/best">Up to 2160p (4K)</option>
+                                <option value="bestvideo[height<=1440]+bestaudio/best">Up to 1440p (2K)</option>
+                                <option value="bestvideo[height<=1080]+bestaudio/best">Up to 1080p (Full HD)</option>
+                                <option value="bestvideo[height<=720]+bestaudio/best">Up to 720p (HD)</option>
+                                <option value="bestvideo[height<=480]+bestaudio/best">Up to 480p (SD)</option>
+                                <option value="worstvideo+worstaudio/worst">Smallest file (lowest quality)</option>
+                                <option value="bestaudio/best">Audio only (best)</option>
+                                <option value="__custom__">Custom (advanced)</option>
+                            </select>
                         </div>
-                        <select id="prefFormat">
-                            <option value="bestvideo+bestaudio/best">Best available (video + audio merged)</option>
-                            <option value="best">Best single file (no merge needed)</option>
-                            <option value="bestvideo[height<=2160]+bestaudio/best">Up to 2160p (4K)</option>
-                            <option value="bestvideo[height<=1440]+bestaudio/best">Up to 1440p (2K)</option>
-                            <option value="bestvideo[height<=1080]+bestaudio/best">Up to 1080p (Full HD)</option>
-                            <option value="bestvideo[height<=720]+bestaudio/best">Up to 720p (HD)</option>
-                            <option value="bestvideo[height<=480]+bestaudio/best">Up to 480p (SD)</option>
-                            <option value="worstvideo+worstaudio/worst">Smallest file (lowest quality)</option>
-                            <option value="bestaudio/best">Audio only (best)</option>
-                            <option value="__custom__">Custom (advanced)</option>
-                        </select>
-                    </div>
-                    <div class="setting-item" id="customFormatRow" data-setting-keywords="custom advanced format selector yt-dlp" data-setting-available="false" hidden>
-                        <div class="setting-copy">
-                            <label for="prefFormatCustom">Custom format</label>
-                            <span>An advanced yt-dlp format selector.</span>
+                        <div class="setting-item" id="customFormatRow" data-setting-keywords="custom advanced format selector yt-dlp" data-setting-available="false" hidden>
+                            <div class="setting-copy">
+                                <label for="prefFormatCustom">Custom format</label>
+                                <span>An advanced yt-dlp format selector.</span>
+                            </div>
+                            <input type="text" id="prefFormatCustom" placeholder="e.g. bestvideo[ext=mp4]+bestaudio[ext=m4a]">
                         </div>
-                        <input type="text" id="prefFormatCustom" placeholder="e.g. bestvideo[ext=mp4]+bestaudio[ext=m4a]">
-                    </div>
-                    <div class="setting-item" data-setting-keywords="maximum concurrent simultaneous parallel downloads workers">
-                        <div class="setting-copy">
-                            <label for="prefMax">Max concurrent downloads</label>
-                            <span>How many downloads may run at the same time.</span>
+                        <div class="setting-item" data-setting-keywords="maximum concurrent simultaneous parallel downloads workers">
+                            <div class="setting-copy">
+                                <label for="prefMax">Max concurrent downloads</label>
+                                <span>How many downloads may run at the same time.</span>
+                            </div>
+                            <input type="number" id="prefMax" min="1">
                         </div>
-                        <input type="number" id="prefMax" min="1">
-                    </div>
-                    <div class="setting-item" data-setting-keywords="videos items per page pagination history library">
-                        <div class="setting-copy">
-                            <label for="prefPageSize">Videos per page</label>
-                            <span>How many videos are shown on each library page.</span>
+                        <div class="setting-item" data-setting-keywords="videos items per page pagination history library">
+                            <div class="setting-copy">
+                                <label for="prefPageSize">Videos per page</label>
+                                <span>How many videos are shown on each library page.</span>
+                            </div>
+                            <select id="prefPageSize">
+                                <option value="5">5</option>
+                                <option value="10">10</option>
+                                <option value="20">20</option>
+                                <option value="50">50</option>
+                                <option value="endless">Endless scrolling</option>
+                            </select>
                         </div>
-                        <select id="prefPageSize">
-                            <option value="5">5</option>
-                            <option value="10">10</option>
-                            <option value="20">20</option>
-                            <option value="50">50</option>
-                        </select>
-                    </div>
-                    <div class="setting-item" data-setting-keywords="theme appearance light dark system color">
-                        <div class="setting-copy">
-                            <label for="prefTheme">Theme</label>
-                            <span>Use a light, dark, or system-matched appearance.</span>
+                        <div class="setting-item" data-setting-keywords="theme appearance light dark system color">
+                            <div class="setting-copy">
+                                <label for="prefTheme">Theme</label>
+                                <span>Use a light, dark, or system-matched appearance.</span>
+                            </div>
+                            <select id="prefTheme">
+                                <option value="system">System (follow OS setting)</option>
+                                <option value="light">Light</option>
+                                <option value="dark">Dark</option>
+                            </select>
                         </div>
-                        <select id="prefTheme">
-                            <option value="system">System (follow OS setting)</option>
-                            <option value="light">Light</option>
-                            <option value="dark">Dark</option>
-                        </select>
-                    </div>
-                </section>
+                    </section>
 
-                <section id="settings-playback" class="settings-section" data-settings-name="playback" tabindex="-1">
-                    <h2>Playback</h2>
-                    <div class="setting-item" data-setting-keywords="play videos player overlay new browser tab window">
-                        <div class="setting-copy">
-                            <label for="prefPlayer">Play videos in</label>
-                            <span>Choose between the built-in player and a browser tab.</span>
+                    <section id="settings-playback" class="settings-section" data-settings-name="playback" tabindex="-1">
+                        <h2>Playback</h2>
+                        <div class="setting-item" data-setting-keywords="play videos player overlay new browser tab window">
+                            <div class="setting-copy">
+                                <label for="prefPlayer">Play videos in</label>
+                                <span>Choose between the built-in player and a browser tab.</span>
+                            </div>
+                            <select id="prefPlayer">
+                                <option value="overlay">Overlay on this page</option>
+                                <option value="new_tab">New browser tab</option>
+                            </select>
                         </div>
-                        <select id="prefPlayer">
-                            <option value="overlay">Overlay on this page</option>
-                            <option value="new_tab">New browser tab</option>
-                        </select>
-                    </div>
-                    <div class="setting-item" data-setting-keywords="start videos full screen fullscreen player display">
-                        <div class="setting-copy">
-                            <label for="prefStartFullscreen">Start videos in full screen</label>
-                            <span id="prefStartFullscreenHint">Automatically enter full screen when the built-in player opens.</span>
+                        <div class="setting-item" data-setting-keywords="start videos full screen fullscreen player display">
+                            <div class="setting-copy">
+                                <label for="prefStartFullscreen">Start videos in full screen</label>
+                                <span id="prefStartFullscreenHint">Automatically enter full screen when the built-in player opens.</span>
+                            </div>
+                            <input type="checkbox" id="prefStartFullscreen" aria-describedby="prefStartFullscreenHint">
                         </div>
-                        <input type="checkbox" id="prefStartFullscreen" aria-describedby="prefStartFullscreenHint">
-                    </div>
-                    <h3 class="settings-subheading">Shuffle</h3>
-                    <div class="setting-item" data-setting-keywords="shuffle random quality resolution">
-                        <div class="setting-copy">
-                            <label for="prefShuffleMinHeight">Minimum video quality</label>
-                            <span>Include videos at or above this resolution.</span>
+                        <h3 class="settings-subheading">Shuffle</h3>
+                        <div class="setting-item" data-setting-keywords="shuffle random quality resolution">
+                            <div class="setting-copy">
+                                <label for="prefShuffleMinHeight">Minimum video quality</label>
+                                <span>Include videos at or above this resolution.</span>
+                            </div>
+                            <select id="prefShuffleMinHeight">
+                                <option value="0">Any quality</option>
+                                <option value="360">360p</option>
+                                <option value="480">480p</option>
+                                <option value="720">720p</option>
+                                <option value="1080">1080p</option>
+                                <option value="1440">1440p</option>
+                                <option value="2160">2160p (4K)</option>
+                                <option value="4320">4320p (8K)</option>
+                            </select>
                         </div>
-                        <select id="prefShuffleMinHeight">
-                            <option value="0">Any quality</option>
-                            <option value="360">360p</option>
-                            <option value="480">480p</option>
-                            <option value="720">720p</option>
-                            <option value="1080">1080p</option>
-                            <option value="1440">1440p</option>
-                            <option value="2160">2160p (4K)</option>
-                            <option value="4320">4320p (8K)</option>
-                        </select>
-                    </div>
-                    <div class="setting-item" data-setting-keywords="shuffle random length duration minutes">
-                        <div class="setting-copy">
-                            <label for="prefShuffleMinDuration">Minimum video length (minutes)</label>
-                            <span id="prefShuffleMinDurationHint">0 includes videos of any known length. Both Shuffle filters apply together.</span>
+                        <div class="setting-item" data-setting-keywords="shuffle random length duration minutes">
+                            <div class="setting-copy">
+                                <label for="prefShuffleMinDuration">Minimum video length (minutes)</label>
+                                <span id="prefShuffleMinDurationHint">0 includes videos of any known length. Both Shuffle filters apply together.</span>
+                            </div>
+                            <input id="prefShuffleMinDuration" type="number" min="0" max="1440" step="1" value="0" aria-describedby="prefShuffleMinDurationHint">
                         </div>
-                        <input id="prefShuffleMinDuration" type="number" min="0" max="1440" step="1" value="0" aria-describedby="prefShuffleMinDurationHint">
-                    </div>
-                </section>
+                    </section>
 
-                <section id="settings-browser-extension" class="settings-section" data-settings-name="browser-extension" tabindex="-1">
-                    <h2>Browser Extension</h2>
-                    <p class="settings-section-intro">VDL Companion sends the current page URL and that site's eligible Firefox cookies only after you click its toolbar action.</p>
-                    <div class="extension-warning" role="note">
-                        Cookies can grant the same website access as your signed-in browser session. VDL stores the page URL and query, but keeps cookies only in memory for the live download.
-                    </div>
-                    <div class="setting-item" data-setting-keywords="firefox install update extension companion addon browser">
-                        <div class="setting-copy">
-                            <strong>Install VDL Companion</strong>
-                            <span id="extensionInstallHint">Firefox will show an Add confirmation. Installation and pairing are separate steps.</span>
+                    <section id="settings-browser-extension" class="settings-section" data-settings-name="browser-extension" tabindex="-1">
+                        <h2>Browser Extension</h2>
+                        <p class="settings-section-intro">VDL Companion sends the current page URL and that site's eligible Firefox cookies only after you click its toolbar action.</p>
+                        <div class="extension-warning" role="note">
+                            Cookies can grant the same website access as your signed-in browser session. VDL stores the page URL and query, but keeps cookies only in memory for the live download.
                         </div>
-                        <a id="extensionInstallLink" class="settings-button-link" href="/browser-extension/vdl-companion-firefox.xpi" onclick="extensionPackageAction()">Install Firefox extension</a>
-                    </div>
-                    <div class="setting-item extension-pairing-item" data-setting-keywords="pair connect code string https localhost loopback private network cidr copy invalidate">
-                        <div class="setting-copy">
-                            <strong>Pair this Firefox profile</strong>
-                            <span>Create a one-time pairing string that is valid for five minutes.</span>
-                            <span id="extensionHttpsStatus" class="extension-origin-status">Checking whether this origin is safe for pairing…</span>
+                        <div class="setting-item" data-setting-keywords="firefox install update extension companion addon browser">
+                            <div class="setting-copy">
+                                <strong>Install VDL Companion</strong>
+                                <span id="extensionInstallHint">Firefox will show an Add confirmation. Installation and pairing are separate steps.</span>
+                            </div>
+                            <a id="extensionInstallLink" class="settings-button-link" href="/browser-extension/vdl-companion-firefox.xpi" onclick="extensionPackageAction()">Install Firefox extension</a>
                         </div>
-                        <div class="extension-pairing-controls">
-                            <button id="extensionCreatePairing" type="button" onclick="createExtensionPairing()">Create pairing string</button>
+                        <div class="setting-item extension-pairing-item" data-setting-keywords="pair connect code string https localhost loopback private network cidr copy invalidate">
+                            <div class="setting-copy">
+                                <strong>Pair this Firefox profile</strong>
+                                <span>Create a one-time pairing string that is valid for five minutes.</span>
+                                <span id="extensionHttpsStatus" class="extension-origin-status">Checking whether this origin is safe for pairing…</span>
+                            </div>
+                            <div class="extension-pairing-controls">
+                                <button id="extensionCreatePairing" type="button" onclick="createExtensionPairing()">Create pairing string</button>
+                            </div>
                         </div>
-                    </div>
-                    <div class="extension-connections" data-setting-keywords="connections paired devices revoke token sign out">
-                        <h3>Active companion connections</h3>
-                        <p>The five-minute limit applies only to an unused pairing string. A successful connection remains active until you revoke it here or choose Unpair in the extension.</p>
-                        <div id="extensionConnectionList"></div>
-                        <p id="extensionNoConnections">No active companion connections.</p>
-                    </div>
-                    <p id="extensionStatus" class="extension-live-status" role="status" aria-live="polite"></p>
-                </section>
+                        <div class="extension-connections" data-setting-keywords="connections paired devices revoke token sign out">
+                            <h3>Active companion connections</h3>
+                            <p>The five-minute limit applies only to an unused pairing string. A successful connection remains active until you revoke it here or choose Unpair in the extension.</p>
+                            <div id="extensionConnectionList"></div>
+                            <p id="extensionNoConnections">No active companion connections.</p>
+                        </div>
+                        <p id="extensionStatus" class="extension-live-status" role="status" aria-live="polite"></p>
+                    </section>
 
-                {% if is_admin %}
-                <section id="settings-users" class="settings-section" data-settings-name="users" tabindex="-1">
-                    <h2>Users</h2>
-                    <p class="settings-section-intro">Add accounts and manage access to this application.</p>
-                    <div class="user-table-scroll" data-setting-keywords="users accounts add create role name suspend remove">
-                        <table class="user-table">
-                            <thead>
-                                <tr>
-                                    <th scope="col">Login Name</th>
-                                    <th scope="col">Name</th>
-                                    <th scope="col">Role</th>
-                                    <th scope="col"><span class="visually-hidden">Actions</span></th>
-                                </tr>
-                            </thead>
-                            <tbody id="userList" aria-live="polite"></tbody>
-                        </table>
-                    </div>
-                    <form id="addUserForm" onsubmit="addUser(event)"></form>
-                </section>
-                {% endif %}
-
-                {% if is_admin %}
-                <section id="settings-danger" class="settings-section settings-danger" data-settings-name="danger" tabindex="-1">
-                    <h2>Danger Zone</h2>
-                    <div class="setting-item settings-history-row" data-setting-keywords="clear delete remove download history files completed failed">
-                        <div class="setting-copy">
-                            <strong>Download history</strong>
-                            <span>Remove completed and failed downloads and their files.</span>
+                    {% if is_admin %}
+                    <section id="settings-users" class="settings-section" data-settings-name="users" tabindex="-1">
+                        <h2>Users</h2>
+                        <p class="settings-section-intro">Add accounts and manage access to this application.</p>
+                        <div class="user-table-scroll" data-setting-keywords="users accounts add create role name suspend remove">
+                            <table class="user-table">
+                                <thead>
+                                    <tr>
+                                        <th scope="col">Login Name</th>
+                                        <th scope="col">Name</th>
+                                        <th scope="col">Role</th>
+                                        <th scope="col"><span class="visually-hidden">Actions</span></th>
+                                    </tr>
+                                </thead>
+                                <tbody id="userList" aria-live="polite"></tbody>
+                            </table>
                         </div>
-                        <button class="clear-btn" type="button" onclick="clearHistory()">Clear History</button>
-                    </div>
-                </section>
-                {% endif %}
+                        <form id="addUserForm" onsubmit="addUser(event)"></form>
+                    </section>
+                    {% endif %}
 
-                <p id="settingsNoResults" class="settings-no-results" role="status" hidden>No settings match your search.</p>
-                <div class="pref-actions">
-                    <button id="saveBtn" type="button" onclick="savePreferences()"><svg class="btn-icon"><use href="#i-save"/></svg><span>Save</span></button>
+                    {% if is_admin %}
+                    <section id="settings-danger" class="settings-section settings-danger" data-settings-name="danger" tabindex="-1">
+                        <h2>Danger Zone</h2>
+                        <div class="setting-item settings-history-row" data-setting-keywords="clear delete remove download history files completed failed">
+                            <div class="setting-copy">
+                                <strong>Download history</strong>
+                                <span>Remove completed and failed downloads and their files.</span>
+                            </div>
+                            <button class="clear-btn" type="button" onclick="clearHistory()">Clear History</button>
+                        </div>
+                    </section>
+                    {% endif %}
+
+                    <p id="settingsNoResults" class="settings-no-results" role="status" hidden>No settings match your search.</p>
+                    <div class="pref-actions">
+                        <button id="saveBtn" type="button" onclick="savePreferences()"><svg class="btn-icon"><use href="#i-save"/></svg><span>Save</span></button>
+                    </div>
                 </div>
             </div>
         </div>

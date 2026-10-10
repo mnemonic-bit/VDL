@@ -855,6 +855,7 @@ function applyHistorySearch() {
     document.getElementById('historySearchClear').hidden = !input.value;
     searchTerms = parseSearchTerms(input.value);
     historyPage = 0;
+    historyEndlessVisibleCount = HISTORY_ENDLESS_BATCH_SIZE;
     fetchHistory({ sortFavorites: true });
 }
 
@@ -1658,8 +1659,8 @@ function toggleMenu(id, ev) {
     }
 }
 
-const HOVER_PREVIEW_DELAY_MS = 500;
-const HOVER_PREVIEW_CACHE_VERSION = 3;
+const HOVER_PREVIEW_DELAY_MS = 250;
+const HOVER_PREVIEW_CACHE_VERSION = 4;
 let hoverPreviewTimer = null;
 let pendingHoverPreview = null;
 let activeHoverPreview = null;
@@ -1856,6 +1857,16 @@ function formatDuration(startEpochSeconds, endEpochSeconds) {
     return parts.length ? parts.join(' and ') : '0 Seconds';
 }
 
+function formatMediaDuration(durationSeconds) {
+    const seconds = Math.round(Number(durationSeconds));
+    if (!Number.isFinite(seconds) || seconds <= 0) return null;
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const remainder = seconds % 60;
+    const minuteText = hours ? String(minutes).padStart(2, '0') : String(minutes);
+    return `${hours ? `${hours}:` : ''}${minuteText}:${String(remainder).padStart(2, '0')}`;
+}
+
 function formatBytes(n) {
     if (n == null || isNaN(n)) return null;
     const units = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -1995,18 +2006,23 @@ function renderHistoryCard(info) {
     const qualityBadge = quality
         ? `<span class="history-preview-label history-preview-quality${quality === '4k' ? ' is-4k' : ''}">${escapeHtml(quality)}</span>`
         : '';
+    const mediaDuration = formatMediaDuration(info.duration_seconds);
+    const durationBadge = mediaDuration
+        ? `<span class="history-preview-label history-preview-duration">${mediaDuration}</span>`
+        : '';
     let preview;
     if (hasPlay) {
         const playLabel = info.filename.split('/').pop().split('\\').pop();
         const playExt = info.filename.split('.').pop().toLowerCase();
         preview = `
                 <div class="history-preview-wrap">
-                    <button class="history-preview" type="button" data-play-action data-download-id="${escapeAttr(id)}" data-play-label="${escapeAttr(playLabel)}" data-play-ext="${escapeAttr(playExt)}" aria-label="Play">
+                    <button class="history-preview${mediaDuration ? ' has-preview-duration' : ''}" type="button" data-play-action data-download-id="${escapeAttr(id)}" data-play-label="${escapeAttr(playLabel)}" data-play-ext="${escapeAttr(playExt)}" aria-label="Play">
                         <span class="history-preview-fallback"><svg><use href="#i-camera"/></svg><span>No video preview</span></span>
                         <img src="/api/thumbnail/${encodeURIComponent(id)}" alt="" loading="lazy" onerror="this.closest('.history-preview').classList.add('thumbnail-unavailable')">
                         <video class="history-preview-video" muted playsinline loop preload="none" aria-hidden="true"></video>
                         ${newBadge}
                         ${qualityBadge}
+                        ${durationBadge}
                     </button>
                     ${favoriteButton}
                 </div>`;
@@ -2309,9 +2325,14 @@ function renderItem(info, inHistoryView = false) {
 
 const DEFAULT_HISTORY_PAGE_SIZE = 10;
 const HISTORY_PAGE_SIZES = new Set([5, 10, 20, 50]);
+const HISTORY_ENDLESS_MODE = 'endless';
+const HISTORY_ENDLESS_BATCH_SIZE = 10;
+const ENDLESS_PLAYBACK_PAGE_SIZE = 100;
 let historyPageSize = DEFAULT_HISTORY_PAGE_SIZE;
 let historyPage = 0;
 let historyTotal = 0;
+let historyEndlessVisibleCount = HISTORY_ENDLESS_BATCH_SIZE;
+let historyEndlessLoadPending = false;
 let historyOrderIds = [];
 let historyOrdering = 'favorites_first';
 let historyPageItems = [];
@@ -2319,6 +2340,40 @@ let _renderedActiveIds  = new Set();
 let _renderedHistoryIds = new Set();
 const pendingActiveAnimations = new Set();
 const pendingHistoryAnimations = new Set();
+
+function endlessHistoryEnabled() {
+    return historyPageSize === HISTORY_ENDLESS_MODE;
+}
+
+function loadNextEndlessHistoryBatch() {
+    if (!endlessHistoryEnabled() || historyEndlessLoadPending
+            || historyEndlessVisibleCount >= historyTotal) return;
+    historyEndlessLoadPending = true;
+    historyEndlessVisibleCount = Math.min(
+        historyTotal,
+        historyEndlessVisibleCount + HISTORY_ENDLESS_BATCH_SIZE,
+    );
+    fetchHistory().finally(() => {
+        historyEndlessLoadPending = false;
+    });
+}
+
+const historyEndlessSentinel = document.getElementById('historyEndlessSentinel');
+if ('IntersectionObserver' in window) {
+    const historyEndlessObserver = new IntersectionObserver(entries => {
+        if (entries.some(entry => entry.isIntersecting)) {
+            loadNextEndlessHistoryBatch();
+        }
+    }, { rootMargin: '0px 0px 160px' });
+    historyEndlessObserver.observe(historyEndlessSentinel);
+} else {
+    window.addEventListener('scroll', () => {
+        if (historyEndlessSentinel.getBoundingClientRect().top
+                <= window.innerHeight + 160) {
+            loadNextEndlessHistoryBatch();
+        }
+    }, { passive: true });
+}
 
 function animateInsertedItem(element, pendingAnimations, id) {
     // Rows vary with their metadata, so animate toward the natural box size
@@ -2360,6 +2415,7 @@ function animateInsertedItem(element, pendingAnimations, id) {
 }
 
 function changePage(delta) {
+    if (endlessHistoryEnabled()) return;
     const maxPage = Math.max(0, Math.ceil(historyTotal / historyPageSize) - 1);
     const next = Math.min(maxPage, Math.max(0, historyPage + delta));
     if (next === historyPage) return;
@@ -2368,6 +2424,7 @@ function changePage(delta) {
 }
 
 function goToPage(target) {
+    if (endlessHistoryEnabled()) return;
     const maxPage = Math.max(0, Math.ceil(historyTotal / historyPageSize) - 1);
     const next = Math.min(maxPage, Math.max(0, target));
     if (next === historyPage) return;
@@ -2416,10 +2473,14 @@ function fetchHistory({ sortFavorites = false } = {}) {
         const done = historyEntries.filter(matchesSearchFilter);
 
         historyTotal = done.length;
-        const maxPage = Math.max(0, Math.ceil(historyTotal / historyPageSize) - 1);
+        const endless = endlessHistoryEnabled();
+        const maxPage = endless
+            ? 0
+            : Math.max(0, Math.ceil(historyTotal / historyPageSize) - 1);
         if (historyPage > maxPage) historyPage = maxPage;
-        const start = historyPage * historyPageSize;
-        const pageItems = done.slice(start, start + historyPageSize);
+        const start = endless ? 0 : historyPage * historyPageSize;
+        const visibleCount = endless ? historyEndlessVisibleCount : historyPageSize;
+        const pageItems = done.slice(start, start + visibleCount);
         historyPageItems = pageItems;
         const sequentialAvailable = pageItems.some(
             info => info.status === 'finished' && info.filename,
@@ -2530,7 +2591,8 @@ function fetchHistory({ sortFavorites = false } = {}) {
         document.getElementById('historyEmpty').style.display = done.length ? 'none' : '';
 
         const pager = document.getElementById('historyPager');
-        if (historyTotal > historyPageSize) {
+        historyEndlessSentinel.hidden = !endless || pageItems.length >= historyTotal;
+        if (!endless && historyTotal > historyPageSize) {
             pager.style.display = '';
             document.getElementById('pagerInfo').textContent =
                 `Page ${historyPage + 1} of ${maxPage + 1} · ${historyTotal} items`;
@@ -3011,13 +3073,21 @@ function startEndlessPlayback(id = null, label = '', extension = '', mode = 'seq
     }
     if (startVideosFullscreen) requestPlayerFullscreen({ launch: true });
 
+    const historyPosition = id ? historyPositionForId(id) : 0;
+    const playbackPageSize = endlessHistoryEnabled()
+        ? ENDLESS_PLAYBACK_PAGE_SIZE
+        : historyPageSize;
     const body = mode === 'shuffle' ? { mode: 'shuffle' } : {
         mode: 'sequential',
         filter: historySearchInput.value,
         ordering: historyOrdering,
-        page_size: historyPageSize,
-        page: historyPage,
-        position: id ? historyPositionForId(id) : 0,
+        page_size: playbackPageSize,
+        page: endlessHistoryEnabled()
+            ? Math.floor(historyPosition / playbackPageSize)
+            : historyPage,
+        position: endlessHistoryEnabled()
+            ? historyPosition % playbackPageSize
+            : historyPosition,
     };
     if (id && mode === 'sequential') body.start_download_id = String(id);
     apiFetch('/api/playback-sessions', {
@@ -4105,13 +4175,16 @@ function loadPreferences() {
         document.getElementById('prefDir').value = p.download_dir || '';
         document.getElementById('prefMax').value = p.max_concurrent || '';
         const configuredPageSize = Number(p.history_page_size);
-        const nextPageSize = HISTORY_PAGE_SIZES.has(configuredPageSize)
-            ? configuredPageSize
-            : DEFAULT_HISTORY_PAGE_SIZE;
+        const nextPageSize = p.history_page_size === HISTORY_ENDLESS_MODE
+            ? HISTORY_ENDLESS_MODE
+            : (HISTORY_PAGE_SIZES.has(configuredPageSize)
+                ? configuredPageSize
+                : DEFAULT_HISTORY_PAGE_SIZE);
         document.getElementById('prefPageSize').value = String(nextPageSize);
         if (historyPageSize !== nextPageSize) {
             historyPageSize = nextPageSize;
             historyPage = 0;
+            historyEndlessVisibleCount = HISTORY_ENDLESS_BATCH_SIZE;
             if (historyTotal > 0) fetchHistory();
         }
 
@@ -4189,10 +4262,13 @@ function savePreferences() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
     }).then(() => {
-        const nextPageSize = Number(body.history_page_size);
+        const nextPageSize = body.history_page_size === HISTORY_ENDLESS_MODE
+            ? HISTORY_ENDLESS_MODE
+            : Number(body.history_page_size);
         if (historyPageSize !== nextPageSize) {
             historyPageSize = nextPageSize;
             historyPage = 0;
+            historyEndlessVisibleCount = HISTORY_ENDLESS_BATCH_SIZE;
             fetchHistory();
         }
         playerMode = body.player_mode;

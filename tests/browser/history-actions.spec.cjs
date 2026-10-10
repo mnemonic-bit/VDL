@@ -99,7 +99,7 @@ test('fixed header opens the Current drawer and full Settings page', async ({ pa
     ), '#accountMenuButton')).toBeTruthy();
     await expect(settingsButton).toBeVisible();
     await expect(settingsButton.locator('use')).toHaveAttribute('href', '#i-cog');
-    await expect(settingsButton).toContainText('Preferences');
+    await expect(settingsButton).toContainText('Settings');
     await expect(accountMenu.getByRole('menuitem', { name: 'Sign out' })).toBeVisible();
     await settingsButton.click();
 
@@ -523,7 +523,8 @@ test('History preview labels show compact quality and clear new after playback',
 test('hover previews wait before loading and only play one montage at a time', async ({ page }) => {
     await seed(page, {
         id: 'hover01', status: 'finished', file: true,
-        name: 'hover-one.mp4', title: 'Hover one',
+        name: 'hover-one.mp4', title: 'Hover one', resolution: '720p',
+        duration_seconds: 125,
     });
     await seed(page, {
         id: 'hover02', status: 'finished', file: true,
@@ -556,17 +557,23 @@ test('hover previews wait before loading and only play one montage at a time', a
     await first.evaluate(element => element.classList.remove('thumbnail-unavailable'));
     await second.evaluate(element => element.classList.remove('thumbnail-unavailable'));
     await expect(firstVideo).not.toHaveAttribute('src', /./);
+    await expect(first.locator('.history-preview-quality')).toHaveText('720p');
+    await expect(first.locator('.history-preview-quality')).toBeVisible();
+    await expect(first.locator('.history-preview-duration')).toBeHidden();
 
     await first.hover();
-    await page.waitForTimeout(300);
+    await page.waitForTimeout(150);
     await expect(firstVideo).not.toHaveAttribute('src', /./);
     expect(await page.evaluate(() => window.__hoverPreviewPlays)).toBe(0);
     await expect.poll(() => page.evaluate(() => window.__hoverPreviewPlays)).toBe(1);
-    await expect(firstVideo).toHaveAttribute('src', '/api/preview/hover01?v=3');
+    await expect(firstVideo).toHaveAttribute('src', '/api/preview/hover01?v=4');
     await expect(first).toHaveClass(/preview-playing/);
+    await expect(first.locator('.history-preview-quality')).toBeHidden();
+    await expect(first.locator('.history-preview-duration')).toHaveText('2:05');
+    await expect(first.locator('.history-preview-duration')).toBeVisible();
 
     await page.locator('[data-row-id="hover01"] .favorite-toggle').hover();
-    await expect(firstVideo).toHaveAttribute('src', '/api/preview/hover01?v=3');
+    await expect(firstVideo).toHaveAttribute('src', '/api/preview/hover01?v=4');
     await expect(first).toHaveClass(/preview-playing/);
     expect(await page.evaluate(() => window.__hoverPreviewPauses)).toBe(0);
 
@@ -574,7 +581,7 @@ test('hover previews wait before loading and only play one montage at a time', a
     await expect(firstVideo).not.toHaveAttribute('src', /./);
     await expect(first).not.toHaveClass(/preview-playing/);
     await expect.poll(() => page.evaluate(() => window.__hoverPreviewPlays)).toBe(2);
-    await expect(secondVideo).toHaveAttribute('src', '/api/preview/hover02?v=3');
+    await expect(secondVideo).toHaveAttribute('src', '/api/preview/hover02?v=4');
     await expect(second).toHaveClass(/preview-playing/);
 
     await page.locator('.app-header').hover();

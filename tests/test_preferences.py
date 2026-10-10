@@ -72,6 +72,15 @@ class PreferencesTest(AppCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["history_page_size"], "20")
+        endless = self.client.post(
+            "/api/preferences",
+            json={"history_page_size": "endless"},
+        )
+        self.assertEqual(endless.status_code, 200)
+        self.assertEqual(
+            endless.get_json()["history_page_size"],
+            "endless",
+        )
         rejected = self.client.post(
             "/api/preferences",
             json={"history_page_size": "12"},
@@ -79,7 +88,7 @@ class PreferencesTest(AppCase):
         self.assertEqual(rejected.status_code, 400)
         self.assertEqual(
             vdl.db_get_preferences()["history_page_size"],
-            "20",
+            "endless",
         )
 
     def test_fullscreen_preference_is_available_and_persists(self):

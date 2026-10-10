@@ -21,24 +21,24 @@ class HoverPreviewTest(AppCase):
 
         self.assertEqual(
             preview_path,
-            os.path.join(self.download_dir, ".vdl_test0001.preview-v3.mp4"),
+            os.path.join(self.download_dir, ".vdl_test0001.preview-v4.mp4"),
         )
 
     def test_preview_segments_span_long_videos_without_repeating_short_ones(self):
         self.assertEqual(vdl._preview_segments(0), [])
         self.assertEqual(vdl._preview_segments(10), [])
         self.assertEqual(vdl._preview_segments(12), [(5.0, 2.0)])
-        self.assertEqual(vdl._preview_segments(30), [(5.0, 20.0)])
+        self.assertEqual(vdl._preview_segments(20), [(5.0, 10.0)])
 
         segments = vdl._preview_segments(63)
         self.assertEqual(len(segments), 7)
-        self.assertEqual([length for _start, length in segments], [3.0] * 7)
+        self.assertEqual([length for _start, length in segments], [2.0] * 7)
         starts = [start for start, _length in segments]
         self.assertEqual(starts[0], 5.0)
-        self.assertEqual(starts[-1], 55.0)
+        self.assertEqual(starts[-1], 56.0)
         self.assertEqual(
             [round(starts[index + 1] - starts[index], 6) for index in range(6)],
-            [round(50 / 6, 6)] * 6,
+            [8.5] * 6,
         )
 
     def test_ffprobe_duration_requires_a_finite_video_stream(self):
@@ -89,7 +89,7 @@ class HoverPreviewTest(AppCase):
         self.assertEqual(command.count("-i"), 7)
         self.assertEqual(
             [command[index + 1] for index, value in enumerate(command) if value == "-ss"],
-            ["5.000", "13.333", "21.667", "30.000", "38.333", "46.667", "55.000"],
+            ["5.000", "13.500", "22.000", "30.500", "39.000", "47.500", "56.000"],
         )
         self.assertIn("concat=n=7:v=1:a=0[outv]", command[command.index("-filter_complex") + 1])
         self.assertEqual(command[command.index("-c:v") + 1], "libx264")

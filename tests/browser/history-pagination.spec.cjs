@@ -64,3 +64,34 @@ test('page-size preference controls pagination and enables long-range jumps', as
     await expect(page.locator('#pagerInfo')).toHaveText('Page 5 of 5 · 21 items');
     await expect(page.locator('#historyList [data-row-id]')).toHaveCount(1);
 });
+
+test('endless scrolling reveals the next batch at the end of the library', async ({ page }) => {
+    await page.setViewportSize({ width: 800, height: 400 });
+    for (let index = 1; index <= 21; index += 1) {
+        await seed(page, {
+            id: `endless${String(index).padStart(4, '0')}`,
+            status: 'finished',
+        });
+    }
+    await refresh(page);
+
+    await openSettings(page);
+    await page.locator('#prefPageSize').selectOption('endless');
+    await page.locator('#saveBtn').click();
+    await expect(page.locator('#saveBtn')).toContainText('Saved');
+    await page.getByRole('button', { name: 'Back to videos', exact: true }).click();
+
+    const cards = page.locator('#historyList [data-row-id]');
+    const sentinel = page.locator('#historyEndlessSentinel');
+    await expect(cards).toHaveCount(10);
+    await expect(page.locator('#historyPager')).toBeHidden();
+    await expect(sentinel).toBeVisible();
+
+    await sentinel.scrollIntoViewIfNeeded();
+    await expect.poll(async () => cards.count()).toBeGreaterThanOrEqual(20);
+    if (await sentinel.isVisible()) {
+        await sentinel.evaluate(element => element.scrollIntoView());
+    }
+    await expect(cards).toHaveCount(21);
+    await expect(sentinel).toBeHidden();
+});

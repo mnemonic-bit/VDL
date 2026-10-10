@@ -141,6 +141,14 @@ Nested `dragenter` events left the depth counter above zero after the final
 page-level `dragleave`. A leave with no related in-document target now clears
 the complete drag state and closes the overlay. A browser regression covers
 the nested-entry exit sequence, and the reporter confirmed the deployed fix.
+Issue 48 was reported and resolved through an iterative Settings and library
+review on 2026-10-10, then deployed in version `0.32.5`. Settings terminology,
+spacing, search alignment, and persistent navigation were made consistent;
+follow-up regressions restored the browser-owned scrollbar and limited the
+sticky header background to the left navigation column while preserving the
+search-height gap. The library also gained persisted endless scrolling, and
+hover previews now start after 250 milliseconds, use two-second excerpts, and
+show total duration in place of quality while playing.
 
 ## Bug reports
 
@@ -191,6 +199,7 @@ the nested-entry exit sequence, and the reporter confirmed the deployed fix.
 - [Bug 0045 — Fullscreen Escape ignored the playback launch mode](bug-0045-fullscreen-escape-ignored-playback-launch-mode.md)
 - [Bug 0046 — History Info tag selection closed the popover and Escape exited macOS fullscreen](bug-0046-info-tag-selection-closed-popover-and-escape-exited-fullscreen.md)
 - [Bug 0047 — Upload overlay remained open after a file drag left the page](bug-0047-upload-overlay-remained-open-after-drag-left-page.md)
+- [Bug 0048 — Settings and hover-preview controls were inconsistent](bug-0048-settings-and-hover-preview-controls-were-inconsistent.md)
 
 ## Accepted UI decisions
 

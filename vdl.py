@@ -3494,7 +3494,7 @@ def _thumbnail_path(entry, fallback_dir=None):
     )
 
 
-_PREVIEW_CACHE_VERSION = 3
+_PREVIEW_CACHE_VERSION = 4
 _PREVIEW_FRAMES_PER_SECOND = 12
 
 
@@ -3548,7 +3548,7 @@ def generate_video_thumbnail(media_path, thumbnail_path):
 
 
 _PREVIEW_SEGMENT_COUNT = 7
-_PREVIEW_SEGMENT_SECONDS = 3.0
+_PREVIEW_SEGMENT_SECONDS = 2.0
 _PREVIEW_TOTAL_SECONDS = _PREVIEW_SEGMENT_COUNT * _PREVIEW_SEGMENT_SECONDS
 _PREVIEW_EDGE_MARGIN_SECONDS = 5.0
 
@@ -5111,8 +5111,10 @@ def preferences():
             return jsonify({"error": str(exc)}), 400
     if "history_page_size" in updates:
         updates["history_page_size"] = str(updates["history_page_size"])
-        if updates["history_page_size"] not in {'5', '10', '20', '50'}:
-            return jsonify({"error": "Videos per page must be 5, 10, 20, or 50"}), 400
+        if updates["history_page_size"] not in {'5', '10', '20', '50', 'endless'}:
+            return jsonify({
+                "error": "Videos per page must be 5, 10, 20, 50, or endless"
+            }), 400
     if 'shuffle_min_height' in updates:
         value = updates['shuffle_min_height']
         if (isinstance(value, bool)
