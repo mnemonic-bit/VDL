@@ -10,8 +10,6 @@ services:
             VDL_COMPANION_HTTP_CIDRS: ${VDL_COMPANION_HTTP_CIDRS:-}
             VDL_POT_PROVIDER_URL: ${VDL_POT_PROVIDER_URL:-}
             VDL_INGEST_DIR: /ingest
-            VDL_INGEST_SCAN_SECONDS: ${VDL_INGEST_SCAN_SECONDS:-10}
-            VDL_INGEST_SETTLE_SECONDS: ${VDL_INGEST_SETTLE_SECONDS:-60}
         volumes:
             - vdl-downloads:/downloads
             - vdl-data:/data

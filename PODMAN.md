@@ -34,8 +34,6 @@ podman run --detach \
     --env VDL_COMPANION_HTTP_CIDRS=100.96.0.0/24 \
     --env VDL_POT_PROVIDER_URL= \
     --env VDL_INGEST_DIR=/ingest \
-    --env VDL_INGEST_SCAN_SECONDS=10 \
-    --env VDL_INGEST_SETTLE_SECONDS=60 \
     --volume vdl-downloads:/downloads \
     --volume vdl-data:/data \
     --volume "$(pwd)/ingest:/ingest:ro" \
@@ -48,6 +46,14 @@ The `ingest/` bind-source directory must exist before `podman run`. The named
 volumes retain downloads and SQLite state across replacements. Podman's default
 OCI image format ignores the Dockerfile `HEALTHCHECK`, so verify the HTTP health
 endpoint directly.
+
+VDL takes one recursive snapshot of `ingest/` when the serving process starts.
+Finish writing each source under a temporary or hidden name in its destination
+subfolder and rename it to the final name before this command starts. Folder
+names become tags on imported History items. New or changed files require a
+container restart; unchanged sources are skipped using persistent SQLite
+receipts. The bind remains read-only. A container without the explicit
+`VDL_INGEST_DIR` environment variable does not import from `/ingest`.
 
 ## Verify
 

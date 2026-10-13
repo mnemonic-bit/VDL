@@ -40,7 +40,8 @@ class RealMediaIntegrationTest(AppCase):
         playback.close()
         renamed = self.client.post("/api/rename/dash0360", json={"filename": "renamed-dash"})
         self.assertEqual(renamed.status_code, 200)
-        renamed_path = renamed.get_json()["filename"]
+        renamed_path = vdl.db_get_download("dash0360")["filename"]
+        self.assertEqual(renamed.get_json()["filename"], os.path.basename(renamed_path))
         self.assertTrue(os.path.isfile(renamed_path))
         self.client.post("/api/remove/dash0360")
         self.assertFalse(os.path.exists(renamed_path))

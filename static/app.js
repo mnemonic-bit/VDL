@@ -794,6 +794,7 @@ function searchPlaylistValues(terms = searchTerms) {
 function matchesSearchFilter(info, terms = searchTerms) {
     if (terms.length === 0) return true;
     const title = tagSearchKey(info.title);
+    const filename = tagSearchKey(displayFilename(info));
     const tags = new Set((Array.isArray(info.tags) ? info.tags : []).map(tagSearchKey));
     const userTerms = [];
     const qualityTerms = [];
@@ -851,7 +852,7 @@ function matchesSearchFilter(info, terms = searchTerms) {
 
     const matchesContent = term => {
         const key = tagSearchKey(term);
-        return tags.has(key) || title.includes(key);
+        return tags.has(key) || title.includes(key) || filename.includes(key);
     };
     return contentTerms.some(matchesContent);
 }
@@ -1896,6 +1897,11 @@ function formatBytes(n) {
     return v.toFixed(v >= 100 ? 0 : 1) + ' ' + units[i];
 }
 
+function displayFilename(info) {
+    const name = info.display_filename || info.filename || '';
+    return String(name).split('/').pop().split('\\').pop();
+}
+
 function formatSpeed(bps) {
     const s = formatBytes(bps);
     return s ? s + '/s' : null;
@@ -1996,7 +2002,7 @@ let playlistChooserReturnFocus = null;
 function libraryTitle(info) {
     if (info && info.title) return info.title;
     if (info && info.filename) {
-        return info.filename.split('/').pop().split('\\').pop().replace(/\.[^.]+$/, '');
+        return displayFilename(info).replace(/\.[^.]+$/, '');
     }
     return 'Untitled download';
 }
@@ -2347,7 +2353,7 @@ function renderHistoryCard(info) {
 
     let displayTitle = info.title || '';
     if (!displayTitle && info.filename) {
-        const base = info.filename.split('/').pop().split('\\').pop();
+        const base = displayFilename(info);
         displayTitle = base.replace(/\.[^.]+$/, '');
     }
     if (!displayTitle) displayTitle = 'Untitled download';
@@ -2359,7 +2365,7 @@ function renderHistoryCard(info) {
         menuItems.push(`<button data-url-action="open" ${urlData}><svg class="menu-icon"><use href="#i-external"/></svg>Open URL</button>`);
     }
     if (hasPlay) {
-        const playLabel = info.filename.split('/').pop().split('\\').pop();
+        const playLabel = displayFilename(info);
         const playExt = info.filename.split('.').pop().toLowerCase();
         menuItems.push(`<button data-endless-action data-download-id="${escapeAttr(id)}" data-play-label="${escapeAttr(playLabel)}" data-play-ext="${escapeAttr(playExt)}"><svg class="menu-icon"><use href="#i-play"/></svg>Play All</button>`);
         if (PLAYLIST_VIDEO_EXTENSIONS.has(playExt)) {
@@ -2392,7 +2398,7 @@ function renderHistoryCard(info) {
         : '';
     let preview;
     if (hasPlay) {
-        const playLabel = info.filename.split('/').pop().split('\\').pop();
+        const playLabel = displayFilename(info);
         const playExt = info.filename.split('.').pop().toLowerCase();
         preview = `
                 <div class="history-preview-wrap">
@@ -2418,7 +2424,7 @@ function renderHistoryCard(info) {
 
     let fileControl = '';
     if (info.filename) {
-        const base = info.filename.split('/').pop().split('\\').pop();
+        const base = displayFilename(info);
         fileControl = `
                             <div class="history-info-section history-file-section">
                                 <div class="history-info-label">File</div>
@@ -2431,7 +2437,7 @@ function renderHistoryCard(info) {
     const sourceControl = isUpload
         ? `<div class="history-info-section history-source-section">
                                 <div class="history-info-label">Source</div>
-                                <div class="history-source-field"><span>Local upload</span></div>
+                                <div class="history-source-field"><span>${info.mounted_import ? 'Mounted import' : 'Local upload'}</span></div>
                             </div>`
         : `<div class="history-info-section history-source-section">
                                 <div class="history-info-label">Original URL</div>
@@ -2493,7 +2499,7 @@ function renderHistoryCard(info) {
                             </div>`;
 
     return `
-                <article class="history-card" data-row-id="${escapeAttr(id)}">
+                <article class="history-card" id="history-item-${escapeAttr(id)}" data-row-id="${escapeAttr(id)}">
                     ${preview}
                     <div class="history-card-caption">
                         <div class="history-card-title" title="${escapeAttr(displayTitle)}">${escapeHtml(displayTitle)}</div>
@@ -2582,7 +2588,7 @@ function renderItem(info, inHistoryView = false) {
     const hasPlay = isFinished && info.filename;
     let playBtn = '';
     if (hasPlay) {
-        const playLabel = info.filename.split('/').pop().split('\\').pop();
+        const playLabel = displayFilename(info);
         const playExt = info.filename.split('.').pop().toLowerCase();
         // Filenames stay in data attributes so HTML entity decoding cannot
         // turn stored text into executable inline JavaScript.
@@ -2630,7 +2636,7 @@ function renderItem(info, inHistoryView = false) {
         }
         const meta = [];
         if (info.filename) {
-            const base = info.filename.split('/').pop().split('\\').pop();
+            const base = displayFilename(info);
             if (isFinished) {
                 meta.push(`<div class="file-meta-row"><strong>File:</strong>${renderRenameControl(id, base)}</div>`);
             } else {
@@ -2680,7 +2686,7 @@ function renderItem(info, inHistoryView = false) {
 
     let displayTitle = info.title || '';
     if (!displayTitle && info.filename) {
-        const base = info.filename.split('/').pop().split('\\').pop();
+        const base = displayFilename(info);
         displayTitle = base.replace(/\.[^.]+$/, '');
     }
     const authenticatedLabel = info.browser_authenticated
@@ -2720,6 +2726,134 @@ let _renderedActiveIds  = new Set();
 let _renderedHistoryIds = new Set();
 const pendingActiveAnimations = new Set();
 const pendingHistoryAnimations = new Set();
+let libraryView = 'history';
+let duplicatesRequest = 0;
+
+function setLibraryView(view) {
+    libraryView = view;
+    const showingDuplicates = view === 'duplicates';
+    document.getElementById('historyMain').hidden = showingDuplicates;
+    document.getElementById('duplicatesPanel').hidden = !showingDuplicates;
+    document.getElementById('historySearch').hidden = showingDuplicates;
+    document.getElementById('playbackModeControl').hidden = showingDuplicates;
+    document.getElementById('createPlaylistButton').hidden = showingDuplicates;
+    for (const [id, active] of [
+        ['historyViewButton', !showingDuplicates],
+        ['duplicatesViewButton', showingDuplicates],
+    ]) {
+        const button = document.getElementById(id);
+        button.classList.toggle('active', active);
+        button.setAttribute('aria-pressed', String(active));
+    }
+    if (showingDuplicates) fetchDuplicates();
+}
+
+function duplicateSourceLabel(info) {
+    if (info.mounted_import) return 'Mounted import';
+    if (info.source_type === 'upload') return 'Local upload';
+    return 'URL download';
+}
+
+function renderDuplicateMember(info) {
+    const id = String(info.id);
+    const name = displayFilename(info);
+    const title = info.title || name.replace(/\.[^.]+$/, '') || 'Untitled download';
+    const tags = Array.isArray(info.tags) ? info.tags : [];
+    const details = [duplicateSourceLabel(info), info.resolution, formatBytes(info.filesize)]
+        .filter(Boolean).map(value => `<span>${escapeHtml(value)}</span>`).join('');
+    return `<article class="duplicate-member" data-duplicate-id="${escapeAttr(id)}">
+                <img src="/api/thumbnail/${encodeURIComponent(id)}" alt="" loading="lazy">
+                <div class="duplicate-member-detail">
+                    <div class="duplicate-member-title">${escapeHtml(title)}</div>
+                    <div class="duplicate-member-filename">${escapeHtml(name)}</div>
+                    <div class="duplicate-member-meta">${details}</div>
+                    ${tags.length ? `<div class="tag-row">${tags.map(tag => tagChipHtml(tag, false)).join('')}</div>` : ''}
+                    <a class="duplicate-history-link" href="#history-item-${escapeAttr(id)}" data-duplicate-history-link="${escapeAttr(id)}">View in History</a>
+                </div>
+            </article>`;
+}
+
+function renderDuplicates(data) {
+    const groups = Array.isArray(data.groups) ? data.groups : [];
+    const pending = Math.max(0, Number(data.pending_count) || 0);
+    const unavailable = Math.max(0, Number(data.unavailable_count) || 0);
+    const count = groups.length;
+    const summary = `${count} confirmed ${count === 1 ? 'group' : 'groups'} · ${pending} pending · ${unavailable} unavailable`;
+    document.getElementById('duplicatesStatus').textContent = summary;
+    document.getElementById('duplicatesList').innerHTML = groups.length
+        ? groups.map(group => {
+            const items = Array.isArray(group.items) ? group.items : [];
+            const byteSize = formatBytes(group.byte_size) || 'Unknown size';
+            return `<section class="duplicate-group">
+                        <h3>${items.length} ${items.length === 1 ? 'item' : 'items'} · ${escapeHtml(byteSize)} each</h3>
+                        <div class="duplicate-members">${items.map(renderDuplicateMember).join('')}</div>
+                    </section>`;
+        }).join('')
+        : `<p class="history-empty">${pending || unavailable
+            ? 'No confirmed duplicates yet. Some files are still pending or unavailable for indexing.'
+            : 'No duplicate media found.'}</p>`;
+}
+
+async function fetchDuplicates() {
+    if (libraryView !== 'duplicates') return;
+    const request = ++duplicatesRequest;
+    try {
+        const response = await apiFetch('/api/duplicates');
+        if (!response.ok) throw new Error('Could not load duplicate media.');
+        const data = await response.json();
+        if (request === duplicatesRequest && libraryView === 'duplicates') {
+            renderDuplicates(data);
+        }
+    } catch (_error) {
+        if (request === duplicatesRequest && libraryView === 'duplicates') {
+            document.getElementById('duplicatesStatus').textContent =
+                'Could not load duplicate media. Try again.';
+        }
+    }
+}
+
+async function showDuplicateHistoryItem(id) {
+    setLibraryView('history');
+    const input = document.getElementById('historySearchInput');
+    input.value = '';
+    document.getElementById('historySearchClear').hidden = true;
+    searchTerms = [];
+    await fetchHistory();
+    const index = historyOrderIds.indexOf(String(id));
+    if (index < 0) return;
+    if (endlessHistoryEnabled()) {
+        historyEndlessVisibleCount = Math.max(historyEndlessVisibleCount, index + 1);
+    } else {
+        historyPage = Math.floor(index / historyPageSize);
+    }
+    await fetchHistory();
+    const card = document.getElementById(`history-item-${id}`);
+    if (card) card.scrollIntoView({ block: 'center' });
+}
+
+document.getElementById('historyViewButton').addEventListener('click', () => setLibraryView('history'));
+document.getElementById('duplicatesViewButton').addEventListener('click', () => setLibraryView('duplicates'));
+document.getElementById('duplicatesList').addEventListener('click', event => {
+    const link = event.target.closest('[data-duplicate-history-link]');
+    if (!link) return;
+    event.preventDefault();
+    showDuplicateHistoryItem(link.dataset.duplicateHistoryLink);
+});
+document.getElementById('duplicatesRefresh').addEventListener('click', async event => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    try {
+        const response = await apiFetch('/api/duplicates/refresh', { method: 'POST' });
+        if (!response.ok) throw new Error('Could not start the duplicate index refresh.');
+        document.getElementById('duplicatesStatus').textContent = 'Refreshing duplicate index…';
+        await fetchDuplicates();
+    } catch (_error) {
+        document.getElementById('duplicatesStatus').textContent =
+            'Could not start the duplicate index refresh. Try again.';
+    } finally {
+        button.disabled = false;
+    }
+});
 
 function updateHistoryEmptyState() {
     const hasFilter = searchTerms.length > 0;
@@ -4940,6 +5074,7 @@ function scheduleFetch({ sortFavorites = false } = {}) {
         pendingFavoriteSort = false;
         fetchHistory({ sortFavorites: applyFavoriteSort });
         fetchPlaylists();
+        if (libraryView === 'duplicates') fetchDuplicates();
     }, 0);
 }
 

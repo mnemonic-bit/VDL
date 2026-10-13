@@ -55,12 +55,14 @@ fi
 "$engine" volume create "$data_volume" >/dev/null
 "$engine" volume create "$media_volume" >/dev/null
 "$engine" volume create "$ingest_volume" >/dev/null
+"$engine" run --rm --entrypoint mkdir \
+    -v "$ingest_volume:/ingest" "$image" -p /ingest/First
 "$engine" run --rm --entrypoint ffmpeg \
     -v "$ingest_volume:/ingest" "$image" \
     -v error -f lavfi -i color=c=black:s=16x16:d=0.2 \
-    -c:v mpeg4 -an -y /ingest/watched-folder.mp4
+    -c:v mpeg4 -an -y /ingest/First/watched-folder.mp4
 "$engine" run -d --name "$name" \
-    -e VDL_INGEST_SCAN_SECONDS=1 -e VDL_INGEST_SETTLE_SECONDS=1 \
+    -e VDL_INGEST_DIR=/ingest \
     -v "$data_volume:/data" -v "$media_volume:/downloads" \
     -v "$ingest_volume:/ingest:ro" "$image" >/dev/null
 
@@ -258,12 +260,40 @@ assert watched is not None, 'watched-folder.mp4 was not ingested'
 assert watched['status'] == 'finished', watched
 assert watched['source_type'] == 'upload', watched
 assert watched['resolution'] == '16p', watched
+assert watched['tags'] == ['First'], watched
 remove = urllib.request.Request(
     f'http://127.0.0.1:5000/api/remove/{upload_id}',
     data=b'',
     method='POST',
 )
 opener.open(remove, timeout=3).close()
+PY
+
+# A source added after the startup snapshot must wait for a restart.
+"$engine" run --rm --entrypoint sh \
+    -v "$ingest_volume:/ingest" "$image" -c \
+    'mkdir -p /ingest/Second && cp /ingest/First/watched-folder.mp4 /ingest/Second/watched-folder.mp4'
+"$engine" exec "$name" python - <<'PY'
+import http.cookiejar
+import json
+import urllib.parse
+import urllib.request
+
+base_url = 'http://127.0.0.1:5000'
+opener = urllib.request.build_opener(
+    urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())
+)
+opener.open(urllib.request.Request(
+    base_url + '/login',
+    data=urllib.parse.urlencode({
+        'username': 'admin', 'password': 'container-test-password',
+    }).encode(),
+    method='POST',
+), timeout=3).close()
+with opener.open(base_url + '/api/history', timeout=3) as response:
+    rows = [row for row in json.load(response) if row['title'] == 'watched-folder']
+assert len(rows) == 1, rows
+assert rows[0]['tags'] == ['First'], rows
 PY
 
 "$engine" exec "$name" python - <<'PY'
@@ -307,7 +337,7 @@ PY
 
 "$engine" rm -f "$name" >/dev/null
 "$engine" run -d --name "$name" \
-    -e VDL_INGEST_SCAN_SECONDS=1 -e VDL_INGEST_SETTLE_SECONDS=1 \
+    -e VDL_INGEST_DIR=/ingest \
     -v "$data_volume:/data" -v "$media_volume:/downloads" \
     -v "$ingest_volume:/ingest:ro" "$image" >/dev/null
 for attempt in $(seq 1 40); do
@@ -321,6 +351,10 @@ done
 "$engine" exec "$name" python - <<'PY'
 import json
 import http.cookiejar
+import os
+import re
+import sqlite3
+import time
 import urllib.parse
 import urllib.request
 
@@ -341,12 +375,75 @@ opener.open(login, timeout=3).close()
 
 with opener.open(base_url + '/api/preferences') as response:
     assert json.load(response)['theme'] == 'dark'
-with opener.open(base_url + '/api/history') as response:
-    history = json.load(response)
+for attempt in range(40):
+    with opener.open(base_url + '/api/history') as response:
+        history = json.load(response)
+    imports = [row for row in history if row['title'] == 'watched-folder']
+    if len(imports) == 2:
+        break
+    time.sleep(0.25)
 assert any(row['id'] == 'persist1' for row in history)
-assert sum(row['title'] == 'watched-folder' for row in history) == 1, history
+assert len(imports) == 2, history
+assert {tuple(row['tags']) for row in imports} == {('First',), ('Second',)}, imports
+with sqlite3.connect('/data/downloads.db') as connection:
+    paths = [connection.execute(
+        'SELECT filename, display_filename FROM downloads WHERE id = ?',
+        (row['id'],),
+    ).fetchone() for row in imports]
+assert len({path for path, _display in paths}) == 2, paths
+for path, display in paths:
+    assert re.fullmatch(r'watched-folder--[0-9a-f]{12}\.mp4', os.path.basename(path)), path
+    assert display == 'watched-folder.mp4', display
+    assert os.path.isfile(path), path
+for attempt in range(40):
+    with opener.open(base_url + '/api/duplicates') as response:
+        duplicate_info = json.load(response)
+    groups = duplicate_info['groups']
+    if any({item['id'] for item in group['items']} ==
+           {row['id'] for row in imports} for group in groups):
+        break
+    time.sleep(0.25)
+assert any({item['id'] for item in group['items']} ==
+           {row['id'] for row in imports} for group in groups), duplicate_info
 with opener.open(base_url + '/api/file/persist1') as response:
     assert response.read() == b'persistent media'
+PY
+
+# Receipts survive a second restart: neither mounted source is imported again.
+"$engine" rm -f "$name" >/dev/null
+"$engine" run -d --name "$name" \
+    -e VDL_INGEST_DIR=/ingest \
+    -v "$data_volume:/data" -v "$media_volume:/downloads" \
+    -v "$ingest_volume:/ingest:ro" "$image" >/dev/null
+for attempt in $(seq 1 40); do
+    if "$engine" exec "$name" python -c \
+        "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/api/health', timeout=1)" \
+        >/dev/null 2>&1; then
+        break
+    fi
+    sleep 0.25
+done
+"$engine" exec "$name" python - <<'PY'
+import http.cookiejar
+import json
+import urllib.parse
+import urllib.request
+
+base_url = 'http://127.0.0.1:5000'
+opener = urllib.request.build_opener(
+    urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())
+)
+opener.open(urllib.request.Request(
+    base_url + '/login',
+    data=urllib.parse.urlencode({
+        'username': 'admin', 'password': 'container-test-password',
+    }).encode(),
+    method='POST',
+), timeout=3).close()
+with opener.open(base_url + '/api/history', timeout=3) as response:
+    rows = [row for row in json.load(response) if row['title'] == 'watched-folder']
+assert len(rows) == 2, rows
+assert {tuple(row['tags']) for row in rows} == {('First',), ('Second',)}, rows
 PY
 
 # Mount only test code; application code remains the immutable /app payload

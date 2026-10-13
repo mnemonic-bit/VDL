@@ -7,7 +7,6 @@ ARG VDL_GID=10001
 
 ENV DOWNLOADS_DIR=/downloads \
     DOWNLOADS_DB=/data/downloads.db \
-    VDL_INGEST_DIR=/ingest \
     HOST=0.0.0.0 \
     PORT=5000 \
     FLASK_DEBUG=0 \
@@ -45,7 +44,7 @@ RUN cd /app/browser-extension/dist \
 RUN chmod 0555 /app/docker-entrypoint.sh \
     && chmod -R a-w /app
 
-VOLUME ["/downloads", "/data", "/ingest"]
+VOLUME ["/downloads", "/data"]
 EXPOSE 5000
 
 USER 10001:10001

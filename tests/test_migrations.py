@@ -87,10 +87,11 @@ class SchemaMigrationTest(unittest.TestCase):
                     "visibility", "browser_authenticated",
                     "extension_request_id",
                     "duration_seconds", "media_metadata_probed",
+                    "display_filename", "ingest_source_path",
                 })
                 self.assertTrue({
                     "tags", "download_tags", "app_config", "roles", "users",
-                    "user_roles", "ingest_receipts",
+                    "user_roles", "ingest_receipts", "media_hashes",
                     "extension_tokens", "playlists", "playlist_items",
                     "playlist_progress",
                 }.issubset(tables))

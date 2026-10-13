@@ -580,6 +580,18 @@ def init_db():
                 download_id TEXT NOT NULL,
                 ingested_at REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS media_hashes (
+                download_id TEXT PRIMARY KEY REFERENCES downloads(id) ON DELETE CASCADE,
+                algorithm TEXT NOT NULL DEFAULT 'sha256',
+                digest TEXT,
+                byte_size INTEGER,
+                device INTEGER,
+                inode INTEGER,
+                mtime_ns INTEGER,
+                state TEXT NOT NULL DEFAULT 'pending'
+            );
+            CREATE INDEX IF NOT EXISTS media_hashes_match
+                ON media_hashes(byte_size, digest);
             CREATE TABLE IF NOT EXISTS extension_tokens (
                 id                     TEXT PRIMARY KEY,
                 user_id                INTEGER NOT NULL
@@ -664,9 +676,21 @@ def init_db():
             # never inferred from a source stream that may later be remuxed.
             ("duration_seconds", "ALTER TABLE downloads ADD COLUMN duration_seconds REAL"),
             ("media_metadata_probed", "ALTER TABLE downloads ADD COLUMN media_metadata_probed INTEGER NOT NULL DEFAULT 0"),
+            ("display_filename", "ALTER TABLE downloads ADD COLUMN display_filename TEXT"),
+            # Receipts can move to a later import of the same source path;
+            # each History row still needs its own permanent origin.
+            ("ingest_source_path", "ALTER TABLE downloads ADD COLUMN ingest_source_path TEXT"),
         ]:
             if col not in existing_cols:
                 conn.execute(ddl)
+        conn.execute(
+            "UPDATE downloads SET ingest_source_path = ("
+            "SELECT source_path FROM ingest_receipts "
+            "WHERE ingest_receipts.download_id = downloads.id) "
+            "WHERE ingest_source_path IS NULL AND EXISTS ("
+            "SELECT 1 FROM ingest_receipts "
+            "WHERE ingest_receipts.download_id = downloads.id)"
+        )
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS downloads_extension_request "
             "ON downloads(owner_user_id, extension_request_id) "
@@ -806,8 +830,9 @@ def db_insert_upload(download_id, upload_name, title, filesize, output_dir,
 
 def db_insert_ingested_video(download_id, source_path, source_signature,
                              upload_name, title, filesize, output_dir,
-                             filename, resolution, duration_seconds=None):
-    """Atomically register a watched-folder video and its source receipt."""
+                             filename, resolution, duration_seconds=None,
+                             content_hash=None, folder_tags=()):
+    """Atomically register a mounted video, receipt, tags, and final hash."""
     now = time.time()
     device, inode, _signature_size, mtime_ns = source_signature
     with _db_lock, db() as conn:
@@ -816,13 +841,15 @@ def db_insert_ingested_video(download_id, source_path, source_signature,
             "id, url, status, progress, created_at, filename, resolution, "
             "duration_seconds, media_metadata_probed, "
             "filesize, speed, eta, title, finished_at, output_dir, "
-            "requested_filename, downloaded_bytes, total_bytes, source_type"
+            "requested_filename, display_filename, ingest_source_path, "
+            "downloaded_bytes, total_bytes, source_type"
             ") VALUES (?, '', 'finished', '100%', ?, ?, ?, ?, 1, ?, 0, 0, ?, ?, "
-            "?, ?, ?, ?, 'upload')",
+            "?, ?, ?, ?, ?, ?, 'upload')",
             (
                 download_id, now, filename, resolution, duration_seconds,
                 filesize, title, now,
-                output_dir, upload_name, filesize, filesize,
+                output_dir, upload_name, upload_name, source_path,
+                filesize, filesize,
             ),
         )
         conn.execute(
@@ -839,11 +866,41 @@ def db_insert_ingested_video(download_id, source_path, source_signature,
                 now,
             ),
         )
+        for tag_name in folder_tags:
+            display_name, normalized_name = _validated_tag_name(tag_name)
+            conn.execute(
+                "INSERT OR IGNORE INTO tags(name, normalized_name, created_at) "
+                "VALUES (?, ?, ?)",
+                (display_name, normalized_name, now),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO download_tags(download_id, tag_id, created_at) "
+                "SELECT ?, id, ? FROM tags WHERE normalized_name = ?",
+                (download_id, now, normalized_name),
+            )
+        if content_hash is not None:
+            digest, identity = content_hash
+            conn.execute(
+                "INSERT INTO media_hashes(download_id, algorithm, digest, "
+                "byte_size, device, inode, mtime_ns, state) "
+                "VALUES (?, 'sha256', ?, ?, ?, ?, ?, 'ready')",
+                (download_id, digest, identity[2], identity[0],
+                 identity[1], identity[3]),
+            )
     event_bus.publish('change', {'reason': 'insert', 'id': download_id})
 
 
+def _path_is_below(path, directory):
+    try:
+        path = os.path.abspath(path)
+        directory = os.path.abspath(directory)
+        return path != directory and os.path.commonpath((path, directory)) == directory
+    except (TypeError, ValueError):
+        return False
+
+
 def db_get_ingest_receipts(directory):
-    """Return source signatures already imported from one watched folder."""
+    """Return source signatures below this ingest root, including children."""
     directory = os.path.realpath(directory)
     with db() as conn:
         rows = conn.execute(
@@ -855,12 +912,12 @@ def db_get_ingest_receipts(directory):
             row['device'], row['inode'], row['filesize'], row['mtime_ns'],
         )
         for row in rows
-        if os.path.dirname(row['source_path']) == directory
+        if _path_is_below(row['source_path'], directory)
     }
 
 
 def db_prune_ingest_receipts(directory, visible_paths):
-    """Forget removed inbox files so a later replacement can be imported."""
+    """Forget paths absent from a complete startup snapshot."""
     receipts = db_get_ingest_receipts(directory)
     missing = set(receipts).difference(visible_paths)
     if not missing:
@@ -876,7 +933,8 @@ def db_update_download(download_id, *, status=None, progress=None,
                        filename=None, resolution=None, filesize=None,
                        speed=None, eta=None, title=None, finished_at=None,
                        formats=None, requested_format=None, output_dir=None,
-                       requested_filename=None, downloaded_bytes=None,
+                       requested_filename=None, display_filename=None,
+                       downloaded_bytes=None,
                        total_bytes=_NO_UPDATE, duration_seconds=_NO_UPDATE,
                        media_metadata_probed=None):
     fields, values = [], []
@@ -906,6 +964,8 @@ def db_update_download(download_id, *, status=None, progress=None,
         fields.append("output_dir = ?"); values.append(output_dir)
     if requested_filename is not None:
         fields.append("requested_filename = ?"); values.append(requested_filename)
+    if display_filename is not None:
+        fields.append("display_filename = ?"); values.append(display_filename)
     if downloaded_bytes is not None:
         fields.append("downloaded_bytes = ?"); values.append(downloaded_bytes)
     if total_bytes is not _NO_UPDATE:
@@ -923,7 +983,17 @@ def db_update_download(download_id, *, status=None, progress=None,
             f"UPDATE downloads SET {', '.join(fields)} WHERE id = ?",
             values,
         )
+        if status == 'finished':
+            conn.execute(
+                "INSERT INTO media_hashes(download_id, state) "
+                "VALUES (?, 'pending') ON CONFLICT(download_id) DO UPDATE "
+                "SET state = 'pending', digest = NULL, byte_size = NULL "
+                "WHERE media_hashes.state != 'ready' OR ? IS NOT NULL",
+                (download_id, filename),
+            )
     event_bus.publish('change', {'reason': 'update', 'id': download_id})
+    if status == 'finished':
+        _wake_duplicate_backfill()
 
 
 def db_claim_download_for_resume(download_id):
@@ -1348,11 +1418,12 @@ def db_list_downloads(user_id=None, is_admin=False):
         rows = conn.execute(
             "SELECT downloads.id, url, status, progress, "
             "downloads.created_at, "
-            "filename, resolution, filesize, speed, eta, title, finished_at, "
+            "filename, display_filename, resolution, filesize, speed, eta, title, finished_at, "
             "duration_seconds, media_metadata_probed, "
             "formats, requested_format, downloaded_bytes, total_bytes, favorite, "
             "view_count, "
             "source_type, owner_user_id, visibility, browser_authenticated, "
+            "(downloads.ingest_source_path IS NOT NULL) AS mounted_import, "
             "COALESCE(users.username, downloads.owner_username) "
             "AS downloaded_by "
             "FROM downloads "
@@ -1380,6 +1451,7 @@ def db_list_downloads(user_id=None, is_admin=False):
             download["media_metadata_probed"] = bool(
                 download["media_metadata_probed"]
             )
+            download["mounted_import"] = bool(download["mounted_import"])
             download["quality"] = classify_video_quality(
                 download["resolution"]
             )
@@ -1391,6 +1463,221 @@ def db_list_downloads(user_id=None, is_admin=False):
             # need the display name and this derived capability.
             download.pop("owner_user_id")
         return downloads
+
+
+def _public_download_entry(entry):
+    """Keep physical library paths out of ordinary browser responses."""
+    public = dict(entry)
+    stored = public.get('filename')
+    public['filename'] = (
+        public.get('display_filename') or os.path.basename(stored)
+        if stored else None
+    )
+    return public
+
+
+def _hash_backfill_once():
+    """Index finished library rows serially, including legacy unindexed rows."""
+    with db() as conn:
+        candidates = [dict(row) for row in conn.execute(
+            "SELECT downloads.id, downloads.filename, media_hashes.state, "
+            "media_hashes.device, media_hashes.inode, media_hashes.byte_size, "
+            "media_hashes.mtime_ns FROM downloads "
+            "LEFT JOIN media_hashes ON media_hashes.download_id = downloads.id "
+            "WHERE downloads.status = 'finished' ORDER BY downloads.created_at"
+        )]
+    changed = False
+    for candidate in candidates:
+        download_id, filename = candidate['id'], candidate['filename']
+        identity = _current_file_identity(filename)
+        recorded = (
+            candidate['device'], candidate['inode'],
+            candidate['byte_size'], candidate['mtime_ns'],
+        )
+        if candidate['state'] == 'ready' and identity == recorded:
+            continue
+        if candidate['state'] == 'unavailable':
+            continue
+        try:
+            if identity is None:
+                raise OSError('Media is missing or outside the library')
+            digest, hashed_identity = _hash_final_file(filename)
+            if _current_file_identity(filename) != hashed_identity:
+                raise OSError('Media changed while hashing')
+        except (OSError, ValueError):
+            state = 'unavailable'
+        else:
+            state = 'ready'
+        with _db_lock, db() as conn:
+            current = conn.execute(
+                "SELECT filename FROM downloads "
+                "WHERE id = ? AND status = 'finished'", (download_id,)
+            ).fetchone()
+            if current is None or current['filename'] != filename:
+                continue
+            if state == 'ready':
+                conn.execute(
+                    "INSERT INTO media_hashes(download_id, algorithm, digest, "
+                    "byte_size, device, inode, mtime_ns, state) "
+                    "VALUES (?, 'sha256', ?, ?, ?, ?, ?, 'ready') "
+                    "ON CONFLICT(download_id) DO UPDATE SET "
+                    "algorithm='sha256', digest=excluded.digest, "
+                    "byte_size=excluded.byte_size, device=excluded.device, "
+                    "inode=excluded.inode, mtime_ns=excluded.mtime_ns, "
+                    "state='ready'",
+                    (download_id, digest, hashed_identity[2],
+                     hashed_identity[0], hashed_identity[1], hashed_identity[3]),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO media_hashes(download_id, state) "
+                    "VALUES (?, 'unavailable') "
+                    "ON CONFLICT(download_id) DO UPDATE SET "
+                    "state='unavailable', digest=NULL, byte_size=NULL",
+                    (download_id,),
+                )
+            changed = True
+    if changed:
+        event_bus.publish('change', {'reason': 'duplicates'})
+
+
+def _mark_hash_state(download_id, state):
+    with _db_lock, db() as conn:
+        conn.execute(
+            "INSERT INTO media_hashes(download_id, state) VALUES (?, ?) "
+            "ON CONFLICT(download_id) DO UPDATE SET "
+            "state=excluded.state, digest=NULL, byte_size=NULL",
+            (download_id, state),
+        )
+    if state == 'pending':
+        _wake_duplicate_backfill()
+
+
+def _files_match(left, right, expected_size):
+    """Confirm a digest match by comparing final bytes and file identities."""
+    left_path, left_identity = left
+    right_path, right_identity = right
+    if (_current_file_identity(left_path) != left_identity
+            or _current_file_identity(right_path) != right_identity):
+        raise OSError('Media changed before comparison')
+    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0)
+    left_fd = os.open(left_path, flags)
+    try:
+        right_fd = os.open(right_path, flags)
+    except BaseException:
+        os.close(left_fd)
+        raise
+    with os.fdopen(left_fd, 'rb') as first, os.fdopen(right_fd, 'rb') as second:
+        if (_file_identity(os.fstat(first.fileno())) != left_identity
+                or _file_identity(os.fstat(second.fileno())) != right_identity):
+            raise OSError('Media changed before comparison')
+        read_size = 0
+        equal = True
+        while True:
+            a = first.read(1024 * 1024)
+            b = second.read(1024 * 1024)
+            if a != b:
+                equal = False
+                break
+            if not a:
+                break
+            read_size += len(a)
+        if (_file_identity(os.fstat(first.fileno())) != left_identity
+                or _file_identity(os.fstat(second.fileno())) != right_identity
+                or _current_file_identity(left_path) != left_identity
+                or _current_file_identity(right_path) != right_identity):
+            raise OSError('Media changed during comparison')
+        return equal and read_size == expected_size
+
+
+def _duplicate_groups(user_id, is_admin):
+    entries = [entry for entry in db_list_downloads(user_id, is_admin)
+               if entry['status'] == 'finished']
+    with db() as conn:
+        hashes = {row['download_id']: dict(row)
+                  for row in conn.execute("SELECT * FROM media_hashes")}
+    candidates = {}
+    pending_count = unavailable_count = 0
+    for entry in entries:
+        record = hashes.get(entry['id'])
+        identity = _current_file_identity(entry['filename'])
+        if identity is None:
+            unavailable_count += 1
+            if record is not None and record['state'] != 'unavailable':
+                _mark_hash_state(entry['id'], 'unavailable')
+            continue
+        if record is None or record['state'] == 'pending':
+            pending_count += 1
+            _wake_duplicate_backfill()
+            continue
+        if record['state'] == 'unavailable':
+            unavailable_count += 1
+            continue
+        recorded = (record['device'], record['inode'],
+                    record['byte_size'], record['mtime_ns'])
+        if identity != recorded:
+            pending_count += 1
+            _mark_hash_state(entry['id'], 'pending')
+            continue
+        candidates.setdefault(
+            (record['byte_size'], record['digest']), []
+        ).append((entry, identity))
+
+    groups = []
+    for (byte_size, _digest), members in candidates.items():
+        if len(members) < 2:
+            continue
+        confirmed = []
+        for member in members:
+            placed = False
+            for group in confirmed:
+                representative = group[0]
+                try:
+                    same = _files_match(
+                        (member[0]['filename'], member[1]),
+                        (representative[0]['filename'], representative[1]),
+                        byte_size,
+                    )
+                except OSError:
+                    pending_count += 1
+                    _mark_hash_state(member[0]['id'], 'pending')
+                    placed = True
+                    break
+                if same:
+                    group.append(member)
+                    placed = True
+                    break
+            if not placed:
+                confirmed.append([member])
+        for group in confirmed:
+            if len(group) > 1:
+                changed = []
+                for entry, identity in group:
+                    current_identity = _current_file_identity(entry['filename'])
+                    if current_identity != identity:
+                        changed.append((entry, current_identity))
+                if changed:
+                    for entry, current_identity in changed:
+                        state = ('pending' if current_identity is not None
+                                 else 'unavailable')
+                        _mark_hash_state(entry['id'], state)
+                        if state == 'pending':
+                            pending_count += 1
+                        else:
+                            unavailable_count += 1
+                    continue
+                groups.append({
+                    'byte_size': byte_size,
+                    'item_count': len(group),
+                    'items': [_public_download_entry(entry)
+                              for entry, _identity in group],
+                })
+    groups.sort(key=lambda group: group['items'][0]['created_at'], reverse=True)
+    return {
+        'groups': groups,
+        'pending_count': pending_count,
+        'unavailable_count': unavailable_count,
+    }
 
 
 def _parse_history_filter(value):
@@ -1454,6 +1741,10 @@ def _matches_history_filter(entry, normalized_filter):
         return True
 
     title = _history_search_key(entry.get('title'))
+    display_filename = _history_search_key(
+        entry.get('display_filename')
+        or os.path.basename(entry.get('filename') or '')
+    )
     tags = {
         _history_search_key(tag) for tag in entry.get('tags', [])
     }
@@ -1521,6 +1812,7 @@ def _matches_history_filter(entry, normalized_filter):
         return True
     return any(
         (_history_search_key(term) in title)
+        or (_history_search_key(term) in display_filename)
         or (_history_search_key(term) in tags)
         for term in content_terms
     )
@@ -3864,6 +4156,18 @@ def _validated_upload_filename(value):
     return name
 
 
+def _validated_mounted_filename(value):
+    """Keep the complete safe source basename; storage gets its own suffix."""
+    if not isinstance(value, str):
+        raise ValueError('Mounted file must have a filename')
+    name = value
+    if (not name or name in ('.', '..') or '/' in name or '\\' in name
+            or '\x00' in name
+            or any(ord(character) < 32 for character in name)):
+        raise ValueError('Mounted file must have a valid filename')
+    return name
+
+
 def _reserve_upload_path(directory, filename):
     """Atomically reserve a collision-safe destination in the library."""
     stem, extension = os.path.splitext(filename)
@@ -3885,8 +4189,72 @@ def _reserve_upload_path(directory, filename):
     raise OSError('Unable to choose an unused filename for the upload')
 
 
+def _reserve_mounted_path(directory, filename):
+    """Reserve a new opaque library basename without replacing any file."""
+    stem, extension = os.path.splitext(filename)
+    limit = os.pathconf(directory, 'PC_NAME_MAX')
+    available = limit - len(os.fsencode(extension)) - len('--') - 12
+    if available < 1:
+        raise ValueError('Mounted filename extension is too long')
+    while len(os.fsencode(stem)) > available:
+        stem = stem[:-1]
+    for _attempt in range(10000):
+        candidate = os.path.join(
+            directory, f'{stem}--{uuid.uuid4().hex[:12]}{extension}'
+        )
+        try:
+            descriptor = os.open(
+                candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+            )
+        except FileExistsError:
+            continue
+        os.close(descriptor)
+        return candidate
+    raise OSError('Unable to choose an unused filename for the import')
+
+
+def _file_identity(metadata):
+    return (
+        int(metadata.st_dev), int(metadata.st_ino),
+        int(metadata.st_size), int(metadata.st_mtime_ns),
+    )
+
+
+def _hash_final_file(path):
+    """Read one allowed regular artifact in bounded chunks and detect races."""
+    if not _is_allowed_download_path(path):
+        raise PermissionError('Media path is outside the library')
+    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0)
+    descriptor = os.open(path, flags)
+    with os.fdopen(descriptor, 'rb') as source:
+        before = os.fstat(source.fileno())
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError('Media path is not a regular file')
+        digest = hashlib.sha256()
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+        identity = _file_identity(before)
+        if (_file_identity(os.fstat(source.fileno())) != identity
+                or _file_identity(os.stat(path, follow_symlinks=False)) != identity
+                or not _is_allowed_download_path(path)):
+            raise OSError('Media changed while hashing')
+    return digest.hexdigest(), identity
+
+
+def _current_file_identity(path):
+    if not path or not _is_allowed_download_path(path):
+        return None
+    try:
+        metadata = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return None
+    if not stat.S_ISREG(metadata.st_mode):
+        return None
+    return _file_identity(metadata)
+
+
 class IngestSourceChanged(Exception):
-    """The watched source stopped matching the settled scan candidate."""
+    """A captured source no longer matches its startup snapshot."""
 
 
 def _ingest_signature(metadata):
@@ -3908,17 +4276,100 @@ def _source_signature(path):
     return _ingest_signature(metadata)
 
 
-def _ingest_watched_file(source_path, expected_signature):
-    """Copy one settled inbox file into the library without publishing early."""
+def _disjoint_ingest_and_output(ingest_root, output_dir):
+    ingest_root = os.path.realpath(ingest_root)
+    output_dir = os.path.realpath(output_dir)
+    if os.path.commonpath((ingest_root, output_dir)) in (ingest_root, output_dir):
+        raise ValueError(
+            'The ingest folder and download directory must be different directory trees'
+        )
+
+
+def _ingest_relative_components(ingest_root, source_path, relative_path):
+    """Reject lexical escapes before walking any source path components."""
+    root = os.path.realpath(os.path.abspath(ingest_root))
     source_path = os.path.abspath(source_path)
-    original_name = _validated_upload_filename(os.path.basename(source_path))
+    if (not relative_path or os.path.isabs(relative_path)
+            or any(part in ('', '.', '..') for part in relative_path.split(os.sep))
+            or os.path.join(root, relative_path) != source_path):
+        raise IngestSourceChanged('Source path escaped the ingest mount')
+    return root, relative_path.split(os.sep)
+
+
+def _verified_ingest_signature(ingest_root, source_path, relative_path):
+    root, components = _ingest_relative_components(
+        ingest_root, source_path, relative_path
+    )
+    current = root
+    try:
+        for component in components[:-1]:
+            current = os.path.join(current, component)
+            if not stat.S_ISDIR(os.stat(current, follow_symlinks=False).st_mode):
+                raise IngestSourceChanged('Source directory changed or became a symlink')
+        return _source_signature(source_path)
+    except OSError as exc:
+        raise IngestSourceChanged('Source path changed after enumeration') from exc
+
+
+def _open_ingest_source(ingest_root, source_path, relative_path):
+    root, components = _ingest_relative_components(
+        ingest_root, source_path, relative_path
+    )
+    descriptor = None
+    try:
+        descriptor = _open_ingest_directory(root, os.path.dirname(relative_path))
+        return os.open(
+            components[-1], os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0),
+            dir_fd=descriptor,
+        )
+    except OSError as exc:
+        raise IngestSourceChanged('Source path changed after enumeration') from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _open_ingest_directory(root, relative_path):
+    """Walk from the configured root with no-follow directory descriptors."""
+    descriptor = None
+    flags = (os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0)
+             | getattr(os, 'O_NOFOLLOW', 0))
+    try:
+        descriptor = os.open(root, flags)
+        for component in relative_path.split(os.sep) if relative_path else ():
+            if component in ('', '.', '..'):
+                raise ValueError('Invalid ingest directory component')
+            child = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise
+
+
+def _ingest_watched_file(source_path, expected_signature, *,
+                         ingest_root=None, relative_path=None):
+    """Copy one captured inbox file into the library without publishing early."""
+    source_path = os.path.abspath(source_path)
+    if ingest_root is None:
+        ingest_root = os.path.dirname(source_path)
+    if relative_path is None:
+        relative_path = os.path.relpath(source_path, ingest_root)
+    _verified_ingest_signature(ingest_root, source_path, relative_path)
+    original_name = _validated_mounted_filename(os.path.basename(source_path))
+    folder_tags = []
+    seen_tags = set()
+    for component in relative_path.split(os.sep)[:-1]:
+        display, identity = _validated_tag_name(component)
+        if identity not in seen_tags:
+            folder_tags.append(display)
+            seen_tags.add(identity)
     output_dir = os.path.abspath(_prepare_download_directory(
         db_get_preferences().get('download_dir', '.')
     ))
-    if os.path.realpath(output_dir) == os.path.dirname(source_path):
-        raise ValueError(
-            'The ingest folder and download directory must be different'
-        )
+    _disjoint_ingest_and_output(ingest_root, output_dir)
 
     download_id = str(uuid.uuid4())[:8]
     title = os.path.splitext(original_name)[0] or original_name
@@ -3926,15 +4377,17 @@ def _ingest_watched_file(source_path, expected_signature):
     final_path = None
     registered = False
     received = 0
+    digest = hashlib.sha256()
     descriptor = None
     try:
-        flags = os.O_RDONLY
-        if hasattr(os, 'O_NOFOLLOW'):
-            flags |= os.O_NOFOLLOW
-        descriptor = os.open(source_path, flags)
+        descriptor = _open_ingest_source(
+            ingest_root, source_path, relative_path
+        )
         with os.fdopen(descriptor, 'rb') as source:
             descriptor = None
-            if _ingest_signature(os.fstat(source.fileno())) != expected_signature:
+            source_metadata = os.fstat(source.fileno())
+            if (not stat.S_ISREG(source_metadata.st_mode)
+                    or _ingest_signature(source_metadata) != expected_signature):
                 raise IngestSourceChanged()
             with tempfile.NamedTemporaryFile(
                     mode='wb', dir=output_dir,
@@ -3946,26 +4399,37 @@ def _ingest_watched_file(source_path, expected_signature):
                     if not chunk:
                         break
                     temporary.write(chunk)
+                    digest.update(chunk)
                     received += len(chunk)
                 temporary.flush()
-            if _ingest_signature(os.fstat(source.fileno())) != expected_signature:
+            if (received != expected_signature[2]
+                    or _ingest_signature(os.fstat(source.fileno()))
+                    != expected_signature):
+                raise IngestSourceChanged()
+            if (_verified_ingest_signature(
+                    ingest_root, source_path, relative_path) != expected_signature):
+                raise IngestSourceChanged()
+            resolution = inspect_uploaded_video(temporary_path)
+            duration_seconds = _consume_media_probe(temporary_path, resolution)
+            # A writer can resume while ffprobe runs, even after copy completes.
+            if (_ingest_signature(os.fstat(source.fileno()))
+                    != expected_signature
+                    or _verified_ingest_signature(
+                        ingest_root, source_path, relative_path)
+                    != expected_signature):
                 raise IngestSourceChanged()
 
-        if received != expected_signature[2]:
-            raise IngestSourceChanged()
-        if _source_signature(source_path) != expected_signature:
-            raise IngestSourceChanged()
-        resolution = inspect_uploaded_video(temporary_path)
-        duration_seconds = _consume_media_probe(temporary_path, resolution)
-        # ffprobe is bounded, but a host writer can still resume while it runs.
-        # A final comparison prevents that changed source from being published.
-        if _source_signature(source_path) != expected_signature:
+        copy_identity = _file_identity(os.stat(temporary_path))
+        if copy_identity[2] != received:
             raise IngestSourceChanged()
 
         with _upload_lock:
-            final_path = _reserve_upload_path(output_dir, original_name)
+            final_path = _reserve_mounted_path(output_dir, original_name)
             os.replace(temporary_path, final_path)
             temporary_path = None
+
+        if _current_file_identity(final_path) != copy_identity:
+            raise IngestSourceChanged()
 
         db_insert_ingested_video(
             download_id,
@@ -3978,6 +4442,8 @@ def _ingest_watched_file(source_path, expected_signature):
             final_path,
             resolution,
             duration_seconds,
+            content_hash=(digest.hexdigest(), copy_identity),
+            folder_tags=folder_tags,
         )
         registered = True
         print(
@@ -4006,102 +4472,106 @@ _INGEST_TEMP_SUFFIXES = (
 )
 
 
-class IngestFolderWatcher:
-    """Periodically reconcile a flat drop folder into the video library."""
+def _eligible_ingest_name(name):
+    return not name.startswith('.') and not name.lower().endswith(
+        _INGEST_TEMP_SUFFIXES
+    )
 
-    def __init__(self, directory, scan_seconds=10.0, settle_seconds=60.0):
-        self.directory = os.path.realpath(directory)
-        self.scan_seconds = scan_seconds
-        self.settle_seconds = settle_seconds
-        self._candidates = {}
 
-    @staticmethod
-    def _eligible_name(name):
-        lowered = name.lower()
-        return (
-            not name.startswith('.')
-            and not lowered.endswith(_INGEST_TEMP_SUFFIXES)
-        )
-
-    def scan_once(self, now=None):
-        """Observe candidates once and import only settled regular files."""
-        now = time.monotonic() if now is None else now
-        receipts = db_get_ingest_receipts(self.directory)
-        visible_paths = set()
+def _snapshot_ingest_files(directory):
+    """Finish a single recursive walk before any copied file is processed."""
+    root = os.path.realpath(os.path.abspath(directory))
+    pending = ['']
+    visited = set()
+    snapshot = []
+    while pending:
+        relative_dir = pending.pop()
+        descriptor = _open_ingest_directory(root, relative_dir)
         try:
-            with os.scandir(self.directory) as entries:
+            metadata = os.fstat(descriptor)
+            identity = (metadata.st_dev, metadata.st_ino)
+            if identity in visited:
+                continue
+            visited.add(identity)
+            with os.scandir(descriptor) as entries:
                 for entry in entries:
-                    if not self._eligible_name(entry.name):
+                    if entry.name.startswith('.'):
                         continue
-                    try:
-                        metadata = entry.stat(follow_symlinks=False)
-                    except (FileNotFoundError, OSError):
-                        continue
-                    if not stat.S_ISREG(metadata.st_mode):
-                        continue
+                    metadata = entry.stat(follow_symlinks=False)
+                    relative = os.path.join(relative_dir, entry.name)
+                    if stat.S_ISDIR(metadata.st_mode):
+                        pending.append(relative)
+                    elif (stat.S_ISREG(metadata.st_mode)
+                          and _eligible_ingest_name(entry.name)):
+                        snapshot.append((
+                            os.path.join(root, relative),
+                            relative,
+                            _ingest_signature(metadata),
+                        ))
+        finally:
+            os.close(descriptor)
+    snapshot.sort(key=lambda item: item[1])
+    return snapshot
 
-                    path = os.path.join(self.directory, entry.name)
-                    signature = _ingest_signature(metadata)
-                    visible_paths.add(path)
-                    if receipts.get(path) == signature:
-                        self._candidates.pop(path, None)
-                        continue
 
-                    candidate = self._candidates.get(path)
-                    if candidate is None or candidate['signature'] != signature:
-                        self._candidates[path] = {
-                            'signature': signature,
-                            'stable_since': now,
-                            'observations': 1,
-                            'failed': False,
-                        }
-                        continue
+class IngestStartupImporter:
+    """Process one immutable startup snapshot, then exit."""
 
-                    candidate['observations'] += 1
-                    if (
-                        candidate['failed']
-                        or candidate['observations'] < 3
-                        or now - candidate['stable_since'] < self.settle_seconds
-                    ):
-                        continue
-
-                    try:
-                        _ingest_watched_file(path, signature)
-                    except IngestSourceChanged:
-                        # The next scan starts a fresh quiet period from a new
-                        # stat instead of treating a racing writer as an error.
-                        self._candidates.pop(path, None)
-                    except Exception as exc:
-                        # A malformed movie should not be copied and probed on
-                        # every pass. A modification or restart makes it
-                        # eligible again after the operator fixes the source.
-                        candidate['failed'] = True
-                        print(
-                            f'VDL ingest: could not add {entry.name!r}: {exc}',
-                            flush=True,
-                        )
-                    else:
-                        self._candidates.pop(path, None)
-        except OSError as exc:
-            print(
-                f'VDL ingest: unable to scan {self.directory!r}: {exc}',
-                flush=True,
-            )
-            return
-
-        for path in set(self._candidates).difference(visible_paths):
-            self._candidates.pop(path, None)
-        db_prune_ingest_receipts(self.directory, visible_paths)
+    def __init__(self, directory):
+        self.directory = os.path.realpath(os.path.abspath(directory))
 
     def run(self, stop_event):
-        while not stop_event.is_set():
+        counts = {
+            'enumerated': 0, 'imported': 0, 'receipt-skipped': 0,
+            'changed/missing': 0, 'failed': 0,
+        }
+        print(f'VDL ingest: startup scan beginning {self.directory!r}', flush=True)
+        try:
+            snapshot = _snapshot_ingest_files(self.directory)
+        except OSError as exc:
+            print(f'VDL ingest: unable to scan {self.directory!r}: {exc}', flush=True)
+            print(f'VDL ingest: startup scan failed; {counts}', flush=True)
+            return
+
+        counts['enumerated'] = len(snapshot)
+        visible_paths = {path for path, _relative, _signature in snapshot}
+        try:
+            db_prune_ingest_receipts(self.directory, visible_paths)
+            receipts = db_get_ingest_receipts(self.directory)
+        except Exception as exc:
+            print(f'VDL ingest: receipt reconciliation failed: {exc}', flush=True)
+            print(f'VDL ingest: startup scan failed; {counts}', flush=True)
+            return
+
+        for source_path, relative_path, expected_signature in snapshot:
+            if stop_event.is_set():
+                break
             try:
-                self.scan_once()
+                if (_verified_ingest_signature(
+                        self.directory, source_path, relative_path)
+                        != expected_signature):
+                    raise IngestSourceChanged('Source changed after enumeration')
+            except IngestSourceChanged as exc:
+                counts['changed/missing'] += 1
+                print(f'VDL ingest: skipped {relative_path!r}: {exc}', flush=True)
+                continue
+            if receipts.get(source_path) == expected_signature:
+                counts['receipt-skipped'] += 1
+                continue
+            try:
+                _ingest_watched_file(
+                    source_path, expected_signature,
+                    ingest_root=self.directory, relative_path=relative_path,
+                )
+            except IngestSourceChanged as exc:
+                counts['changed/missing'] += 1
+                print(f'VDL ingest: skipped {relative_path!r}: {exc}', flush=True)
             except Exception as exc:
-                # One DB or filesystem failure must not permanently kill the
-                # only reconciliation thread.
-                print(f'VDL ingest: scan failed: {exc}', flush=True)
-            stop_event.wait(self.scan_seconds)
+                counts['failed'] += 1
+                print(f'VDL ingest: could not add {relative_path!r}: {exc}', flush=True)
+            else:
+                counts['imported'] += 1
+        print(f'VDL ingest: startup scan complete; {counts}', flush=True)
 
 
 def _thumbnail_path(entry, fallback_dir=None):
@@ -5126,7 +5596,8 @@ def rename_download(download_id):
     if entry.get('status') != 'finished':
         return jsonify({"error": "Only finished downloads can be renamed"}), 409
     old_path = entry.get('filename')
-    if not old_path or not os.path.isfile(old_path):
+    if (not old_path or not os.path.isfile(old_path)
+            or not _is_allowed_download_path(old_path)):
         return jsonify({"error": "Original file is missing on disk"}), 410
 
     payload = request.get_json(silent=True) or {}
@@ -5150,10 +5621,20 @@ def rename_download(download_id):
     final_name = new_base + old_ext
     new_path = os.path.join(directory, final_name)
 
+    if entry.get('display_filename'):
+        if len(os.fsencode(final_name)) > 255:
+            return jsonify({"error": "Filename is too long"}), 400
+        if final_name == entry['display_filename']:
+            return jsonify({"message": "Unchanged", "id": download_id,
+                            "filename": final_name})
+        db_update_download(download_id, display_filename=final_name)
+        return jsonify({"message": "Renamed", "id": download_id,
+                        "filename": final_name})
+
     # No-op if the user submitted the same name.
     if os.path.realpath(new_path) == os.path.realpath(old_path):
         return jsonify({"message": "Unchanged", "id": download_id,
-                        "filename": old_path})
+                        "filename": os.path.basename(old_path)})
 
     if os.path.exists(new_path):
         return jsonify({"error": "A file with that name already exists"}), 409
@@ -5165,7 +5646,7 @@ def rename_download(download_id):
 
     db_update_download(download_id, filename=new_path)
     return jsonify({"message": "Renamed", "id": download_id,
-                    "filename": new_path})
+                    "filename": os.path.basename(new_path)})
 
 
 @app.route('/api/remove/<download_id>', methods=['POST'])
@@ -5211,10 +5692,37 @@ def clear_history():
 
 @app.route('/api/history', methods=['GET'])
 def get_history():
-    return jsonify(db_list_downloads(
-        g.current_user['id'],
-        is_admin='admin' in g.current_user['roles'],
+    return jsonify([
+        _public_download_entry(entry) for entry in db_list_downloads(
+            g.current_user['id'],
+            is_admin='admin' in g.current_user['roles'],
+        )
+    ])
+
+
+@app.route('/api/duplicates', methods=['GET'])
+def get_duplicates():
+    return jsonify(_duplicate_groups(
+        g.current_user['id'], 'admin' in g.current_user['roles']
     ))
+
+
+@app.route('/api/duplicates/refresh', methods=['POST'])
+def refresh_duplicates():
+    with _db_lock, db() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO media_hashes(download_id, state) "
+            "SELECT id, 'pending' FROM downloads WHERE status = 'finished'"
+        )
+        conn.execute(
+            "UPDATE media_hashes SET state = 'pending', digest = NULL, "
+            "byte_size = NULL WHERE download_id IN "
+            "(SELECT id FROM downloads WHERE status = 'finished')"
+        )
+    start_duplicate_backfill()
+    _wake_duplicate_backfill()
+    event_bus.publish('change', {'reason': 'duplicates'})
+    return jsonify({'message': 'Duplicate index refresh started'}), 202
 
 
 def _playlist_error_response(exc):
@@ -5933,7 +6441,8 @@ def stream_file(download_id):
         mimetype=mimetype,
         conditional=True,
         as_attachment=as_attachment,
-        download_name=os.path.basename(real) if as_attachment else None,
+        download_name=(entry.get('display_filename') or os.path.basename(real))
+        if as_attachment else None,
     )
 
 
@@ -6058,6 +6567,66 @@ _ingest_stop_event = None
 _metadata_service_lock = threading.Lock()
 _metadata_thread = None
 _metadata_stop_event = None
+_duplicate_service_lock = threading.Lock()
+_duplicate_thread = None
+_duplicate_stop_event = None
+_duplicate_wake_event = threading.Event()
+
+
+def _wake_duplicate_backfill():
+    _duplicate_wake_event.set()
+
+
+def _duplicate_backfill(stop_event):
+    while not stop_event.is_set():
+        try:
+            _hash_backfill_once()
+        except Exception as exc:
+            print(f'VDL duplicate index: backfill failed: {exc}', flush=True)
+        _duplicate_wake_event.wait(timeout=30)
+        _duplicate_wake_event.clear()
+
+
+def _requeue_unavailable_hashes():
+    """Give prior-process failures one retry when a new worker starts."""
+    with _db_lock, db() as conn:
+        conn.execute(
+            "UPDATE media_hashes SET state = 'pending' "
+            "WHERE state = 'unavailable' AND download_id IN "
+            "(SELECT id FROM downloads WHERE status = 'finished')"
+        )
+
+
+def start_duplicate_backfill():
+    """Run at most one serial hash worker for final library files."""
+    global _duplicate_thread, _duplicate_stop_event
+    with _duplicate_service_lock:
+        if _duplicate_thread is not None and _duplicate_thread.is_alive():
+            return _duplicate_thread
+        _requeue_unavailable_hashes()
+        _duplicate_stop_event = threading.Event()
+        _duplicate_thread = threading.Thread(
+            target=_duplicate_backfill,
+            args=(_duplicate_stop_event,),
+            name='vdl-duplicates',
+            daemon=True,
+        )
+        _duplicate_thread.start()
+        return _duplicate_thread
+
+
+def stop_duplicate_backfill():
+    global _duplicate_thread, _duplicate_stop_event
+    with _duplicate_service_lock:
+        thread = _duplicate_thread
+        stop_event = _duplicate_stop_event
+        _duplicate_thread = None
+        _duplicate_stop_event = None
+    if stop_event is not None:
+        stop_event.set()
+        _duplicate_wake_event.set()
+    if thread is not None and thread is not threading.current_thread():
+        thread.join(timeout=5)
 
 
 def _metadata_backfill(stop_event):
@@ -6137,17 +6706,6 @@ def stop_metadata_backfill():
         thread.join(timeout=5)
 
 
-def _positive_seconds_from_env(name, default):
-    value = os.environ.get(name, str(default))
-    try:
-        seconds = float(value)
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError(f'{name} must be a positive number') from exc
-    if not math.isfinite(seconds) or seconds < 1:
-        raise RuntimeError(f'{name} must be at least 1 second')
-    return seconds
-
-
 def _remove_stale_ingest_partials(directory):
     """Discard unpublished copies left by an interrupted ingest process."""
     pattern = re.compile(r'^\.vdl_[0-9a-f]{8}\..+\.ingest\.part$')
@@ -6167,8 +6725,8 @@ def _remove_stale_ingest_partials(directory):
             pass
 
 
-def start_ingest_watcher():
-    """Start the optional watched-folder importer exactly once."""
+def start_ingest_import():
+    """Start one optional startup import worker per serving process."""
     global _ingest_thread, _ingest_stop_event
     configured_dir = os.environ.get('VDL_INGEST_DIR', '').strip()
     if not configured_dir:
@@ -6183,47 +6741,32 @@ def start_ingest_watcher():
         raise RuntimeError(
             f'VDL_INGEST_DIR is not readable: {configured_dir}'
         )
-    scan_seconds = _positive_seconds_from_env(
-        'VDL_INGEST_SCAN_SECONDS', 10
-    )
-    settle_seconds = _positive_seconds_from_env(
-        'VDL_INGEST_SETTLE_SECONDS', 60
-    )
     output_dir = os.path.realpath(os.path.abspath(_prepare_download_directory(
         db_get_preferences().get('download_dir', '.')
     )))
-    if directory == output_dir:
-        raise RuntimeError(
-            'VDL_INGEST_DIR and the download directory must be different'
-        )
+    try:
+        _disjoint_ingest_and_output(directory, output_dir)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
 
     with _ingest_service_lock:
-        if _ingest_thread is not None and _ingest_thread.is_alive():
+        if _ingest_thread is not None:
             return _ingest_thread
         _remove_stale_ingest_partials(output_dir)
-        watcher = IngestFolderWatcher(
-            directory,
-            scan_seconds=scan_seconds,
-            settle_seconds=settle_seconds,
-        )
+        importer = IngestStartupImporter(directory)
         _ingest_stop_event = threading.Event()
         _ingest_thread = threading.Thread(
-            target=watcher.run,
+            target=importer.run,
             args=(_ingest_stop_event,),
             name='vdl-ingest',
             daemon=True,
         )
         _ingest_thread.start()
-        print(
-            f'VDL ingest: watching {directory!r} every {scan_seconds:g}s '
-            f'(settle {settle_seconds:g}s)',
-            flush=True,
-        )
         return _ingest_thread
 
 
-def stop_ingest_watcher():
-    """Stop the optional importer after the HTTP server exits."""
+def stop_ingest_import():
+    """Stop the startup batch if the HTTP server exits before it finishes."""
     global _ingest_thread, _ingest_stop_event
     with _ingest_service_lock:
         thread = _ingest_thread
@@ -6234,6 +6777,11 @@ def stop_ingest_watcher():
         stop_event.set()
     if thread is not None and thread is not threading.current_thread():
         thread.join(timeout=5)
+
+
+def _should_start_ingest_import():
+    return (os.environ.get('FLASK_DEBUG', '1') != '1'
+            or os.environ.get('WERKZEUG_RUN_MAIN') == 'true')
 
 
 def _port_number(value):
@@ -6275,11 +6823,10 @@ def main(argv=None):
     debug = os.environ.get("FLASK_DEBUG", "1") == "1"
     # Werkzeug executes main once in its debug parent and again in the serving
     # child. Only the child may own the singleton ingest thread.
-    owns_ingest_watcher = (
-        not debug or os.environ.get('WERKZEUG_RUN_MAIN') == 'true'
-    )
-    ingest_thread = start_ingest_watcher() if owns_ingest_watcher else None
-    metadata_thread = start_metadata_backfill() if owns_ingest_watcher else None
+    owns_background_work = _should_start_ingest_import()
+    ingest_thread = start_ingest_import() if owns_background_work else None
+    metadata_thread = start_metadata_backfill() if owns_background_work else None
+    duplicate_thread = start_duplicate_backfill() if owns_background_work else None
     print(
         f'VDL startup: UI v{APP_VERSION} | API v{APP_VERSION}',
         flush=True,
@@ -6288,9 +6835,11 @@ def main(argv=None):
         app.run(host=host, port=args.port, debug=debug, threaded=True)
     finally:
         if ingest_thread is not None:
-            stop_ingest_watcher()
+            stop_ingest_import()
         if metadata_thread is not None:
             stop_metadata_backfill()
+        if duplicate_thread is not None:
+            stop_duplicate_backfill()
 
 
 if __name__ == '__main__':

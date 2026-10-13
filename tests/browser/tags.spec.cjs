@@ -384,9 +384,9 @@ test('Header search expands from the leftmost magnifier', async ({ page }) => {
 
     await expect(toggle.locator('use')).toHaveAttribute('href', '#i-search');
     await expect(input).toHaveAttribute('type', 'text');
-    await expect(input).toHaveAttribute('placeholder', 'Search title, tag, or filters');
+    await expect(input).toHaveAttribute('placeholder', 'Search title, filename, tag, or filters');
     await expect(input).toHaveAttribute(
-        'aria-label', 'Search history by title, tag, user, quality, star, or views');
+        'aria-label', 'Search history by title, filename, tag, user, quality, star, or views');
     await expect(toggle).toHaveAttribute('aria-expanded', 'false');
     await expect(input).toBeHidden();
     await expect(header.locator('select')).toHaveCount(0);

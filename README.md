@@ -54,46 +54,56 @@ VDL_PORT=8080 docker compose up --build -d
 Stop containers with `docker compose down`. This preserves `vdl-data` and
 `vdl-downloads`; `docker compose down -v` intentionally deletes both volumes.
 
-### Watched ingest folder
+### Import mounted files at startup
 
-Compose mounts the repository's `./ingest` directory at `/ingest` read-only in
-the container. Copy a movie into that host directory and VDL will add a
-validated copy to Download History after the file has remained unchanged for
-60 seconds. The original stays in `./ingest`; remove it after the History item
-appears to keep the periodic directory scan small. Receipts in SQLite prevent
-an unchanged source from being imported again across restarts.
+Compose mounts the repository's `./ingest` directory at `/ingest` read-only.
+On startup, VDL takes one recursive snapshot of eligible files in that mount
+and imports each captured file at most once. Imported videos appear in History
+as local uploads; the original files stay in `./ingest`. A movie at
+`./ingest/Family/Trips/movie.mp4` receives the tags `Family` and `Trips`.
+Files directly under `./ingest` receive no folder tags. Folder names follow
+the normal tag rules: invalid names cause that file's import to fail with a
+logged error, while other files continue.
 
-A file appearing under its final name cannot prove that its writer is done.
-For a guaranteed completion handoff, copy under an ignored temporary name and
-rename it only after the copy completes. Both paths must be in the ingest
-directory so the rename is atomic:
+Finish writing each file before starting VDL. For an atomic handoff, write a
+temporary or hidden name in the same destination subfolder, close it, then
+rename it to its final name before VDL starts:
 
 ```bash
-cp /path/to/movie.mkv ./ingest/.movie.mkv.part
-mv ./ingest/.movie.mkv.part ./ingest/movie.mkv
+cp /path/to/movie.mkv ./ingest/Family/.movie.mkv.part
+mv ./ingest/Family/.movie.mkv.part ./ingest/Family/movie.mkv
+docker compose up --build -d
 ```
 
-Direct copies are supported as a convenience: VDL requires three unchanged
-observations spanning the settle period, compares device, inode, size, and
-nanosecond modification time before and after copying, then validates the
-copy with `ffprobe` before publishing it. A stalled writer can still exceed
-any finite settle period, which is why the temporary-name protocol is the
-strict option.
+VDL ignores hidden files and subfolders, symlinks, and names ending in
+`.part`, `.partial`, `.tmp`, `.crdownload`, or `.download`. It checks source
+identity before and after copying and validates video content with `ffprobe`.
+Files added, renamed, or changed after the startup snapshot require a VDL
+restart before they can be considered. There is no timed rescan. SQLite
+receipts prevent unchanged imported sources from creating another History
+item across restarts; a changed source can create a new item on a later
+startup. Removed source receipts are pruned after a complete startup scan.
 
-Set `VDL_INGEST_HOST_DIR` to bind another host folder. The container only needs
-read and search permission on it:
+Set `VDL_INGEST_HOST_DIR` to bind another host folder. The container needs read
+and search permission on the entire directory tree:
 
 ```bash
 VDL_INGEST_HOST_DIR=/srv/vdl/ingest docker compose up --build -d
 ```
 
-`VDL_INGEST_SCAN_SECONDS` defaults to `10` and
-`VDL_INGEST_SETTLE_SECONDS` defaults to `60`; both accept values of at least
-one second. The scan is flat and uses directory metadata only, so idle cost is
-proportional to the number of top-level inbox entries, not their byte size.
-Hidden files, directories, symlinks, and names ending in `.part`, `.partial`,
-`.tmp`, `.crdownload`, or `.download` are ignored. Native runs can opt in with
-`VDL_INGEST_DIR`; leaving it unset disables the watcher.
+Native runs opt in by setting `VDL_INGEST_DIR` to a readable directory. An
+unset or empty value disables import. A standalone container also requires an
+explicit read-only mount and `VDL_INGEST_DIR=/ingest`; the image itself does
+not activate importing. The inbox and library output paths must be separate
+directory trees.
+
+Imported copies use unique internal filenames, while History and browser
+downloads show the original filename. History's **Duplicates** view groups
+finished library files with identical bytes, including uploads and downloads.
+It keeps every item and its tags; deletion remains an individual action.
+Indexing older media can take time, and **Refresh duplicate index** checks
+stored library files again after external edits. Neither action scans the
+ingest mount for new files.
 
 ### First sign-in and user access
 
@@ -113,6 +123,7 @@ or Docker Compose) is required to use `compose.yaml` through Podman.
 ```bash
 docker build --pull -t vdl:local .
 docker run --rm -p 127.0.0.1:5000:5000 \
+  -e VDL_INGEST_DIR=/ingest \
   -v vdl-downloads:/downloads -v vdl-data:/data \
   -v /srv/vdl/ingest:/ingest:ro vdl:local
 ```
@@ -126,6 +137,7 @@ Published multi-platform images are available from GHCR:
 ```bash
 docker pull ghcr.io/mnemonic-bit/vdl:latest
 docker run --rm -p 127.0.0.1:5000:5000 \
+  -e VDL_INGEST_DIR=/ingest \
   -v vdl-downloads:/downloads -v vdl-data:/data \
   -v /srv/vdl/ingest:/ingest:ro \
   ghcr.io/mnemonic-bit/vdl:latest
@@ -191,12 +203,14 @@ be readable and searchable:
 sudo install -d -o 10001 -g 10001 /srv/vdl/data /srv/vdl/downloads
 sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0755 /srv/vdl/ingest
 docker run --rm -p 127.0.0.1:5000:5000 \
+  -e VDL_INGEST_DIR=/ingest \
   -v /srv/vdl/data:/data -v /srv/vdl/downloads:/downloads \
   -v /srv/vdl/ingest:/ingest:ro vdl:local
 ```
 
 The entrypoint fails with a clear storage-access error instead of starting a
-server that cannot create its database, write media, or read the ingest mount.
+server that cannot create its database, write media, or read a configured
+ingest mount.
 
 ## Network exposure
 
