@@ -34,6 +34,12 @@ container build.
    sha256sum vdl-companion-firefox.xpi > vdl-companion-firefox.xpi.sha256
    ```
 
+   From the repository root, run
+   `python scripts/verify_companion_xpi.py --require-signed` to check the
+   checksum, every archived source byte, and signature metadata before release.
+   The normal validation workflow runs this audit without `--require-signed`
+   so development packages remain testable.
+
 6. Test the signed XPI on supported Firefox Release and ESR builds. Capture
    Origin, preflight, Private/Local Network Access, trusted-certificate,
    redirect, Container, rotating-cookie, pause, cancellation, and fresh-resume
@@ -41,9 +47,10 @@ container build.
 
 The checked-in artifact is an unsigned development package. It is the exact
 input served by VDL and copied into development containers, and the Docker
-build fails if its checksum is missing or mismatched. A production release is
-not complete until that file is replaced by Mozilla's signed artifact and the
-checksum is regenerated.
+build fails if its checksum is missing or mismatched. The publication workflow
+rejects a new release until that file is replaced by Mozilla's signed artifact,
+the checksum is regenerated, and the source-byte audit passes. Firefox must
+still validate the signature during release testing.
 
 ## Pairing and troubleshooting
 

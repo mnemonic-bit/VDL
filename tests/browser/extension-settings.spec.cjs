@@ -49,18 +49,28 @@ test('Browser Extension settings allow operator-approved private HTTP pairing', 
         protocol: 'https:', hostname: 'vdl.example',
     }))).toBe(true);
     const packageLink = page.locator('#extensionInstallLink');
-    await expect(packageLink).toHaveAttribute(
-        'href', '/browser-extension/vdl-companion-firefox.xpi?download=1',
-    );
-    await expect(packageLink).toHaveAttribute('download', 'vdl-companion-firefox.xpi');
-    await expect(packageLink).toHaveText('Download unsigned XPI');
-    await expect(page.locator('#extensionInstallHint')).toContainText('not Mozilla-signed');
-    const downloadPromise = page.waitForEvent('download');
-    await packageLink.click();
-    const packageDownload = await downloadPromise;
-    expect(packageDownload.suggestedFilename()).toBe('vdl-companion-firefox.xpi');
-    await expect(page.locator('#extensionStatus')).toContainText('Firefox Release cannot install it');
-    await packageDownload.cancel();
+    const packageState = await (await page.request.get('/api/extension/connections')).json();
+    if (packageState.bundled_extension.signed) {
+        await expect(packageLink).toHaveAttribute(
+            'href', '/browser-extension/vdl-companion-firefox.xpi',
+        );
+        await expect(packageLink).not.toHaveAttribute('download');
+        await expect(packageLink).toHaveText('Install Firefox extension');
+        await expect(page.locator('#extensionInstallHint')).toContainText('Add confirmation');
+    } else {
+        await expect(packageLink).toHaveAttribute(
+            'href', '/browser-extension/vdl-companion-firefox.xpi?download=1',
+        );
+        await expect(packageLink).toHaveAttribute('download', 'vdl-companion-firefox.xpi');
+        await expect(packageLink).toHaveText('Download unsigned XPI');
+        await expect(page.locator('#extensionInstallHint')).toContainText('not Mozilla-signed');
+        const downloadPromise = page.waitForEvent('download');
+        await packageLink.click();
+        const packageDownload = await downloadPromise;
+        expect(packageDownload.suggestedFilename()).toBe('vdl-companion-firefox.xpi');
+        await expect(page.locator('#extensionStatus')).toContainText('Firefox Release cannot install it');
+        await packageDownload.cancel();
+    }
     await expect(page.locator('#extensionNoConnections')).toBeVisible();
     await page.locator('#extensionCreatePairing').click();
     const pairingDialog = page.getByRole('dialog', { name: 'Pair Firefox with VDL' });

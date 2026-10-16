@@ -1,7 +1,7 @@
 # Download authenticated pages with a Firefox companion
 
 **Source:** User-requested feature  
-**Status:** Proposed  
+**Status:** Implemented in repository; Mozilla signing and release validation pending
 **Last refined:** 2026-10-01  
 **Extends:** Feature 0022, Move settings to a searchable, sectioned page; Feature 0023, Require authentication and manage users
 

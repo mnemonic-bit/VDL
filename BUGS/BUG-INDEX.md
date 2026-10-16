@@ -149,6 +149,10 @@ sticky header background to the left navigation column while preserving the
 search-height gap. The library also gained persisted endless scrolling, and
 hover previews now start after 250 milliseconds, use two-second excerpts, and
 show total duration in place of quality while playing.
+Issue 49 was reported on 2026-10-16. After closing one video midway, opening a
+different video can appear to reuse the first video's playback position. The
+reporter observed this while ingestion was adding and shifting video cards;
+that connection remains unconfirmed.
 
 ## Bug reports
 
@@ -200,6 +204,7 @@ show total duration in place of quality while playing.
 - [Bug 0046 — History Info tag selection closed the popover and Escape exited macOS fullscreen](bug-0046-info-tag-selection-closed-popover-and-escape-exited-fullscreen.md)
 - [Bug 0047 — Upload overlay remained open after a file drag left the page](bug-0047-upload-overlay-remained-open-after-drag-left-page.md)
 - [Bug 0048 — Settings and hover-preview controls were inconsistent](bug-0048-settings-and-hover-preview-controls-were-inconsistent.md)
+- [Bug 0049 — Opening another video can reuse the previous playback position](bug-0049-next-video-reuses-previous-playback-position.md)
 
 ## Accepted UI decisions
 

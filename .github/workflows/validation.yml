@@ -41,6 +41,9 @@ jobs:
             - name: Validate multi-platform container dependency lock
               run: ./tests/container/check-lock.sh
 
+            - name: Verify Firefox companion package contents
+              run: python scripts/verify_companion_xpi.py
+
             - name: Install browser dependencies
               working-directory: tests/browser
               run: |

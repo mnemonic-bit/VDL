@@ -9,6 +9,7 @@ from unittest import mock
 import zipfile
 
 import vdl
+from scripts.verify_companion_xpi import verify as verify_companion_xpi
 from tests.support.app_case import AppCase
 from tests.support.fake_ytdlp import FakeYoutubeDL
 
@@ -405,7 +406,7 @@ class BrowserExtensionTest(AppCase):
         checksum = hashlib.sha256(Path(vdl.COMPANION_XPI_PATH).read_bytes()).hexdigest()
         package = vdl._bundled_extension()
         self.assertEqual(checksum, package['sha256'])
-        self.assertFalse(package['signed'])
+        self.assertEqual(package['signed'], verify_companion_xpi())
         self.assertEqual(
             package['download_url'],
             '/browser-extension/vdl-companion-firefox.xpi?download=1',
