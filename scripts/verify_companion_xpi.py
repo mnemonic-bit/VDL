@@ -19,6 +19,19 @@ SIGNATURE_FILES = {
     'meta-inf/mozilla.sf',
     'meta-inf/mozilla.rsa',
 }
+UNSIGNED_RELEASE_HELP = """To obtain and bundle a signed XPI:
+  1. From the repository root, run:
+     npx --yes web-ext@latest build --source-dir browser-extension/src --artifacts-dir /tmp/vdl-extension
+  2. Open https://addons.mozilla.org/en-US/developers/ and choose
+     Submit a New Add-on > On your own. Upload the ZIP from /tmp/vdl-extension.
+     When Mozilla finishes signing, download the signed XPI from My Add-ons.
+  3. Replace browser-extension/dist/vdl-companion-firefox.xpi with that XPI.
+  4. From the repository root, run:
+     cd browser-extension/dist
+     sha256sum vdl-companion-firefox.xpi > vdl-companion-firefox.xpi.sha256
+     cd ../..
+     python3 scripts/verify_companion_xpi.py --require-signed
+See browser-extension/README.md for release and Firefox testing details."""
 
 
 def verify(source=SOURCE, package=PACKAGE, checksum=CHECKSUM, *, require_signed=False):
@@ -65,6 +78,12 @@ def main():
         signed = verify(require_signed=args.require_signed)
     except (OSError, ValueError, zipfile.BadZipFile) as error:
         print(f'Companion XPI verification failed: {error}', file=sys.stderr)
+        if args.require_signed:
+            if str(error) == 'XPI lacks Mozilla signature metadata':
+                print(UNSIGNED_RELEASE_HELP, file=sys.stderr)
+            else:
+                print('See browser-extension/README.md for the release process.',
+                      file=sys.stderr)
         return 1
     print(f'Companion XPI matches source and checksum ({"signed" if signed else "unsigned"})')
     return 0

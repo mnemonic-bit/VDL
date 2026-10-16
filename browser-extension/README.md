@@ -24,7 +24,10 @@ container build.
 1. Increment `manifest.json`'s version for every behavior change.
 2. Run `web-ext lint` and the extension tests.
 3. Sign the source as an unlisted extension through AMO, keeping the immutable
-   add-on ID `{9f743f7e-c0b3-4b99-9e58-6434d3c883d4}`.
+   add-on ID `{9f743f7e-c0b3-4b99-9e58-6434d3c883d4}`. In the
+   [AMO Developer Hub](https://addons.mozilla.org/en-US/developers/), choose
+   **Submit a New Add-on → On your own**, upload a ZIP built from `src/`, and
+   download the signed XPI from **My Add-ons** after Mozilla approves it.
 4. Rename the returned signed file to `vdl-companion-firefox.xpi`.
 5. Audit the archive against `src/`, ignoring only Mozilla signature metadata
    under `META-INF/`, then generate the checksum:
