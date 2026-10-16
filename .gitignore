@@ -11,3 +11,4 @@ downloads.db
 # for OpenCode
 .sisyphus/
 .playwright-mcp/
+node_modules/

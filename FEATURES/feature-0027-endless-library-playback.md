@@ -1,7 +1,7 @@
 # Add endless library playback with display-mode continuity
 
 **Source:** User-requested feature  
-**Status:** Proposed  
+**Status:** Implemented
 **Last refined:** 2026-10-04  
 **Extends:** Feature 0002, Search and filter Download History; Feature 0017,
 Make Download History the primary thumbnail library; Feature 0025, Track video

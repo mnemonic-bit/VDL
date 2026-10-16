@@ -4,6 +4,7 @@ on:
     push:
         branches:
             - main
+    workflow_dispatch:
 
 permissions: {}
 
@@ -18,10 +19,59 @@ jobs:
         permissions:
             contents: read
 
+    sign-extension:
+        name: Sign Firefox companion
+        needs: validation
+        if: github.ref == 'refs/heads/main'
+        runs-on: ubuntu-24.04
+        timeout-minutes: 45
+        environment: amo-signing
+        permissions:
+            contents: read
+        steps:
+            - name: Check out tested commit
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  ref: ${{ github.sha }}
+                  persist-credentials: false
+
+            - name: Set up Node.js
+              uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+              with:
+                  node-version: "24.8.0"
+                  package-manager-cache: false
+
+            - name: Install locked signing tool
+              run: npm ci
+
+            - name: Resolve extension artifact name
+              id: artifact
+              run: |
+                  version=$(python3 -c 'import json; print(json.load(open("browser-extension/src/manifest.json"))["version"])')
+                  echo "name=companion-$GITHUB_SHA-$version" >> "$GITHUB_OUTPUT"
+
+            - name: Resolve and verify approved unlisted XPI
+              env:
+                  WEB_EXT_API_KEY: ${{ secrets.AMO_JWT_ISSUER }}
+                  WEB_EXT_API_SECRET: ${{ secrets.AMO_JWT_SECRET }}
+              run: python3 scripts/extension_release.py sign --output "$RUNNER_TEMP/signed-companion"
+
+            - name: Upload verified signed artifact
+              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+              with:
+                  name: ${{ steps.artifact.outputs.name }}
+                  path: ${{ runner.temp }}/signed-companion/
+                  if-no-files-found: error
+                  include-hidden-files: false
+                  retention-days: 7
+                  overwrite: false
+
     publish:
         name: Publish tested image
         needs:
             - validation
+            - sign-extension
+        if: github.ref == 'refs/heads/main'
         runs-on: ubuntu-24.04
         timeout-minutes: 120
         permissions:
@@ -33,7 +83,23 @@ jobs:
             - name: Check out tested commit
               uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
               with:
+                  ref: ${{ github.sha }}
                   persist-credentials: false
+
+            - name: Resolve extension artifact name
+              id: extension-artifact
+              run: |
+                  version=$(python3 -c 'import json; print(json.load(open("browser-extension/src/manifest.json"))["version"])')
+                  echo "name=companion-$GITHUB_SHA-$version" >> "$GITHUB_OUTPUT"
+
+            - name: Download signed extension from this run
+              uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+              with:
+                  name: ${{ steps.extension-artifact.outputs.name }}
+                  path: ${{ runner.temp }}/signed-companion
+
+            - name: Verify and stage signed extension
+              run: python3 scripts/extension_release.py stage --artifact "$RUNNER_TEMP/signed-companion"
 
             - name: Set up Docker with the containerd image store
               uses: docker/setup-docker-action@77e84dbf09b47d1e29270283c22f16145aa85ca1 # v5.4.0
@@ -115,10 +181,6 @@ jobs:
                   fi
                   echo "new_release=$new_release" >> "$GITHUB_OUTPUT"
 
-            - name: Require signed Firefox companion for a new release
-              if: steps.release.outputs.new_release == 'true'
-              run: python3 scripts/verify_companion_xpi.py --require-signed
-
             - name: Build the multi-platform image locally
               env:
                   NEW_RELEASE: ${{ steps.release.outputs.new_release }}
@@ -146,6 +208,7 @@ jobs:
                   CONTAINER_ENGINE: docker
                   DOCKER_DEFAULT_PLATFORM: linux/amd64
                   VDL_IMAGE: ${{ env.IMAGE }}:${{ github.sha }}
+                  VDL_REQUIRE_SIGNED_COMPANION: "1"
               run: ./tests/container/smoke.sh
 
             - name: Validate linux/arm64 image under QEMU
@@ -153,6 +216,7 @@ jobs:
                   CONTAINER_ENGINE: docker
                   DOCKER_DEFAULT_PLATFORM: linux/arm64
                   VDL_IMAGE: ${{ env.IMAGE }}:${{ github.sha }}
+                  VDL_REQUIRE_SIGNED_COMPANION: "1"
               run: ./tests/container/smoke.sh
 
             - name: Publish main and immutable commit tags

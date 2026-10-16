@@ -57,6 +57,15 @@ with Docker/Podman and QEMU-capable Docker respectively.
 
 ## First image publication
 
+Before any `main` image can publish, create a GitHub environment named
+`amo-signing`, restrict deployment branches to `main`, and add environment
+secrets `AMO_JWT_ISSUER` and `AMO_JWT_SECRET` from the AMO developer account
+that owns the fixed VDL add-on ID. A required reviewer is optional. Rotate
+the AMO secret in the Developer Hub and replace the environment secret if it
+may have been exposed. A pending Mozilla review fails the signing job; rerun
+that failed workflow after approval. The signing job has read-only repository
+permission, and the separate publication job does not receive these secrets.
+
 The first successful `Main` run pushes `main` and a full-commit-SHA tag, then
 checks the SHA tag without registry credentials. A new GHCR package may default
 to private and make that run stop before creating version tags or a Release.

@@ -1,7 +1,7 @@
 # Automate Firefox extension signing for container releases
 
 **Source:** User-requested feature
-**Status:** Proposed
+**Status:** Implemented in repository; protected AMO environment and first live signing pending
 **Last refined:** 2026-10-04
 **Extends:** Feature 0014, Make the repository GitHub-ready; Feature 0026, Download authenticated pages with a Firefox companion
 

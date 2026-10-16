@@ -76,6 +76,31 @@ class CompanionPackageTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'symbolic link'):
             self.check()
 
+    def test_unsafe_member_paths_and_case_collisions_are_rejected(self):
+        for name in ('../manifest.json', '/manifest.json',
+                     'folder\\manifest.json', 'C:/manifest.json',
+                     'folder//manifest.json', 'folder/./manifest.json'):
+            with self.subTest(name=name):
+                self.make_package([(name, b'{}')])
+                with self.assertRaisesRegex(ValueError, 'unsafe archive path'):
+                    self.check()
+        self.make_package([
+            ('manifest.json', b'{"version":"1.0"}'),
+            ('MANIFEST.JSON', b'{"version":"1.0"}'),
+        ])
+        with self.assertRaisesRegex(ValueError, 'case-colliding'):
+            self.check()
+
+    def test_extra_signature_metadata_is_allowed_when_signature_trio_exists(self):
+        self.make_package([
+            ('manifest.json', b'{"version":"1.0"}'),
+            ('META-INF/manifest.mf', b'manifest'),
+            ('META-INF/mozilla.sf', b'signature'),
+            ('META-INF/mozilla.rsa', b'certificate'),
+            ('META-INF/cose.sig', b'additional Mozilla metadata'),
+        ])
+        self.assertTrue(self.check(require_signed=True))
+
 
 if __name__ == '__main__':
     unittest.main()

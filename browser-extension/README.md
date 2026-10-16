@@ -9,9 +9,10 @@ remote executable code.
 From the repository root:
 
 ```bash
-npx --yes web-ext@latest lint --source-dir browser-extension/src
-npx --yes web-ext@latest build --source-dir browser-extension/src \
-  --artifacts-dir browser-extension/dist --overwrite-dest
+npm ci
+npm run extension:lint
+npm run extension:build -- --artifacts-dir /tmp/vdl-extension-build
+python3 scripts/extension_release.py validate
 ```
 
 Temporary installation through `about:debugging` is suitable only for local
@@ -21,39 +22,33 @@ container build.
 
 ## Release process
 
-1. Increment `manifest.json`'s version for every behavior change.
-2. Run `web-ext lint` and the extension tests.
-3. Sign the source as an unlisted extension through AMO, keeping the immutable
-   add-on ID `{9f743f7e-c0b3-4b99-9e58-6434d3c883d4}`. In the
-   [AMO Developer Hub](https://addons.mozilla.org/en-US/developers/), choose
-   **Submit a New Add-on → On your own**, upload a ZIP built from `src/`, and
-   download the signed XPI from **My Add-ons** after Mozilla approves it.
-4. Rename the returned signed file to `vdl-companion-firefox.xpi`.
-5. Audit the archive against `src/`, ignoring only Mozilla signature metadata
-   under `META-INF/`, then generate the checksum:
+Every packaged-source change must increment `manifest.json`'s version and the
+matching `COMPANION_PACKAGE_VERSION` in `vdl.py`. The add-on ID remains fixed.
+The pull-request gate uses the lockfile-pinned `web-ext` to lint and build the
+source, then checks the development XPI and version contract without AMO
+credentials.
 
-   ```bash
-   cd browser-extension/dist
-   sha256sum vdl-companion-firefox.xpi > vdl-companion-firefox.xpi.sha256
-   ```
+After `main` validation, the protected `amo-signing` job resolves that exact
+ID/version. It submits an absent version once as unlisted, or downloads an
+already approved version. A pending review blocks publication; rerun the failed
+workflow after AMO approves it. The signed XPI is checked against AMO's SHA-256,
+the manifest, and every source byte outside `META-INF/`. Only the verified
+artifact is handed to the image publisher. The source invariant is intentionally
+strict: if Mozilla changes another file during signing, investigate and document
+that transformation before changing the verifier.
 
-   From the repository root, run
-   `python scripts/verify_companion_xpi.py --require-signed` to check the
-   checksum, every archived source byte, and signature metadata before release.
-   The normal validation workflow runs this audit without `--require-signed`
-   so development packages remain testable.
+Maintainers configure `AMO_JWT_ISSUER` and `AMO_JWT_SECRET` as secrets in the
+branch-restricted `amo-signing` GitHub environment. Create or rotate those
+credentials in the [AMO Developer Hub](https://addons.mozilla.org/en-US/developers/)
+and never add them to the repository or Docker build. The first live submission
+must confirm that the AMO account owns the fixed ID and that Mozilla accepts
+the source-equivalence rule. Test the resulting XPI in supported Firefox builds.
 
-6. Test the signed XPI on supported Firefox Release and ESR builds. Capture
-   Origin, preflight, Private/Local Network Access, trusted-certificate,
-   redirect, Container, rotating-cookie, pause, cancellation, and fresh-resume
-   behavior before release.
-
-The checked-in artifact is an unsigned development package. It is the exact
-input served by VDL and copied into development containers, and the Docker
-build fails if its checksum is missing or mismatched. The publication workflow
-rejects a new release until that file is replaced by Mozilla's signed artifact,
-the checksum is regenerated, and the source-byte audit passes. Firefox must
-still validate the signature during release testing.
+The checked-in artifact is an unsigned development package. Local containers
+serve it for testing. Published images receive the verified signed artifact in
+the release workspace; no signed binary or AMO credential needs to be committed.
+Firefox still validates the signature when installing. Updates remain manual:
+install the newer XPI from VDL Settings after upgrading the container.
 
 ## Pairing and troubleshooting
 

@@ -80,11 +80,15 @@ for attempt in $(seq 1 40); do
     sleep 0.25
 done
 
-"$engine" exec "$name" python - <<'PY'
+"$engine" exec -e "VDL_REQUIRE_SIGNED_COMPANION=${VDL_REQUIRE_SIGNED_COMPANION:-0}" "$name" python - <<'PY'
 import hashlib
+import json
 import os
 import urllib.error
 import urllib.request
+import zipfile
+
+import vdl
 
 for path in ('/api/health', '/', '/static/app.js', '/static/styles.css'):
     with urllib.request.urlopen('http://127.0.0.1:5000' + path, timeout=3) as response:
@@ -121,6 +125,14 @@ with open(package_path, 'rb') as bundled:
 with open(checksum_path, encoding='ascii') as checksum_file:
     expected_hash = checksum_file.read().split()[0]
 assert hashlib.sha256(package).hexdigest() == expected_hash
+with zipfile.ZipFile(package_path) as archive:
+    manifest = json.loads(archive.read('manifest.json'))
+    assert manifest['browser_specific_settings']['gecko']['id'] == (
+        '{9f743f7e-c0b3-4b99-9e58-6434d3c883d4}'
+    )
+    assert manifest['version'] == vdl.COMPANION_PACKAGE_VERSION
+if os.environ['VDL_REQUIRE_SIGNED_COMPANION'] == '1':
+    assert vdl._bundled_extension()['signed'] is True
 
 try:
     urllib.request.urlopen(

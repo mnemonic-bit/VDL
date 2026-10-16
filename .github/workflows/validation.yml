@@ -19,6 +19,7 @@ jobs:
               uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
               with:
                   persist-credentials: false
+                  fetch-depth: 0
 
             - name: Set up Python
               uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -42,7 +43,14 @@ jobs:
               run: ./tests/container/check-lock.sh
 
             - name: Verify Firefox companion package contents
-              run: python scripts/verify_companion_xpi.py
+              env:
+                  BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
+              run: |
+                  npm ci
+                  npm run extension:lint
+                  npm run extension:build -- --artifacts-dir "$RUNNER_TEMP/extension-build"
+                  python scripts/extension_release.py validate --base-ref "$BASE_REF" \
+                      --built-dir "$RUNNER_TEMP/extension-build"
 
             - name: Install browser dependencies
               working-directory: tests/browser

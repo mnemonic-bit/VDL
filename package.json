@@ -1,0 +1,11 @@
+{
+  "name": "vdl-extension-tooling",
+  "private": true,
+  "scripts": {
+    "extension:lint": "web-ext lint --self-hosted --source-dir browser-extension/src",
+    "extension:build": "web-ext build --source-dir browser-extension/src"
+  },
+  "devDependencies": {
+    "web-ext": "10.8.0"
+  }
+}
