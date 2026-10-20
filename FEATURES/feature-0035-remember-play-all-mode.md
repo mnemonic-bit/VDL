@@ -1,7 +1,7 @@
 # Remember the last Play All mode
 
 **Source:** User-requested feature  
-**Status:** Proposed  
+**Status:** Implemented
 **Last refined:** 2026-10-16  
 **Extends:** Feature 0030, Add shuffle playback to the Play All control
 
@@ -119,5 +119,5 @@ actionable error.
 
 Before marking implementation complete, run `./tests/run-all.sh --unit` and
 verify the required 90% `vdl.py` line coverage, then run the relevant browser
-tests for the split button. This documentation-only specification leaves
-`VERSION` unchanged; implementation requires a MINOR bump under `AGENTS.md`.
+tests for the split button. Implementation bumped `VERSION` from `0.38.0` to
+`0.39.0` under `AGENTS.md`.

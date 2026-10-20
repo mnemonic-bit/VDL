@@ -152,7 +152,9 @@ show total duration in place of quality while playing.
 Issue 49 was reported on 2026-10-16. After closing one video midway, opening a
 different video can appear to reuse the first video's playback position. The
 reporter observed this while ingestion was adding and shifting video cards;
-that connection remains unconfirmed.
+that connection remains unconfirmed. A follow-up report on 2026-10-20 described
+the same apparent timestamp carryover and raised possible network or server
+delay during heavy folder import; reproducibility and cause remain unconfirmed.
 
 ## Bug reports
 

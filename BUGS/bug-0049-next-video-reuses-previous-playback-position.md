@@ -2,13 +2,19 @@
 
 **Severity:** Medium
 
-**Status:** Open; reported on 2026-10-16. Not yet independently reproduced.
+**Status:** Open; reported on 2026-10-16 and again on 2026-10-20. Not yet independently reproduced.
 
 After a user stops watching one video partway through, opening a different
 video can appear to seek to the time where the first video was closed. The
 reporter noticed this while VDL was importing videos from its ingestion folder
 and new items were shifting the main video view. The ingestion activity may be
 related, but that connection has not been established.
+
+**Follow-up observation, 2026-10-20:** After stopping one video and opening
+another, the second again seemed to start at the timestamp where the first
+stopped. The reporter is unsure whether the behavior is repeatable or whether
+network/server delay or heavy folder import contributed. No media URL, browser
+timeline trace, or controlled reproduction has yet confirmed a cause.
 
 ### Reproduction to confirm
 
@@ -25,6 +31,10 @@ related, but that connection has not been established.
 5. Repeat with A's or B's media response deliberately delayed, stalled, or
    aborted before playable data arrives. Record whether a browser media error
    or application playback timeout occurs before B shows A's old position.
+6. For any occurrence, record the two video IDs, A's stop time, B's first
+   displayed and actual playback times, whether folder import was active, and
+   whether B's media request completed or stalled. Repeat once with imports
+   idle before attributing the behavior to server load.
 
 **Reported actual:** B tries to start at approximately the time where A was
 closed, instead of at B's beginning. Whether this happens before or after B's

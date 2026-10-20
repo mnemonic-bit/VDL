@@ -903,6 +903,51 @@ const accountMenu = document.getElementById('accountMenu');
 
 const playbackModeToggle = document.getElementById('playbackModeToggle');
 const playbackModeMenu = document.getElementById('playbackModeMenu');
+const endlessPlaybackButton = document.getElementById('endlessPlaybackButton');
+const playbackModeStorageKey = 'playback-mode-user-'
+    + document.getElementById('playbackModeControl').dataset.userId;
+
+function loadRememberedPlaybackMode() {
+    try {
+        const stored = localStorage.getItem(playbackModeStorageKey);
+        if (stored === 'shuffle') return 'shuffle';
+    } catch (error) {
+        // Browser storage can be blocked even when the page itself is usable.
+    }
+    return 'sequential';
+}
+
+let rememberedPlaybackMode = loadRememberedPlaybackMode();
+
+function renderRememberedPlaybackMode() {
+    const shuffle = rememberedPlaybackMode === 'shuffle';
+    const label = shuffle ? 'Shuffle' : 'Play All';
+    endlessPlaybackButton.setAttribute('aria-label', label);
+    endlessPlaybackButton.title = shuffle
+        ? 'Shuffle your library continuously in the built-in player'
+        : 'Play the current History selection continuously in the built-in player';
+    endlessPlaybackButton.querySelector('svg use').setAttribute(
+        'href', shuffle ? '#i-shuffle' : '#i-play',
+    );
+    endlessPlaybackButton.querySelector('span').textContent = label;
+    endlessPlaybackButton.disabled = document.getElementById(
+        shuffle ? 'playbackMenuShuffle' : 'playbackMenuPlayAll',
+    ).disabled;
+}
+
+function startChosenPlaybackMode(mode) {
+    rememberedPlaybackMode = mode;
+    renderRememberedPlaybackMode();
+    try {
+        localStorage.setItem(playbackModeStorageKey, mode);
+    } catch (error) {
+        // Keep the in-page choice and let the requested playback proceed.
+    }
+    if (mode === 'shuffle') startShufflePlayback();
+    else startSequentialPlayback();
+}
+
+renderRememberedPlaybackMode();
 
 function closePlaybackModeMenu(restoreFocus = false) {
     if (playbackModeMenu.hidden) return;
@@ -953,14 +998,14 @@ playbackModeMenu.addEventListener('keydown', event => {
     event.preventDefault();
     items[next].focus();
 });
-document.getElementById('endlessPlaybackButton').addEventListener(
-    'click', startSequentialPlayback,
-);
+endlessPlaybackButton.addEventListener('click', () => {
+    startChosenPlaybackMode(rememberedPlaybackMode);
+});
 document.getElementById('playbackMenuPlayAll').addEventListener(
-    'click', startSequentialPlayback,
+    'click', () => startChosenPlaybackMode('sequential'),
 );
 document.getElementById('playbackMenuShuffle').addEventListener(
-    'click', startShufflePlayback,
+    'click', () => startChosenPlaybackMode('shuffle'),
 );
 accountMenuButton.addEventListener('click', event => {
     event.stopPropagation();
@@ -3024,9 +3069,9 @@ function fetchHistory({ sortFavorites = false } = {}) {
         const shuffleAvailable = historyEntries.some(
             info => info.status === 'finished' && info.filename,
         );
-        document.getElementById('endlessPlaybackButton').disabled = !sequentialAvailable;
         document.getElementById('playbackMenuPlayAll').disabled = !sequentialAvailable;
         document.getElementById('playbackMenuShuffle').disabled = !shuffleAvailable;
+        renderRememberedPlaybackMode();
         document.getElementById('playbackModeToggle').disabled =
             !sequentialAvailable && !shuffleAvailable;
         if (document.getElementById('playbackModeToggle').disabled) {

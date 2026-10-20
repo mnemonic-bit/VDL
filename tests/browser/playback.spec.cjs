@@ -48,6 +48,19 @@ async function startEndlessFromCard(page, id) {
     await expect.poll(() => page.evaluate(() => endlessPlayback.sessionId)).not.toBeNull();
 }
 
+async function expectMainPlaybackMode(page, name, icon) {
+    const button = page.locator('#endlessPlaybackButton');
+    await expect(button).toHaveAttribute('aria-label', name);
+    await expect(button).toContainText(name);
+    await expect(button.locator('use')).toHaveAttribute('href', `#i-${icon}`);
+    await expect(button).toHaveAttribute('title', new RegExp(name === 'Shuffle' ? 'Shuffle' : 'History'));
+}
+
+async function choosePlaybackMode(page, name) {
+    await page.getByRole('button', { name: 'Choose playback mode' }).click();
+    await page.locator('#playbackModeMenu').getByRole('menuitem', { name }).click();
+}
+
 test('overlay playback assigns MIME, supports Range, and Escape closes it', async ({ page }) => {
     await seed(page, { id: 'play0001', status: 'finished', file: true, name: 'fixture.mp4' });
     await refresh(page);
@@ -249,6 +262,165 @@ test('Play All split button keeps its direct action and exposes an accessible me
     await page.locator('#endlessPlaybackButton').click();
     await expect.poll(() => page.evaluate(() => endlessPlayback.sessionId)).not.toBeNull();
     expect(await page.evaluate(() => endlessPlayback.mode)).toBe('sequential');
+});
+
+test('split button remembers explicit Shuffle and Play All starts across reloads', async ({ page }) => {
+    await installMediaHarness(page);
+    await seed(page, { id: 'mode-one', status: 'finished', file: true, name: 'one.mp4' });
+    await seed(page, { id: 'mode-two', status: 'finished', file: true, name: 'two.mp4' });
+    await refresh(page);
+
+    const requests = [];
+    page.on('request', request => {
+        if (request.url().endsWith('/api/playback-sessions') && request.method() === 'POST') {
+            requests.push(request.postDataJSON());
+        }
+    });
+    await expectMainPlaybackMode(page, 'Play All', 'play');
+    await choosePlaybackMode(page, 'Shuffle');
+    await expect.poll(() => requests.length).toBe(1);
+    expect(requests[0]).toEqual({ mode: 'shuffle' });
+    await expectMainPlaybackMode(page, 'Shuffle', 'shuffle');
+    await page.setViewportSize({ width: 420, height: 720 });
+    await expect(page.locator('#endlessPlaybackButton span')).toBeHidden();
+    await expect(page.locator('#endlessPlaybackButton')).toHaveAttribute('aria-label', 'Shuffle');
+    await page.setViewportSize({ width: 1280, height: 720 });
+
+    await page.reload();
+    await installMediaHarness(page);
+    await expectMainPlaybackMode(page, 'Shuffle', 'shuffle');
+    await page.locator('#endlessPlaybackButton').click();
+    await expect.poll(() => requests.length).toBe(2);
+    expect(requests[1]).toEqual({ mode: 'shuffle' });
+    await page.keyboard.press('Escape');
+
+    await choosePlaybackMode(page, 'Play All');
+    await expect.poll(() => requests.length).toBe(3);
+    expect(requests[2].mode).toBe('sequential');
+    await expectMainPlaybackMode(page, 'Play All', 'play');
+    await page.keyboard.press('Escape');
+
+    await page.locator('#historySearchToggle').click();
+    await page.locator('#historySearchInput').fill('one');
+    await expect(page.locator('#historyList [data-row-id]')).toHaveCount(1);
+    await page.locator('#endlessPlaybackButton').click();
+    await expect.poll(() => requests.length).toBe(4);
+    expect(requests[3]).toMatchObject({ mode: 'sequential', filter: 'one', start_download_id: 'mode-one' });
+});
+
+test('remembered mode controls main-button availability without switching modes', async ({ page }) => {
+    await seed(page, { id: 'mode-available', status: 'finished', file: true, name: 'video.mp4' });
+    await refresh(page);
+    await page.locator('#historySearchToggle').click();
+    await page.locator('#historySearchInput').fill('zzzzmissing');
+    await expect(page.locator('#historyList [data-row-id]')).toHaveCount(0);
+
+    const main = page.locator('#endlessPlaybackButton');
+    const toggle = page.getByRole('button', { name: 'Choose playback mode' });
+    await expectMainPlaybackMode(page, 'Play All', 'play');
+    await expect(main).toBeDisabled();
+    await expect(toggle).toBeEnabled();
+    await toggle.click();
+    await expect(page.locator('#playbackMenuPlayAll')).toBeDisabled();
+    await expect(page.locator('#playbackMenuShuffle')).toBeEnabled();
+    await toggle.click();
+    await expectMainPlaybackMode(page, 'Play All', 'play');
+
+    await choosePlaybackMode(page, 'Shuffle');
+    await expectMainPlaybackMode(page, 'Shuffle', 'shuffle');
+    await expect(main).toBeEnabled();
+    await page.keyboard.press('Escape');
+    await page.locator('#historySearchInput').fill('video');
+    await expect(page.locator('#historyList [data-row-id]')).toHaveCount(1);
+    await choosePlaybackMode(page, 'Play All');
+    await expectMainPlaybackMode(page, 'Play All', 'play');
+    await page.keyboard.press('Escape');
+    await page.locator('#historySearchInput').fill('zzzzmissing');
+    await expect(main).toBeDisabled();
+    await expect(toggle).toBeEnabled();
+});
+
+test('failed Shuffle start keeps the chosen mode for a later main-button retry', async ({ page }) => {
+    await seed(page, { id: 'mode-failure', status: 'finished', file: true, name: 'failure.mp4' });
+    await refresh(page);
+    let attempts = 0;
+    await page.route('**/api/playback-sessions', async route => {
+        if (route.request().method() !== 'POST') return route.continue();
+        attempts += 1;
+        if (attempts === 1) {
+            return route.fulfill({
+                status: 400,
+                contentType: 'application/json',
+                body: JSON.stringify({ code: 'no_shuffle_candidates', error: 'No videos meet Shuffle settings.' }),
+            });
+        }
+        return route.continue();
+    });
+
+    await choosePlaybackMode(page, 'Shuffle');
+    await expect.poll(() => attempts).toBe(1);
+    await expectMainPlaybackMode(page, 'Shuffle', 'shuffle');
+    await page.keyboard.press('Escape');
+    await page.locator('#endlessPlaybackButton').click();
+    await expect.poll(() => attempts).toBe(2);
+    await expect.poll(() => page.evaluate(() => endlessPlayback.mode)).toBe('shuffle');
+});
+
+test('malformed and unavailable browser storage do not prevent explicit playback', async ({ page }) => {
+    await seed(page, { id: 'mode-storage', status: 'finished', file: true, name: 'storage.mp4' });
+    await refresh(page);
+    await page.evaluate(() => {
+        const id = document.getElementById('playbackModeControl').dataset.userId;
+        localStorage.setItem(`playback-mode-user-${id}`, 'obsolete-mode');
+    });
+    await page.reload();
+    await expectMainPlaybackMode(page, 'Play All', 'play');
+
+    await page.addInitScript(() => {
+        const getItem = Storage.prototype.getItem;
+        const setItem = Storage.prototype.setItem;
+        Storage.prototype.getItem = function guardedGet(key) {
+            if (String(key).startsWith('playback-mode-user-')) throw new Error('Storage blocked');
+            return getItem.call(this, key);
+        };
+        Storage.prototype.setItem = function guardedSet(key, value) {
+            if (String(key).startsWith('playback-mode-user-')) throw new Error('Storage blocked');
+            return setItem.call(this, key, value);
+        };
+    });
+    await page.reload();
+    await expectMainPlaybackMode(page, 'Play All', 'play');
+    await choosePlaybackMode(page, 'Shuffle');
+    await expectMainPlaybackMode(page, 'Shuffle', 'shuffle');
+    await expect.poll(() => page.evaluate(() => endlessPlayback.mode)).toBe('shuffle');
+    await page.reload();
+    await expectMainPlaybackMode(page, 'Play All', 'play');
+});
+
+test('playback mode is scoped to account and survives sign-out on this browser', async ({ page }) => {
+    await seed(page, { id: 'mode-account', status: 'finished', file: true, name: 'account.mp4' });
+    await refresh(page);
+    const username = `mode-user-${Date.now()}`;
+    const password = 'browser-mode-password';
+    const created = await page.request.post('/api/users', {
+        data: { username, password, role: 'normal' },
+    });
+    expect(created.status()).toBe(201);
+
+    await choosePlaybackMode(page, 'Shuffle');
+    await expectMainPlaybackMode(page, 'Shuffle', 'shuffle');
+    await page.request.post('/logout');
+    await page.request.post('/login', { form: { username, password } });
+    await page.goto('/');
+    await expectMainPlaybackMode(page, 'Play All', 'play');
+
+    await page.request.post('/logout');
+    await page.request.post('/login', {
+        form: { username: 'admin', password: 'browser-test-password' },
+    });
+    await page.goto('/');
+    await expectMainPlaybackMode(page, 'Shuffle', 'shuffle');
+    await page.request.delete(`/api/users/${(await created.json()).id}`);
 });
 
 test('Shuffle ignores History search and hands off randomly in the same player', async ({ page }) => {
