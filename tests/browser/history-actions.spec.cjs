@@ -9,6 +9,28 @@ async function openInfo(row) {
 
 test.beforeEach(async ({ page }) => reset(page));
 
+test('Library reload requests the current thumbnail cache version', async ({ page }) => {
+    await page.goto('about:blank');
+    await seed(page, {
+        id: 'thumb-version', status: 'finished', file: true, thumbnail: true,
+        name: 'thumb-version.mp4', title: 'Thumbnail version',
+    });
+    const oldResponse = await page.goto('/api/thumbnail/thumb-version');
+    expect(oldResponse.status()).toBe(200);
+    expect(oldResponse.headers()['cache-control']).toContain('max-age=86400');
+
+    const requests = [];
+    page.on('request', request => {
+        if (request.url().includes('/api/thumbnail/thumb-version')) {
+            requests.push(new URL(request.url()).search);
+        }
+    });
+    await page.goto('/');
+    await expect(page.locator('[data-row-id="thumb-version"] .history-preview img'))
+        .toHaveAttribute('src', '/api/thumbnail/thumb-version?v=2');
+    await expect.poll(() => requests).toContain('?v=2');
+});
+
 test('fixed header opens the Current drawer and full Settings page', async ({ page }) => {
     await seed(page, { id: 'drawer001', status: 'downloading', progress: '25%' });
     await refresh(page);

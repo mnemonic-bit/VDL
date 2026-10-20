@@ -53,6 +53,16 @@ class HoverPreviewTest(AppCase):
             self.assertEqual(vdl.ffprobe_video_duration("movie.mp4"), 63.25)
         self.assertIn("stream=duration:format=duration", run.call_args.args[0])
 
+        stream_duration = subprocess.CompletedProcess(
+            [], 0,
+            stdout=json.dumps({
+                "streams": [{"duration": "42"}],
+                "format": {"duration": "nan"},
+            }),
+        )
+        with mock.patch.object(vdl.subprocess, "run", return_value=stream_duration):
+            self.assertEqual(vdl.ffprobe_video_duration("movie.mp4"), 42)
+
         invalid_results = [
             subprocess.CompletedProcess([], 1, stdout="{}"),
             subprocess.CompletedProcess([], 0, stdout="not json"),

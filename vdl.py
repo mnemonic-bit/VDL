@@ -1245,9 +1245,17 @@ def delete_download_artifacts(entry, fallback_dir=None):
         # generated download ID used to identify yt-dlp's temporary files.
         candidates.update((filename, filename + ".part", filename + ".ytdl"))
 
-    thumbnail = _thumbnail_path(entry, fallback_dir)
-    if thumbnail:
-        candidates.add(thumbnail)
+    for version in (1, _THUMBNAIL_CACHE_VERSION):
+        thumbnail = _thumbnail_path(entry, fallback_dir, version=version)
+        if thumbnail:
+            candidates.add(thumbnail)
+    if entry.get('output_dir'):
+        # Earlier versions placed sidecars in output_dir even when the stored
+        # media path later pointed elsewhere.
+        candidates.add(os.path.join(
+            os.path.abspath(entry['output_dir']),
+            f".vdl_{entry['id']}.thumbnail.jpg",
+        ))
     preview = _preview_path(entry, fallback_dir)
     if preview:
         candidates.add(preview)
@@ -2057,7 +2065,7 @@ def _playlist_item(entry, position):
         'duration_seconds': _finite_positive_number(
             entry.get('duration_seconds')
         ),
-        'thumbnail_url': f"/api/thumbnail/{entry['id']}",
+        'thumbnail_url': f"/api/thumbnail/{entry['id']}?v={_THUMBNAIL_CACHE_VERSION}",
     })
     return item
 
@@ -4004,7 +4012,9 @@ def _background_download(url, download_id, cookie_bundle=None):
                 # extractors. ffprobe always reflects the final container.
                 final_res = ffprobe_resolution(final_path)
                 final_duration = _consume_media_probe(final_path, final_res)
-                thumbnail_path = _thumbnail_path(entry, output_dir)
+                thumbnail_path = _thumbnail_path(
+                    {**entry, 'filename': final_path}, output_dir,
+                )
                 if thumbnail_path:
                     generate_video_thumbnail(final_path, thumbnail_path)
                 db_update_download(
@@ -4574,18 +4584,22 @@ class IngestStartupImporter:
         print(f'VDL ingest: startup scan complete; {counts}', flush=True)
 
 
-def _thumbnail_path(entry, fallback_dir=None):
+_THUMBNAIL_CACHE_VERSION = 2
+
+
+def _thumbnail_path(entry, fallback_dir=None, *, version=_THUMBNAIL_CACHE_VERSION):
     """Return the stable sidecar path for one download's generated preview."""
-    directory = entry.get('output_dir')
-    if not directory and entry.get('filename'):
+    directory = None
+    if entry.get('filename'):
         directory = os.path.dirname(os.path.abspath(entry['filename']))
     if not directory:
-        directory = fallback_dir
+        directory = entry.get('output_dir') or fallback_dir
     if not directory:
         return None
+    suffix = f'-v{version}' if version != 1 else ''
     return os.path.join(
         os.path.abspath(directory),
-        f".vdl_{entry['id']}.thumbnail.jpg",
+        f".vdl_{entry['id']}.thumbnail{suffix}.jpg",
     )
 
 
@@ -4610,7 +4624,10 @@ def _preview_path(entry, fallback_dir=None):
 
 def generate_video_thumbnail(media_path, thumbnail_path):
     """Extract a compact preview frame without making download success depend on it."""
-    for seek_time in ('1', '0'):
+    duration = ffprobe_video_duration(media_path)
+    seek_times = ([f'{duration * 2 / 3:.3f}'] if duration is not None else [])
+    seek_times.extend(('1', '0'))
+    for seek_time in seek_times:
         temporary_path = (
             f"{thumbnail_path}.{uuid.uuid4().hex}.tmp.jpg"
         )
@@ -4667,12 +4684,14 @@ def ffprobe_video_duration(path):
         streams = data.get('streams') or []
         if not streams:
             return None
-        value = (data.get('format') or {}).get('duration')
-        if value is None:
-            value = streams[0].get('duration')
-        duration = float(value)
-        if math.isfinite(duration) and duration > 0:
-            return duration
+        for value in ((data.get('format') or {}).get('duration'),
+                      streams[0].get('duration')):
+            try:
+                duration = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(duration) and duration > 0:
+                return duration
     except (OSError, subprocess.SubprocessError, TypeError, ValueError,
             json.JSONDecodeError):
         pass

@@ -7,6 +7,11 @@ const ACTIVE_PROGRESS_STATUSES = new Set(['starting', 'downloading', 'paused']);
 const CURRENT_TAB_STATUSES = new Set(['starting', 'downloading', 'paused', 'cancelled', 'interrupted']);
 const HISTORY_TAB_STATUSES = new Set(['finished', 'error']);
 const TERMINAL_STATUSES = new Set(['finished', 'error', 'cancelled', 'interrupted']);
+const THUMBNAIL_CACHE_VERSION = 2;
+
+function thumbnailUrl(id) {
+    return `/api/thumbnail/${encodeURIComponent(id)}?v=${THUMBNAIL_CACHE_VERSION}`;
+}
 
 const favicon = document.getElementById('appFavicon');
 const idleFaviconHref = favicon ? favicon.getAttribute('href') : '';
@@ -2078,7 +2083,7 @@ function renderPlaylistMosaic(playlist) {
     if (!ids.length) {
         return '<div class="playlist-mosaic-empty"><svg aria-hidden="true"><use href="#i-playlist"/></svg><span>No videos yet</span></div>';
     }
-    return ids.map(id => `<img src="/api/thumbnail/${encodeURIComponent(id)}" alt="" loading="lazy" onerror="this.classList.add('thumbnail-unavailable')">`).join('');
+    return ids.map(id => `<img src="${thumbnailUrl(id)}" alt="" loading="lazy" onerror="this.classList.add('thumbnail-unavailable')">`).join('');
 }
 
 function renderPlaylistCard(playlist) {
@@ -2169,12 +2174,12 @@ function renderPlaylistEditor() {
         && (!query || tagSearchKey(libraryTitle(info)).includes(query))
     ));
     document.getElementById('playlistAvailable').innerHTML = available.length
-        ? available.map(info => `<button type="button" class="playlist-picker-row" onclick="playlistEditorAdd('${escapeAttr(info.id)}')"><img src="/api/thumbnail/${encodeURIComponent(info.id)}" alt=""><span>${escapeHtml(libraryTitle(info))}</span><svg aria-hidden="true"><use href="#i-plus"/></svg></button>`).join('')
+        ? available.map(info => `<button type="button" class="playlist-picker-row" onclick="playlistEditorAdd('${escapeAttr(info.id)}')"><img src="${thumbnailUrl(info.id)}" alt=""><span>${escapeHtml(libraryTitle(info))}</span><svg aria-hidden="true"><use href="#i-plus"/></svg></button>`).join('')
         : '<p>No available videos match.</p>';
     document.getElementById('playlistSelected').innerHTML = playlistEditorDraft.items.length
         ? playlistEditorDraft.items.map((item, index) => `<div class="playlist-selected-row${item.unavailable ? ' is-unavailable' : ''}" draggable="${!item.unavailable}" data-playlist-index="${index}">
             <span class="playlist-drag-handle" aria-hidden="true">⋮⋮</span>
-            ${item.id ? `<img src="/api/thumbnail/${encodeURIComponent(item.id)}" alt="">` : '<span class="playlist-unavailable-thumb"><svg><use href="#i-camera"/></svg></span>'}
+            ${item.id ? `<img src="${thumbnailUrl(item.id)}" alt="">` : '<span class="playlist-unavailable-thumb"><svg><use href="#i-camera"/></svg></span>'}
             <span class="playlist-selected-title"><span>${index + 1}</span>${escapeHtml(item.title || 'Unavailable video')}</span>
             <span class="playlist-order-actions">
                 <button type="button" onclick="playlistEditorMove(${index}, -1)" ${index === 0 ? 'disabled' : ''} aria-label="Move ${escapeAttr(item.title || 'video')} up">↑</button>
@@ -2449,7 +2454,7 @@ function renderHistoryCard(info) {
                 <div class="history-preview-wrap">
                     <button class="history-preview${mediaDuration ? ' has-preview-duration' : ''}" type="button" data-play-action data-download-id="${escapeAttr(id)}" data-play-label="${escapeAttr(playLabel)}" data-play-ext="${escapeAttr(playExt)}" aria-label="Play">
                         <span class="history-preview-fallback"><svg><use href="#i-camera"/></svg><span>No video preview</span></span>
-                        <img src="/api/thumbnail/${encodeURIComponent(id)}" alt="" loading="lazy" onerror="this.closest('.history-preview').classList.add('thumbnail-unavailable')">
+                        <img src="${thumbnailUrl(id)}" alt="" loading="lazy" onerror="this.closest('.history-preview').classList.add('thumbnail-unavailable')">
                         <video class="history-preview-video" muted playsinline loop preload="none" aria-hidden="true"></video>
                         ${newBadge}
                         ${qualityBadge}
@@ -2807,7 +2812,7 @@ function renderDuplicateMember(info) {
     const details = [duplicateSourceLabel(info), info.resolution, formatBytes(info.filesize)]
         .filter(Boolean).map(value => `<span>${escapeHtml(value)}</span>`).join('');
     return `<article class="duplicate-member" data-duplicate-id="${escapeAttr(id)}">
-                <img src="/api/thumbnail/${encodeURIComponent(id)}" alt="" loading="lazy">
+                <img src="${thumbnailUrl(id)}" alt="" loading="lazy">
                 <div class="duplicate-member-detail">
                     <div class="duplicate-member-title">${escapeHtml(title)}</div>
                     <div class="duplicate-member-filename">${escapeHtml(name)}</div>
@@ -3666,7 +3671,7 @@ function renderPlaylistQueue() {
         }
         return `<button type="button" class="playlist-queue-row${active ? ' is-active' : ''}" data-queue-position="${index}" onclick="selectPlaylistQueueItem('${escapeAttr(item.id)}')" ${active ? 'aria-current="true"' : ''}>
             <span class="playlist-queue-number">${index + 1}</span>
-            <img src="/api/thumbnail/${encodeURIComponent(item.id)}" alt="">
+            <img src="${thumbnailUrl(item.id)}" alt="">
             <span><strong>${escapeHtml(item.title || 'Untitled video')}</strong>${duration ? `<small>${duration}</small>` : ''}</span>
         </button>`;
     }).join('');

@@ -112,6 +112,10 @@ def test_row():
         updates.setdefault("finished_at", time.time())
     if updates:
         vdl.db_update_download(download_id, **updates)
+    if filename and data.get("thumbnail"):
+        thumbnail_path = vdl._thumbnail_path(vdl.db_get_download(download_id))
+        with open(thumbnail_path, "wb") as image:
+            image.write(b"\xff\xd8cached-frame\xff\xd9")
     if data.get("visibility") in ("public", "private"):
         vdl.db_set_download_visibility(download_id, data["visibility"])
     if data.get("browser_authenticated") is True:
