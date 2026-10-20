@@ -145,6 +145,7 @@ function apiFetch(url, options) {
         }
         return res;
     }).catch(err => {
+        if (err.name === 'AbortError') throw err;
         showServerStatus();
         throw err;
     });
@@ -3259,6 +3260,356 @@ const endlessPlayback = {
     lastSavedPosition: null,
 };
 
+const PLAYER_PRELOAD_SECONDS = 10;
+const PLAYER_FADE_SECONDS = 3;
+let playerPreparation = null;
+const playerMediaWaiting = new WeakSet();
+const playerMediaTimes = new WeakMap();
+
+function canPreparePlayer() {
+    return endlessPlayback.active && endlessPlayback.sessionId
+        && ['sequential', 'shuffle'].includes(endlessPlayback.mode);
+}
+
+function currentPreparation(preparation) {
+    return playerPreparation === preparation && endlessPlayback.active
+        && preparation.epoch === endlessPlayback.epoch
+        && preparation.sessionId === endlessPlayback.sessionId
+        && preparation.generation === endlessPlayback.loadGeneration;
+}
+
+function unloadPlayerMedia(video) {
+    video.pause();
+    video.removeAttribute('src');
+    video.replaceChildren();
+    video.load();
+    video.style.removeProperty('opacity');
+    video.style.removeProperty('z-index');
+}
+
+function setPlayerStandby(video, standby) {
+    video.classList.toggle('player-standby', standby);
+    video.controls = !standby;
+    video.controlsList?.toggle('nofullscreen', endlessPlayback.active
+        && ['sequential', 'shuffle'].includes(endlessPlayback.mode)
+        && Boolean(document.getElementById('playerMediaStage').requestFullscreen));
+    video.autoplay = !standby;
+    if (standby) {
+        video.setAttribute('aria-hidden', 'true');
+        video.setAttribute('tabindex', '-1');
+    } else {
+        video.removeAttribute('aria-hidden');
+        video.removeAttribute('tabindex');
+    }
+}
+
+function clearPlayerPreparation() {
+    const preparation = playerPreparation;
+    playerPreparation = null;
+    if (!preparation) return;
+    preparation.controller.abort();
+    cancelAnimationFrame(preparation.frame);
+    preparation.cleanup?.();
+    const standby = document.getElementById('playerStandby');
+    unloadPlayerMedia(standby);
+    setPlayerStandby(standby, true);
+}
+
+function finishPlayerFade() {
+    const preparation = playerPreparation;
+    if (!preparation?.fade) return;
+    const { incoming, outgoing, baseVolume, muted } = preparation;
+    preparation.fade = false;
+    cancelAnimationFrame(preparation.frame);
+    incoming.volume = baseVolume;
+    incoming.muted = muted;
+    incoming.style.removeProperty('opacity');
+    incoming.style.removeProperty('z-index');
+    outgoing.volume = baseVolume;
+    outgoing.muted = muted;
+    clearPlayerPreparation();
+    endlessPlayback.handoffInProgress = false;
+}
+
+function applyPlayerFade(preparation) {
+    if (!currentPreparation(preparation) || !preparation.fade) return;
+    const { outgoing, incoming, startTime, fadeDuration } = preparation;
+    const progress = outgoing.ended ? 1 : Math.max(0, Math.min(1,
+        (outgoing.currentTime - startTime) / fadeDuration,
+    ));
+    if (Number.isFinite(preparation.newVolume)
+            && Math.abs(incoming.volume - preparation.newVolume) > 0.0001) {
+        preparation.baseVolume = incoming.volume;
+    }
+    preparation.muted = incoming.muted;
+    preparation.progress = progress;
+    incoming.style.opacity = preparation.reducedMotion ? '1' : String(progress);
+    const oldVolume = preparation.baseVolume * Math.cos(Math.PI * progress / 2);
+    const newVolume = preparation.baseVolume * Math.sin(Math.PI * progress / 2);
+    preparation.oldVolume = oldVolume;
+    preparation.newVolume = newVolume;
+    outgoing.volume = oldVolume;
+    incoming.volume = newVolume;
+    outgoing.muted = incoming.muted = preparation.muted;
+    if (Math.abs(outgoing.volume - oldVolume) > 0.01
+            || Math.abs(incoming.volume - newVolume) > 0.01) {
+        failPlayerFade(preparation);
+        return;
+    }
+    if (progress >= 1) finishPlayerFade();
+}
+
+function playerFadeFrame(preparation) {
+    if (!currentPreparation(preparation) || !preparation.fade) return;
+    applyPlayerFade(preparation);
+    if (preparation.fade) {
+        preparation.frame = requestAnimationFrame(() => playerFadeFrame(preparation));
+    }
+}
+
+function failPlayerFade(preparation) {
+    if (!currentPreparation(preparation)) return;
+    if (preparation.fade) {
+        // The server has committed. Restore the outgoing picture until ended,
+        // then retry that committed item without drawing another Shuffle choice.
+        preparation.fade = false;
+        preparation.failedDuringFade = true;
+        preparation.disabled = true;
+        cancelAnimationFrame(preparation.frame);
+        clearPlayerMediaCallbacks();
+        const { outgoing, incoming } = preparation;
+        incoming.id = 'playerStandby';
+        outgoing.id = 'playerVideo';
+        setPlayerStandby(outgoing, false);
+        setPlayerStandby(incoming, true);
+        outgoing.volume = preparation.baseVolume;
+        outgoing.muted = preparation.muted;
+        incoming.pause();
+        incoming.style.opacity = '0';
+        endlessPlayback.currentItem = preparation.outgoingItem;
+        endlessPlayback.currentDownloadId = String(preparation.outgoingItem.id);
+        endlessPlayback.phase = 'playing';
+        endlessPlayback.handoffInProgress = true;
+        if (outgoing.ended) usePreparedPlayerHandoff();
+    } else {
+        preparation.disabled = true;
+        unloadPlayerMedia(preparation.incoming);
+        preparation.incoming.style.opacity = '0';
+    }
+}
+
+function usePreparedPlayerHandoff() {
+    const preparation = playerPreparation;
+    if (!preparation || preparation.fade) return false;
+    if (preparation.committing) {
+        preparation.ended = true;
+        return true;
+    }
+    if (!preparation.response) return false;
+    const response = preparation.response;
+    const recoverPrepared = preparation.failedDuringFade;
+    clearPlayerPreparation();
+    advanceEndlessPlayback(false, response, recoverPrepared);
+    return true;
+}
+
+function beginPlayerFade(preparation) {
+    if (!currentPreparation(preparation) || preparation.disabled) return;
+    const { outgoing, incoming } = preparation;
+    const remaining = outgoing.duration - outgoing.currentTime;
+    if (outgoing.paused || outgoing.ended || remaining < 1
+            || endlessPlayback.presentation === 'webkit-fullscreen'
+            || document.fullscreenElement === outgoing) {
+        failPlayerFade(preparation);
+        if (outgoing.ended || preparation.ended) usePreparedPlayerHandoff();
+        return;
+    }
+    preparation.baseVolume = outgoing.volume;
+    preparation.muted = outgoing.muted;
+    incoming.muted = outgoing.muted;
+    incoming.playbackRate = outgoing.playbackRate;
+    preparation.startTime = outgoing.currentTime;
+    preparation.fadeDuration = Math.min(PLAYER_FADE_SECONDS, remaining);
+    preparation.reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    preparation.fade = true;
+    preparation.progress = 0;
+    clearPlayerMediaCallbacks();
+    const moveFocus = document.activeElement === outgoing;
+    outgoing.id = 'playerStandby';
+    incoming.id = 'playerVideo';
+    setPlayerStandby(outgoing, true);
+    setPlayerStandby(incoming, false);
+    // The outgoing picture stays opaque underneath the incoming picture.
+    outgoing.classList.add('player-fade-outgoing');
+    incoming.style.zIndex = '1';
+    loadPlaybackItem(preparation.data.item, { adopt: true });
+    if (moveFocus) incoming.focus({ preventScroll: true });
+    preparation.generation = endlessPlayback.loadGeneration;
+    endlessPlayback.sequence = preparation.data.sequence;
+    markPlaybackStarted(preparation.generation);
+    endlessPlayback.handoffInProgress = true;
+    playerFadeFrame(preparation);
+}
+
+async function commitPlayerFade(preparation) {
+    preparation.committing = true;
+    endlessPlayback.handoffInProgress = true;
+    try {
+        const response = await apiFetch(
+            '/api/playback-sessions/' + encodeURIComponent(endlessPlayback.sessionId) + '/advance',
+            {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    expected_download_id: preparation.expectedId,
+                    sequence: preparation.sequence,
+                }),
+                signal: preparation.controller.signal,
+            },
+        );
+        if (!currentPreparation(preparation)) return;
+        // Detach the completed response body from the abort signal: cleanup
+        // must not invalidate the committed item needed by the ended fallback.
+        const body = await response.text();
+        if (!currentPreparation(preparation)) return;
+        preparation.response = new Response(body || null, {
+            status: response.status, headers: response.headers,
+        });
+        preparation.data = response.ok && response.status !== 204
+            ? JSON.parse(body) : null;
+        if (!currentPreparation(preparation)) return;
+        preparation.committing = false;
+        if (preparation.ended || preparation.outgoing.ended) {
+            usePreparedPlayerHandoff();
+            return;
+        }
+        if (!preparation.data || String(preparation.data.item.id) !== String(preparation.item.id)
+                || preparation.data.item.extension !== preparation.item.extension
+                || preparation.disabled || preparation.outgoing.duration - preparation.outgoing.currentTime < 1) {
+            failPlayerFade(preparation);
+            return;
+        }
+        const { incoming, outgoing } = preparation;
+        preparation.baseVolume = outgoing.volume;
+        preparation.muted = outgoing.muted;
+        incoming.volume = 0;
+        if (incoming.volume !== 0) {
+            preparation.disabled = true;
+            return;
+        }
+        incoming.muted = outgoing.muted;
+        incoming.playbackRate = outgoing.playbackRate;
+        if (incoming.currentTime !== 0) incoming.currentTime = 0;
+        preparation.starting = true;
+        const playback = incoming.play();
+        await playback;
+        if (!currentPreparation(preparation)) return;
+        preparation.playResolved = true;
+        if (preparation.playing) beginPlayerFade(preparation);
+    } catch (error) {
+        if (!currentPreparation(preparation)) return;
+        preparation.committing = false;
+        failPlayerFade(preparation);
+        if (preparation.ended || preparation.outgoing.ended) {
+            if (!usePreparedPlayerHandoff()) advanceEndlessPlayback();
+        }
+    }
+}
+
+function maybeCommitPlayerFade(preparation) {
+    if (!currentPreparation(preparation) || preparation.disabled || preparation.committing
+            || preparation.response || !preparation.item || preparation.fade) return;
+    const { incoming, outgoing } = preparation;
+    const remaining = outgoing.duration - outgoing.currentTime;
+    if (outgoing.paused || outgoing.ended || playerMediaWaiting.has(outgoing)
+            || remaining > PLAYER_FADE_SECONDS || remaining < 1
+            || endlessPlayback.presentation === 'webkit-fullscreen'
+            || document.fullscreenElement === outgoing
+            || incoming.readyState < HTMLMediaElement.HAVE_FUTURE_DATA
+            || !Number.isFinite(incoming.duration) || incoming.duration <= PLAYER_FADE_SECONDS) return;
+    commitPlayerFade(preparation);
+}
+
+function maybePreparePlayer() {
+    if (!canPreparePlayer()) return;
+    const outgoing = document.getElementById('playerVideo');
+    const remaining = outgoing.duration - outgoing.currentTime;
+    if (outgoing.paused || outgoing.ended || outgoing.seeking || outgoing.playbackRate <= 0
+            || playerMediaWaiting.has(outgoing)
+            || !Number.isFinite(remaining) || remaining <= 0 || remaining > PLAYER_PRELOAD_SECONDS) return;
+    if (playerPreparation) {
+        maybeCommitPlayerFade(playerPreparation);
+        return;
+    }
+    const preparation = {
+        epoch: endlessPlayback.epoch, generation: endlessPlayback.loadGeneration,
+        sessionId: endlessPlayback.sessionId,
+        expectedId: endlessPlayback.currentDownloadId, sequence: endlessPlayback.sequence + 1,
+        outgoing, incoming: document.getElementById('playerStandby'),
+        outgoingItem: endlessPlayback.currentItem, controller: new AbortController(),
+    };
+    if (!preparation.expectedId || endlessPlayback.advancePending) return;
+    playerPreparation = preparation;
+    const { incoming } = preparation;
+    const onReady = () => maybeCommitPlayerFade(preparation);
+    const onPlaying = () => {
+        if (!currentPreparation(preparation) || !preparation.starting || preparation.disabled) return;
+        preparation.playing = true;
+        if (preparation.playResolved && !preparation.fade) beginPlayerFade(preparation);
+    };
+    const onFailure = () => failPlayerFade(preparation);
+    incoming.addEventListener('loadedmetadata', onReady);
+    incoming.addEventListener('canplay', onReady);
+    incoming.addEventListener('playing', onPlaying);
+    incoming.addEventListener('error', onFailure);
+    const onWaiting = () => {
+        if (preparation.fade) failPlayerFade(preparation);
+    };
+    incoming.addEventListener('waiting', onWaiting);
+    preparation.cleanup = () => {
+        incoming.removeEventListener('loadedmetadata', onReady);
+        incoming.removeEventListener('canplay', onReady);
+        incoming.removeEventListener('playing', onPlaying);
+        incoming.removeEventListener('error', onFailure);
+        incoming.removeEventListener('waiting', onWaiting);
+        outgoing.classList.remove('player-fade-outgoing');
+    };
+    apiFetch('/api/playback-sessions/' + encodeURIComponent(endlessPlayback.sessionId) + '/prepare', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ expected_download_id: preparation.expectedId, sequence: preparation.sequence }),
+        signal: preparation.controller.signal,
+    }).then(async response => {
+        if (!response.ok || response.status === 204) throw new Error('No prepared item');
+        const data = await response.json();
+        if (!currentPreparation(preparation) || preparation.disabled) return;
+        if (data.session_id !== preparation.sessionId || data.sequence !== preparation.sequence
+                || data.prepared !== true || !data.item?.id) {
+            preparation.disabled = true;
+            return;
+        }
+        preparation.item = data.item;
+        incoming.preload = 'auto';
+        incoming.style.opacity = '0';
+        const source = document.createElement('source');
+        source.src = '/api/file/' + encodeURIComponent(data.item.id);
+        if (_VIDEO_MIME[data.item.extension]) source.type = _VIDEO_MIME[data.item.extension];
+        incoming.replaceChildren(source);
+        incoming.load();
+        maybeCommitPlayerFade(preparation);
+    }).catch(() => {
+        if (currentPreparation(preparation)) preparation.disabled = true;
+    });
+}
+
+function playerVolumeChanged(video) {
+    const preparation = playerPreparation;
+    if (!preparation?.fade || video !== preparation.incoming) return;
+    if (Math.abs(video.volume - preparation.newVolume) > 0.0001) {
+        preparation.baseVolume = video.volume;
+    }
+    preparation.muted = video.muted;
+    applyPlayerFade(preparation);
+}
+
 function hidePlayerControls() {
     clearTimeout(playerControlsTimer);
     playerControlsTimer = null;
@@ -3307,7 +3658,8 @@ function clearPlaybackWatchdog() {
 
 function armPlaybackWatchdog(generation) {
     clearPlaybackWatchdog();
-    if (!endlessPlayback.active || document.hidden) return;
+    if (!endlessPlayback.active || document.hidden
+            || endlessPlayback.failedGeneration === generation) return;
     endlessPlayback.watchdogTimer = setTimeout(() => {
         if (generation !== endlessPlayback.loadGeneration) return;
         handlePlaybackFailure(generation, 'The next video did not become ready in time.');
@@ -3332,7 +3684,8 @@ function markPlaybackStarted(generation) {
     if (generation !== endlessPlayback.loadGeneration) return;
     clearPlaybackWatchdog();
     endlessPlayback.phase = 'playing';
-    endlessPlayback.handoffInProgress = false;
+    endlessPlayback.handoffInProgress = Boolean(playerPreparation?.fade
+        || playerPreparation?.committing || playerPreparation?.response);
     endlessPlayback.failureCount = 0;
     endlessPlayback.failedGeneration = null;
     if (endlessPlayback.returnFullscreenNeeded) {
@@ -3395,7 +3748,8 @@ function observePlaybackPromise(playback, generation) {
     );
 }
 
-function loadPlaybackItem(item, { automatic = false, seekSeconds = null } = {}) {
+function loadPlaybackItem(item, { automatic = false, seekSeconds = null, adopt = false, waitForRetry = false } = {}) {
+    if (!adopt) clearPlayerPreparation();
     const video = document.getElementById('playerVideo');
     clearPlayerMediaCallbacks();
     const generation = ++endlessPlayback.loadGeneration;
@@ -3404,6 +3758,7 @@ function loadPlaybackItem(item, { automatic = false, seekSeconds = null } = {}) 
     endlessPlayback.failedGeneration = null;
     endlessPlayback.currentItem = item;
     endlessPlayback.currentDownloadId = String(item.id);
+    setPlayerStandby(video, false);
     video.style.removeProperty('width');
     video.style.removeProperty('height');
 
@@ -3425,9 +3780,12 @@ function loadPlaybackItem(item, { automatic = false, seekSeconds = null } = {}) 
     const onResize = current(() => applyOriginalPlayerSize(generation));
     const onCanPlay = current(() => armPlaybackWatchdog(generation));
     const onPlaying = current(() => markPlaybackStarted(generation));
-    const onError = current(() => handlePlaybackFailure(
-        generation, 'This video is missing or uses an unsupported format.',
-    ));
+    const onError = current(() => {
+        if (playerPreparation?.fade) failPlayerFade(playerPreparation);
+        else handlePlaybackFailure(
+            generation, 'This video is missing or uses an unsupported format.',
+        );
+    });
     video.addEventListener('loadedmetadata', onMetadata);
     video.addEventListener('resize', onResize);
     video.addEventListener('canplay', onCanPlay);
@@ -3441,6 +3799,12 @@ function loadPlaybackItem(item, { automatic = false, seekSeconds = null } = {}) 
         video.removeEventListener('error', onError);
     };
 
+    video.setAttribute('aria-label', item.title || 'Video playback');
+    if (adopt) {
+        applyOriginalPlayerSize(generation);
+        return generation;
+    }
+
     // Clear any previous <source> children and src attribute before reloading.
     // Setting video.src directly doesn't carry a type hint; using a <source>
     // element with an explicit type lets the browser decide playability before
@@ -3452,6 +3816,7 @@ function loadPlaybackItem(item, { automatic = false, seekSeconds = null } = {}) 
     const mime = _VIDEO_MIME[item.extension] || null;
     if (mime) source.type = mime;
     video.appendChild(source);
+    video.autoplay = !waitForRetry;
     video.load();
     if (endlessPlayback.active) {
         showPlayerTransition(`Loading ${item.title || 'next video'}`, []);
@@ -3470,9 +3835,11 @@ function loadPlaybackItem(item, { automatic = false, seekSeconds = null } = {}) 
 function requestPlayerFullscreen({ launch = false } = {}) {
     const video = document.getElementById('playerVideo');
     try {
-        if (video.requestFullscreen) {
+        const target = endlessPlayback.active && ['sequential', 'shuffle'].includes(endlessPlayback.mode)
+            ? document.getElementById('playerMediaStage') : video;
+        if (target.requestFullscreen) {
             if (launch) playerStartedFullscreen = true;
-            const request = video.requestFullscreen();
+            const request = target.requestFullscreen();
             if (request) request.catch(() => {
                 if (launch) {
                     playerStartedFullscreen = false;
@@ -3512,6 +3879,8 @@ function openBuiltInPlayer({ fullscreen = false, requestFullscreen = true } = {}
     const backdrop = document.getElementById('playerBackdrop');
     hidePlayerControls();
     backdrop.classList.add('open');
+    document.getElementById('playerMediaStage').classList.toggle('player-continuous',
+        endlessPlayback.active && ['sequential', 'shuffle'].includes(endlessPlayback.mode));
     endlessPlayback.launchProvenance = fullscreen ? 'fullscreen' : 'original';
     endlessPlayback.presentation = 'original';
     playerStartedFullscreen = false;
@@ -3527,12 +3896,16 @@ function releasePlaybackLease(sessionId) {
 }
 
 function deactivateEndlessPlayback({ release = true } = {}) {
+    finishPlayerFade();
+    clearPlayerPreparation();
     const sessionId = endlessPlayback.sessionId;
     clearInterval(endlessPlayback.keepaliveTimer);
     endlessPlayback.keepaliveTimer = null;
     clearInterval(endlessPlayback.progressTimer);
     endlessPlayback.progressTimer = null;
     endlessPlayback.active = false;
+    document.getElementById('playerMediaStage').classList.remove('player-continuous');
+    document.getElementById('playerVideo').controlsList?.remove('nofullscreen');
     endlessPlayback.sessionId = null;
     endlessPlayback.sequence = 0;
     endlessPlayback.advancePending = false;
@@ -3603,6 +3976,9 @@ function closePlayer() {
     backdrop.classList.remove('open');
     backdrop.querySelector('.player-box').classList.remove('playlist-player');
     document.getElementById('playlistQueue').hidden = true;
+    if (document.fullscreenElement === document.getElementById('playerMediaStage')) {
+        document.exitFullscreen()?.catch(() => {});
+    }
 }
 
 async function playbackResponseError(response) {
@@ -3930,6 +4306,7 @@ function startEndlessPlayback(id = null, label = '', extension = '', mode = 'seq
             endlessPlayback.currentItem = data.item;
             if (endlessPlayback.phase === 'failed') advanceEndlessPlayback();
         }
+        maybePreparePlayer();
     }).catch(error => {
         if (epoch !== endlessPlayback.epoch || !endlessPlayback.active) return;
         deactivateEndlessPlayback({ release: false });
@@ -3940,7 +4317,7 @@ function startEndlessPlayback(id = null, label = '', extension = '', mode = 'seq
     });
 }
 
-function advanceEndlessPlayback(completed = false) {
+function advanceEndlessPlayback(completed = false, preparedResponse = null, recoverPrepared = false) {
     if (!endlessPlayback.active || !endlessPlayback.sessionId
             || endlessPlayback.advancePending) return;
     const epoch = endlessPlayback.epoch;
@@ -3957,7 +4334,9 @@ function advanceEndlessPlayback(completed = false) {
             : 'Loading next video',
         [],
     );
-    apiFetch(
+    clearPlayerPreparation();
+    const generation = endlessPlayback.loadGeneration;
+    (preparedResponse ? Promise.resolve(preparedResponse) : apiFetch(
         '/api/playback-sessions/' + encodeURIComponent(sessionId) + '/advance',
         {
             method: 'POST',
@@ -3968,8 +4347,9 @@ function advanceEndlessPlayback(completed = false) {
                 completed: endlessPlayback.mode === 'playlist' && completed,
             }),
         },
-    ).then(async response => {
-        if (epoch !== endlessPlayback.epoch || !endlessPlayback.active) return;
+    )).then(async response => {
+        if (epoch !== endlessPlayback.epoch || generation !== endlessPlayback.loadGeneration
+                || !endlessPlayback.active) return;
         if (response.status === 204) {
             const mode = endlessPlayback.mode;
             deactivateEndlessPlayback({ release: false });
@@ -3994,7 +4374,8 @@ function advanceEndlessPlayback(completed = false) {
         }
         if (!response.ok) throw await playbackResponseError(response);
         const data = await response.json();
-        if (epoch !== endlessPlayback.epoch || !endlessPlayback.active) return;
+        if (epoch !== endlessPlayback.epoch || generation !== endlessPlayback.loadGeneration
+                || !endlessPlayback.active) return;
         endlessPlayback.sequence = data.sequence;
         endlessPlayback.currentDownloadId = String(data.item.id);
         if (endlessPlayback.mode === 'playlist') {
@@ -4004,7 +4385,15 @@ function advanceEndlessPlayback(completed = false) {
             renderPlaylistQueue();
             recordView(data.item.id);
         }
-        loadPlaybackItem(data.item, { automatic: true });
+        loadPlaybackItem(data.item, { automatic: !recoverPrepared, waitForRetry: recoverPrepared });
+        if (recoverPrepared) {
+            clearPlaybackWatchdog();
+            endlessPlayback.phase = 'failed';
+            endlessPlayback.failedGeneration = endlessPlayback.loadGeneration;
+            endlessPlayback.handoffInProgress = false;
+            showPlayerTransition('The next video stalled during the transition.',
+                ['retry', 'skip', 'stop', 'close'], 'retry');
+        }
     }).catch(error => {
         if (epoch !== endlessPlayback.epoch || !endlessPlayback.active) return;
         endlessPlayback.phase = 'failed';
@@ -4117,29 +4506,82 @@ function handleFullscreenExit() {
 }
 
 document.addEventListener('fullscreenchange', () => {
-    if (document.fullscreenElement === document.getElementById('playerVideo')) {
+    if (document.fullscreenElement === document.getElementById('playerVideo')
+            || document.fullscreenElement === document.getElementById('playerMediaStage')) {
         endlessPlayback.presentation = 'standard-fullscreen';
         return;
     }
     if (!document.fullscreenElement) handleFullscreenExit();
 });
 
-const playerVideo = document.getElementById('playerVideo');
-playerVideo.addEventListener('webkitbeginfullscreen', () => {
-    endlessPlayback.presentation = 'webkit-fullscreen';
-});
-playerVideo.addEventListener('webkitendfullscreen', handleFullscreenExit);
-playerVideo.addEventListener('ended', () => {
-    if (endlessPlayback.active && endlessPlayback.phase === 'playing') {
-        advanceEndlessPlayback(endlessPlayback.mode === 'playlist');
-    }
-});
-playerVideo.addEventListener('pause', () => {
-    if (endlessPlayback.active && endlessPlayback.mode === 'playlist'
-            && !playerVideo.ended) {
-        savePlaylistProgress({ force: true });
-    }
-});
+for (const video of document.querySelectorAll('#playerMediaStage video')) {
+    video.addEventListener('webkitbeginfullscreen', () => {
+        endlessPlayback.presentation = 'webkit-fullscreen';
+    });
+    video.addEventListener('webkitendfullscreen', handleFullscreenExit);
+    video.addEventListener('timeupdate', () => {
+        const previousTime = playerMediaTimes.get(video);
+        // WebKit can keep HAVE_CURRENT_DATA after a seek even as its clock
+        // advances. Actual forward progress also proves that waiting ended.
+        if (video.currentTime > previousTime && !video.seeking && !video.paused) {
+            playerMediaWaiting.delete(video);
+        }
+        playerMediaTimes.set(video, video.currentTime);
+        if (playerPreparation?.fade) applyPlayerFade(playerPreparation);
+        if (video.id === 'playerVideo') maybePreparePlayer();
+    });
+    video.addEventListener('playing', () => {
+        playerMediaWaiting.delete(video);
+        if (video.id === 'playerVideo') maybePreparePlayer();
+    });
+    video.addEventListener('waiting', () => {
+        playerMediaWaiting.add(video);
+        playerMediaTimes.set(video, video.currentTime);
+    });
+    video.addEventListener('ended', () => {
+        if (playerPreparation?.fade && video === playerPreparation.outgoing) {
+            finishPlayerFade();
+            return;
+        }
+        if (video.id !== 'playerVideo') return;
+        if (usePreparedPlayerHandoff()) return;
+        if (endlessPlayback.active && endlessPlayback.phase === 'playing') {
+            advanceEndlessPlayback(endlessPlayback.mode === 'playlist');
+        }
+    });
+    video.addEventListener('pause', () => {
+        if (video.id !== 'playerVideo') return;
+        if (playerPreparation?.fade) playerPreparation.outgoing.pause();
+        if (endlessPlayback.active && endlessPlayback.mode === 'playlist' && !video.ended) {
+            savePlaylistProgress({ force: true });
+        }
+    });
+    video.addEventListener('play', () => {
+        if (video.id !== 'playerVideo' || !playerPreparation?.fade) return;
+        const preparation = playerPreparation;
+        try {
+            Promise.resolve(preparation.outgoing.play()).catch(() => failPlayerFade(preparation));
+        } catch (error) { failPlayerFade(preparation); }
+    });
+    video.addEventListener('seeking', () => {
+        playerMediaTimes.delete(video);
+        if (video.id !== 'playerVideo') return;
+        if (playerPreparation?.fade) finishPlayerFade();
+        else if (playerPreparation?.starting || playerPreparation?.committing) {
+            failPlayerFade(playerPreparation);
+        }
+    });
+    video.addEventListener('seeked', () => {
+        playerMediaTimes.set(video, video.currentTime);
+        if (video.id === 'playerVideo') maybePreparePlayer();
+    });
+    video.addEventListener('ratechange', () => {
+        if (video.id === 'playerVideo' && playerPreparation?.fade) {
+            playerPreparation.outgoing.playbackRate = video.playbackRate;
+        }
+    });
+    video.addEventListener('volumechange', () => playerVolumeChanged(video));
+}
 window.addEventListener('pagehide', () => {
     if (endlessPlayback.active && endlessPlayback.mode === 'playlist') {
         savePlaylistProgress({ force: true, keepalive: true });

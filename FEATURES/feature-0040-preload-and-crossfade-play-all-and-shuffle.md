@@ -1,7 +1,7 @@
 # Preload and crossfade Play All and Shuffle videos
 
 **Source:** User-requested feature  
-**Status:** Proposed  
+**Status:** Implemented; Safari desktop validation pending\
 **Last refined:** 2026-10-20  
 **Extends:** Feature 0027, Endless library playback; Feature 0030, Shuffle playback
 
@@ -248,6 +248,19 @@ and no extra session or media element remains active after closing.
 | `static/app.js` | Preparation trigger, standby loading, crossfade controller, cleanup and fallback |
 | `static/styles.css` | Layered videos, fullscreen stage, controls, reduced-motion presentation |
 | `tests/` | Session contract and browser media handoff coverage |
+
+## Implementation notes
+
+Implemented in version `0.41.0`. Reservations stay in the existing in-memory
+session, and library selection resolves outside the session lock. Browser
+handoffs reuse two connected media elements and a stable fullscreen stage;
+failed overlaps retain the committed response for same-element recovery.
+
+Deterministic session tests cover concurrent retries, live authorization and
+selection changes, and reservation cleanup. Browser tests combine simulated
+media clocks with a generated WebM fixture for real buffering and fullscreen.
+Safari on macOS still requires the desktop validation described above;
+Playwright WebKit coverage does not establish native Safari fullscreen behavior.
 
 ## Non-goals
 

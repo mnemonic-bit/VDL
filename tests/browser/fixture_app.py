@@ -1,6 +1,7 @@
 """Deterministic Flask fixture used only by the Playwright regression tier."""
 
 import os
+import shutil
 import sys
 import threading
 import time
@@ -95,8 +96,14 @@ def test_row():
     if data.get("file"):
         os.makedirs(os.environ["DOWNLOADS_DIR"], exist_ok=True)
         filename = os.path.join(os.environ["DOWNLOADS_DIR"], data.get("name", "fixture.mp4"))
-        with open(filename, "wb") as output:
-            output.write(bytes(range(100)))
+        if data.get("media_fixture") == "crossfade":
+            shutil.copyfile(
+                os.path.join(os.path.dirname(__file__), "fixtures", "crossfade.webm"),
+                filename,
+            )
+        else:
+            with open(filename, "wb") as output:
+                output.write(bytes(range(100)))
     updates = {
         key: value for key, value in data.items()
         if key in {

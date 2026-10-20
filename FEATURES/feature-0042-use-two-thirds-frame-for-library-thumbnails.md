@@ -1,7 +1,7 @@
 # Use a two-thirds frame for library thumbnails
 
 **Source:** User-requested feature  
-**Status:** Proposed  
+**Status:** Implemented
 **Last refined:** 2026-10-20  
 **Updates:** Feature 0017, Make download history the primary thumbnail library
 

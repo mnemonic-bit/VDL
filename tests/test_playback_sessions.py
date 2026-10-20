@@ -1,4 +1,6 @@
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import time
 import unittest
 from unittest import mock
@@ -35,6 +37,194 @@ class PlaybackSessionTest(AppCase):
             duration_seconds=duration,
             media_metadata_probed=probed,
         )
+
+    def session_step(self, state, action, **overrides):
+        payload = {
+            'expected_download_id': state['item']['id'],
+            'sequence': state['sequence'] + 1,
+        }
+        payload.update(overrides)
+        return self.client.post(
+            f"/api/playback-sessions/{state['session_id']}/{action}",
+            json=payload,
+        )
+
+    def test_prepare_is_stable_without_advancing_or_recording_views(self):
+        for index, download_id in enumerate(('old', 'middle', 'new')):
+            self.finished_file(download_id, f'{download_id}.mp4')
+            self.set_created_at(download_id, index)
+        state = self.create_session(start_download_id='new').get_json()
+        before = dict(vdl._playback_sessions[state['session_id']])
+        prepared = self.session_step(state, 'prepare')
+        self.assertEqual(prepared.status_code, 200)
+        self.assertEqual(prepared.get_json(), self.session_step(state, 'prepare').get_json())
+        self.assertEqual(prepared.get_json()['item']['id'], 'middle')
+        self.assertTrue(prepared.get_json()['prepared'])
+        self.assertEqual(prepared.get_json()['sequence'], 1)
+        self.assertNotIn('filename', prepared.get_json()['item'])
+        stored = vdl._playback_sessions[state['session_id']]
+        for key in ('sequence', 'page', 'position', 'current_download_id', 'last_response'):
+            self.assertEqual(stored[key], before[key])
+        self.assertTrue(all(row['view_count'] == 0 for row in vdl.db_list_downloads()))
+        advanced = self.session_step(state, 'advance').get_json()
+        self.assertEqual(advanced['item'], prepared.get_json()['item'])
+        self.assertEqual(advanced, self.session_step(state, 'advance').get_json())
+        self.assertNotIn('prepared', stored)
+        self.session_step(advanced, 'advance')
+        last = vdl._playback_sessions[state['session_id']]['last_response']
+        wrapped = self.session_step(last, 'prepare').get_json()
+        self.assertEqual(wrapped['item']['id'], 'new')
+
+    def test_shuffle_reservation_draws_once_and_survives_pool_growth(self):
+        for download_id in ('one', 'two', 'three'):
+            self.shuffle_video(download_id)
+        with mock.patch.object(vdl.secrets, 'randbelow', return_value=0) as draw:
+            state = self.create_session(mode='shuffle').get_json()
+            prepared = self.session_step(state, 'prepare').get_json()
+            self.assertNotEqual(prepared['item']['id'], state['item']['id'])
+            self.shuffle_video('added')
+            self.assertEqual(prepared, self.session_step(state, 'prepare').get_json())
+            advanced = self.session_step(state, 'advance').get_json()
+            self.assertEqual(advanced['item'], prepared['item'])
+            self.assertEqual(advanced, self.session_step(state, 'advance').get_json())
+            self.assertEqual(draw.call_count, 2)
+
+    def test_prepared_one_item_pool_repeats_in_both_modes(self):
+        self.shuffle_video('only')
+        for mode in ('sequential', 'shuffle'):
+            with self.subTest(mode=mode):
+                state = self.create_session(mode=mode).get_json()
+                prepared = self.session_step(state, 'prepare').get_json()
+                self.assertEqual(prepared['item']['id'], 'only')
+                advanced = self.session_step(state, 'advance').get_json()
+                self.assertEqual(advanced['item'], prepared['item'])
+
+    def test_prepared_missing_or_ineligible_item_uses_live_selection(self):
+        for mode in ('sequential', 'shuffle'):
+            for download_id in ('one', 'two', 'three'):
+                self.shuffle_video(download_id)
+            with self.subTest(mode=mode):
+                state = self.create_session(mode=mode).get_json()
+                prepared = self.session_step(state, 'prepare').get_json()
+                missing_id = prepared['item']['id']
+                os.remove(vdl.db_get_download(missing_id)['filename'])
+                advanced = self.session_step(state, 'advance').get_json()
+                self.assertNotEqual(advanced['item']['id'], missing_id)
+                self.assertEqual(advanced, self.session_step(state, 'advance').get_json())
+
+    def test_sequential_preparation_rechecks_live_ordering(self):
+        for index, download_id in enumerate(('one', 'two', 'three')):
+            self.shuffle_video(download_id)
+            self.set_created_at(download_id, index)
+        state = self.create_session(start_download_id='three').get_json()
+        self.assertEqual(self.session_step(state, 'prepare').get_json()['item']['id'], 'two')
+        self.set_created_at('one', 1.5)
+        advanced = self.session_step(state, 'advance').get_json()
+        self.assertEqual(advanced['item']['id'], 'one')
+
+    def test_prepared_visibility_is_rechecked_by_advance_and_file_route(self):
+        self.shuffle_video('one')
+        self.shuffle_video('two')
+        vdl.db_create_user('bob', 'password-2', 'normal')
+        self.client = self.authenticated_client('bob', 'password-2')
+        for mode in ('sequential', 'shuffle'):
+            vdl.db_set_download_visibility('one', 'public')
+            vdl.db_set_download_visibility('two', 'public')
+            state = self.create_session(mode=mode).get_json()
+            prepared_id = self.session_step(state, 'prepare').get_json()['item']['id']
+            vdl.db_set_download_visibility(prepared_id, 'private')
+            self.assertEqual(self.client.get(f'/api/file/{prepared_id}').status_code, 404)
+            advanced = self.session_step(state, 'advance').get_json()
+            self.assertNotEqual(advanced['item']['id'], prepared_id)
+
+    def test_prepare_empty_pool_keeps_session_until_ended(self):
+        path = self.finished_file('only', 'only.mp4')
+        state = self.create_session().get_json()
+        os.remove(path)
+        self.assertEqual(self.session_step(state, 'prepare').status_code, 204)
+        self.assertIn(state['session_id'], vdl._playback_sessions)
+        self.assertEqual(self.session_step(state, 'advance').status_code, 204)
+
+    def test_prepare_rejects_invalid_stale_foreign_and_expired_requests(self):
+        self.shuffle_video('only')
+        state = self.create_session().get_json()
+        url = f"/api/playback-sessions/{state['session_id']}/prepare"
+        for payload in ([], {}, {'expected_download_id': 5, 'sequence': 1},
+                        {'expected_download_id': 'only', 'sequence': True}):
+            self.assertEqual(self.client.post(url, json=payload).status_code, 400)
+        self.assertEqual(self.session_step(state, 'prepare', sequence=2).status_code, 409)
+        self.assertEqual(self.session_step(state, 'prepare', expected_download_id='other').status_code, 409)
+        vdl.db_create_user('bob', 'password-2', 'normal')
+        bob = self.authenticated_client('bob', 'password-2')
+        self.assertEqual(bob.post(url, json={
+            'expected_download_id': 'only', 'sequence': 1,
+        }).status_code, 404)
+        self.session_step(state, 'advance')
+        self.assertEqual(self.session_step(state, 'prepare').status_code, 409)
+        vdl._playback_sessions[state['session_id']]['last_activity'] -= vdl.PLAYBACK_SESSION_TTL_SECONDS
+        self.assertEqual(self.session_step(state, 'prepare').status_code, 404)
+
+    def test_preparation_resolves_without_holding_session_lock_and_rechecks_lease(self):
+        self.shuffle_video('only')
+        state = self.create_session().get_json()
+        original = vdl.resolve_library_selection
+
+        def resolve(*args):
+            self.assertTrue(vdl._playback_sessions_lock.acquire(blocking=False))
+            try:
+                vdl._playback_sessions.pop(state['session_id'])
+            finally:
+                vdl._playback_sessions_lock.release()
+            return original(*args)
+
+        with mock.patch.object(vdl, 'resolve_library_selection', side_effect=resolve):
+            self.assertEqual(self.session_step(state, 'prepare').status_code, 404)
+
+    def test_prepared_candidate_rechecks_safe_paths_and_shuffle_thresholds(self):
+        self.shuffle_video('one')
+        self.shuffle_video('two')
+        state = self.create_session(mode='shuffle').get_json()
+        reserved = self.session_step(state, 'prepare').get_json()['item']['id']
+        vdl.db_update_download(reserved, resolution='unknown', media_metadata_probed=True)
+        advanced = self.session_step(state, 'advance').get_json()
+        self.assertNotEqual(advanced['item']['id'], reserved)
+        vdl.db_update_download(reserved, resolution='720p')
+        state = self.create_session().get_json()
+        reserved = self.session_step(state, 'prepare').get_json()['item']['id']
+        outside = os.path.join(self.temp_dir.name, 'outside.mp4')
+        with open(outside, 'wb') as output:
+            output.write(b'outside')
+        vdl.db_update_download(reserved, filename=outside)
+        self.assertEqual(self.client.get(f'/api/file/{reserved}').status_code, 403)
+        self.assertNotEqual(self.session_step(state, 'advance').get_json()['item']['id'], reserved)
+
+    def test_simultaneous_prepare_and_advance_retries_draw_only_once(self):
+        for download_id in ('one', 'two', 'three'):
+            self.shuffle_video(download_id)
+        state = self.create_session(mode='shuffle').get_json()
+        clients = [self.authenticated_client(), self.authenticated_client()]
+        original = vdl.resolve_shuffle_pool
+        for action in ('prepare', 'advance'):
+            barrier = threading.Barrier(2)
+
+            def resolve(*args):
+                result = original(*args)
+                barrier.wait(timeout=5)
+                return result
+
+            def send(client):
+                return client.post(
+                    f"/api/playback-sessions/{state['session_id']}/{action}",
+                    json={'expected_download_id': state['item']['id'], 'sequence': 1},
+                )
+
+            with mock.patch.object(vdl, 'resolve_shuffle_pool', side_effect=resolve), \
+                    mock.patch.object(vdl.secrets, 'randbelow', return_value=0) as draw, \
+                    ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(send, clients))
+            self.assertEqual([result.status_code for result in results], [200, 200])
+            self.assertEqual(results[0].get_json(), results[1].get_json())
+            self.assertEqual(draw.call_count, 1 if action == 'prepare' else 0)
 
     def test_create_advance_retry_page_boundary_and_wrap(self):
         for index, download_id in enumerate(("old", "middle", "new"), 1):

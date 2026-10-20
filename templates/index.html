@@ -747,18 +747,23 @@
             <button class="player-close" type="button" onclick="closePlayer()" aria-label="Close player"><svg aria-hidden="true"><use href="#i-x"/></svg></button>
             <div class="player-layout">
                 <div class="player-media-column">
-                    <video id="playerVideo" controls autoplay></video>
-                    <div id="playerTransition" class="player-transition" hidden>
-                        <span id="playerStatus" role="status" aria-live="polite"></span>
-                        <div class="player-transition-actions">
-                            <button id="playerContinue" type="button" onclick="continueEndlessPlayback()" hidden>Continue playback</button>
-                            <button id="playerReturnFullscreen" type="button" onclick="returnEndlessFullscreen()" hidden>Return to fullscreen</button>
-                            <button id="playerRetry" type="button" onclick="retryEndlessPlayback()" hidden>Retry</button>
-                            <button id="playerRestart" type="button" onclick="restartEndlessPlayback()" hidden>Start a new session</button>
-                            <button id="playerSkip" type="button" onclick="skipEndlessPlayback()" hidden>Skip</button>
-                            <button id="playerStopEndless" type="button" onclick="stopEndlessPlayback()" hidden>Stop endless playback</button>
-                            <button id="playerPlaybackSettings" type="button" onclick="openPlaybackSettingsFromPlayer()" hidden>Open Playback settings</button>
-                            <button id="playerTransitionClose" type="button" onclick="closePlayer()" hidden>Close</button>
+                    <div id="playerMediaStage" class="player-media-stage">
+                        <video id="playerVideo" controls autoplay></video>
+                        <video id="playerStandby" class="player-standby" preload="none" aria-hidden="true" tabindex="-1"></video>
+                        <button class="player-stage-fullscreen" type="button" onclick="requestPlayerFullscreen()">Fullscreen</button>
+                        <button class="player-stage-close" type="button" onclick="closePlayer()" aria-label="Close fullscreen player"><svg aria-hidden="true"><use href="#i-x"/></svg></button>
+                        <div id="playerTransition" class="player-transition" hidden>
+                            <span id="playerStatus" role="status" aria-live="polite"></span>
+                            <div class="player-transition-actions">
+                                <button id="playerContinue" type="button" onclick="continueEndlessPlayback()" hidden>Continue playback</button>
+                                <button id="playerReturnFullscreen" type="button" onclick="returnEndlessFullscreen()" hidden>Return to fullscreen</button>
+                                <button id="playerRetry" type="button" onclick="retryEndlessPlayback()" hidden>Retry</button>
+                                <button id="playerRestart" type="button" onclick="restartEndlessPlayback()" hidden>Start a new session</button>
+                                <button id="playerSkip" type="button" onclick="skipEndlessPlayback()" hidden>Skip</button>
+                                <button id="playerStopEndless" type="button" onclick="stopEndlessPlayback()" hidden>Stop endless playback</button>
+                                <button id="playerPlaybackSettings" type="button" onclick="openPlaybackSettingsFromPlayer()" hidden>Open Playback settings</button>
+                                <button id="playerTransitionClose" type="button" onclick="closePlayer()" hidden>Close</button>
+                            </div>
                         </div>
                     </div>
                 </div>

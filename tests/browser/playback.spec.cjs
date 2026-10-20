@@ -9,7 +9,7 @@ async function installFullscreenHarness(page) {
             configurable: true,
             get: () => window.__fullscreenElement || null,
         });
-        HTMLVideoElement.prototype.requestFullscreen = function requestFullscreen() {
+        Element.prototype.requestFullscreen = function requestFullscreen() {
             window.__fullscreenRequests = (window.__fullscreenRequests || 0) + 1;
             window.__fullscreenElement = this;
             document.dispatchEvent(new Event('fullscreenchange'));
@@ -471,7 +471,7 @@ test('endless handoff retains standard fullscreen without requesting it again', 
 
     await page.locator('#playerVideo').evaluate(video => video.dispatchEvent(new Event('ended')));
     await expect(page.locator('#playerVideo source')).toHaveAttribute('src', '/api/file/full-old');
-    expect(await page.evaluate(() => document.fullscreenElement?.id)).toBe('playerVideo');
+    expect(await page.evaluate(() => document.fullscreenElement?.id)).toBe('playerMediaStage');
     expect(await page.evaluate(() => window.__fullscreenRequests)).toBe(1);
 });
 

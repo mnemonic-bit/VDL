@@ -19,6 +19,16 @@ in SQLite, writes media to a configurable directory, supports light and dark
 themes, and ships as a hardened non-root container for `linux/amd64` and
 `linux/arm64`.
 
+Built-in **Play All** and **Shuffle** prepare the next stored video around ten
+seconds before the current one ends and blend picture and sound over the final
+three seconds when the browser is ready. Pausing freezes the overlap; volume,
+mute, and playback speed apply to both videos. Use **Fullscreen** or **F** to
+keep both pictures inside one fullscreen stage. Reduced motion switches the
+picture immediately while retaining the audio fade. When buffering or browser
+playback restrictions prevent an overlap, the current video finishes before
+the usual handoff and recovery controls appear. Playlists, direct playback,
+and native WebKit video fullscreen retain their existing handoff.
+
 ## Prerequisites
 
 The recommended deployment needs Docker Engine with Compose. Podman works with

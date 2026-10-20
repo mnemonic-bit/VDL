@@ -1876,3 +1876,37 @@ details[open] > .history-summary::before { transform: rotate(90deg); }
     white-space: nowrap;
     border: 0;
 }
+
+/* Keep the fullscreen surface connected while the media elements trade roles. */
+.player-media-stage { position: relative; min-width: 0; }
+.player-media-stage > video { position: relative; }
+.player-media-stage video.player-standby {
+    position: absolute; inset: 0; width: 100% !important; height: 100% !important;
+    opacity: 0; pointer-events: none;
+}
+.player-media-stage video.player-fade-outgoing { opacity: 1; }
+.player-stage-close, .player-stage-fullscreen { display: none; }
+.player-continuous .player-stage-fullscreen {
+    display: block; position: absolute; top: 12px; left: 12px; z-index: 4;
+    padding: 6px 10px; color: var(--fg); background: var(--surface);
+    border: 1px solid var(--border); border-radius: 4px; cursor: pointer;
+    opacity: 0; pointer-events: none;
+}
+.player-controls-visible .player-stage-fullscreen,
+.player-stage-fullscreen:focus { opacity: 1; pointer-events: auto; }
+.player-media-stage:fullscreen .player-stage-fullscreen { display: none; }
+.player-media-stage:fullscreen {
+    display: grid; place-items: center; width: 100vw; height: 100vh; background: black;
+}
+.player-media-stage:fullscreen video {
+    width: 100% !important; height: 100% !important; max-width: none; max-height: none;
+    object-fit: contain; border-radius: 0;
+}
+.player-media-stage:fullscreen .player-stage-close {
+    display: inline-flex; align-items: center; justify-content: center;
+    position: absolute; top: 12px; right: 12px; z-index: 4;
+    width: 36px; height: 36px; color: var(--fg); background: var(--surface);
+    border: 1px solid var(--border); border-radius: 50%; cursor: pointer;
+}
+.player-stage-close svg { width: 22px; height: 22px; }
+.player-box.playlist-player .player-media-stage { display: grid; place-items: center; min-height: 0; max-height: 100%; }

@@ -1,5 +1,7 @@
 const { defineConfig } = require('@playwright/test');
 
+const browserName = process.env.VDL_TEST_BROWSER || 'chromium';
+
 module.exports = defineConfig({
     testDir: '.',
     testMatch: '*.spec.cjs',
@@ -10,7 +12,8 @@ module.exports = defineConfig({
     use: {
         baseURL: process.env.VDL_BROWSER_BASE_URL,
         headless: true,
-        permissions: ['clipboard-read', 'clipboard-write'],
+        browserName,
+        permissions: browserName === 'chromium' ? ['clipboard-read', 'clipboard-write'] : [],
         trace: 'retain-on-failure',
         screenshot: 'only-on-failure',
     },

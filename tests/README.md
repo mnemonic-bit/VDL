@@ -47,6 +47,20 @@ npm ci
 npx playwright install chromium
 ```
 
+The crossfade tests include a small generated WebM fixture for real buffering,
+media clocks, and fullscreen, alongside simulated clocks for failure cases.
+To exercise them on additional engines:
+
+```bash
+cd tests/browser
+npx playwright install firefox webkit
+VDL_TEST_BROWSER=firefox python3 run.py crossfade.spec.cjs crossfade-media.spec.cjs
+VDL_TEST_BROWSER=webkit python3 run.py crossfade.spec.cjs crossfade-media.spec.cjs
+```
+
+Playwright WebKit is useful engine coverage; Safari's native fullscreen and
+per-element autoplay policy still need a supported macOS device.
+
 Set `VDL_PYTHON` when the Python with Flask and yt-dlp is not on `PATH`.
 The runners can use `CONTAINER_ENGINE=podman` and `VDL_IMAGE=vdl:local`.
 Developer media runs skip when tools are absent; `--media`, `--container`, and

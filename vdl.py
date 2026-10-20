@@ -6031,6 +6031,120 @@ def create_playback_session():
     return jsonify(_playback_session_response(state, entry)), 201
 
 
+def _library_session_step(session_id, expected_download_id, sequence, prepare):
+    """Resolve files outside the lease lock, then atomically reserve or commit."""
+    user_id = g.current_user['id']
+    is_admin = 'admin' in g.current_user['roles']
+
+    def check_state():
+        _prune_playback_sessions_locked(time.monotonic())
+        state = _playback_sessions.get(session_id)
+        if (state is None or state['owner_user_id'] != user_id
+                or state['mode'] == 'playlist'):
+            return None, (jsonify({'error': 'Unknown playback session'}), 404)
+        if not prepare and sequence == state['sequence']:
+            if expected_download_id != state['last_expected_download_id']:
+                return None, (jsonify({'error': 'Playback position changed'}), 409)
+            state['last_activity'] = time.monotonic()
+            return None, jsonify(state['last_response'])
+        if (sequence != state['sequence'] + 1
+                or expected_download_id != state['current_download_id']):
+            return None, (jsonify({'error': 'Playback position changed'}), 409)
+        if prepare and state.get('prepared'):
+            state['last_activity'] = time.monotonic()
+            return None, jsonify(state['prepared'])
+        return state, None
+
+    with _playback_sessions_lock:
+        state, response = check_state()
+        if response is not None:
+            return response
+        original_state = state
+        snapshot = dict(state)
+
+    if snapshot['mode'] == 'shuffle':
+        selection, metadata_pending = resolve_shuffle_pool(
+            user_id, is_admin, snapshot['minimum_height'],
+            snapshot['minimum_duration_seconds'],
+        )
+        if len(selection) > 1:
+            selection = [entry for entry in selection
+                         if str(entry['id']) != expected_download_id]
+        next_index = None
+    else:
+        selection = resolve_library_selection(
+            user_id, is_admin, snapshot['filter'], snapshot['ordering']
+        )
+        metadata_pending = False
+        next_index = ((snapshot['page'] * snapshot['page_size']
+                       + snapshot['position'] + 1) % len(selection)
+                      if selection else None)
+
+    with _playback_sessions_lock:
+        state, response = check_state()
+        if response is not None:
+            return response
+        if state is not original_state:
+            return jsonify({'error': 'Unknown playback session'}), 404
+        state['last_activity'] = time.monotonic()
+        if not selection:
+            if prepare:
+                return '', 204
+            if metadata_pending:
+                return jsonify({
+                    'code': 'shuffle_metadata_pending',
+                    'error': 'Older videos are still being prepared for Shuffle.',
+                }), 409
+            _playback_sessions.pop(session_id, None)
+            return '', 204
+        if next_index is not None:
+            entry = selection[next_index]
+        else:
+            prepared_id = (state.get('prepared') or {}).get('item', {}).get('id')
+            entry = next((entry for entry in selection
+                          if str(entry['id']) == prepared_id), None)
+            if entry is None:
+                entry = _shuffle_choice(selection)
+        if prepare:
+            response = {
+                'session_id': session_id, 'sequence': sequence,
+                'prepared': True, 'item': _playback_item(entry),
+            }
+            state['prepared'] = response
+            return jsonify(response)
+        state.pop('prepared', None)
+        if next_index is not None:
+            state['page'] = next_index // state['page_size']
+            state['position'] = next_index % state['page_size']
+        state['current_download_id'] = str(entry['id'])
+        state['sequence'] = sequence
+        state['last_expected_download_id'] = expected_download_id
+        state['last_status'] = 200
+        response = _playback_session_response(state, entry)
+        state['last_response'] = response
+        return jsonify(response)
+
+
+@app.route('/api/playback-sessions/<session_id>/prepare', methods=['POST'])
+def prepare_playback_session(session_id):
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({'error': 'A JSON object is required'}), 400
+    expected_download_id = payload.get('expected_download_id')
+    if (not isinstance(expected_download_id, str)
+            or not expected_download_id or len(expected_download_id) > 128):
+        return jsonify({'error': 'expected_download_id is invalid'}), 400
+    try:
+        sequence = _playback_integer(
+            payload, 'sequence', 1, PLAYBACK_SESSION_MAX_COORDINATE
+        )
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    return _library_session_step(
+        session_id, expected_download_id, sequence, prepare=True
+    )
+
+
 @app.route('/api/playback-sessions/<session_id>/advance', methods=['POST'])
 def advance_playback_session(session_id):
     payload = request.get_json(silent=True)
@@ -6047,6 +6161,14 @@ def advance_playback_session(session_id):
         )
     except ValueError as exc:
         return jsonify({'error': str(exc)}), 400
+
+    with _playback_sessions_lock:
+        state = _playback_sessions.get(session_id)
+        library_mode = state is None or state['mode'] != 'playlist'
+    if library_mode:
+        return _library_session_step(
+            session_id, expected_download_id, sequence, prepare=False
+        )
 
     now = time.monotonic()
     user_id = g.current_user['id']
@@ -6123,42 +6245,6 @@ def advance_playback_session(session_id):
             state['playlist_position'] = next_position
             state['resume_seconds'] = 0
             entry = next_entry
-        elif state['mode'] == 'shuffle':
-            selection, metadata_pending = resolve_shuffle_pool(
-                user_id,
-                is_admin,
-                state['minimum_height'],
-                state['minimum_duration_seconds'],
-            )
-            if len(selection) > 1:
-                selection = [
-                    entry for entry in selection
-                    if str(entry['id']) != state['current_download_id']
-                ]
-            if not selection and metadata_pending:
-                state['last_activity'] = now
-                return jsonify({
-                    'code': 'shuffle_metadata_pending',
-                    'error': 'Older videos are still being prepared for Shuffle.',
-                }), 409
-            if not selection:
-                _playback_sessions.pop(session_id, None)
-                return '', 204
-            entry = _shuffle_choice(selection)
-        else:
-            selection = resolve_library_selection(
-                user_id, is_admin, state['filter'], state['ordering']
-            )
-        if state['mode'] != 'playlist' and not selection:
-            _playback_sessions.pop(session_id, None)
-            return '', 204
-        if state['mode'] == 'sequential':
-            next_index = (
-                state['page'] * state['page_size'] + state['position'] + 1
-            ) % len(selection)
-            entry = selection[next_index]
-            state['page'] = next_index // state['page_size']
-            state['position'] = next_index % state['page_size']
         state['current_download_id'] = str(entry['id'])
         state['sequence'] = sequence
         state['last_expected_download_id'] = expected_download_id
