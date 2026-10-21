@@ -3201,6 +3201,7 @@ function fetchHistory({ sortFavorites = false } = {}) {
 
 let playerMode = 'overlay';
 let startVideosFullscreen = false;
+let skipVideoEdges = false;
 let playerStartedFullscreen = false;
 
 // MIME types for <source type="..."> — tells the browser the codec upfront so
@@ -3258,6 +3259,191 @@ let playerPreparation = null;
 const playerMediaWaiting = new WeakSet();
 const playerMediaTimes = new WeakMap();
 
+// Each media load owns its preference snapshot and original-timeline bounds.
+// Keeping this on the element also preserves the incoming clock across a fade.
+const playerBoundaries = new WeakMap();
+
+function playerBoundaryCurrent(video, state) {
+    return playerBoundaries.get(video) === state
+        && (state.current() || (playerPreparation?.outgoing === video
+            && currentPreparation(playerPreparation)));
+}
+
+function updateSkipVideoEdges(enabled) {
+    if (skipVideoEdges === enabled) return;
+    skipVideoEdges = enabled;
+    // A preloaded item has not become current yet. Reload it with the saved
+    // setting, or retain an already committed response for an ordinary handoff.
+    if (playerPreparation && !playerPreparation.fade) {
+        if (playerPreparation.committing || playerPreparation.response) {
+            playerPreparation.disabled = true;
+        } else {
+            clearPlayerPreparation();
+        }
+    }
+}
+
+function playPlayerVideo(video, generation = endlessPlayback.loadGeneration) {
+    const play = () => {
+        if (generation !== endlessPlayback.loadGeneration) return;
+        try {
+            observePlaybackPromise(video.play(), generation);
+        } catch (_error) {
+            handlePlaybackFailure(generation, 'This video could not be played.');
+        }
+    };
+    const boundary = playerBoundaries.get(video);
+    if (boundary) boundary.playWhenReady(play);
+    else play();
+}
+
+function playerEffectiveEnd(video) {
+    const state = playerBoundaries.get(video);
+    return state?.valid && !state.tail ? state.end : video.duration;
+}
+
+function seekPlayerBoundary(video, state, position) {
+    if (Math.abs(video.currentTime - position) < 0.01) return;
+    state.ownSeek = true;
+    state.target = position;
+    state.ready = false;
+    state.seekFailed = false;
+    try {
+        video.currentTime = position;
+    } catch (_error) {
+        // Some media cannot seek. Play what is available without failing it.
+        state.seekFailed = true;
+    }
+    if (!video.seeking || state.seekFailed) {
+        state.ownSeek = false;
+        state.ready = true;
+    }
+}
+
+function createPlayerBoundary(video, { current, seekSeconds = null } = {}) {
+    playerBoundaries.get(video)?.cleanup();
+    const state = {
+        enabled: skipVideoEdges, current, metadata: false, started: false,
+        valid: false, start: 0, end: NaN, tail: false, finished: false,
+        initialApplied: false, unreliable: false, ownSeek: false,
+        ready: !skipVideoEdges, resume: seekSeconds, play: null,
+    };
+    playerBoundaries.set(video, state);
+    const alive = () => playerBoundaryCurrent(video, state);
+    const resumePlayback = () => {
+        if (!alive() || !state.ready || !state.play) return;
+        const play = state.play;
+        state.play = null;
+        play();
+    };
+    const update = event => {
+        if (!alive() || !state.enabled) return;
+        if (event.type === 'loadedmetadata') state.metadata = true;
+        if (!state.metadata) return;
+        const duration = video.duration;
+        const reliable = Number.isFinite(duration) && duration > 0;
+        if (!reliable && state.started) state.unreliable = true;
+        const hadBounds = state.valid;
+        state.valid = reliable && duration > 20 && !state.unreliable;
+        state.start = state.valid ? 10 : 0;
+        state.end = state.valid ? duration - 10 : duration;
+        if (hadBounds && !state.valid && playerPreparation?.fade
+                && playerPreparation.outgoing === video) {
+            failPlayerFade(playerPreparation);
+        }
+        state.ready = !state.ownSeek;
+        if (reliable && !state.initialApplied) {
+            state.initialApplied = true;
+            const resume = state.resume !== null && Number.isFinite(Number(state.resume));
+            let position = resume ? Math.max(0, Number(state.resume))
+                : state.started ? video.currentTime : 0;
+            if (state.valid) {
+                position = position < state.start || (resume && position >= state.end)
+                    ? state.start : position;
+            } else {
+                position = Math.min(position, duration);
+            }
+            seekPlayerBoundary(video, state, position);
+        }
+        resumePlayback();
+    };
+    const onSeeking = () => {
+        if (!alive() || !state.enabled) return;
+        if (state.ownSeek && Math.abs(video.currentTime - state.target) < 0.1) return;
+        state.ownSeek = false;
+        state.ready = false;
+        state.finished = false;
+        state.tail = state.valid && video.currentTime >= state.end;
+        if (state.tail && playerPreparation?.outgoing === video) {
+            if (playerPreparation.committing || playerPreparation.response) {
+                playerPreparation.disabled = true;
+            } else {
+                clearPlayerPreparation();
+            }
+        }
+    };
+    const onSeeked = () => {
+        if (!alive()) return;
+        state.ownSeek = false;
+        state.ready = true;
+        resumePlayback();
+    };
+    const onPlay = () => {
+        if (!alive() || !state.enabled || !state.finished) return;
+        state.finished = false;
+        state.tail = false;
+        if (state.valid) seekPlayerBoundary(video, state, state.start);
+    };
+    const onPlaying = () => { if (alive()) state.started = true; };
+    const listeners = {
+        loadedmetadata: update, durationchange: update, seeking: onSeeking,
+        seeked: onSeeked, play: onPlay, playing: onPlaying,
+    };
+    for (const [name, listener] of Object.entries(listeners)) video.addEventListener(name, listener);
+    state.cleanup = () => {
+        state.play = null;
+        for (const [name, listener] of Object.entries(listeners)) video.removeEventListener(name, listener);
+        if (playerBoundaries.get(video) === state) playerBoundaries.delete(video);
+    };
+    state.playWhenReady = play => {
+        if (!state.enabled || state.ready) play();
+        else state.play = play;
+    };
+    return state;
+}
+
+function completePlayerItem(video, natural = false) {
+    const state = playerBoundaries.get(video);
+    if (state && (!playerBoundaryCurrent(video, state) || state.finished)) return;
+    // An ended event queued for the previous source must not finish a new load.
+    if (natural && state?.enabled && (!state.metadata
+            || (!video.ended && (!state.valid || video.currentTime < state.end)))) return;
+    if (playerPreparation?.fade && video === playerPreparation.outgoing) {
+        if (state) state.finished = true;
+        finishPlayerFade();
+        return;
+    }
+    if (video.id !== 'playerVideo') return;
+    if (state) state.finished = true;
+    if (!natural) {
+        if (state?.valid) seekPlayerBoundary(video, state, state.end);
+        video.pause();
+    }
+    if (usePreparedPlayerHandoff()) return;
+    if (endlessPlayback.active && endlessPlayback.phase === 'playing') {
+        advanceEndlessPlayback(endlessPlayback.mode === 'playlist');
+    }
+}
+
+function checkPlayerBoundary(video) {
+    const state = playerBoundaries.get(video);
+    if (!state?.valid || !playerBoundaryCurrent(video, state) || state.finished
+            || state.tail || state.ownSeek || video.paused || video.seeking
+            || playerMediaWaiting.has(video)
+            || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
+    if (video.currentTime >= state.end) completePlayerItem(video);
+}
+
 function canPreparePlayer() {
     return endlessPlayback.active && endlessPlayback.sessionId
         && ['sequential', 'shuffle'].includes(endlessPlayback.mode);
@@ -3271,6 +3457,7 @@ function currentPreparation(preparation) {
 }
 
 function unloadPlayerMedia(video) {
+    playerBoundaries.get(video)?.cleanup();
     video.pause();
     video.removeAttribute('src');
     video.replaceChildren();
@@ -3372,6 +3559,13 @@ function failPlayerFade(preparation) {
         const { outgoing, incoming } = preparation;
         incoming.id = 'playerStandby';
         outgoing.id = 'playerVideo';
+        const boundary = playerBoundaries.get(outgoing);
+        if (boundary) {
+            const epoch = endlessPlayback.epoch;
+            const generation = endlessPlayback.loadGeneration;
+            boundary.current = () => epoch === endlessPlayback.epoch
+                && generation === endlessPlayback.loadGeneration;
+        }
         setPlayerStandby(outgoing, false);
         setPlayerStandby(incoming, true);
         outgoing.volume = preparation.baseVolume;
@@ -3408,8 +3602,9 @@ function usePreparedPlayerHandoff() {
 function beginPlayerFade(preparation) {
     if (!currentPreparation(preparation) || preparation.disabled) return;
     const { outgoing, incoming } = preparation;
-    const remaining = outgoing.duration - outgoing.currentTime;
-    if (outgoing.paused || outgoing.ended || remaining < 1
+    const remaining = playerEffectiveEnd(outgoing) - outgoing.currentTime;
+    if (outgoing.paused || outgoing.ended || !Number.isFinite(remaining)
+            || remaining < 1 || remaining > PLAYER_FADE_SECONDS
             || endlessPlayback.presentation === 'webkit-fullscreen'
             || document.fullscreenElement === outgoing) {
         failPlayerFade(preparation);
@@ -3476,7 +3671,7 @@ async function commitPlayerFade(preparation) {
         }
         if (!preparation.data || String(preparation.data.item.id) !== String(preparation.item.id)
                 || preparation.data.item.extension !== preparation.item.extension
-                || preparation.disabled || preparation.outgoing.duration - preparation.outgoing.currentTime < 1) {
+                || preparation.disabled || playerEffectiveEnd(preparation.outgoing) - preparation.outgoing.currentTime < 1) {
             failPlayerFade(preparation);
             return;
         }
@@ -3490,7 +3685,6 @@ async function commitPlayerFade(preparation) {
         }
         incoming.muted = outgoing.muted;
         incoming.playbackRate = outgoing.playbackRate;
-        if (incoming.currentTime !== 0) incoming.currentTime = 0;
         preparation.starting = true;
         const playback = incoming.play();
         await playback;
@@ -3511,20 +3705,26 @@ function maybeCommitPlayerFade(preparation) {
     if (!currentPreparation(preparation) || preparation.disabled || preparation.committing
             || preparation.response || !preparation.item || preparation.fade) return;
     const { incoming, outgoing } = preparation;
-    const remaining = outgoing.duration - outgoing.currentTime;
+    if (playerBoundaries.get(outgoing)?.tail) return;
+    const boundary = playerBoundaries.get(incoming);
+    const remaining = playerEffectiveEnd(outgoing) - outgoing.currentTime;
     if (outgoing.paused || outgoing.ended || playerMediaWaiting.has(outgoing)
             || remaining > PLAYER_FADE_SECONDS || remaining < 1
             || endlessPlayback.presentation === 'webkit-fullscreen'
             || document.fullscreenElement === outgoing
             || incoming.readyState < HTMLMediaElement.HAVE_FUTURE_DATA
-            || !Number.isFinite(incoming.duration) || incoming.duration <= PLAYER_FADE_SECONDS) return;
+            || !Number.isFinite(incoming.duration)
+            || playerEffectiveEnd(incoming) - (boundary?.start || 0) <= PLAYER_FADE_SECONDS
+            || (boundary?.valid && boundary.seekFailed)
+            || !boundary?.ready || incoming.seeking) return;
     commitPlayerFade(preparation);
 }
 
 function maybePreparePlayer() {
     if (!canPreparePlayer()) return;
     const outgoing = document.getElementById('playerVideo');
-    const remaining = outgoing.duration - outgoing.currentTime;
+    if (playerBoundaries.get(outgoing)?.tail) return;
+    const remaining = playerEffectiveEnd(outgoing) - outgoing.currentTime;
     if (outgoing.paused || outgoing.ended || outgoing.seeking || outgoing.playbackRate <= 0
             || playerMediaWaiting.has(outgoing)
             || !Number.isFinite(remaining) || remaining <= 0 || remaining > PLAYER_PRELOAD_SECONDS) return;
@@ -3542,7 +3742,10 @@ function maybePreparePlayer() {
     if (!preparation.expectedId || endlessPlayback.advancePending) return;
     playerPreparation = preparation;
     const { incoming } = preparation;
-    const onReady = () => maybeCommitPlayerFade(preparation);
+    const onReady = () => {
+        // Boundary metadata handlers run before this readiness check.
+        queueMicrotask(() => maybeCommitPlayerFade(preparation));
+    };
     const onPlaying = () => {
         if (!currentPreparation(preparation) || !preparation.starting || preparation.disabled) return;
         preparation.playing = true;
@@ -3551,6 +3754,7 @@ function maybePreparePlayer() {
     const onFailure = () => failPlayerFade(preparation);
     incoming.addEventListener('loadedmetadata', onReady);
     incoming.addEventListener('canplay', onReady);
+    incoming.addEventListener('seeked', onReady);
     incoming.addEventListener('playing', onPlaying);
     incoming.addEventListener('error', onFailure);
     const onWaiting = () => {
@@ -3560,6 +3764,7 @@ function maybePreparePlayer() {
     preparation.cleanup = () => {
         incoming.removeEventListener('loadedmetadata', onReady);
         incoming.removeEventListener('canplay', onReady);
+        incoming.removeEventListener('seeked', onReady);
         incoming.removeEventListener('playing', onPlaying);
         incoming.removeEventListener('error', onFailure);
         incoming.removeEventListener('waiting', onWaiting);
@@ -3585,6 +3790,7 @@ function maybePreparePlayer() {
         source.src = '/api/file/' + encodeURIComponent(data.item.id);
         if (_VIDEO_MIME[data.item.extension]) source.type = _VIDEO_MIME[data.item.extension];
         incoming.replaceChildren(source);
+        createPlayerBoundary(incoming, { current: () => currentPreparation(preparation) });
         incoming.load();
         maybeCommitPlayerFade(preparation);
     }).catch(() => {
@@ -3746,6 +3952,13 @@ function loadPlaybackItem(item, { automatic = false, seekSeconds = null, adopt =
     clearPlayerMediaCallbacks();
     const generation = ++endlessPlayback.loadGeneration;
     const epoch = endlessPlayback.epoch;
+    const boundary = adopt ? playerBoundaries.get(video)
+        : createPlayerBoundary(video, {
+            seekSeconds, current: () => epoch === endlessPlayback.epoch
+                && generation === endlessPlayback.loadGeneration,
+        });
+    if (adopt && boundary) boundary.current = () => epoch === endlessPlayback.epoch
+        && generation === endlessPlayback.loadGeneration;
     endlessPlayback.phase = 'loading';
     endlessPlayback.failedGeneration = null;
     endlessPlayback.currentItem = item;
@@ -3759,7 +3972,7 @@ function loadPlaybackItem(item, { automatic = false, seekSeconds = null, adopt =
                 && generation === endlessPlayback.loadGeneration) callback(event);
     };
     const onMetadata = current(() => {
-        if (Number.isFinite(Number(seekSeconds))) {
+        if (!boundary?.enabled && Number.isFinite(Number(seekSeconds))) {
             const requested = Math.max(0, Number(seekSeconds));
             const duration = Number(video.duration);
             video.currentTime = Number.isFinite(duration)
@@ -3808,18 +4021,14 @@ function loadPlaybackItem(item, { automatic = false, seekSeconds = null, adopt =
     const mime = _VIDEO_MIME[item.extension] || null;
     if (mime) source.type = mime;
     video.appendChild(source);
-    video.autoplay = !waitForRetry;
+    video.autoplay = !waitForRetry && !boundary.enabled;
     video.load();
     if (endlessPlayback.active) {
         showPlayerTransition(`Loading ${item.title || 'next video'}`, []);
         armPlaybackWatchdog(generation);
     }
-    if (automatic) {
-        try {
-            observePlaybackPromise(video.play(), generation);
-        } catch (error) {
-            handlePlaybackFailure(generation, 'This video could not be played.');
-        }
+    if (automatic || (boundary.enabled && !waitForRetry)) {
+        playPlayerVideo(video, generation);
     }
     return generation;
 }
@@ -3959,6 +4168,7 @@ function closePlayer() {
     hidePlayerControls();
     showPlayerTransition('', []);
     if (document.activeElement === closeButton) closeButton.blur();
+    playerBoundaries.get(video)?.cleanup();
     video.pause();
     video.style.removeProperty('width');
     video.style.removeProperty('height');
@@ -4435,14 +4645,8 @@ function retryEndlessPlayback() {
     endlessPlayback.failedGeneration = null;
     endlessPlayback.phase = 'loading';
     showPlayerTransition('Resuming playback…', []);
-    try {
-        observePlaybackPromise(
-            document.getElementById('playerVideo').play(), generation,
-        );
-        armPlaybackWatchdog(generation);
-    } catch (error) {
-        handlePlaybackFailure(generation, 'This video could not be played.');
-    }
+    playPlayerVideo(document.getElementById('playerVideo'), generation);
+    armPlaybackWatchdog(generation);
 }
 
 function skipEndlessPlayback() {
@@ -4519,6 +4723,7 @@ for (const video of document.querySelectorAll('#playerMediaStage video')) {
             playerMediaWaiting.delete(video);
         }
         playerMediaTimes.set(video, video.currentTime);
+        checkPlayerBoundary(video);
         if (playerPreparation?.fade) applyPlayerFade(playerPreparation);
         if (video.id === 'playerVideo') maybePreparePlayer();
     });
@@ -4530,21 +4735,12 @@ for (const video of document.querySelectorAll('#playerMediaStage video')) {
         playerMediaWaiting.add(video);
         playerMediaTimes.set(video, video.currentTime);
     });
-    video.addEventListener('ended', () => {
-        if (playerPreparation?.fade && video === playerPreparation.outgoing) {
-            finishPlayerFade();
-            return;
-        }
-        if (video.id !== 'playerVideo') return;
-        if (usePreparedPlayerHandoff()) return;
-        if (endlessPlayback.active && endlessPlayback.phase === 'playing') {
-            advanceEndlessPlayback(endlessPlayback.mode === 'playlist');
-        }
-    });
+    video.addEventListener('ended', () => completePlayerItem(video, true));
     video.addEventListener('pause', () => {
         if (video.id !== 'playerVideo') return;
         if (playerPreparation?.fade) playerPreparation.outgoing.pause();
-        if (endlessPlayback.active && endlessPlayback.mode === 'playlist' && !video.ended) {
+        if (endlessPlayback.active && endlessPlayback.mode === 'playlist' && !video.ended
+                && !playerBoundaries.get(video)?.finished) {
             savePlaylistProgress({ force: true });
         }
     });
@@ -4557,7 +4753,7 @@ for (const video of document.querySelectorAll('#playerMediaStage video')) {
     });
     video.addEventListener('seeking', () => {
         playerMediaTimes.delete(video);
-        if (video.id !== 'playerVideo') return;
+        if (video.id !== 'playerVideo' || playerBoundaries.get(video)?.ownSeek) return;
         if (playerPreparation?.fade) finishPlayerFade();
         else if (playerPreparation?.starting || playerPreparation?.committing) {
             failPlayerFade(playerPreparation);
@@ -4598,22 +4794,7 @@ function togglePlayerPlayback() {
         video.pause();
         return;
     }
-    try {
-        const playback = video.play();
-        if (endlessPlayback.active) {
-            observePlaybackPromise(playback, endlessPlayback.loadGeneration);
-        } else if (playback && typeof playback.catch === 'function') {
-            // Keyboard playback should not leak a rejected autoplay promise.
-            playback.catch(() => {});
-        }
-    } catch (error) {
-        if (endlessPlayback.active) {
-            handlePlaybackFailure(
-                endlessPlayback.loadGeneration,
-                'This video could not be played.',
-            );
-        }
-    }
+    playPlayerVideo(video);
 }
 
 function handlePlayerShortcut(ev) {
@@ -5460,6 +5641,8 @@ function loadPreferences() {
 
         playerMode = (p.player_mode === 'new_tab') ? 'new_tab' : 'overlay';
         document.getElementById('prefPlayer').value = playerMode;
+        updateSkipVideoEdges(p.skip_video_edges === 'true');
+        document.getElementById('prefSkipVideoEdges').checked = skipVideoEdges;
         startVideosFullscreen = p.start_fullscreen === 'true';
         document.getElementById('prefStartFullscreen').checked = startVideosFullscreen;
         refreshFullscreenAvailability();
@@ -5511,6 +5694,8 @@ function savePreferences() {
         player_mode: document.getElementById('prefPlayer').value,
         start_fullscreen: document.getElementById('prefStartFullscreen').checked
             ? 'true' : 'false',
+        skip_video_edges: document.getElementById('prefSkipVideoEdges').checked
+            ? 'true' : 'false',
         shuffle_min_height: document.getElementById('prefShuffleMinHeight').value,
         shuffle_min_duration_minutes:
             document.getElementById('prefShuffleMinDuration').value,
@@ -5532,6 +5717,7 @@ function savePreferences() {
         }
         playerMode = body.player_mode;
         startVideosFullscreen = body.start_fullscreen === 'true';
+        updateSkipVideoEdges(body.skip_video_edges === 'true');
         applyTheme(body.theme);
         const btn = document.getElementById('saveBtn');
         btn.innerHTML = '<svg class="btn-icon"><use href="#i-check"/></svg><span>Saved</span>';

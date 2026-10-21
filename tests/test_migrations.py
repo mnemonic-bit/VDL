@@ -126,6 +126,7 @@ class SchemaMigrationTest(unittest.TestCase):
                     "max_concurrent": "3",
                     "player_mode": "overlay",
                     "start_fullscreen": "false",
+                    "skip_video_edges": "false",
                     "shuffle_min_height": "0",
                     "shuffle_min_duration_minutes": "0",
                     "theme": "dark",

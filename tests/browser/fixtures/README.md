@@ -8,3 +8,8 @@ ffmpeg -f lavfi -i color=c=blue:s=160x90:r=10 \
     -f lavfi -i sine=frequency=440:sample_rate=24000 -t 14 \
     -c:v libvpx -b:v 25k -g 10 -c:a libopus -b:a 12k crossfade.webm
 ```
+
+`edges.webm` uses the same generated picture and tone for 30 seconds. It tests
+intro/outro start seeks, early finishing, and crossfade using a real browser
+media timeline. Regenerate it with the command above using `-t 30` and output
+`edges.webm` instead.

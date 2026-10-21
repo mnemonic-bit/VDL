@@ -96,9 +96,9 @@ def test_row():
     if data.get("file"):
         os.makedirs(os.environ["DOWNLOADS_DIR"], exist_ok=True)
         filename = os.path.join(os.environ["DOWNLOADS_DIR"], data.get("name", "fixture.mp4"))
-        if data.get("media_fixture") == "crossfade":
+        if data.get("media_fixture") in {"crossfade", "edges"}:
             shutil.copyfile(
-                os.path.join(os.path.dirname(__file__), "fixtures", "crossfade.webm"),
+                os.path.join(os.path.dirname(__file__), "fixtures", data["media_fixture"] + ".webm"),
                 filename,
             )
         else:

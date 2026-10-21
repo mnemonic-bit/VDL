@@ -7,6 +7,36 @@ from tests.support.app_case import AppCase
 
 
 class PreferencesTest(AppCase):
+    def test_skip_video_edges_defaults_and_survives_database_initialization(self):
+        self.assertEqual(
+            self.client.get('/api/preferences').get_json()['skip_video_edges'],
+            'false',
+        )
+        vdl.db_set_preferences({'skip_video_edges': 'true'})
+        vdl.init_db()
+        self.assertEqual(vdl.db_get_preferences()['skip_video_edges'], 'true')
+
+    def test_skip_video_edges_normalizes_only_booleans_and_exact_strings(self):
+        for value, expected in ((True, 'true'), (False, 'false'),
+                                ('true', 'true'), ('false', 'false')):
+            with self.subTest(value=value):
+                response = self.client.post('/api/preferences', json={
+                    'skip_video_edges': value,
+                })
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.get_json()['skip_video_edges'], expected)
+
+    def test_invalid_skip_video_edges_rejects_the_entire_request(self):
+        original = vdl.db_get_preferences()
+        for value in (None, 0, 1, 1.5, '', 'True', 'FALSE', ' true ', [], {}):
+            with self.subTest(value=value):
+                response = self.client.post('/api/preferences', json={
+                    'skip_video_edges': value, 'theme': 'dark',
+                    'shuffle_min_height': '1080',
+                })
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(vdl.db_get_preferences(), original)
+
     def test_shuffle_thresholds_default_validate_normalize_and_persist(self):
         preferences = self.client.get('/api/preferences').get_json()
         self.assertEqual(preferences['shuffle_min_height'], '0')

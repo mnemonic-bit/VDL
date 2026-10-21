@@ -423,12 +423,19 @@
                         <div class="setting-item" data-setting-keywords="play videos player overlay new browser tab window">
                             <div class="setting-copy">
                                 <label for="prefPlayer">Play videos in</label>
-                                <span>Choose between the built-in player and a browser tab.</span>
+                                <span>Intro and outro skipping applies only to the built-in player. A new browser tab plays the complete video.</span>
                             </div>
                             <select id="prefPlayer">
                                 <option value="overlay">Overlay on this page</option>
                                 <option value="new_tab">New browser tab</option>
                             </select>
+                        </div>
+                        <div class="setting-item" data-setting-keywords="skip video intro outro advertisement ads playback built-in player">
+                            <div class="setting-copy">
+                                <label for="prefSkipVideoEdges">Skip video intro and outro</label>
+                                <span id="prefSkipVideoEdgesHint">Start 10 seconds in and finish 10 seconds early in the built-in player. The saved video stays complete. Videos of 20 seconds or less play normally.</span>
+                            </div>
+                            <input type="checkbox" id="prefSkipVideoEdges" aria-describedby="prefSkipVideoEdgesHint">
                         </div>
                         <div class="setting-item" data-setting-keywords="start videos full screen fullscreen player display">
                             <div class="setting-copy">

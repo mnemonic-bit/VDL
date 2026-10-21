@@ -768,6 +768,7 @@ def init_db():
             "max_concurrent": "3",
             "player_mode": "overlay",
             "start_fullscreen": "false",
+            "skip_video_edges": "false",
             "shuffle_min_height": "0",
             "shuffle_min_duration_minutes": "0",
             "theme": "system",
@@ -2455,7 +2456,11 @@ class PlaylistService:
                 duration = _finite_positive_number(
                     playable[start_position].get('duration_seconds')
                 )
-                if (duration is not None
+                # Edge skipping uses the browser's duration and clamps resume
+                # positions there; the legacy near-end heuristic would skip
+                # the item before the player can apply those bounds.
+                if (db_get_preferences().get('skip_video_edges') != 'true'
+                        and duration is not None
                         and duration - min(duration, resume_seconds)
                         <= max(30, duration * 0.05)):
                     next_positions = [
@@ -6616,9 +6621,19 @@ def preferences():
     allowed = {
         'download_dir', 'format', 'history_page_size', 'max_concurrent', 'player_mode',
         'start_fullscreen', 'theme', 'shuffle_min_height',
-        'shuffle_min_duration_minutes',
+        'shuffle_min_duration_minutes', 'skip_video_edges',
     }
     updates = {k: v for k, v in data.items() if k in allowed and v is not None}
+    if 'skip_video_edges' in data:
+        value = data['skip_video_edges']
+        if isinstance(value, bool):
+            updates['skip_video_edges'] = 'true' if value else 'false'
+        elif isinstance(value, str) and value in {'true', 'false'}:
+            updates['skip_video_edges'] = value
+        else:
+            return jsonify({
+                'error': 'Skip video intro and outro must be true or false'
+            }), 400
     if not updates:
         return jsonify({"error": "No valid preference fields provided"}), 400
     if "download_dir" in updates:

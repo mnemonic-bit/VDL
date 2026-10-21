@@ -1,7 +1,8 @@
 # Skip the first and last 10 seconds during video playback
 
 **Source:** User-requested feature  
-**Status:** Proposed  
+**Status:** Implemented\
+**Implemented:** 2026-10-21 · Version `0.43.0`\
 **Last refined:** 2026-10-20  
 **Related:** Feature 0040, Preload and crossfade Play All and Shuffle videos
 
@@ -128,5 +129,24 @@ keeps its specified timing.
 
 Before implementation is marked complete, run `./tests/run-all.sh --unit` and
 verify at least 90% `vdl.py` line coverage, then run the relevant browser
-playback and Settings tests. This documentation-only spec leaves `VERSION`
-unchanged; implementation needs a MINOR version bump under `AGENTS.md`.
+playback and Settings tests. Implementation increments the MINOR version to `0.43.0` under `AGENTS.md`.
+
+
+## Implementation notes
+
+Each media load captures its own setting and original-timeline bounds. Metadata
+and start-seek completion gate playback and incoming crossfade readiness. A
+saved setting change invalidates uncommitted preloads, while current playback
+retains its bounds. Playlist sessions with skipping enabled defer the existing
+server near-end resume heuristic to the browser so saved positions can be
+clamped instead of prematurely completing or advancing the item.
+
+## Validation
+
+- `./tests/run-all.sh --unit` with Python 3.12: 238 tests run, 5 skipped;
+  `vdl.py` line coverage 90.9% (4562/5019), above the 90% minimum.
+- `./tests/run-all.sh --browser`: all 201 browser tests passed, including real
+  media start seeks, early finishing, and fullscreen crossfade.
+- Three additional focused recovery checks passed for duration becoming
+  unreliable during a fade, stale end events before new metadata, and stopping
+  after a failed fade while retaining the restored item's bounds.
