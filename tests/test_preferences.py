@@ -7,6 +7,46 @@ from tests.support.app_case import AppCase
 
 
 class PreferencesTest(AppCase):
+    def test_download_limits_default_migrate_and_persist(self):
+        prefs = self.client.get('/api/preferences').get_json()
+        self.assertEqual(prefs['max_concurrent'], '3')
+        self.assertEqual(prefs['max_concurrent_per_host'], '2')
+        self.assertEqual(prefs['max_total_download_mbps'], '0')
+        with vdl._db_lock, vdl.db() as conn:
+            conn.execute("DELETE FROM preferences WHERE key = 'max_concurrent_per_host'")
+            conn.execute("DELETE FROM preferences WHERE key = 'max_total_download_mbps'")
+            conn.execute("UPDATE preferences SET value = '7' WHERE key = 'max_concurrent'")
+        vdl.init_db()
+        self.assertEqual(vdl.db_get_preferences()['max_concurrent'], '7')
+        self.assertEqual(vdl.db_get_preferences()['max_concurrent_per_host'], '2')
+        for value, canonical in (('0016.00', '16'), (0, '0'), (1.25, '1.25'), ('0.01', '0.01')):
+            response = self.client.post('/api/preferences', json={
+                'max_concurrent': 2, 'max_concurrent_per_host': '4',
+                'max_total_download_mbps': value,
+            })
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.get_json()['max_total_download_mbps'], canonical)
+            vdl.init_db()
+            current = vdl.db_get_preferences()
+            self.assertEqual(current['max_concurrent'], '2')
+            self.assertEqual(current['max_concurrent_per_host'], '4')
+            self.assertEqual(current['max_total_download_mbps'], canonical)
+
+    def test_download_limits_reject_invalid_values_atomically(self):
+        original = vdl.db_get_preferences()
+        invalid = [True, False, None, '', ' ', -1, '-1', [], {}, 'abc', '1e2']
+        for key in ('max_concurrent', 'max_concurrent_per_host', 'max_total_download_mbps'):
+            values = invalid + ([0, '0', '1.5', 1.5, 2.0] if key != 'max_total_download_mbps'
+                                else ['1 Mbps', '1.001', 1.001, float('nan'), float('inf')])
+            for value in values:
+                with self.subTest(key=key, value=value):
+                    response = self.client.post('/api/preferences', json={
+                        key: value, 'theme': 'dark',
+                    })
+                    self.assertEqual(response.status_code, 400)
+                    self.assertIn('error', response.get_json())
+                    self.assertEqual(vdl.db_get_preferences(), original)
+
     def test_skip_video_edges_defaults_and_survives_database_initialization(self):
         self.assertEqual(
             self.client.get('/api/preferences').get_json()['skip_video_edges'],

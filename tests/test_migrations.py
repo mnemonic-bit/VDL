@@ -124,6 +124,8 @@ class SchemaMigrationTest(unittest.TestCase):
                     "format": "best",
                     "history_page_size": "10",
                     "max_concurrent": "3",
+                    "max_concurrent_per_host": "2",
+                    "max_total_download_mbps": "0",
                     "player_mode": "overlay",
                     "start_fullscreen": "false",
                     "skip_video_edges": "false",

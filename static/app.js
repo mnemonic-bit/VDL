@@ -2653,6 +2653,9 @@ function renderItem(info, inHistoryView = false) {
     const etaStr = isRunning ? formatEta(info.eta) : '';
     const downloadedPercent = itemProgressPercent(info);
     const downloadSummaryParts = [];
+    if (info.status === 'starting' && info.progress === 'Waiting for a download slot') {
+        downloadSummaryParts.push('Waiting for a download slot');
+    }
     const summarySize = formatBytes(info.filesize);
     if (summarySize) downloadSummaryParts.push(`<strong>Total size:</strong> ${summarySize}`);
     if (info.resolution) downloadSummaryParts.push(`<strong>Quality:</strong> ${info.resolution}`);
@@ -5613,7 +5616,9 @@ function loadPreferences() {
         // overlap; only the newest response may populate editable controls.
         if (generation !== preferencesLoadGeneration) return;
         document.getElementById('prefDir').value = p.download_dir || '';
-        document.getElementById('prefMax').value = p.max_concurrent || '';
+        document.getElementById('prefMax').value = p.max_concurrent || '3';
+        document.getElementById('prefMaxPerHost').value = p.max_concurrent_per_host || '2';
+        document.getElementById('prefMaxMbps').value = p.max_total_download_mbps || '0';
         const configuredPageSize = Number(p.history_page_size);
         const nextPageSize = p.history_page_size === HISTORY_ENDLESS_MODE
             ? HISTORY_ENDLESS_MODE
@@ -5681,6 +5686,9 @@ document.getElementById('prefPlayer').addEventListener(
 );
 
 function savePreferences() {
+    for (const id of ['prefMax', 'prefMaxPerHost', 'prefMaxMbps']) {
+        if (!document.getElementById(id).reportValidity()) return;
+    }
     const sel = document.getElementById('prefFormat');
     const fmt = sel.value === '__custom__'
         ? document.getElementById('prefFormatCustom').value.trim()
@@ -5691,6 +5699,8 @@ function savePreferences() {
         format: fmt || 'best',
         history_page_size: document.getElementById('prefPageSize').value,
         max_concurrent: document.getElementById('prefMax').value,
+        max_concurrent_per_host: document.getElementById('prefMaxPerHost').value,
+        max_total_download_mbps: document.getElementById('prefMaxMbps').value,
         player_mode: document.getElementById('prefPlayer').value,
         start_fullscreen: document.getElementById('prefStartFullscreen').checked
             ? 'true' : 'false',

@@ -29,6 +29,27 @@ playback restrictions prevent an overlap, the current video finishes before
 the usual handoff and recovery controls appear. Playlists, direct playback,
 and native WebKit video fullscreen retain their existing handoff.
 
+## Download limits
+
+Settings controls the total number of URL downloads (default **3**) and the
+number from one source hostname (default **2**). Additional URLs wait in
+Current downloads without occupying a worker thread. A busy server does not
+block eligible jobs from another server. Paused downloads retain their slots;
+Stop removes waiting jobs and Continue joins the end of that server's queue.
+Both limits apply across all users, and changes take effect immediately
+without stopping active downloads.
+
+**Maximum total download speed (Mbps)** shares one media intake budget across
+all URL downloads, including audio/video streams, fragments, retries, and
+resumed work. **0** means Unlimited; **8 Mbps** is about **1 MB/s**. The limiter
+allows up to one second of burst credit. It excludes playback, uploads,
+imports, and the New download dialog's metadata probe. Changing the speed
+updates running native transfers. Transfers that require an external media
+downloader, including live HLS delegated to ffmpeg, report an unsupported
+transfer error while a cap is enabled. Enabling a cap during an external
+transfer stops that job with the same error; local ffmpeg post-processing
+continues to work.
+
 ## Prerequisites
 
 The recommended deployment needs Docker Engine with Compose. Podman works with

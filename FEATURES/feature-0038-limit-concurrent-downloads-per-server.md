@@ -1,7 +1,8 @@
 # Limit concurrent downloads globally and per source server
 
 **Source:** User-requested feature  
-**Status:** Proposed  
+**Status:** Implemented\
+**Implemented:** 2026-10-21 · Version `0.44.0`\
 **Last refined:** 2026-10-16
 
 ## Decision summary
@@ -140,3 +141,15 @@ pause, cancellation, resume, and every slot-release path. Test the preferences
 API and Settings controls. Run `./tests/run-all.sh --unit` and check that
 `vdl.py` line coverage meets the required 90% threshold; run the browser tier
 for the Settings and queued-row behavior before marking the feature complete.
+
+## Implementation outcome
+
+Implemented a process-wide queue of stored jobs. The scheduler reserves both
+slots atomically before starting a worker, skips blocked source hosts, and
+retains FIFO order within each normalized hostname. Stop removes queued work;
+Continue joins the queue again. Live preference changes reconsider waiting
+jobs, while lower limits let current workers drain. Settings persists the
+total and per-server limits, and queued rows show their waiting state.
+
+Validation: Python 3.12 unit coverage gate passed with `vdl.py` at 91.1%
+(required 90.0%); the full Chromium browser tier passed all 206 tests.

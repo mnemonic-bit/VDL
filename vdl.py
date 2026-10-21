@@ -34,6 +34,8 @@ from functools import wraps
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from download_bandwidth import SharedBandwidth, govern_download, canonical_mbps
+
 
 SEMVER_PATTERN = re.compile(
     r'^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
@@ -465,12 +467,12 @@ _playback_sessions_lock = threading.Lock()
 _media_probe_cache = {}
 _media_probe_cache_lock = threading.Lock()
 
-# Workers wait here before entering yt-dlp. A FIFO queue keeps a burst in
-# worker-arrival order while the counter lets preference changes take
-# effect without replacing a fixed-size semaphore.
+# Waiting jobs are data, not sleeping threads. Reserve both limits under one
+# lock; skip blocked hosts while retaining FIFO order within each hostname.
 _worker_condition = threading.Condition()
 _worker_queue = []
 _active_worker_count = 0
+_worker_hosts = {}
 # Terminal status is visible before a worker has necessarily unwound its
 # yt-dlp stack. Keep that resource-ownership lifetime separate from the slot
 # counter so removal cannot unlink a file the worker still has open.
@@ -766,6 +768,8 @@ def init_db():
             "format": "best",
             "history_page_size": "10",
             "max_concurrent": "3",
+            "max_concurrent_per_host": "2",
+            "max_total_download_mbps": "0",
             "player_mode": "overlay",
             "start_fullscreen": "false",
             "skip_video_edges": "false",
@@ -1360,13 +1364,12 @@ def _db_remove_download_from_playlists(conn, download_id):
 
 def db_remove_download_if_inactive(download_id, fallback_dir=None):
     """Atomically remove a non-active, fully stopped download row."""
-    with _db_lock, db() as conn:
+    with _worker_condition, _db_lock, db() as conn:
         row = conn.execute(
             "SELECT * FROM downloads WHERE id = ?", (download_id,)
         ).fetchone()
         entry = dict(row) if row else None
-        with _worker_condition:
-            worker_is_live = download_id in _live_worker_ids
+        worker_is_live = download_id in _live_worker_ids
         if (entry is None
                 or entry['status'] in ('starting', 'downloading', 'paused')
                 or worker_is_live):
@@ -2490,15 +2493,19 @@ def db_get_preferences():
 
 
 def db_set_preferences(updates: dict):
-    with _db_lock, db() as conn:
-        for k, v in updates.items():
-            conn.execute(
-                "INSERT INTO preferences(key, value) VALUES (?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (k, str(v)),
-            )
-    if "max_concurrent" in updates:
-        with _worker_condition:
+    # Serialize persistence and live controller updates in the same order.
+    with _worker_condition:
+        with _db_lock, db() as conn:
+            for k, v in updates.items():
+                conn.execute(
+                    "INSERT INTO preferences(key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (k, str(v)),
+                )
+        if 'max_total_download_mbps' in updates:
+            _bandwidth.configure(updates['max_total_download_mbps'])
+        if {'max_concurrent', 'max_concurrent_per_host'} & updates.keys():
+            _dispatch_worker_queue()
             _worker_condition.notify_all()
 
 
@@ -3329,7 +3336,17 @@ def request_cancel(download_id):
     # A queued worker is asleep on the slot condition rather than inside a
     # progress hook, so wake it to observe the cancellation immediately.
     with _worker_condition:
+        for job in list(_worker_queue):
+            if job['id'] == download_id:
+                _worker_queue.remove(job)
+                db_update_download(download_id, status='cancelled', finished_at=time.time())
+                if job.get('ready'):
+                    job['ready'].set()
+                clear_cancel(download_id)
+                clear_pause(download_id)
+        _dispatch_worker_queue()
         _worker_condition.notify_all()
+    _bandwidth.wake()
 
 
 def is_cancel_requested(download_id):
@@ -3345,6 +3362,7 @@ def clear_cancel(download_id):
 def request_pause(download_id):
     with _cancel_lock:
         _pause_flags[download_id] = True
+    _bandwidth.wake()
 
 
 def is_pause_requested(download_id):
@@ -3355,6 +3373,7 @@ def is_pause_requested(download_id):
 def clear_pause(download_id):
     with _cancel_lock:
         _pause_flags.pop(download_id, None)
+    _bandwidth.wake()
 
 
 def _clear_progress_estimate(download_id):
@@ -3477,43 +3496,122 @@ def _smoothed_eta(download_id, raw_eta, downloaded):
         return max(0, int(round(displayed_deadline - now)))
 
 
-def _configured_worker_limit():
-    value = db_get_preferences().get("max_concurrent", "3")
+def _source_server(url):
     try:
-        return max(1, int(value))
-    except (TypeError, ValueError):
-        return 3
-
-
-def _acquire_worker_slot(download_id):
-    global _active_worker_count
-
-    ticket = object()
-    with _worker_condition:
-        _worker_queue.append(ticket)
+        host = urlsplit(url).hostname
+        if not host:
+            return 'unknown-source'
+        host = host.rstrip('.')
         try:
-            while True:
-                if is_cancel_requested(download_id):
-                    return False
-                if (_worker_queue[0] is ticket
-                        and _active_worker_count < _configured_worker_limit()):
-                    _worker_queue.pop(0)
-                    _active_worker_count += 1
-                    _worker_condition.notify_all()
-                    return True
-                _worker_condition.wait()
-        finally:
-            if ticket in _worker_queue:
-                _worker_queue.remove(ticket)
-                _worker_condition.notify_all()
+            return ipaddress.ip_address(host).compressed.lower()
+        except ValueError:
+            host = host.encode('idna').decode('ascii').lower()
+            if (len(host) > 253 or not all(
+                    re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', label)
+                    for label in host.split('.'))):
+                return 'unknown-source'
+            return host
+    except (ValueError, UnicodeError, TypeError, AttributeError):
+        return 'unknown-source'
 
 
-def _release_worker_slot():
+def _dispatch_worker_queue():
+    """Called under the scheduler lock; reserve both counts before starting."""
     global _active_worker_count
+    prefs = db_get_preferences()
 
+    def limit(key, default):
+        try:
+            return max(1, int(prefs.get(key, default)))
+        except (ValueError, TypeError):
+            return default
+
+    total = limit('max_concurrent', 3)
+    per_host = limit('max_concurrent_per_host', 2)
+    unwinding_hosts = set()
+    for job in list(_worker_queue):
+        if job not in _worker_queue:
+            continue
+        if _active_worker_count >= total:
+            break
+        if job['host'] in unwinding_hosts:
+            continue
+        # Continue can be accepted after terminal status is published but
+        # before the previous worker has closed its files and unwound.
+        if (job['id'] in _worker_hosts
+                or (not job.get('ready') and job['id'] in _live_worker_ids)):
+            unwinding_hosts.add(job['host'])
+            continue
+        if sum(host == job['host'] for host in _worker_hosts.values()) >= per_host:
+            continue
+        _worker_queue.remove(job)
+        _worker_hosts[job['id']] = job['host']
+        _active_worker_count += 1
+        if job.get('ready'):
+            job['ready'].set()
+            continue
+        _live_worker_ids.add(job['id'])
+        try:
+            db_update_download(job['id'], progress='Preparing download')
+            args = (job['url'], job['id'])
+            if job['cookies'] is not None:
+                args += (job['cookies'],)
+            thread = threading.Thread(target=background_download, args=args, daemon=True)
+            thread.start()
+        except Exception as exc:
+            _live_worker_ids.discard(job['id'])
+            _worker_hosts.pop(job['id'], None)
+            _active_worker_count -= 1
+            db_update_download(job['id'], status='error', progress=str(exc), finished_at=time.time())
+
+
+def enqueue_download(url, download_id, cookie_bundle=None):
     with _worker_condition:
-        _active_worker_count -= 1
+        if is_cancel_requested(download_id):
+            db_update_download(download_id, status='cancelled', finished_at=time.time())
+            clear_cancel(download_id)
+            clear_pause(download_id)
+            return
+        db_update_download(download_id, progress='Waiting for a download slot')
+        _worker_queue.append({
+            'id': download_id, 'url': url, 'host': _source_server(url),
+            'cookies': cookie_bundle,
+        })
+        _dispatch_worker_queue()
+
+
+def _acquire_worker_slot(download_id, url):
+    # Direct callers may run a worker synchronously (CLI/tests). HTTP routes
+    # enqueue data instead, so waiting URLs never own blocked worker threads.
+    with _worker_condition:
+        if download_id in _worker_hosts:
+            return True
+        if is_cancel_requested(download_id):
+            return False
+        ready = threading.Event()
+        _worker_queue.append({
+            'id': download_id, 'host': _source_server(url), 'ready': ready,
+        })
+        _dispatch_worker_queue()
+    ready.wait()
+    with _worker_condition:
+        return download_id in _worker_hosts
+
+
+def _release_worker_slot(download_id):
+    global _active_worker_count
+    with _worker_condition:
+        if _worker_hosts.pop(download_id, None) is not None:
+            _active_worker_count -= 1
+        _dispatch_worker_queue()
         _worker_condition.notify_all()
+
+
+_bandwidth = SharedBandwidth(
+    cancelled=is_cancel_requested, paused=is_pause_requested,
+    pause=lambda download_id: progress_hook({'status': None}, download_id),
+    cancel_error=DownloadCancelled,
+)
 
 
 def progress_hook(d, download_id):
@@ -3788,15 +3886,27 @@ def background_download(url, download_id, cookie_bundle=None):
     with _worker_condition:
         _live_worker_ids.add(download_id)
     try:
+        if not _acquire_worker_slot(download_id, url):
+            db_update_download(
+                download_id, status='cancelled', finished_at=time.time(),
+                output_dir=os.path.abspath(db_get_preferences().get('download_dir', '.')),
+            )
+            clear_cancel(download_id)
+            clear_pause(download_id)
+            return
         return _background_download(url, download_id, cookie_bundle)
     finally:
         # Fragment downloaders can retain their locked destination stream in a
         # progress-hook reference cycle when cancellation skips normal cleanup.
         # Finalize those unreachable objects before Remove may unlink the file.
-        gc.collect()
-        with _worker_condition:
-            _live_worker_ids.discard(download_id)
-            _worker_condition.notify_all()
+        try:
+            _release_worker_slot(download_id)
+        finally:
+            gc.collect()
+            with _worker_condition:
+                _live_worker_ids.discard(download_id)
+                _dispatch_worker_queue()
+                _worker_condition.notify_all()
 
 
 def _background_download(url, download_id, cookie_bundle=None):
@@ -3892,12 +4002,6 @@ def _background_download(url, download_id, cookie_bundle=None):
     formats_summary = None  # captured during the probe phase, used as
                             # the fallback source if the first attempt fails.
 
-    if not _acquire_worker_slot(download_id):
-        db_update_download(download_id, status='cancelled', finished_at=time.time())
-        clear_cancel(download_id)
-        clear_pause(download_id)
-        return
-
     if cookie_bundle is not None:
         try:
             cookie_buffer = _cookies_to_netscape(cookie_bundle)
@@ -3910,7 +4014,6 @@ def _background_download(url, download_id, cookie_bundle=None):
             )
             clear_cancel(download_id)
             clear_pause(download_id)
-            _release_worker_slot()
             return
 
     # A Continue action starts a new worker, so its in-memory filter is gone.
@@ -3963,6 +4066,7 @@ def _background_download(url, download_id, cookie_bundle=None):
         # First attempt with the user's configured format selector.
         try:
             with yt_dlp.YoutubeDL(build_opts(fmt)) as ydl:
+                govern_download(ydl, _bandwidth, download_id)
                 ydl.download([url])
         except yt_dlp.utils.DownloadError as e:
             # Auto-fallback only for yt-dlp's canonical unavailable-format
@@ -3978,6 +4082,7 @@ def _background_download(url, download_id, cookie_bundle=None):
                 raise
             db_update_download(download_id, requested_format=best_id)
             with yt_dlp.YoutubeDL(build_opts(best_id)) as ydl:
+                govern_download(ydl, _bandwidth, download_id)
                 ydl.download([url])
         # Re-stat the final file (post-processing may have changed it,
         # e.g. ffmpeg merging .f137 + .f140 into a single .mp4).
@@ -4063,7 +4168,6 @@ def _background_download(url, download_id, cookie_bundle=None):
         clear_pause(download_id)
         _clear_progress_estimate(download_id)
         _clear_eta_estimate(download_id)
-        _release_worker_slot()
 
 
 def _finite_positive_number(value):
@@ -5092,12 +5196,7 @@ def extension_downloads():
         with _cancel_lock:
             _cancel_flags.pop(row['id'], None)
             _pause_flags.pop(row['id'], None)
-        thread = threading.Thread(
-            target=background_download,
-            args=(canonical_url, row['id'], cookies),
-            daemon=True,
-        )
-        thread.start()
+        enqueue_download(canonical_url, row['id'], cookies)
     response_action = 'already_active' if action in ('existing', 'already_active') else action
     return jsonify({
         'id': row['id'],
@@ -5251,9 +5350,7 @@ def add_download():
     if requested_filename:
         db_update_download(download_id, requested_filename=requested_filename)
 
-    thread = threading.Thread(target=background_download, args=(url, download_id))
-    thread.daemon = True
-    thread.start()
+    enqueue_download(url, download_id)
 
     return jsonify({"message": "Download started", "id": download_id})
 
@@ -5559,11 +5656,7 @@ def resume_download(download_id):
         return jsonify({
             "error": f"Cannot resume from status '{current['status']}'"
         }), 409
-    thread = threading.Thread(
-        target=background_download, args=(entry['url'], download_id)
-    )
-    thread.daemon = True
-    thread.start()
+    enqueue_download(entry['url'], download_id)
     return jsonify({"message": "Resumed", "id": download_id})
 
 
@@ -6621,9 +6714,25 @@ def preferences():
     allowed = {
         'download_dir', 'format', 'history_page_size', 'max_concurrent', 'player_mode',
         'start_fullscreen', 'theme', 'shuffle_min_height',
+        'max_concurrent_per_host', 'max_total_download_mbps',
         'shuffle_min_duration_minutes', 'skip_video_edges',
     }
     updates = {k: v for k, v in data.items() if k in allowed and v is not None}
+    for key, label in (
+        ('max_concurrent', 'Max concurrent downloads (total)'),
+        ('max_concurrent_per_host', 'Max concurrent downloads per server'),
+    ):
+        if key in data:
+            value = data[key]
+            if (isinstance(value, bool) or not isinstance(value, (str, int))
+                    or not re.fullmatch(r'[0-9]+', str(value)) or int(value) < 1):
+                return jsonify({'error': f'{label} must be a positive whole number'}), 400
+            updates[key] = str(int(value))
+    if 'max_total_download_mbps' in data:
+        try:
+            updates['max_total_download_mbps'] = canonical_mbps(data['max_total_download_mbps'])
+        except ValueError as exc:
+            return jsonify({'error': str(exc)}), 400
     if 'skip_video_edges' in data:
         value = data['skip_video_edges']
         if isinstance(value, bool):
@@ -6680,6 +6789,7 @@ def preferences():
 # ---------------------------------------------------------------------------
 
 init_db()
+_bandwidth.configure(db_get_preferences()['max_total_download_mbps'])
 
 _ingest_service_lock = threading.Lock()
 _ingest_thread = None

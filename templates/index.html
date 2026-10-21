@@ -387,10 +387,24 @@
                         </div>
                         <div class="setting-item" data-setting-keywords="maximum concurrent simultaneous parallel downloads workers">
                             <div class="setting-copy">
-                                <label for="prefMax">Max concurrent downloads</label>
-                                <span>How many downloads may run at the same time.</span>
+                                <label for="prefMax">Max concurrent downloads (total)</label>
+                                <span>Maximum URL downloads running across all servers. Additional URLs wait in the queue.</span>
                             </div>
-                            <input type="number" id="prefMax" min="1">
+                            <input type="number" id="prefMax" min="1" step="1" required>
+                        </div>
+                        <div class="setting-item" data-setting-keywords="maximum concurrent simultaneous parallel downloads server hostname queue">
+                            <div class="setting-copy">
+                                <label for="prefMaxPerHost">Max concurrent downloads per server</label>
+                                <span>Maximum URL downloads running from the same source hostname. Additional URLs from that server wait.</span>
+                            </div>
+                            <input type="number" id="prefMaxPerHost" min="1" step="1" required>
+                        </div>
+                        <div class="setting-item" data-setting-keywords="maximum total download bandwidth speed rate Mbps unlimited">
+                            <div class="setting-copy">
+                                <label for="prefMaxMbps">Maximum total download speed (Mbps)</label>
+                                <span>Shared by all running URL downloads. Set to 0 for unlimited. 8 Mbps is about 1 MB/s.</span>
+                            </div>
+                            <input type="number" id="prefMaxMbps" min="0" step="0.01" required>
                         </div>
                         <div class="setting-item" data-setting-keywords="videos items per page pagination history library">
                             <div class="setting-copy">

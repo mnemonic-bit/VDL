@@ -146,10 +146,10 @@ class CancelledDownloadCleanupTest(AppCase):
         finish_release = threading.Event()
         original_release = vdl._release_worker_slot
 
-        def delayed_release():
+        def delayed_release(candidate_id):
             release_entered.set()
             finish_release.wait(2)
-            original_release()
+            original_release(candidate_id)
 
         gc_was_enabled = gc.isenabled()
         gc.disable()

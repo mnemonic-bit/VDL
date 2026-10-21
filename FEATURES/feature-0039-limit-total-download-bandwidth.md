@@ -1,7 +1,8 @@
 # Limit total URL download bandwidth
 
 **Source:** User-requested feature  
-**Status:** Proposed  
+**Status:** Implemented\
+**Implemented:** 2026-10-21 · Version `0.44.0`\
 **Last refined:** 2026-10-17
 
 ## Decision summary
@@ -132,3 +133,20 @@ browser Settings tests for validation, persistence, units, and help text.
 Run `./tests/run-all.sh --unit` and verify the required `vdl.py` 90% line
 coverage, then run `./tests/run-all.sh --browser` before marking the feature
 complete.
+
+## Implementation outcome
+
+Implemented `download_bandwidth.py` with one FIFO token bucket shared by all
+managed URL workers. Native HTTP, HLS, DASH, and ISM media responses obtain
+allowance before reads; short reads refund unused credit. The controller
+supports live changes, interruptible waits, pause, and Unlimited mode.
+Extractor requests outside the media downloader remain outside the budget.
+
+External media downloaders report an unsupported-transfer error under an
+enabled cap, including HLS that delegates to ffmpeg after reading a manifest.
+Private process guards also terminate an already-running external transfer
+when a cap is enabled. Local ffmpeg post-processing remains available.
+Settings stores canonical decimal Mbps values and validates saves atomically.
+
+Validation: Python 3.12 unit coverage gate passed with `vdl.py` at 91.1%
+(required 90.0%); the full Chromium browser tier passed all 206 tests.

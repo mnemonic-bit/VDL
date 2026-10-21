@@ -34,6 +34,7 @@ class AppCase(unittest.TestCase):
         with vdl._worker_condition:
             vdl._worker_queue.clear()
             vdl._active_worker_count = 0
+            vdl._worker_hosts.clear()
             vdl._live_worker_ids.clear()
         with vdl._pairing_lock:
             vdl._pairing_codes.clear()
@@ -44,7 +45,7 @@ class AppCase(unittest.TestCase):
         with vdl._playback_sessions_lock:
             vdl._playback_sessions.clear()
         vdl.init_db()
-        vdl.db_set_preferences({"download_dir": self.download_dir})
+        vdl.db_set_preferences({"download_dir": self.download_dir, "max_total_download_mbps": "0"})
         vdl.app.config.update(TESTING=True)
         admin = vdl.db_get_initial_admin()
         vdl.db_set_initial_admin_password(admin["id"], "test-password")
@@ -76,6 +77,7 @@ class AppCase(unittest.TestCase):
         with vdl._worker_condition:
             vdl._worker_queue.clear()
             vdl._active_worker_count = 0
+            vdl._worker_hosts.clear()
             vdl._live_worker_ids.clear()
         with vdl._pairing_lock:
             vdl._pairing_codes.clear()

@@ -1,5 +1,5 @@
 const { test, expect } = require('@playwright/test');
-const { reset, seed, refresh, openSettings } = require('./support.cjs');
+const { reset, seed, refresh, openSettings, openCurrent } = require('./support.cjs');
 
 test.beforeEach(async ({ page }) => reset(page));
 
@@ -227,4 +227,57 @@ test('saved full-screen playback preference requests full screen for the overlay
     expect(await page.evaluate(() => window.__fullscreenRequestCount)).toBe(1);
     const preferences = await (await page.request.get('/api/preferences')).json();
     expect(preferences.start_fullscreen).toBe('true');
+});
+
+
+test('download concurrency and shared Mbps settings validate, persist, and are searchable', async ({ page }) => {
+    await openSettings(page);
+    await expect(page.getByLabel('Max concurrent downloads (total)', { exact: true })).toHaveValue('3');
+    await expect(page.getByLabel('Max concurrent downloads per server', { exact: true })).toHaveValue('2');
+    await expect(page.getByLabel('Maximum total download speed (Mbps)', { exact: true })).toHaveValue('0');
+    await page.locator('#prefMax').fill('2');
+    await page.locator('#prefMaxPerHost').fill('4');
+    await page.locator('#prefMaxMbps').fill('16.25');
+    await page.locator('#saveBtn').click();
+    await expect(page.locator('#saveBtn')).toContainText('Saved');
+    const saved = await (await page.request.get('/api/preferences')).json();
+    expect(saved.max_concurrent).toBe('2');
+    expect(saved.max_concurrent_per_host).toBe('4');
+    expect(saved.max_total_download_mbps).toBe('16.25');
+    await page.reload();
+    await openSettings(page);
+    await expect(page.locator('#prefMaxPerHost')).toHaveValue('4');
+    await expect(page.locator('#prefMaxMbps')).toHaveValue('16.25');
+    await page.getByRole('searchbox', { name: 'Search settings' }).fill('bandwidth');
+    await expect(page.locator('#prefMaxMbps')).toBeVisible();
+    await expect(page.getByText('Shared by all running URL downloads. Set to 0 for unlimited. 8 Mbps is about 1 MB/s.')).toBeVisible();
+    await page.locator('#prefMaxMbps').fill('1.001');
+    await page.locator('#saveBtn').click();
+    await expect(page.locator('#prefMaxMbps')).toBeFocused();
+    expect(await (await page.request.get('/api/preferences')).json()).toEqual(saved);
+});
+
+test('queued URLs show a waiting message and Stop cancels before admission', async ({ page }) => {
+    await page.request.post('/api/preferences', { data: { max_concurrent: 1 } });
+    await page.request.post('/__test__/hold-downloads');
+    try {
+        const first = await (await page.request.post('/api/download', {
+            data: { url: 'https://a.example/first' },
+        })).json();
+        const second = await (await page.request.post('/api/download', {
+            data: { url: 'https://a.example/second', format: 'chosen-quality' },
+        })).json();
+        await refresh(page);
+        await openCurrent(page);
+        const row = page.locator(`[data-row-id="${second.id}"]`);
+        await expect(row).toContainText('Waiting for a download slot');
+        await row.getByRole('button', { name: 'Stop', exact: true }).click();
+        await expect(row.getByRole('button', { name: 'Continue', exact: true })).toBeVisible();
+        const history = await (await page.request.get('/api/history')).json();
+        expect(history.find(item => item.id === second.id).status).toBe('cancelled');
+        expect(history.find(item => item.id === second.id).requested_format).toBe('chosen-quality');
+        expect(history.find(item => item.id === first.id).status).toBe('starting');
+    } finally {
+        await page.request.post('/__test__/release-downloads');
+    }
 });
