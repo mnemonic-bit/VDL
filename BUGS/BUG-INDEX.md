@@ -155,6 +155,15 @@ reporter observed this while ingestion was adding and shifting video cards;
 that connection remains unconfirmed. A follow-up report on 2026-10-20 described
 the same apparent timestamp carryover and raised possible network or server
 delay during heavy folder import; reproducibility and cause remain unconfirmed.
+Issue 50 was reported on 2026-10-21. In dark mode, numeric-input up/down
+buttons, including those for Max concurrent downloads, remain light, and
+unchecked checkboxes have white backgrounds despite their green checked
+state. Browser details, independent reproduction, and cause remain unconfirmed.
+Issue 51 was reported on 2026-10-21. The Settings quick-index reaches its
+sticky position beneath the page title, but its highlighted entry does not
+follow further scrolling through the options. It should identify the topmost
+visible options section in either scroll direction. Independent reproduction
+and cause remain unconfirmed.
 
 ## Bug reports
 
@@ -207,6 +216,8 @@ delay during heavy folder import; reproducibility and cause remain unconfirmed.
 - [Bug 0047 — Upload overlay remained open after a file drag left the page](bug-0047-upload-overlay-remained-open-after-drag-left-page.md)
 - [Bug 0048 — Settings and hover-preview controls were inconsistent](bug-0048-settings-and-hover-preview-controls-were-inconsistent.md)
 - [Bug 0049 — Opening another video can reuse the previous playback position](bug-0049-next-video-reuses-previous-playback-position.md)
+- [Bug 0050 — Number-input buttons and checkboxes do not match the dark theme](bug-0050-number-input-buttons-and-checkboxes-ignore-dark-theme.md)
+- [Bug 0051 — Settings quick-index highlight does not follow scrolling](bug-0051-settings-quick-index-highlight-does-not-follow-scrolling.md)
 
 ## Accepted UI decisions
 
