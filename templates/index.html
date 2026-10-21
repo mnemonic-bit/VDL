@@ -636,8 +636,9 @@
                     <input type="url" id="urlInput" placeholder="Enter video URL here..." required autocomplete="off">
                     <button type="button" id="urlClear" class="url-clear" aria-label="Clear URL" style="display:none;"><svg width="14" height="14"><use href="#i-x"/></svg></button>
                 </div>
-                <button type="submit"><svg class="btn-icon"><use href="#i-download"/></svg><span>Download</span></button>
+                <button id="downloadSubmit" type="submit" disabled><svg class="btn-icon" aria-hidden="true"><use href="#i-download"/></svg><span>Download</span></button>
             </form>
+            <p id="downloadReadinessStatus" class="visually-hidden" role="status" aria-live="polite" aria-atomic="true"></p>
 
             <div id="optionsContainer">
                 <details class="options-panel">
@@ -647,9 +648,11 @@
                         </svg>
                         Download Options
                     </summary>
-                    <div class="options-content">
+                    <div id="optionsContent" class="options-content" data-state="empty" aria-busy="false">
                         <div id="optionsOverlay" class="options-overlay">
-                            <span class="options-overlay-msg">Select a URL to see available options</span>
+                            <span id="optionsSpinner" class="options-spinner" aria-hidden="true" hidden></span>
+                            <span id="optionsMessage" class="options-overlay-msg">Select a URL to see available options</span>
+                            <button id="optionsRetry" type="button" hidden>Retry</button>
                         </div>
                         <div class="options-row">
                             <label for="optionsQualitySelect">Quality</label>
@@ -665,7 +668,7 @@
                         </div>
                         <div class="options-row">
                             <label for="optionsFilename">Title/Filename</label>
-                            <input type="text" id="optionsFilename" placeholder="Will be auto-filled from video title" style="flex: 1;">
+                            <input type="text" id="optionsFilename" form="downloadForm" placeholder="Will be auto-filled from video title" style="flex: 1;" disabled>
                         </div>
                     </div>
                 </details>

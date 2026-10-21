@@ -467,6 +467,10 @@ body.settings-open .create-playlist-button { display: none; }
     display: inline-flex; align-items: center; gap: 6px;
 }
 .form-group button[type="submit"]:hover { background-color: var(--surface-hover); }
+#downloadSubmit:disabled { background: var(--surface-2); color: var(--muted); cursor: default; }
+#downloadSubmit:enabled { background: var(--brand); border-color: var(--brand); color: var(--on-brand); }
+#downloadSubmit:enabled:hover { background: color-mix(in srgb, var(--brand) 85%, var(--fg)); }
+#downloadSubmit:focus-visible, #optionsRetry:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
 .form-group:focus-within .url-wrap input[type="url"],
 .form-group:focus-within button[type="submit"] { border-color: var(--muted); }
 #optionsContainer { margin-bottom: 20px; }
@@ -481,20 +485,40 @@ details[open] > .options-summary .chev { transform: rotate(-180deg); }
 .options-overlay {
     position: absolute;
     inset: 0;
-    background: rgba(255,255,255,0.78);
+    background: color-mix(in srgb, var(--surface) 85%, transparent);
     display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px;
     align-items: center;
     justify-content: center;
     border-radius: 0 0 4px 4px;
     z-index: 2;
     pointer-events: all;
 }
-html[data-theme="dark"] .options-overlay {
-    background: rgba(26,29,33,0.82);
-}
 .options-overlay.hidden {
-    opacity: 0;
+    visibility: hidden;
     pointer-events: none;
+}
+.options-content[data-state="empty"] .options-row,
+.options-content[data-state="checking"] .options-row,
+.options-content[data-state="error"] .options-row { opacity: 0.35; }
+.options-content[data-state="error"] .options-overlay-msg { color: var(--error-fg); }
+.options-spinner {
+    width: 22px;
+    height: 22px;
+    flex: none;
+    border: 3px solid var(--border);
+    border-top-color: var(--brand);
+    border-radius: 50%;
+    animation: options-spin 0.8s linear infinite;
+}
+.options-spinner[hidden], #optionsRetry[hidden] { display: none; }
+#optionsRetry { background: var(--surface); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; }
+#optionsRetry:hover { background: var(--surface-hover); }
+@keyframes options-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+    .options-spinner { animation: none; }
 }
 .options-overlay-msg {
     color: var(--muted);
@@ -505,7 +529,12 @@ html[data-theme="dark"] .options-overlay {
 }
 .options-row { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
 .options-row label { width: 120px; flex-shrink: 0; color: var(--muted); font-size: 0.95em; }
-.options-row select, .options-row input[type="text"] { flex: 1; }
+.options-row select, .options-row input[type="text"] { flex: 1; min-width: 0; }
+@media (max-width: 480px) {
+    .url-wrap, .url-wrap input[type="url"] { min-width: 0; }
+    .options-row { flex-direction: column; align-items: stretch; gap: 4px; }
+    .options-row label { width: auto; }
+}
 .options-select { width: 100%; max-width: 420px; padding: 10px; border-radius: 4px; border: 1px solid var(--border); background: var(--surface); color: var(--fg); }
 .options-loading { color: var(--muted); font-size: 0.9em; font-style: italic; }
 .options-error { color: var(--error-fg); background: var(--error-bg); padding: 8px; border-radius: 3px; font-size: 0.9em; border: 1px solid var(--error-border); }

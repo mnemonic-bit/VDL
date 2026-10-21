@@ -451,8 +451,11 @@ checkHealth();
 
 function startDownload(event) {
     if (event) event.preventDefault();
-    const url = document.getElementById('urlInput').value;
-    if (!url) return alert('Please enter a URL');
+    const url = urlInput.value.trim();
+    if (downloadSubmitting || probeState !== 'ready' || url !== probedUrl) return;
+    const generation = probeGeneration;
+    downloadSubmitting = true;
+    renderProbeState();
     const selectedQuality = document.getElementById('optionsQualitySelect').value;
     const selectedContainer = document.getElementById('optionsContainerSelect').value;
     const customFilename = document.getElementById('optionsFilename').value;
@@ -482,26 +485,32 @@ function startDownload(event) {
             filename: customFilename || undefined
         })
     }).then(() => {
+        // A completed submission must not discard a newer URL draft.
+        if (generation !== probeGeneration) {
+            fetchHistory();
+            return;
+        }
         document.getElementById('urlInput').value = '';
         invalidateProbe();
         updateUrlClear();
-        document.getElementById('optionsFilename').value = '';
-        const qualitySelect = document.getElementById('optionsQualitySelect');
-        qualitySelect.selectedIndex = 0;
-        const containerSelect = document.getElementById('optionsContainerSelect');
-        containerSelect.selectedIndex = 0;
-        resetOptions();
         if (optionsDetails && !optionsOpenedManually) setOptionsOpen(false);
         closeNewDownload();
         fetchHistory();
     })
-    .catch(() => {});
+    .catch(() => {})
+    .finally(() => {
+        downloadSubmitting = false;
+        renderProbeState();
+    });
 }
 
 let probeTimeout;
 // A request may finish after its URL has been replaced or cleared. Generation
 // checks keep those callbacks from restoring options for an obsolete input.
 let probeGeneration = 0;
+let probeState = 'empty';
+let probedUrl = '';
+let downloadSubmitting = false;
 const urlInput = document.getElementById('urlInput');
 const urlClear = document.getElementById('urlClear');
 const optionsDetails = document.querySelector('#optionsContainer details');
@@ -510,21 +519,57 @@ function updateUrlClear() {
     urlClear.style.display = urlInput.value ? '' : 'none';
 }
 
-function invalidateProbe() {
-    clearTimeout(probeTimeout);
-    probeGeneration += 1;
+function renderProbeState() {
+    const checking = probeState === 'checking';
+    const ready = probeState === 'ready' && !downloadSubmitting;
+    const content = document.getElementById('optionsContent');
+    const overlay = document.getElementById('optionsOverlay');
+    content.dataset.state = downloadSubmitting ? 'submitting' : probeState;
+    content.setAttribute('aria-busy', String(checking));
+    overlay.classList.toggle('hidden', probeState === 'ready');
+    document.getElementById('optionsSpinner').hidden = !checking;
+    document.getElementById('optionsRetry').hidden = probeState !== 'error';
+
+    const messages = {
+        empty: 'Select a URL to see available options',
+        checking: 'Checking video information…',
+        ready: 'Video information ready. Download is ready.',
+        error: 'Could not load video information. Retry or check the URL.',
+    };
+    document.getElementById('optionsMessage').textContent = messages[probeState];
+    // Keep the live region outside the busy options region, and avoid repeating
+    // Checking announcements for each keystroke during the debounce.
+    const status = document.getElementById('downloadReadinessStatus');
+    const message = downloadSubmitting ? 'Starting download…' : messages[probeState];
+    if (status.textContent !== message) status.textContent = message;
+
+    for (const id of ['optionsQualitySelect', 'optionsContainerSelect']) {
+        const select = document.getElementById(id);
+        select.disabled = !ready || select.options.length <= 1;
+    }
+    document.getElementById('optionsFilename').disabled = !ready;
+    document.getElementById('downloadSubmit').disabled = !ready;
 }
 
-function scheduleProbe(url) {
-    invalidateProbe();
+function invalidateProbe(state = 'empty') {
+    clearTimeout(probeTimeout);
+    probeGeneration += 1;
+    probedUrl = '';
+    resetOptions(state);
+}
+
+function scheduleProbe(url, delay = 500) {
+    invalidateProbe(url ? 'checking' : 'empty');
+    if (!url) return;
     const generation = probeGeneration;
-    probeTimeout = setTimeout(() => probeVideoUrl(url, generation), 500);
+    probedUrl = url;
+    setOptionsOpen(true);
+    probeTimeout = setTimeout(() => probeVideoUrl(url, generation), delay);
 }
 
 urlClear.addEventListener('click', () => {
     urlInput.value = '';
     invalidateProbe();
-    resetOptions();
     if (optionsDetails && !optionsOpenedManually) setOptionsOpen(false);
     updateUrlClear();
     urlInput.focus();
@@ -554,11 +599,16 @@ function setOptionsOpen(open) {
         content.style.maxHeight = '0';
         // Remove [open] after the slide-up finishes so the chevron resets.
         // Filter by target and propertyName so bubbled transitionend events
-        // from child elements (e.g. the overlay's opacity transition) don't
+        // from child elements don't
         // fire this handler prematurely. The setTimeout fallback guarantees
         // [open] is cleared even if transitionend is suppressed (e.g. when
         // the DOM is mutated mid-transition by resetOptions()).
-        const closePanel = () => { optionsDetails.open = false; };
+        const closePanel = () => {
+            // A new URL can reopen Options before the old close finishes.
+            if (content.style.maxHeight === '0px' || content.style.maxHeight === '0') {
+                optionsDetails.open = false;
+            }
+        };
         content.addEventListener('transitionend', (ev) => {
             if (ev.target !== content || ev.propertyName !== 'max-height') return;
             clearTimeout(closeFallback);
@@ -590,141 +640,83 @@ if (optionsDetails) {
 
 urlInput.addEventListener('input', () => {
     updateUrlClear();
-    const url = urlInput.value.trim();
-    if (!url) {
-        invalidateProbe();
-        resetOptions();
-        return;
-    }
-    if (optionsDetails) {
-        setOptionsOpen(true);
-    }
-    const overlay = document.getElementById('optionsOverlay');
-    if (overlay) overlay.classList.add('hidden');
-    scheduleProbe(url);
+    scheduleProbe(urlInput.value.trim());
 });
 
-urlInput.addEventListener('paste', () => {
-    invalidateProbe();
-    setTimeout(() => {
-        updateUrlClear();
-        const url = urlInput.value.trim();
-        if (!url) {
-            resetOptions();
-            return;
-        }
-        if (optionsDetails) {
-            setOptionsOpen(true);
-        }
-        const overlay = document.getElementById('optionsOverlay');
-        if (overlay) overlay.classList.add('hidden');
-        scheduleProbe(url);
-    }, 0);
+// Native paste fires input after updating the field, including clipboard
+// shortcuts. Use that single path so one paste schedules only one probe.
+document.getElementById('optionsRetry').addEventListener('click', () => {
+    scheduleProbe(urlInput.value.trim(), 0);
 });
-        
+
 function probeVideoUrl(url, generation) {
-    if (generation !== probeGeneration) return;
+    const isCurrent = () => generation === probeGeneration
+        && url === urlInput.value.trim();
+    if (!isCurrent()) return;
 
-    const overlay = document.getElementById('optionsOverlay');
-    if (overlay) overlay.classList.add('hidden');
-
-    const select = document.getElementById('optionsQualitySelect');
-    if (optionsDetails) {
-        setOptionsOpen(true);
-    }
-    select.disabled = true;
-    select.innerHTML = '<option value="">Use default preference</option>';
-    
     apiFetch('/api/probe', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: url })
     })
-    .then(res => res.json())
+    .then(res => {
+        if (!res.ok) throw new Error('Probe failed');
+        return res.json();
+    })
     .then(data => {
-        if (generation !== probeGeneration) return;
-
-        if (data.error) {
-            select.disabled = true;
-            const errorOption = document.createElement('option');
-            errorOption.value = '';
-            errorOption.textContent = 'Probe failed';
-            select.appendChild(errorOption);
-                    
-            const containerSelect = document.getElementById('optionsContainerSelect');
-            containerSelect.innerHTML = '<option value="">Automatic</option>';
-            containerSelect.disabled = true;
-            return;
+        if (!isCurrent()) return;
+        if (!data || typeof data !== 'object' || Array.isArray(data)
+                || Object.prototype.hasOwnProperty.call(data, 'error')
+                || !Array.isArray(data.resolutions) || !Array.isArray(data.containers)
+                || !data.resolutions.every(value => typeof value === 'string')
+                || !data.containers.every(value => typeof value === 'string' && value.trim())
+                || (data.title != null && typeof data.title !== 'string')) {
+            throw new Error('Invalid probe response');
         }
-                
+
         if (data.title) {
             document.getElementById('optionsFilename').placeholder = `Will be auto-filled: ${data.title}`;
         }
-                
-        const numericResolutions = Array.isArray(data.resolutions)
-            ? data.resolutions.flatMap(res => {
-                const match = String(res).match(/^(\d+)p$/);
-                if (!match) return [];
-                const height = Number(match[1]);
-                return Number.isSafeInteger(height) && height > 0 ? [height] : [];
-            })
-            : [];
-        if (numericResolutions.length > 0) {
-            numericResolutions.forEach(height => {
-                const formatSelector = `bestvideo[height<=${height}]+bestaudio/best`;
-                const option = document.createElement('option');
-                option.value = formatSelector;
-                option.textContent = `${height}p`;
-                select.appendChild(option);
-            });
-            select.disabled = false;
-        } else {
-            const option = document.createElement('option');
-            option.value = '';
-            option.textContent = 'No video formats detected';
-            select.appendChild(option);
-            select.disabled = true;
-        }
-                
-        const containerSelect = document.getElementById('optionsContainerSelect');
-        containerSelect.innerHTML = '<option value="">Automatic</option>';
-        if (data.containers && data.containers.length > 0) {
-            data.containers.forEach(ext => {
-                const option = document.createElement('option');
-                option.value = ext;
-                option.textContent = ext.toUpperCase();
-                containerSelect.appendChild(option);
-            });
-            containerSelect.disabled = false;
-        } else {
-            containerSelect.disabled = true;
-        }
-    })
-    .catch(err => {
-        if (generation !== probeGeneration) return;
 
-        select.disabled = true;
-        select.innerHTML = '<option value="">Use default preference</option>';
-                
+        const select = document.getElementById('optionsQualitySelect');
+        data.resolutions.forEach(resolution => {
+            const match = resolution.match(/^(\d+)p$/);
+            const height = match ? Number(match[1]) : 0;
+            if (!Number.isSafeInteger(height) || height <= 0) return;
+            const option = document.createElement('option');
+            option.value = `bestvideo[height<=${height}]+bestaudio/best`;
+            option.textContent = `${height}p`;
+            select.appendChild(option);
+        });
+
         const containerSelect = document.getElementById('optionsContainerSelect');
-        containerSelect.innerHTML = '<option value="">Automatic</option>';
-        containerSelect.disabled = true;
+        data.containers.forEach(ext => {
+            const option = document.createElement('option');
+            option.value = ext;
+            option.textContent = ext.toUpperCase();
+            containerSelect.appendChild(option);
+        });
+        probeState = 'ready';
+        renderProbeState();
+    })
+    .catch(() => {
+        if (!isCurrent()) return;
+        // Extractor errors can contain markup or sensitive details. Keep this
+        // local message concise and offer a retry of the current URL.
+        probeState = 'error';
+        renderProbeState();
     });
 }
-        
-function resetOptions() {
-    const qualitySelect = document.getElementById('optionsQualitySelect');
-    qualitySelect.innerHTML = '<option value="">Use default preference</option>';
-    qualitySelect.disabled = true;
-    
-    const containerSelect = document.getElementById('optionsContainerSelect');
-    containerSelect.innerHTML = '<option value="">Automatic</option>';
-    containerSelect.disabled = true;
-    
+
+function resetOptions(state = 'empty') {
+    document.getElementById('optionsQualitySelect').innerHTML =
+        '<option value="">Use default preference</option>';
+    document.getElementById('optionsContainerSelect').innerHTML =
+        '<option value="">Automatic</option>';
     document.getElementById('optionsFilename').value = '';
     document.getElementById('optionsFilename').placeholder = 'Will be auto-filled from video title';
-    const overlay = document.getElementById('optionsOverlay');
-    if (overlay) overlay.classList.remove('hidden');
+    probeState = state;
+    renderProbeState();
 }
 
 let availableTags = [];
@@ -4716,6 +4708,7 @@ function openNewDownload() {
         dialog.showModal();
         document.getElementById('newDownloadButton').setAttribute('aria-expanded', 'true');
     }
+    if (optionsDetails.open) setOptionsOpen(true);
     urlInput.focus();
     urlInput.select();
 }

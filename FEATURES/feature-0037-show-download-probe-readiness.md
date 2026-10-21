@@ -1,7 +1,8 @@
 # Show when a new download is ready to start
 
 **Source:** User-requested feature  
-**Status:** Proposed  
+**Status:** Implemented\
+**Implemented:** 2026-10-21 · Version `0.42.0`\
 **Last refined:** 2026-10-16
 
 ## Decision summary
@@ -135,3 +136,12 @@ Update the existing Enter submission test to wait for Ready. Run
 `./tests/run-all.sh --browser` and `./tests/run-all.sh --unit`; verify the
 required `vdl.py` coverage result before declaring the implemented feature
 complete.
+
+## Implementation validation
+
+- `./tests/run-all.sh --browser`: all 170 browser tests passed, including
+  delayed and stale probes, invalid responses, Retry, empty option lists,
+  submission gating, draft preservation, keyboard submission, both themes,
+  narrow layouts, and reduced motion.
+- `./tests/run-all.sh --unit` with Python 3.12: 235 tests run, 5 skipped;
+  `vdl.py` line coverage was 90.9% (4551/5008), above the 90% minimum.
