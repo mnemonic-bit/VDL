@@ -5,7 +5,7 @@ const ACTIVE_PROGRESS_STATUSES = new Set(['starting', 'downloading', 'paused']);
 // stay here so the user can resume them; everything else terminal
 // goes to History.
 const CURRENT_TAB_STATUSES = new Set(['starting', 'downloading', 'paused', 'cancelled', 'interrupted']);
-const HISTORY_TAB_STATUSES = new Set(['finished', 'error']);
+const HISTORY_TAB_STATUSES = new Set(['finished']);
 const TERMINAL_STATUSES = new Set(['finished', 'error', 'cancelled', 'interrupted']);
 const THUMBNAIL_CACHE_VERSION = 2;
 
@@ -923,7 +923,7 @@ function renderRememberedPlaybackMode() {
     endlessPlaybackButton.setAttribute('aria-label', label);
     endlessPlaybackButton.title = shuffle
         ? 'Shuffle your library continuously in the built-in player'
-        : 'Play the current History selection continuously in the built-in player';
+        : 'Play the current Library selection continuously in the built-in player';
     endlessPlaybackButton.querySelector('svg use').setAttribute(
         'href', shuffle ? '#i-shuffle' : '#i-play',
     );
@@ -1376,12 +1376,7 @@ function unpauseDownload(id) {
 
 function reloadDownload(id, url) {
     closeAllMenus();
-    apiAction('/api/remove/' + encodeURIComponent(id), { method: 'POST' })
-        .then(() => apiAction('/api/download', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ url: url })
-        }))
+    apiAction('/api/retry/' + encodeURIComponent(id), { method: 'POST' })
         .then(() => fetchHistory())
         .catch(() => fetchHistory());
 }
@@ -1446,21 +1441,22 @@ function changeDownloadVisibility(select) {
 }
 
 function clearHistory() {
-    apiAction('/api/clear/preview')
-        .then(r => r.json())
-        .then(data => {
-            const entries = data.entries || 0;
-            if (!entries) { fetchHistory(); return; }
-            const files = data.with_files || 0;
-            const fileLine = files > 0
-                ? ` and delete ${files} file${files !== 1 ? 's' : ''} from disk`
-                : '';
-            const msg = `Remove ${entries} history entr${entries !== 1 ? 'ies' : 'y'}${fileLine}?`;
-            if (!confirm(msg)) return;
-            return apiAction('/api/clear', { method: 'POST' })
-                .then(() => fetchHistory());
-        })
-        .catch(() => fetchHistory());
+    apiAction('/api/clear/preview').then(r => r.json()).then(data => {
+        if (!data.entries) return;
+        if (!confirm(`Delete ${data.entries} terminal attempt records? Library videos and files will be kept.`)) return;
+        return apiAction('/api/clear', { method: 'POST' }).then(() => fetchAttemptHistory());
+    }).catch(() => {});
+}
+
+function clearLibrary() {
+    apiAction('/api/library/clear/preview').then(r => r.json()).then(data => {
+        if (!data.entries) return;
+        if (!confirm(`Delete ${data.entries} Library items and ${data.with_files} files from disk? Attempt records will be kept.`)) return;
+        return apiAction('/api/library/clear', { method: 'POST' }).then(() => {
+            fetchHistory();
+            fetchAttemptHistory();
+        });
+    }).catch(() => {});
 }
 
 let openMenuId = null;
@@ -2775,23 +2771,209 @@ const pendingHistoryAnimations = new Set();
 let libraryView = 'history';
 let duplicatesRequest = 0;
 
+let attemptHistoryOpen = false;
+let attemptPage = 1;
+let attemptRequest = 0;
+let libraryScrollPosition = 0;
+let attemptScrollPosition = 0;
+const attemptRows = new Map();
+
+function openAttemptHistory() {
+    closeAccountMenu();
+    closeHistoryInfo();
+    closeAllMenus();
+    if (!attemptHistoryOpen) libraryScrollPosition = window.scrollY;
+    attemptHistoryOpen = true;
+    document.getElementById('settingsPage').hidden = true;
+    document.body.classList.remove('settings-open');
+    document.body.classList.add('history-open');
+    document.getElementById('tab-history').hidden = true;
+    document.getElementById('attemptHistoryPage').hidden = false;
+    window.scrollTo({ top: attemptScrollPosition });
+    document.getElementById('attemptHistoryTitle').focus({ preventScroll: true });
+    setLibraryView(libraryView);
+}
+
+function closeAttemptHistory() {
+    attemptScrollPosition = window.scrollY;
+    attemptHistoryOpen = false;
+    ++attemptRequest;
+    document.getElementById('attemptHistoryPage').hidden = true;
+    document.getElementById('tab-history').hidden = false;
+    document.body.classList.remove('history-open');
+    window.scrollTo({ top: libraryScrollPosition });
+    document.getElementById('accountMenuButton').focus({ preventScroll: true });
+}
+
+function attemptRowHtml(info) {
+    const statusLabels = {
+        starting: 'Starting', downloading: 'Downloading', paused: 'Paused',
+        finished: 'Finished', error: 'Failed', cancelled: 'Cancelled', interrupted: 'Interrupted',
+    };
+    const sourceLabels = { url: 'URL', companion: 'Companion', upload: 'Upload', mounted_import: 'Mounted import' };
+    let host = '';
+    try { host = new URL(info.source_reference).host; } catch (_error) { }
+    const active = ACTIVE_PROGRESS_STATUSES.has(info.status);
+    const timing = `Started ${formatDateTime(info.started_at)} · ${info.ended_at
+        ? `Completed ${formatDateTime(info.ended_at)}`
+        : `Elapsed ${formatDuration(info.started_at, Date.now() / 1000)}`}`;
+    let result = info.error_summary || ({ cancelled: 'Stopped by user', interrupted: 'Work was interrupted' }[info.status]) || '';
+    if (info.status === 'finished') {
+        result = [info.filename, formatBytes(info.filesize), info.resolution,
+            info.library_id ? '' : info.media_state === 'removed' ? 'Media removed' : 'File unavailable',
+        ].filter(Boolean).join(' · ');
+    } else if (active) {
+        result = [info.progress, formatSpeed(info.speed), info.eta == null ? '' : `ETA ${formatEta(info.eta)}`].filter(Boolean).join(' · ');
+    }
+    const image = info.library_id
+        ? `<img class="attempt-thumbnail" src="${thumbnailUrl(info.library_id)}" alt="" loading="lazy">`
+        : '<span class="attempt-placeholder" aria-hidden="true"><svg><use href="#i-download"/></svg></span>';
+    const action = (name, label) => `<button type="button" data-attempt-action="${name}" data-attempt-id="${escapeAttr(info.id)}">${label}</button>`;
+    return `${image}<div class="attempt-copy">
+        <div class="attempt-title"><strong>${escapeHtml(info.title || info.filename || 'Untitled attempt')}</strong><span class="attempt-status">${escapeHtml(statusLabels[info.status] || info.status)}</span></div>
+        <div class="attempt-source">${escapeHtml([sourceLabels[info.source_type] || info.source_type, host].filter(Boolean).join(' · '))}${info.legacy ? ' · Legacy record' : ''}</div>
+        <div class="attempt-timing">${escapeHtml(timing)}</div>
+        <div class="attempt-result">${escapeHtml(result)}</div>
+        <div class="attempt-actions">${info.library_id ? action('library', 'View in Library') : ''}${info.can_resume ? action('resume', 'Resume') : ''}${info.can_retry ? action('retry', 'Retry') : ''}${info.source_reference ? action('copy', 'Copy source URL') : ''}</div>
+        <details><summary>Details</summary><div class="attempt-details">${escapeHtml([info.source_reference, info.error_details].filter(Boolean).join('\n') || 'No additional details.')}</div></details>
+    </div>`;
+}
+
+async function fetchAttemptHistory() {
+    if (!attemptHistoryOpen || libraryView === 'duplicates') return;
+    const generation = ++attemptRequest;
+    const filter = document.getElementById('attemptSearchInput').value;
+    try {
+        const response = await apiFetch(`/api/history?${new URLSearchParams({ filter, page: attemptPage, page_size: 20 })}`);
+        if (!response.ok) throw new Error('Could not load download history.');
+        const data = await response.json();
+        if (generation !== attemptRequest || !attemptHistoryOpen) return;
+        attemptPage = data.page;
+        const list = document.getElementById('attemptHistoryList');
+        const retained = new Set();
+        for (const info of data.items) {
+            retained.add(info.id);
+            let row = document.getElementById(`attempt-${info.id}`);
+            if (!row) {
+                row = document.createElement('article');
+                row.id = `attempt-${info.id}`;
+                row.className = 'attempt-row';
+                row.tabIndex = -1;
+            }
+            const html = attemptRowHtml(info);
+            if (attemptRows.get(info.id)?.html !== html) {
+                const opened = row.querySelector('details')?.open;
+                const focused = row.contains(document.activeElement) ? document.activeElement : null;
+                const focusedAction = focused?.dataset.attemptAction;
+                const focusedSummary = focused?.tagName === 'SUMMARY';
+                row.innerHTML = html;
+                row.querySelector('details').open = Boolean(opened);
+                const thumbnail = row.querySelector('img');
+                if (thumbnail) thumbnail.addEventListener('error', () => {
+                    const placeholder = document.createElement('span');
+                    placeholder.className = 'attempt-placeholder';
+                    placeholder.setAttribute('aria-hidden', 'true');
+                    thumbnail.replaceWith(placeholder);
+                }, { once: true });
+                if (focusedAction) (row.querySelector(`[data-attempt-action="${focusedAction}"]`) || row).focus({ preventScroll: true });
+                else if (focusedSummary) row.querySelector('summary').focus({ preventScroll: true });
+            }
+            attemptRows.set(info.id, { info, html });
+            // Insert only when order changes: moving a focused node can blur it.
+            const position = [...retained].length - 1;
+            if (list.children[position] !== row) list.insertBefore(row, list.children[position] || null);
+        }
+        for (const row of [...list.children]) {
+            const id = row.id.slice('attempt-'.length);
+            if (!retained.has(id)) {
+                if (row.contains(document.activeElement)) document.getElementById('attemptHistoryTitle').focus({ preventScroll: true });
+                row.remove();
+                attemptRows.delete(id);
+            }
+        }
+        document.getElementById('attemptHistoryStatus').textContent = data.total
+            ? `${data.total} ${data.total === 1 ? 'attempt' : 'attempts'}`
+            : filter.trim() ? 'No attempts match this filter.' : 'No download attempts yet.';
+        document.getElementById('attemptPageInfo').textContent = `Page ${data.page} of ${Math.max(1, Math.ceil(data.total / data.page_size))} · ${data.total} attempts`;
+        document.getElementById('attemptPagePrev').disabled = data.page <= 1;
+        document.getElementById('attemptPageNext').disabled = data.page * data.page_size >= data.total;
+    } catch (_error) {
+        if (generation === attemptRequest) document.getElementById('attemptHistoryStatus').textContent = 'Could not load download history. Try again.';
+    }
+}
+
+const attemptSearch = document.getElementById('attemptSearch');
+const attemptSearchInput = document.getElementById('attemptSearchInput');
+function expandAttemptSearch(expanded) {
+    attemptSearch.classList.toggle('expanded', expanded);
+    document.getElementById('attemptSearchToggle').setAttribute('aria-expanded', String(expanded));
+}
+function applyAttemptFilter() {
+    attemptPage = 1;
+    document.getElementById('attemptSearchClear').hidden = !attemptSearchInput.value;
+    fetchAttemptHistory();
+}
+document.getElementById('attemptSearchToggle').addEventListener('click', () => {
+    const expanded = !attemptSearch.classList.contains('expanded');
+    expandAttemptSearch(expanded);
+    if (expanded) attemptSearchInput.focus();
+});
+attemptSearchInput.addEventListener('input', applyAttemptFilter);
+attemptSearchInput.addEventListener('keydown', event => {
+    if (event.key !== 'Escape') return;
+    event.preventDefault();
+    event.stopPropagation();
+    attemptSearchInput.value = '';
+    applyAttemptFilter();
+    expandAttemptSearch(false);
+    document.getElementById('attemptSearchToggle').focus();
+});
+document.getElementById('attemptSearchClear').addEventListener('click', () => {
+    attemptSearchInput.value = '';
+    applyAttemptFilter();
+    attemptSearchInput.focus();
+});
+document.getElementById('attemptPagePrev').addEventListener('click', () => { attemptPage--; fetchAttemptHistory(); });
+document.getElementById('attemptPageNext').addEventListener('click', () => { attemptPage++; fetchAttemptHistory(); });
+document.getElementById('attemptHistoryList').addEventListener('click', async event => {
+    const button = event.target.closest('[data-attempt-action]');
+    if (!button || button.disabled) return;
+    const info = attemptRows.get(button.dataset.attemptId)?.info;
+    if (!info) return;
+    const action = button.dataset.attemptAction;
+    if (action === 'copy') { copyToClipboard(info.source_reference, button); return; }
+    if (action === 'library') { showDuplicateHistoryItem(info.library_id); return; }
+    button.disabled = true;
+    try {
+        await apiAction(`/api/${action}/${encodeURIComponent(info.download_id)}`, { method: 'POST' });
+        await fetchAttemptHistory();
+        fetchHistory();
+    } catch (_error) { button.disabled = false; }
+});
+document.querySelector('#attemptHistoryPage [role="tablist"]').addEventListener('keydown', event => {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+    event.preventDefault();
+    const duplicates = event.key === 'End' || (event.key !== 'Home' && libraryView !== 'duplicates');
+    setLibraryView(duplicates ? 'duplicates' : 'history');
+    document.getElementById(duplicates ? 'duplicatesViewButton' : 'historyViewButton').focus();
+});
+
 function setLibraryView(view) {
     libraryView = view;
     const showingDuplicates = view === 'duplicates';
-    document.getElementById('historyMain').hidden = showingDuplicates;
+    document.getElementById('attemptHistoryMain').hidden = showingDuplicates;
     document.getElementById('duplicatesPanel').hidden = !showingDuplicates;
-    document.getElementById('historySearch').hidden = showingDuplicates;
-    document.getElementById('playbackModeControl').hidden = showingDuplicates;
-    document.getElementById('createPlaylistButton').hidden = showingDuplicates;
     for (const [id, active] of [
         ['historyViewButton', !showingDuplicates],
         ['duplicatesViewButton', showingDuplicates],
     ]) {
         const button = document.getElementById(id);
         button.classList.toggle('active', active);
-        button.setAttribute('aria-pressed', String(active));
+        button.setAttribute('aria-selected', String(active));
+        button.tabIndex = active ? 0 : -1;
     }
     if (showingDuplicates) fetchDuplicates();
+    else fetchAttemptHistory();
 }
 
 function duplicateSourceLabel(info) {
@@ -2814,7 +2996,7 @@ function renderDuplicateMember(info) {
                     <div class="duplicate-member-filename">${escapeHtml(name)}</div>
                     <div class="duplicate-member-meta">${details}</div>
                     ${tags.length ? `<div class="tag-row">${tags.map(tag => tagChipHtml(tag, false)).join('')}</div>` : ''}
-                    <a class="duplicate-history-link" href="#history-item-${escapeAttr(id)}" data-duplicate-history-link="${escapeAttr(id)}">View in History</a>
+                    <a class="duplicate-history-link" href="#history-item-${escapeAttr(id)}" data-duplicate-history-link="${escapeAttr(id)}">View in Library</a>
                 </div>
             </article>`;
 }
@@ -2859,7 +3041,7 @@ async function fetchDuplicates() {
 }
 
 async function showDuplicateHistoryItem(id) {
-    setLibraryView('history');
+    closeAttemptHistory();
     const input = document.getElementById('historySearchInput');
     input.value = '';
     document.getElementById('historySearchClear').hidden = true;
@@ -3019,8 +3201,10 @@ function fetchHistory({ sortFavorites = false } = {}) {
         return Promise.resolve();
     }
 
-    return apiFetch('/api/history')
-    .then(res => res.json())
+    return Promise.all([
+        apiFetch('/api/library').then(res => res.json()),
+        apiFetch('/api/current-downloads').then(res => res.json()),
+    ]).then(([library, current]) => library.concat(current))
     .then(data => {
         const itemCount = document.getElementById('itemCount');
         itemCount.textContent = `${data.length} ${data.length === 1 ? 'item' : 'items'}`;
@@ -4960,6 +5144,8 @@ let settingsOpenPromise = null;
 
 function openSettings() {
     const page = document.getElementById('settingsPage');
+    document.getElementById('settingsBackButton').setAttribute('aria-label',
+        attemptHistoryOpen ? 'Back to History' : 'Back to videos');
     closeAllMenus();
     if (!page.hidden) return Promise.resolve();
     if (settingsOpenPromise) return settingsOpenPromise;
@@ -4973,6 +5159,7 @@ function openSettings() {
         loadExtensionConnections(),
     ]).then(() => {
         document.getElementById('tab-history').hidden = true;
+        document.getElementById('attemptHistoryPage').hidden = true;
         page.hidden = false;
         document.body.classList.add('settings-open');
         window.scrollTo({ top: 0 });
@@ -4986,7 +5173,8 @@ function closeSettings() {
     const page = document.getElementById('settingsPage');
     if (page.hidden) return;
     page.hidden = true;
-    document.getElementById('tab-history').hidden = false;
+    document.getElementById('tab-history').hidden = attemptHistoryOpen;
+    document.getElementById('attemptHistoryPage').hidden = !attemptHistoryOpen;
     document.body.classList.remove('settings-open');
     clearExtensionPairing();
     hideActionError();
@@ -5755,7 +5943,10 @@ function scheduleFetch({ sortFavorites = false } = {}) {
         pendingFavoriteSort = false;
         fetchHistory({ sortFavorites: applyFavoriteSort });
         fetchPlaylists();
-        if (libraryView === 'duplicates') fetchDuplicates();
+        if (attemptHistoryOpen) {
+            if (libraryView === 'duplicates') fetchDuplicates();
+            else fetchAttemptHistory();
+        }
     }, 0);
 }
 

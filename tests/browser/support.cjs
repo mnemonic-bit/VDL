@@ -10,7 +10,7 @@ async function reset(page) {
 }
 
 async function seed(page, row) {
-    const response = await page.request.post('/__test__/row', { data: row });
+    const response = await page.request.post('/__test__/row', { data: { ...(row.status === 'finished' ? { file: true, name: `${row.id}.mp4` } : {}), ...row } });
     expect(response.ok()).toBeTruthy();
     return response.json();
 }

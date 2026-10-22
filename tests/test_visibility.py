@@ -48,6 +48,7 @@ class VideoVisibilityTest(AppCase):
     def test_private_rows_are_hidden_from_other_users_and_direct_routes(self):
         public_id = self.owned_row('public01')
         private_id = self.owned_row('private1')
+        self.finished_file(public_id, name='public.mp4')
         vdl.db_set_download_visibility(private_id, 'private')
         private_path = os.path.join(self.download_dir, 'private.mp4')
         with open(private_path, 'wb') as output:
@@ -61,14 +62,14 @@ class VideoVisibilityTest(AppCase):
 
         alice_rows = {
             row['id']: row
-            for row in self.alice_client.get('/api/history').get_json()
+            for row in self.alice_client.get('/api/library').get_json()
         }
         bob_rows = {
             row['id']: row
-            for row in self.bob_client.get('/api/history').get_json()
+            for row in self.bob_client.get('/api/library').get_json()
         }
         admin_ids = {
-            row['id'] for row in self.client.get('/api/history').get_json()
+            row['id'] for row in self.client.get('/api/library').get_json()
         }
 
         self.assertEqual(set(alice_rows), {public_id, private_id})

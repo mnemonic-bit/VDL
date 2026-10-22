@@ -205,12 +205,12 @@
         <div class="header-actions">
             <div id="historySearch" class="header-search" role="search">
                 <button id="historySearchToggle" class="header-search-toggle" type="button"
-                        aria-label="Search history" aria-expanded="false" aria-controls="historySearchInput">
+                        aria-label="Search Library" aria-expanded="false" aria-controls="historySearchInput">
                     <svg aria-hidden="true"><use href="#i-search"/></svg>
                 </button>
                 <input id="historySearchInput" class="header-search-input" type="text" maxlength="256"
                        placeholder="Search title, filename, tag, or filters" autocomplete="off"
-                       aria-label="Search history by title, filename, tag, user, quality, star, or views">
+                       aria-label="Search Library by title, filename, tag, user, quality, star, or views">
                 <button id="historySearchClear" class="header-search-clear" type="button"
                         aria-label="Clear search" hidden>
                     <svg aria-hidden="true"><use href="#i-x"/></svg>
@@ -220,7 +220,7 @@
                     data-user-id="{{ current_user.id }}">
                 <button id="endlessPlaybackButton" class="endless-playback-button" type="button"
                         aria-label="Play All"
-                        title="Play the current History selection continuously in the built-in player" disabled>
+                        title="Play the current Library selection continuously in the built-in player" disabled>
                     <svg aria-hidden="true"><use href="#i-play"/></svg>
                     <span>Play All</span>
                 </button>
@@ -268,6 +268,9 @@
                         <svg aria-hidden="true"><use href="#i-cog"/></svg>
                         <span>Settings</span>
                     </button>
+                    <button id="attemptHistoryButton" class="account-menu-item" type="button" onclick="openAttemptHistory()" role="menuitem" aria-controls="attemptHistoryPage">
+                        <svg aria-hidden="true"><use href="#i-download"/></svg><span>History</span>
+                    </button>
                     <form method="post" action="{{ url_for('logout') }}" class="logout-form" role="none">
                         <button class="account-menu-item logout-button" type="submit" role="menuitem">
                             <svg aria-hidden="true"><use href="#i-sign-out"/></svg>
@@ -279,11 +282,7 @@
         </div>
     </header>
 
-    <section id="tab-history" class="history-panel" aria-label="Download history">
-        <div class="library-view-switch" role="group" aria-label="History views">
-            <button id="historyViewButton" type="button" class="active" aria-pressed="true">All history</button>
-            <button id="duplicatesViewButton" type="button" aria-pressed="false">Duplicates</button>
-        </div>
+    <section id="tab-history" class="history-panel" aria-label="Library">
         <div id="historyMain">
         <section id="playlistShelf" class="playlist-shelf" aria-labelledby="playlistShelfTitle" hidden>
             <div class="playlist-shelf-heading">
@@ -309,7 +308,34 @@
             <button id="historyEmptyAction" type="button" onclick="focusNewDownload()">Start a download</button>
         </div>
         </div>
-        <section id="duplicatesPanel" class="duplicates-panel" aria-label="Duplicate media" hidden>
+    </section>
+
+    <section id="attemptHistoryPage" class="attempt-history-page" aria-labelledby="attemptHistoryTitle" hidden>
+        <div class="attempt-history-heading">
+            <button id="historyBackButton" type="button" onclick="closeAttemptHistory()">Back to Library</button>
+            <h1 id="attemptHistoryTitle" tabindex="-1">History</h1>
+        </div>
+        <div class="library-view-switch" role="tablist" aria-label="History views">
+            <button id="historyViewButton" type="button" role="tab" aria-selected="true" aria-controls="attemptHistoryMain" class="active">Download attempts</button>
+            <button id="duplicatesViewButton" type="button" role="tab" aria-selected="false" aria-controls="duplicatesPanel" tabindex="-1">Duplicates</button>
+        </div>
+        <section id="attemptHistoryMain" role="tabpanel" aria-labelledby="historyViewButton">
+            <div id="attemptSearch" class="header-search" role="search">
+                <button id="attemptSearchToggle" class="header-search-toggle" type="button" aria-label="Filter download history" aria-expanded="false" aria-controls="attemptSearchInput">
+                    <svg aria-hidden="true"><use href="#i-search"/></svg>
+                </button>
+                <input id="attemptSearchInput" class="header-search-input" type="text" maxlength="256" placeholder="Filter attempts or status:error" autocomplete="off" aria-label="Filter download history">
+                <button id="attemptSearchClear" class="header-search-clear" type="button" aria-label="Clear History filter" hidden><svg aria-hidden="true"><use href="#i-x"/></svg></button>
+            </div>
+            <p id="attemptHistoryStatus" role="status" aria-live="polite"></p>
+            <div id="attemptHistoryList" class="attempt-history-list"></div>
+            <nav id="attemptHistoryPager" class="pager" aria-label="History pages">
+                <button id="attemptPagePrev" type="button" aria-label="Previous History page">‹</button>
+                <span id="attemptPageInfo"></span>
+                <button id="attemptPageNext" type="button" aria-label="Next History page">›</button>
+            </nav>
+        </section>
+        <section id="duplicatesPanel" class="duplicates-panel" role="tabpanel" aria-labelledby="duplicatesViewButton" hidden>
             <div class="duplicates-toolbar">
                 <div>
                     <h2>Duplicate media</h2>
@@ -320,11 +346,12 @@
             <p id="duplicatesStatus" class="duplicates-status" role="status" aria-live="polite"></p>
             <div id="duplicatesList"></div>
         </section>
+
     </section>
 
     <section id="settingsPage" class="settings-page" aria-labelledby="settingsTitle" hidden>
         <div class="settings-page-header">
-            <button class="settings-back" type="button" onclick="closeSettings()" aria-label="Back to videos">
+            <button id="settingsBackButton" class="settings-back" type="button" onclick="closeSettings()" aria-label="Back to videos">
                 <svg aria-hidden="true"><use href="#i-chevron"/></svg>
             </button>
             <h1 id="settingsTitle">Settings</h1>
@@ -543,9 +570,13 @@
                         <div class="setting-item settings-history-row" data-setting-keywords="clear delete remove download history files completed failed">
                             <div class="setting-copy">
                                 <strong>Download history</strong>
-                                <span>Remove completed and failed downloads and their files.</span>
+                                <span>Remove terminal attempt records. Library videos and files are kept.</span>
                             </div>
                             <button class="clear-btn" type="button" onclick="clearHistory()">Clear History</button>
+                        </div>
+                        <div class="setting-item settings-history-row" data-setting-keywords="delete remove library videos files">
+                            <div class="setting-copy"><strong>Library media</strong><span>Delete completed and failed Library items and their files. Attempt records are kept.</span></div>
+                            <button class="clear-btn" type="button" onclick="clearLibrary()">Delete Library media</button>
                         </div>
                     </section>
                     {% endif %}

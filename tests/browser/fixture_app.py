@@ -43,6 +43,7 @@ def test_reset():
     with vdl._db_lock, vdl.db() as connection:
         connection.execute("DELETE FROM playlists")
         connection.execute("DELETE FROM downloads")
+        connection.execute("DELETE FROM download_attempts")
         connection.execute("DELETE FROM preferences")
     with vdl._cancel_lock:
         vdl._cancel_flags.clear()

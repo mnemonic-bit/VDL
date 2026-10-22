@@ -89,7 +89,7 @@ Stop containers with `docker compose down`. This preserves `vdl-data` and
 
 Compose mounts the repository's `./ingest` directory at `/ingest` read-only.
 On startup, VDL takes one recursive snapshot of eligible files in that mount
-and imports each captured file at most once. Imported videos appear in History
+and imports each captured file at most once. Imported videos appear in the Library
 as local uploads; the original files stay in `./ingest`. A movie at
 `./ingest/Family/Trips/movie.mp4` receives the tags `Family` and `Trips`.
 Files directly under `./ingest` receive no folder tags. Folder names follow
@@ -111,7 +111,7 @@ VDL ignores hidden files and subfolders, symlinks, and names ending in
 identity before and after copying and validates video content with `ffprobe`.
 Files added, renamed, or changed after the startup snapshot require a VDL
 restart before they can be considered. There is no timed rescan. SQLite
-receipts prevent unchanged imported sources from creating another History
+receipts prevent unchanged imported sources from creating another Library
 item across restarts; a changed source can create a new item on a later
 startup. Removed source receipts are pruned after a complete startup scan.
 
@@ -128,13 +128,66 @@ explicit read-only mount and `VDL_INGEST_DIR=/ingest`; the image itself does
 not activate importing. The inbox and library output paths must be separate
 directory trees.
 
-Imported copies use unique internal filenames, while History and browser
+Imported copies use unique internal filenames, while the Library and browser
 downloads show the original filename. History's **Duplicates** view groups
 finished library files with identical bytes, including uploads and downloads.
 It keeps every item and its tags; deletion remains an individual action.
 Indexing older media can take time, and **Refresh duplicate index** checks
 stored library files again after external edits. Neither action scans the
 ingest mount for new files.
+
+### Library and download History
+
+The main **Library** shows available, completed videos and your playlists.
+Failed or incomplete work never becomes a Library card. Open **History** from
+the account menu for a separate list of acquisition attempts, or select its
+**Duplicates** tab to review identical media. The Library has no view tabs.
+The Current downloads drawer remains available from both pages.
+
+History records accepted URL downloads, Firefox companion work, uploads, and
+mounted imports, including failures after acceptance. Pause/unpause belongs to
+one attempt; Resume and Retry create another attempt on the same download
+item. Earlier outcomes survive success and media deletion. Only finished,
+available, authorized media gets a thumbnail and **View in Library** action.
+History shows each user's own attempts; administrators additionally see
+ownerless system imports. Removing an account removes its private attempt log.
+
+History has an independent filter and bounded pagination. Quoted phrases and
+all free-text terms must match; `status:error` and other canonical statuses
+restrict outcomes. Source references omit embedded credentials and redact
+query values except routing identifiers (`v`, `list`, `index`, `t`, `start`,
+`end`, `id`, `page`). Diagnostic URLs redact all query values. Browser cookies
+and authorization headers are never part of an attempt record. Live changes
+use SSE without polling.
+
+In Settings, **Clear History** previews and deletes terminal attempt records
+only, leaving active attempts, Library videos, and files intact. **Delete
+Library media** is the separate administrator action for removing completed
+and failed items and their files; it keeps their attempt snapshots.
+
+Version 0.45.0 changes the internal authenticated collection APIs
+incompatibly. These APIs are not officially published; by maintainer decision,
+this release uses a feature (minor) version bump:
+
+| Endpoint | Contract |
+| --- | --- |
+| `GET /api/library` | Array of authorized finished video entries with safe, existing files. Physical paths are not returned. |
+| `GET /api/current-downloads` | Array of current entries in `starting`, `downloading`, `paused`, `cancelled`, or `interrupted`. |
+| `GET /api/history?filter=...&page=1&page_size=20` | `{items, total, page, page_size}` of personal attempt snapshots, newest first by start time and ID. Pages start at 1; page size is 1–100; an excessive page is clamped. |
+| `POST /api/resume/<id>` | New attempt on cancelled/interrupted URL work, preserving partial media. |
+| `POST /api/retry/<id>` | New attempt on terminal URL work, using the same download ID and clearing previous media artifacts. Companion work requires fresh submission from Firefox; uploads/imports must be submitted again. |
+| `GET /api/clear/preview`, `POST /api/clear` | Administrator preview/delete of terminal attempts, without deleting files. |
+| `GET /api/library/clear/preview`, `POST /api/library/clear` | Administrator preview/delete of completed and failed media items and files. |
+
+History items expose IDs, source type/reference, title and basename snapshots,
+start/end times, status, progress/bytes/speed/ETA, final size/resolution, error
+summary/details, and a `legacy` marker. `library_id` is non-null only for a
+finished attempt with currently playable media; `media_state` distinguishes
+`available`, `unavailable`, and `removed`. Derived `can_resume`/`can_retry`
+capabilities apply only to the latest eligible attempt. `download_id` becomes
+null after media deletion. No old mixed-array `/api/history` alias remains.
+Existing databases get one best-effort legacy attempt per download, not
+invented retry records; startup marks orphaned active attempts interrupted.
 
 ### First sign-in and user access
 

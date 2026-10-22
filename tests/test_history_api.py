@@ -9,6 +9,8 @@ class HistoryApiTest(AppCase):
     def test_favorites_are_persisted_without_changing_date_order(self):
         older_id = self.insert("older001")
         newer_id = self.insert("newer001")
+        self.finished_file(older_id, name="older.mp4")
+        self.finished_file(newer_id, name="newer.mp4")
 
         response = self.client.post(
             f"/api/favorite/{older_id}", json={"favorite": True}
@@ -19,7 +21,7 @@ class HistoryApiTest(AppCase):
             "favorite": True,
             "changed": True,
         })
-        rows = self.client.get("/api/history").get_json()
+        rows = self.client.get("/api/library").get_json()
         self.assertEqual([row["id"] for row in rows], [newer_id, older_id])
         self.assertIs(rows[0]["favorite"], False)
         self.assertIs(rows[1]["favorite"], True)
@@ -29,7 +31,7 @@ class HistoryApiTest(AppCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
-            [row["id"] for row in self.client.get("/api/history").get_json()],
+            [row["id"] for row in self.client.get("/api/library").get_json()],
             [newer_id, older_id],
         )
 
@@ -53,7 +55,7 @@ class HistoryApiTest(AppCase):
             total_bytes=1000,
         )
 
-        row = self.client.get("/api/history").get_json()[0]
+        row = self.client.get("/api/current-downloads").get_json()[0]
         self.assertEqual(row["downloaded_bytes"], 125)
         self.assertEqual(row["total_bytes"], 1000)
 
@@ -67,13 +69,13 @@ class HistoryApiTest(AppCase):
             paths.append(path)
             vdl.db_update_download(download_id, status=status, filename=path)
 
-        preview = self.client.get("/api/clear/preview").get_json()
+        preview = self.client.get("/api/library/clear/preview").get_json()
         self.assertEqual(preview, {"entries": 2, "with_files": 2})
-        result = self.client.post("/api/clear").get_json()
+        result = self.client.post("/api/library/clear").get_json()
         self.assertEqual((result["removed"], result["files_deleted"]), (2, 2))
         self.assertTrue(all(not os.path.exists(path) for path in paths))
 
-    def test_clear_history_preserves_cancelled_and_interrupted_current_rows(self):
+    def test_bulk_media_deletion_preserves_cancelled_and_interrupted_current_rows(self):
         paths = {}
         for index, status in enumerate(("finished", "error", "cancelled", "interrupted")):
             download_id = self.insert(f"clear{index}")
@@ -82,9 +84,9 @@ class HistoryApiTest(AppCase):
                 output.write(b"fixture")
             paths[status] = path
             vdl.db_update_download(download_id, status=status, filename=path)
-        preview = self.client.get("/api/clear/preview").get_json()
+        preview = self.client.get("/api/library/clear/preview").get_json()
         self.assertEqual(preview, {"entries": 2, "with_files": 2})
-        result = self.client.post("/api/clear").get_json()
+        result = self.client.post("/api/library/clear").get_json()
         self.assertEqual((result["removed"], result["files_deleted"]), (2, 2))
         remaining = {row["status"] for row in vdl.db_list_downloads()}
         self.assertEqual(remaining, {"cancelled", "interrupted"})

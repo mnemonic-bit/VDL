@@ -94,11 +94,11 @@ for path in ('/api/health', '/', '/static/app.js', '/static/styles.css'):
     with urllib.request.urlopen('http://127.0.0.1:5000' + path, timeout=3) as response:
         assert response.status == 200, (path, response.status)
 try:
-    urllib.request.urlopen('http://127.0.0.1:5000/api/history', timeout=3)
+    urllib.request.urlopen('http://127.0.0.1:5000/api/library', timeout=3)
 except urllib.error.HTTPError as error:
     assert error.code == 401, error.code
 else:
-    raise AssertionError('history was available without authentication')
+    raise AssertionError('Library was available without authentication')
 
 package_path = '/app/browser-extension/dist/vdl-companion-firefox.xpi'
 checksum_path = package_path + '.sha256'
@@ -215,11 +215,12 @@ with urllib.request.urlopen(download_request, timeout=3) as response:
 assert companion_download['visibility'] == 'private', companion_download
 with opener.open(base_url + '/api/history', timeout=3) as response:
     companion_row = next(
-        row for row in json.load(response)
-        if row['id'] == companion_download['id']
+        row for row in json.load(response)['items']
+        if row['download_id'] == companion_download['id']
     )
-assert companion_row['browser_authenticated'] is True, companion_row
-assert companion_row['visibility'] == 'private', companion_row
+assert companion_row['source_type'] == 'companion', companion_row
+with opener.open(base_url + '/api/current-downloads', timeout=3) as response:
+    assert isinstance(json.load(response), list)
 
 media_path = '/tmp/upload-smoke.mp4'
 subprocess.run(
@@ -251,13 +252,13 @@ transfer = urllib.request.Request(
     method='PUT',
 )
 opener.open(transfer, timeout=10).close()
-with opener.open(base_url + '/api/history') as response:
+with opener.open(base_url + '/api/library') as response:
     uploaded = next(row for row in json.load(response) if row['id'] == upload_id)
 assert uploaded['status'] == 'finished', uploaded
 assert uploaded['source_type'] == 'upload', uploaded
 assert uploaded['resolution'] == '16p', uploaded
 for _attempt in range(20):
-    with opener.open(base_url + '/api/history') as response:
+    with opener.open(base_url + '/api/library') as response:
         watched = next(
             (
                 row for row in json.load(response)
@@ -302,7 +303,7 @@ opener.open(urllib.request.Request(
     }).encode(),
     method='POST',
 ), timeout=3).close()
-with opener.open(base_url + '/api/history', timeout=3) as response:
+with opener.open(base_url + '/api/library', timeout=3) as response:
     rows = [row for row in json.load(response) if row['title'] == 'watched-folder']
 assert len(rows) == 1, rows
 assert rows[0]['tags'] == ['First'], rows
@@ -388,7 +389,7 @@ opener.open(login, timeout=3).close()
 with opener.open(base_url + '/api/preferences') as response:
     assert json.load(response)['theme'] == 'dark'
 for attempt in range(40):
-    with opener.open(base_url + '/api/history') as response:
+    with opener.open(base_url + '/api/library') as response:
         history = json.load(response)
     imports = [row for row in history if row['title'] == 'watched-folder']
     if len(imports) == 2:
@@ -452,7 +453,7 @@ opener.open(urllib.request.Request(
     }).encode(),
     method='POST',
 ), timeout=3).close()
-with opener.open(base_url + '/api/history', timeout=3) as response:
+with opener.open(base_url + '/api/library', timeout=3) as response:
     rows = [row for row in json.load(response) if row['title'] == 'watched-folder']
 assert len(rows) == 2, rows
 assert {tuple(row['tags']) for row in rows} == {('First',), ('Second',)}, rows

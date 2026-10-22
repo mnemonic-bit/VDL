@@ -1939,3 +1939,37 @@ details[open] > .history-summary::before { transform: rotate(90deg); }
 }
 .player-stage-close svg { width: 22px; height: 22px; }
 .player-box.playlist-player .player-media-stage { display: grid; place-items: center; min-height: 0; max-height: 100%; }
+
+body.history-open .header-actions > .header-search,
+body.history-open .playback-mode-control,
+body.history-open .create-playlist-button { display: none; }
+.attempt-history-page[hidden], .attempt-history-page [hidden] { display: none; }
+.attempt-history-heading { display: flex; align-items: center; gap: 18px; margin-bottom: 20px; }
+.attempt-history-heading h1 { margin: 0; }
+.attempt-history-heading button, .attempt-actions button {
+    font: inherit; color: var(--fg); background: var(--surface-2);
+    border: 1px solid var(--border); border-radius: 6px; padding: 7px 11px; cursor: pointer;
+}
+.attempt-history-page button:focus-visible, .attempt-history-page summary:focus-visible {
+    outline: 2px solid var(--brand); outline-offset: 3px;
+}
+.attempt-history-list { display: flex; flex-direction: column; gap: 12px; }
+.attempt-row { display: flex; gap: 16px; width: 100%; box-sizing: border-box; padding: 16px;
+    border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+.attempt-thumbnail, .attempt-placeholder { width: 112px; height: 72px; flex: none; border-radius: 6px;
+    object-fit: cover; background: var(--surface-3); }
+.attempt-placeholder { display: flex; align-items: center; justify-content: center; color: var(--muted); }
+.attempt-placeholder svg { width: 24px; height: 24px; }
+.attempt-copy { min-width: 0; flex: 1; overflow-wrap: anywhere; }
+.attempt-title { display: flex; gap: 10px; flex-wrap: wrap; align-items: baseline; }
+.attempt-status { font-size: 0.8em; border: 1px solid var(--border); border-radius: 4px; padding: 2px 6px; }
+.attempt-source, .attempt-timing { color: var(--muted); font-size: 0.85em; margin-top: 5px; }
+.attempt-result { margin-top: 8px; }
+.attempt-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
+.attempt-copy summary { cursor: pointer; width: max-content; }
+.attempt-details { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 8px; font-size: 0.85em; }
+@media (max-width: 520px) {
+    .attempt-row { flex-wrap: wrap; padding: 12px; }
+    .attempt-copy { flex-basis: 100%; }
+    .attempt-history-heading { flex-wrap: wrap; }
+}

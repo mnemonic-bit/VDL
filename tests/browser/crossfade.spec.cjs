@@ -128,7 +128,7 @@ for (const mode of ['sequential', 'shuffle']) {
         expect(await page.locator('#playerVideo').evaluate(video => video.volume)).toBeCloseTo(0.8);
         await expect(page.locator('#playerStandby source')).toHaveCount(0);
         expect(advances).toHaveLength(1);
-        const rows = await (await page.request.get('/api/history')).json();
+        const rows = await (await page.request.get('/api/library')).json();
         expect(rows.reduce((sum, row) => sum + row.view_count, 0)).toBe(1);
         await page.evaluate(() => closePlayer());
         await expect(page.locator('#playerMediaStage source')).toHaveCount(0);

@@ -273,7 +273,7 @@ test('queued URLs show a waiting message and Stop cancels before admission', asy
         await expect(row).toContainText('Waiting for a download slot');
         await row.getByRole('button', { name: 'Stop', exact: true }).click();
         await expect(row.getByRole('button', { name: 'Continue', exact: true })).toBeVisible();
-        const history = await (await page.request.get('/api/history')).json();
+        const history = await (await page.request.get('/api/current-downloads')).json();
         expect(history.find(item => item.id === second.id).status).toBe('cancelled');
         expect(history.find(item => item.id === second.id).requested_format).toBe('chosen-quality');
         expect(history.find(item => item.id === first.id).status).toBe('starting');

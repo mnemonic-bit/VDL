@@ -214,7 +214,7 @@ class PreferencesTest(AppCase):
         except OSError as exc:
             self.fail(f"worker setup escaped its failure boundary: {exc}")
 
-        row = self.client.get("/api/history").get_json()[0]
+        row = vdl.db_list_downloads()[0]
         self.assertEqual(row["status"], "error")
         self.assertIn("directory", row["progress"].lower())
         self.assertEqual(vdl._active_worker_count, 0)

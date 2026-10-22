@@ -7,7 +7,7 @@ test('Duplicates shows confirmed members and links to their History items', asyn
     await seed(page, { id: 'duplicate-one', status: 'finished', file: true, name: 'first.mp4' });
     await seed(page, { id: 'duplicate-two', status: 'finished', file: true, name: 'second.mp4' });
     await refresh(page);
-    const entries = await (await page.request.get('/api/history')).json();
+    const entries = await (await page.request.get('/api/library')).json();
     const first = entries.find(entry => entry.id === 'duplicate-one');
     const second = entries.find(entry => entry.id === 'duplicate-two');
     await page.route('**/api/duplicates', route => route.fulfill({
@@ -28,6 +28,8 @@ test('Duplicates shows confirmed members and links to their History items', asyn
         },
     }));
 
+    await page.locator('#accountMenuButton').click();
+    await page.locator('#attemptHistoryButton').click();
     await page.locator('#duplicatesViewButton').click();
     await expect(page.locator('#historyMain')).toBeHidden();
     await expect(page.locator('#duplicatesStatus')).toHaveText(
@@ -53,6 +55,8 @@ test('Duplicates reports incomplete indexing and can request a refresh', async (
         refreshes += 1;
         return route.fulfill({ status: 202, json: { message: 'Duplicate index refresh started' } });
     });
+    await page.locator('#accountMenuButton').click();
+    await page.locator('#attemptHistoryButton').click();
     await page.locator('#duplicatesViewButton').click();
     await expect(page.locator('#duplicatesList')).toContainText('Some files are still pending');
     await page.locator('#duplicatesRefresh').click();

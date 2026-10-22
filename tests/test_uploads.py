@@ -50,7 +50,7 @@ class UploadTest(AppCase):
             self.assertEqual(stored.read(), b"video bytes")
         inspect.assert_called_once()
 
-        history_row = self.client.get("/api/history").get_json()[0]
+        history_row = self.client.get("/api/library").get_json()[0]
         self.assertEqual(history_row["source_type"], "upload")
 
     def test_upload_preserves_an_existing_file_with_a_collision_suffix(self):

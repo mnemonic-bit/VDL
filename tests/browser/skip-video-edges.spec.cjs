@@ -131,7 +131,7 @@ test('eligible direct playback waits for metadata and the start seek, then pause
     await page.evaluate(() => { window.__edgeHoldSeek = false; togglePlayerPlayback(); });
     await time(page, 10);
     await expect(page.locator('#playerVideo')).toHaveJSProperty('paused', false);
-    const rows = await (await page.request.get('/api/history')).json();
+    const rows = await (await page.request.get('/api/library')).json();
     expect(rows.find(row => row.id === 'edge-current').duration_seconds).toBe(60);
 });
 

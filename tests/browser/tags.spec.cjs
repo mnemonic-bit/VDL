@@ -124,7 +124,7 @@ test('Header search uses ANY matching without hiding Current downloads', async (
         { id: 'current-both', status: 'cancelled' },
         { id: 'current-music', status: 'interrupted' },
         { id: 'history-tutorial', status: 'finished', file: true, name: 'tutorial.mp4' },
-        { id: 'history-both', status: 'error', progress: 'fixture error' },
+        { id: 'history-both', status: 'finished', file: true, name: 'tagged.mp4' },
     ]) {
         await seed(page, row);
     }
@@ -386,7 +386,7 @@ test('Header search expands from the leftmost magnifier', async ({ page }) => {
     await expect(input).toHaveAttribute('type', 'text');
     await expect(input).toHaveAttribute('placeholder', 'Search title, filename, tag, or filters');
     await expect(input).toHaveAttribute(
-        'aria-label', 'Search history by title, filename, tag, user, quality, star, or views');
+        'aria-label', 'Search Library by title, filename, tag, user, quality, star, or views');
     await expect(toggle).toHaveAttribute('aria-expanded', 'false');
     await expect(input).toBeHidden();
     await expect(header.locator('select')).toHaveCount(0);

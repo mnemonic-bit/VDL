@@ -56,20 +56,14 @@ test('failed Delete request restores the row and reports the error', async ({ pa
     await expect(page.getByText('delete was rejected')).toBeVisible();
 });
 
-test('failed Reload does not resubmit and reports the error', async ({ page }) => {
+test('failed Retry reports the error and preserves the attempt', async ({ page }) => {
     await seed(page, { id: 'failreload', status: 'error', progress: 'fixture error' });
-    await refresh(page);
-    await reject(page, '/api/remove/failreload', 'reload cleanup was rejected');
-    let downloadCalls = 0;
-    await page.route('**/api/download', async route => {
-        downloadCalls += 1;
-        await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' });
-    });
-    const row = page.locator('[data-row-id="failreload"]');
-    await row.locator('.kebab-btn').click();
-    await row.getByRole('button', { name: 'Reload', exact: true }).click();
-    await expect(page.getByText('reload cleanup was rejected')).toBeVisible();
-    expect(downloadCalls).toBe(0);
+    await page.locator('#accountMenuButton').click();
+    await page.locator('#attemptHistoryButton').click();
+    await reject(page, '/api/retry/failreload', 'retry was rejected');
+    const row = page.locator('.attempt-row').filter({ hasText: 'fixture error' });
+    await row.getByRole('button', { name: 'Retry', exact: true }).click();
+    await expect(page.getByText('retry was rejected')).toBeVisible();
     await expect(row).toBeVisible();
 });
 

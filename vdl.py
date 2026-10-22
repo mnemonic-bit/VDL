@@ -34,6 +34,8 @@ from functools import wraps
 from pathlib import Path
 from urllib.parse import urlsplit
 
+import download_history
+
 from download_bandwidth import SharedBandwidth, govern_download, canonical_mbps
 
 
@@ -373,7 +375,7 @@ class EventBus:
     def subscribe(self, user_id=None):
         # maxsize keeps a stuck/disconnected client from ballooning memory.
         # If full, we drop the oldest event for that subscriber -- stale clients
-        # always reconcile by refetching /api/history on the next event anyway.
+        # always reconcile by refetching their visible collections on the next event.
         q = queue.Queue(maxsize=64)
         with self._lock:
             self._subs[q] = user_id
@@ -790,6 +792,8 @@ def init_db():
             "SELECT 1 FROM download_tags WHERE tag_id = tags.id)"
         )
 
+        download_history.initialize(conn)
+
         # Any download that was active when the app died is now orphaned.
         # 'paused' counts as active for this purpose -- the worker thread
         # was holding the connection open and is gone now.
@@ -811,6 +815,7 @@ def db_insert_download(download_id, url, owner_user_id=None,
                 owner_username,
             ),
         )
+        download_history.record(conn, download_id, create=True)
     event_bus.publish('change', {'reason': 'insert', 'id': download_id})
 
 
@@ -830,6 +835,7 @@ def db_insert_upload(download_id, upload_name, title, filesize, output_dir,
                 upload_name, filesize, owner_user_id, owner_username,
             ),
         )
+        download_history.record(conn, download_id, create=True)
     event_bus.publish('change', {'reason': 'insert', 'id': download_id})
 
 
@@ -892,6 +898,7 @@ def db_insert_ingested_video(download_id, source_path, source_signature,
                 (download_id, digest, identity[2], identity[0],
                  identity[1], identity[3]),
             )
+        download_history.record(conn, download_id, create=True)
     event_bus.publish('change', {'reason': 'insert', 'id': download_id})
 
 
@@ -984,6 +991,7 @@ def db_update_download(download_id, *, status=None, progress=None,
         return
     values.append(download_id)
     with _db_lock, db() as conn:
+        previous = conn.execute("SELECT status FROM downloads WHERE id = ?", (download_id,)).fetchone()
         conn.execute(
             f"UPDATE downloads SET {', '.join(fields)} WHERE id = ?",
             values,
@@ -996,6 +1004,9 @@ def db_update_download(download_id, *, status=None, progress=None,
                 "WHERE media_hashes.state != 'ready' OR ? IS NOT NULL",
                 (download_id, filename),
             )
+        download_history.record(conn, download_id, new=bool(
+            previous and previous['status'] in TERMINAL_STATUSES
+            and status in download_history.ACTIVE))
     event_bus.publish('change', {'reason': 'update', 'id': download_id})
     if status == 'finished':
         _wake_duplicate_backfill()
@@ -1005,11 +1016,13 @@ def db_claim_download_for_resume(download_id):
     """Move one resumable row to starting, returning whether we won."""
     with _db_lock, db() as conn:
         cur = conn.execute(
-            "UPDATE downloads SET status = 'starting', progress = '0%' "
+            "UPDATE downloads SET status = 'starting', progress = '0%', finished_at = NULL "
             "WHERE id = ? AND status IN ('cancelled', 'interrupted')",
             (download_id,),
         )
         claimed = cur.rowcount == 1
+        if claimed:
+            download_history.record(conn, download_id, new=True)
     if claimed:
         event_bus.publish('change', {'reason': 'update', 'id': download_id})
     return claimed
@@ -1390,7 +1403,7 @@ def db_remove_download_if_inactive(download_id, fallback_dir=None):
     return entry, removed
 
 
-def db_clear_history():
+def db_clear_library():
     placeholders = ",".join("?" * len(HISTORY_STATUSES))
     fallback_dir = db_get_preferences().get("download_dir", ".")
     with _db_lock, db() as conn:
@@ -3089,9 +3102,10 @@ def _resolve_companion_download(user, request_id, canonical_url):
         if row is not None:
             conn.execute(
                 "UPDATE downloads SET status = 'starting', progress = '0%', "
-                "extension_request_id = ? WHERE id = ?",
+                "finished_at = NULL, extension_request_id = ? WHERE id = ?",
                 (request_id, row['id']),
             )
+            download_history.record(conn, row['id'], new=True)
             result = dict(row)
             result['status'] = 'starting'
             return result, 'resumed', 'update'
@@ -3113,6 +3127,7 @@ def _resolve_companion_download(user, request_id, canonical_url):
                 user['username'], request_id,
             ),
         )
+        download_history.record(conn, download_id, create=True)
         return {
             'id': download_id, 'url': canonical_url, 'status': 'starting',
             'visibility': 'private',
@@ -3907,6 +3922,9 @@ def background_download(url, download_id, cookie_bundle=None):
                 _live_worker_ids.discard(download_id)
                 _dispatch_worker_queue()
                 _worker_condition.notify_all()
+            # Terminal outcomes publish before file handles close; reconcile
+            # once more when Retry can safely own the work item.
+            event_bus.publish('change', {'reason': 'worker-stopped', 'id': download_id})
 
 
 def _background_download(url, download_id, cookie_bundle=None):
@@ -4485,11 +4503,6 @@ def _ingest_watched_file(source_path, expected_signature, *,
         if identity not in seen_tags:
             folder_tags.append(display)
             seen_tags.add(identity)
-    output_dir = os.path.abspath(_prepare_download_directory(
-        db_get_preferences().get('download_dir', '.')
-    ))
-    _disjoint_ingest_and_output(ingest_root, output_dir)
-
     download_id = str(uuid.uuid4())[:8]
     title = os.path.splitext(original_name)[0] or original_name
     temporary_path = None
@@ -4498,7 +4511,14 @@ def _ingest_watched_file(source_path, expected_signature, *,
     received = 0
     digest = hashlib.sha256()
     descriptor = None
+    with _db_lock, db() as conn:
+        download_history.start_mounted(conn, download_id, original_name)
+    event_bus.publish('change', {'reason': 'import-start', 'id': download_id})
     try:
+        output_dir = os.path.abspath(_prepare_download_directory(
+            db_get_preferences().get('download_dir', '.')
+        ))
+        _disjoint_ingest_and_output(ingest_root, output_dir)
         descriptor = _open_ingest_source(
             ingest_root, source_path, relative_path
         )
@@ -4570,6 +4590,11 @@ def _ingest_watched_file(source_path, expected_signature, *,
             flush=True,
         )
         return download_id
+    except Exception as exc:
+        with _db_lock, db() as conn:
+            download_history.fail_mounted(conn, download_id, exc)
+        event_bus.publish('change', {'reason': 'import-error', 'id': download_id})
+        raise
     finally:
         if descriptor is not None:
             os.close(descriptor)
@@ -5785,9 +5810,9 @@ def remove_download(download_id):
     return jsonify({"message": "Removed", "id": download_id})
 
 
-@app.route('/api/clear/preview', methods=['GET'])
+@app.route('/api/library/clear/preview', methods=['GET'])
 @admin_required
-def clear_history_preview():
+def clear_library_preview():
     placeholders = ",".join("?" * len(HISTORY_STATUSES))
     with db() as conn:
         rows = conn.execute(
@@ -5797,24 +5822,116 @@ def clear_history_preview():
     return jsonify({"entries": rows[0], "with_files": rows[1]})
 
 
-@app.route('/api/clear', methods=['POST'])
+@app.route('/api/library/clear', methods=['POST'])
 @admin_required
-def clear_history():
+def clear_library():
     try:
-        removed, files_deleted = db_clear_history()
+        removed, files_deleted = db_clear_library()
     except OSError as exc:
         return jsonify({"error": f"Cleanup failed: {exc}"}), 500
     return jsonify({"message": "Cleared", "removed": removed, "files_deleted": files_deleted})
 
 
-@app.route('/api/history', methods=['GET'])
-def get_history():
+@app.route('/api/library', methods=['GET'])
+def get_library():
     return jsonify([
         _public_download_entry(entry) for entry in db_list_downloads(
-            g.current_user['id'],
-            is_admin='admin' in g.current_user['roles'],
-        )
+            g.current_user['id'], is_admin='admin' in g.current_user['roles'],
+        ) if _playable_library_entry(entry)
     ])
+
+
+@app.route('/api/current-downloads', methods=['GET'])
+def get_current_downloads():
+    return jsonify([
+        _public_download_entry(entry) for entry in db_list_downloads(
+            g.current_user['id'], is_admin='admin' in g.current_user['roles'],
+        ) if entry['status'] in ('starting', 'downloading', 'paused', 'cancelled', 'interrupted')
+    ])
+
+
+@app.route('/api/history', methods=['GET'])
+def get_history():
+    try:
+        value = _normalize_history_filter(request.args.get('filter', ''))
+        page = int(request.args.get('page', '1'))
+        page_size = int(request.args.get('page_size', '20'))
+        if page < 1 or page_size < 1 or page_size > 100:
+            raise ValueError('Page must be positive and page_size between 1 and 100')
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    with db() as conn:
+        result = download_history.page(
+            conn, g.current_user['id'], 'admin' in g.current_user['roles'],
+            _parse_history_filter(value), page, page_size,
+        )
+        for item in result['items']:
+            entry = _visible_download(item['download_id']) if item['download_id'] else None
+            available = bool(entry and _playable_library_entry(entry))
+            item['library_id'] = entry['id'] if available and item['status'] == 'finished' else None
+            item['media_state'] = ('available' if item['library_id'] else
+                                   'removed' if entry is None else 'unavailable')
+            latest = conn.execute(
+                'SELECT id FROM download_attempts WHERE work_id = '
+                '(SELECT work_id FROM download_attempts WHERE id = ?) '
+                'ORDER BY started_at DESC, id DESC LIMIT 1', (item['id'],),
+            ).fetchone()
+            current = bool(latest and latest['id'] == item['id']
+                           and entry and entry['id'] not in _live_worker_ids)
+            item['can_resume'] = bool(current and entry and entry['status'] in ('cancelled', 'interrupted')
+                                      and entry['source_type'] == 'download' and not entry['browser_authenticated'])
+            item['can_retry'] = bool(current and entry and entry['status'] in TERMINAL_STATUSES
+                                     and entry['source_type'] == 'download' and not entry['browser_authenticated'])
+    return jsonify(result)
+
+
+@app.route('/api/clear/preview', methods=['GET'])
+@admin_required
+def clear_history_preview():
+    with db() as conn:
+        count = conn.execute("SELECT COUNT(*) FROM download_attempts WHERE status NOT IN ('starting', 'downloading', 'paused')").fetchone()[0]
+    return jsonify({'entries': count, 'with_files': 0})
+
+
+@app.route('/api/clear', methods=['POST'])
+@admin_required
+def clear_history():
+    with _db_lock, db() as conn:
+        count = conn.execute("DELETE FROM download_attempts WHERE status NOT IN ('starting', 'downloading', 'paused')").rowcount
+    event_bus.publish('change', {'reason': 'clear-attempts', 'count': count})
+    return jsonify({'removed': count, 'files_deleted': 0})
+
+
+@app.route('/api/retry/<download_id>', methods=['POST'])
+def retry_download(download_id):
+    entry = _visible_download(download_id)
+    if entry is None:
+        return jsonify({'error': 'Unknown download id'}), 404
+    if entry.get('browser_authenticated') or entry['source_type'] != 'download':
+        return jsonify({'error': 'Send this source again to start a new attempt'}), 409
+    try:
+        with _worker_condition, _db_lock, db() as conn:
+            current = conn.execute(
+                'SELECT * FROM downloads WHERE id = ?', (download_id,),
+            ).fetchone()
+            if (current is None or current['status'] not in TERMINAL_STATUSES
+                    or download_id in _live_worker_ids):
+                return jsonify({'error': 'Wait until the current worker has stopped'}), 409
+            delete_download_artifacts(
+                dict(current), db_get_preferences().get('download_dir', '.'),
+            )
+            conn.execute(
+                "UPDATE downloads SET status = 'starting', progress = '0%', "
+                "filename = NULL, finished_at = NULL, downloaded_bytes = 0, "
+                "total_bytes = NULL, filesize = NULL, speed = 0, eta = NULL "
+                "WHERE id = ?", (download_id,),
+            )
+            download_history.record(conn, download_id, new=True)
+    except OSError as exc:
+        return jsonify({'error': f'Cleanup failed: {exc}'}), 500
+    event_bus.publish('change', {'reason': 'retry', 'id': download_id})
+    enqueue_download(entry['url'], download_id)
+    return jsonify({'id': download_id})
 
 
 @app.route('/api/duplicates', methods=['GET'])
@@ -6540,7 +6657,7 @@ def download_tags(download_id):
 def events():
     """Server-Sent Events stream. The browser opens one EventSource and we
     push a 'change' event every time a download row is inserted, updated, or
-    deleted. The client reacts by re-fetching /api/history once -- which is
+    deleted. The client reacts by re-fetching the Library, Current, and visible History --
     much cheaper than polling every second when nothing is happening.
 
     Keepalive comments (lines starting with ':') run every ~15s so proxies
@@ -6553,7 +6670,7 @@ def events():
         q = event_bus.subscribe(user_id)
         try:
             # Greet the client so it knows the stream is live; also nudges it
-            # to do an initial reconcile against /api/history.
+            # to do an initial reconcile against the collection APIs.
             yield "event: ready\ndata: {}\n\n"
             while True:
                 try:

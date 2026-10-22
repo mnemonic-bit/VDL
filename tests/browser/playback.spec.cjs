@@ -53,7 +53,7 @@ async function expectMainPlaybackMode(page, name, icon) {
     await expect(button).toHaveAttribute('aria-label', name);
     await expect(button).toContainText(name);
     await expect(button.locator('use')).toHaveAttribute('href', `#i-${icon}`);
-    await expect(button).toHaveAttribute('title', new RegExp(name === 'Shuffle' ? 'Shuffle' : 'History'));
+    await expect(button).toHaveAttribute('title', new RegExp(name === 'Shuffle' ? 'Shuffle' : 'Library'));
 }
 
 async function choosePlaybackMode(page, name) {
@@ -235,7 +235,7 @@ test('endless playback advances once on the same video node and does not count a
     ))).toBe(true);
 
     await expect.poll(async () => {
-        const rows = await (await page.request.get('/api/history')).json();
+        const rows = await (await page.request.get('/api/library')).json();
         return Object.fromEntries(rows.map(row => [row.id, row.view_count]));
     }).toEqual({ 'endless-new': 1, 'endless-old': 0 });
 });

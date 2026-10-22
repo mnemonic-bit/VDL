@@ -164,7 +164,7 @@ class DuplicateMediaTest(AppCase):
             ).fetchone()
         self.assertEqual(hash_row['state'], 'ready')
         self.assertEqual(hash_row['digest'], hashlib.sha256(b'final video').hexdigest())
-        history = self.client.get('/api/history').get_json()[0]
+        history = self.client.get('/api/library').get_json()[0]
         self.assertEqual(history['filename'], 'film.mp4')
         self.assertTrue(history['mounted_import'])
         self.assertNotIn(self.download_dir, str(history))
@@ -270,7 +270,7 @@ class DuplicateMediaTest(AppCase):
         self.assertLessEqual(len(os.fsencode(os.path.basename(row['filename']))),
                              os.pathconf(self.download_dir, 'PC_NAME_MAX'))
         self.assertEqual(
-            self.client.get('/api/history').get_json()[0]['filename'], source_name
+            self.client.get('/api/library').get_json()[0]['filename'], source_name
         )
         attachment = self.client.get(f'/api/file/{download_id}?download=1')
         self.assertIn('filename*=', attachment.headers['Content-Disposition'])

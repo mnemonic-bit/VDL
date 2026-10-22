@@ -1,8 +1,8 @@
 # Add a separate download attempt History
 
 **Source:** User-requested feature  
-**Status:** Proposed  
-**Last refined:** 2026-10-16  
+**Status:** Implemented\
+**Last refined:** 2026-10-22\
 **Supersedes:** The use of **History** for the primary video grid in Features
 0017, 0018, 0022, 0025, 0027, 0030, 0034, and 0035
 
@@ -13,7 +13,9 @@ videos and playlists the user can use, not a record of download failures.
 Only finished media with an available, authorized stored file belongs in its
 video grid. Failed, cancelled, interrupted, paused, and in-progress work does
 not appear there. The existing **Current downloads** drawer remains the place
-to manage live and resumable work.
+to manage live and resumable work. The main Library has no view tabs; videos
+remain front-and-center alongside the existing playlist shelf. Move
+**Duplicates** into a second tab on the History page.
 
 Add a separate **History** page, opened from the signed-in user's menu. It
 replaces the Library content area within the same application shell and shows
@@ -32,12 +34,13 @@ compatibility, but its visible label should describe Library pagination.
 
 ## User flow
 
-1. On opening VDL, the user sees the Library's video grid, playlists, and
-   Duplicates view. Its search and Play All/Shuffle controls work as before,
-   now with Library names and accessible descriptions.
+1. On opening VDL, the user sees the Library's video grid and playlists
+   without a tabbed view switch. Its search and Play All/Shuffle controls work
+   as before, now with Library names and accessible descriptions.
 2. The user opens the account menu and chooses **History**. The Library area
    is replaced by a page headed **History**, a **Back to Library** control, a
    dedicated filter input, and a vertically stacked list of attempt rows.
+   The History page has **Download attempts** and **Duplicates** tabs.
 3. The user can find a failed attempt, read its error and source information,
    and start a new retry or resume when that action is valid. A successful
    attempt links to its Library video while the media remains available.
@@ -203,6 +206,7 @@ silently turn into media deletion because the two views are now distinct.
 
 1. The default main view is called **Library** and contains finished,
    available videos and existing playlists, never failed or incomplete work.
+   It has no view tabs; **Duplicates** is a tab on the separate History page.
 2. **History** is reachable from the account menu and replaces the Library
    area without opening a modal or changing the application's header/footer.
 3. Every accepted attempt appears once in a single-column list with title,
@@ -227,7 +231,42 @@ silently turn into media deletion because the two views are now distinct.
 
 Before marking implementation complete, run `./tests/run-all.sh --unit` and
 verify at least 90% `vdl.py` line coverage, then run the relevant browser tests
-for navigation, filtering, responsive rows, and live status transitions. This
-documentation-only specification leaves `VERSION` unchanged. Reusing
-`/api/history` for a different response is an incompatible API change, so
-implementation requires a MAJOR bump under `AGENTS.md`.
+for navigation, filtering, responsive rows, and live status transitions.
+Reusing `/api/history` for a different response is technically incompatible
+for clients of the old contract. The maintainer explicitly chose a feature
+bump because this API is internal and not officially published. This release
+therefore bumps `VERSION` from `0.44.0` to `0.45.0`, overriding the general
+major-bump rule in `AGENTS.md` for this change.
+
+
+## Implementation outcome
+
+Implemented in `0.45.0`, including the user's refinement moving Duplicates to
+History and removing the main Library's tab switch. Attempt persistence lives
+in `download_history.py`; lifecycle callers pass the same SQLite transaction
+that accepts or changes work. Terminal snapshots are immutable, and only an
+explicit new acceptance can recreate a log removed by clearing or account
+deletion. A final worker-stopped SSE signal makes Retry available after file
+handles close.
+
+Migration backfills one marked legacy record per existing download exactly
+once, even after History is cleared. Foreign keys retain snapshots after media
+deletions and remove an account's private log when the account is deleted.
+Mounted work records acceptance before output setup and records validation,
+copy, or publication failures without publishing incomplete Library items.
+
+History uses server-side authorization, conjunctive quote-aware filtering,
+1-based bounded pagination, stable row identities, and Details/focus
+restoration during SSE updates. Source snapshots remove embedded credentials
+and redact query values except known routing identifiers; diagnostic URLs
+redact all query values. The read and clear route contracts are documented in
+`README.md`; browser/API tests and container smoke checks use the explicit
+Library, Current downloads, and paginated History endpoints.
+
+Validation: Python 3.12 `./tests/run-all.sh --unit` passes 282 tests (5 optional
+media tests skipped), with `vdl.py` line coverage **91.2%** (4754/5210; enforced
+minimum 90%). Shipping-container build and smoke checks pass. All 211 browser
+checks pass across the full run and targeted reruns. Browser coverage includes
+navigation, independent filtering/pagination, responsive rows,
+thumbnail eligibility, deletion/clear semantics, keyboard access, and live
+completion with Details and focus preserved.

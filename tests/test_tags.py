@@ -20,7 +20,7 @@ class DownloadTagsTest(AppCase):
         self.assertTrue(first.get_json()["changed"])
         self.assertEqual(second.get_json()["tags"], ["Music Videos"])
         self.assertEqual(vdl.db_list_tags(), ["Music Videos"])
-        rows = {row["id"]: row for row in self.client.get("/api/history").get_json()}
+        rows = {row["id"]: row for row in self.client.get("/api/current-downloads").get_json()}
         self.assertEqual(rows["tagone01"]["tags"], ["Music Videos"])
         self.assertEqual(rows["tagtwo02"]["tags"], ["Music Videos"])
 

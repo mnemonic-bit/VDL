@@ -42,7 +42,7 @@ class PlaybackTest(AppCase):
         self.assertEqual(second.get_json(), {
             "id": "test0001", "view_count": 2,
         })
-        row = self.client.get("/api/history").get_json()[0]
+        row = self.client.get("/api/library").get_json()[0]
         self.assertEqual(row["view_count"], 2)
         self.assertEqual(row["quality"], "4k")
 

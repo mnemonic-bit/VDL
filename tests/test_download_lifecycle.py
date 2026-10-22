@@ -22,7 +22,7 @@ class DownloadLifecycleTest(AppCase):
             },
         }, download_id)
 
-        row = self.client.get("/api/history").get_json()[0]
+        row = vdl.db_list_downloads()[0]
         self.assertEqual(row["status"], "downloading")
         self.assertEqual(row["progress"], "Downloading")
         self.assertEqual(row["title"], "Unknown length fixture")
@@ -46,7 +46,7 @@ class DownloadLifecycleTest(AppCase):
                 "info_dict": {},
             }, download_id)
 
-            row = self.client.get("/api/history").get_json()[0]
+            row = vdl.db_list_downloads()[0]
             observed_sizes.append(row["filesize"])
             observed_progress.append(float(row["progress"].rstrip("%")))
             self.assertEqual(row["downloaded_bytes"], 400 * mib)
@@ -62,7 +62,7 @@ class DownloadLifecycleTest(AppCase):
                 "total_bytes_estimate": 820 * mib,
                 "info_dict": {},
             }, download_id)
-            row = self.client.get("/api/history").get_json()[0]
+            row = vdl.db_list_downloads()[0]
             observed_sizes.append(row["filesize"])
             observed_progress.append(float(row["progress"].rstrip("%")))
 
@@ -82,7 +82,7 @@ class DownloadLifecycleTest(AppCase):
             "info_dict": {},
         }, download_id)
 
-        row = self.client.get("/api/history").get_json()[0]
+        row = vdl.db_list_downloads()[0]
         self.assertEqual(row["progress"], "50.0%")
         self.assertEqual(row["filesize"], 800)
         self.assertEqual(row["downloaded_bytes"], 400)
@@ -102,7 +102,7 @@ class DownloadLifecycleTest(AppCase):
             "info_dict": {},
         }, download_id)
 
-        row = self.client.get("/api/history").get_json()[0]
+        row = vdl.db_list_downloads()[0]
         self.assertEqual(row["downloaded_bytes"], 450)
         self.assertIsNone(row["total_bytes"])
 
@@ -293,7 +293,7 @@ class DownloadLifecycleTest(AppCase):
         progress.start()
         deadline = time.monotonic() + 1
         while time.monotonic() < deadline:
-            row = self.client.get("/api/history").get_json()[0]
+            row = vdl.db_list_downloads()[0]
             if row["status"] == "paused":
                 break
             time.sleep(0.01)
@@ -303,7 +303,7 @@ class DownloadLifecycleTest(AppCase):
         progress.join(1)
         self.assertFalse(progress.is_alive())
         self.assertEqual(
-            self.client.get("/api/history").get_json()[0]["status"],
+            vdl.db_list_downloads()[0]["status"],
             "downloading",
         )
 

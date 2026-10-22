@@ -105,7 +105,7 @@ class FormatContractTest(AppCase):
         ):
             vdl.background_download("https://fixture.invalid/video", download_id)
 
-        row = self.client.get("/api/history").get_json()[0]
+        row = vdl.db_list_downloads()[0]
         self.assertEqual(row["status"], "finished")
         self.assertEqual(row["requested_format"], "v360")
         self.assertEqual(UnavailableFormat.attempts, ["best", "v360"])
@@ -131,7 +131,7 @@ class FormatContractTest(AppCase):
         ):
             vdl.background_download("https://fixture.invalid/video", download_id)
 
-        row = self.client.get("/api/history").get_json()[0]
+        row = vdl.db_list_downloads()[0]
         self.assertEqual(row["status"], "error")
         self.assertIn("HTTP 403", row["progress"])
         self.assertEqual(row["requested_format"], "best")

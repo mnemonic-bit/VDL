@@ -38,7 +38,7 @@ test('fixed header opens the Current drawer and full Settings page', async ({ pa
     await expect(page.locator('[data-tab]')).toHaveCount(0);
     await expect(page.locator('#tab-history')).toBeVisible();
     await expect(page.locator('#tab-history').getByRole('button', { name: 'Clear History' })).toHaveCount(0);
-    await expect(page.locator('#tab-history')).toHaveAttribute('aria-label', 'Download history');
+    await expect(page.locator('#tab-history')).toHaveAttribute('aria-label', 'Library');
     await expect(page.getByRole('heading', { name: 'Download History' })).toHaveCount(0);
 
     const header = page.locator('#appHeader');
@@ -146,6 +146,8 @@ test('account menu supports keyboard navigation and closes outside', async ({ pa
     await expect(accountMenu).toBeVisible();
     await expect(page.locator('#settingsButton')).toBeFocused();
     await page.locator('#settingsButton').press('ArrowDown');
+    await expect(page.locator('#attemptHistoryButton')).toBeFocused();
+    await page.locator('#attemptHistoryButton').press('ArrowDown');
     await expect(accountMenu.getByRole('menuitem', { name: 'Sign out' })).toBeFocused();
     await page.keyboard.press('Escape');
     await expect(accountMenu).toBeHidden();
@@ -331,7 +333,7 @@ test('History info shows the downloader and changes video visibility', async ({ 
     await expect(popover.locator('.history-visibility-help')).toHaveText(
         'Visible only to you and administrators');
 
-    const rows = await page.request.get('/api/history').then(response => response.json());
+    const rows = await page.request.get('/api/library').then(response => response.json());
     expect(rows.find(item => item.id === 'visibility-row').visibility).toBe('private');
 });
 
@@ -405,48 +407,36 @@ test('Copy URL stays in Info and is omitted from the three-dot menu', async ({ p
     await expect(row.getByRole('button', { name: 'Copy original URL', exact: true })).toBeVisible();
 });
 
-test('error details fold and Reload removes then resubmits the stored URL', async ({ page }) => {
-    const url = 'https://fixture.invalid/missing';
-    await seed(page, { id: 'error001', status: 'error', progress: 'HTTP Error 404', url });
-    await refresh(page);
-    const row = page.locator('[data-row-id="error001"]');
-    await openInfo(row);
-    await row.locator('.error-details summary').click();
-    await expect(row.locator('.error-text')).toContainText('404');
-    const calls = [];
-    await page.route('**/api/remove/error001', async route => {
-        calls.push('remove');
-        await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' });
+test('failed attempts show details and Retry starts work on the same item', async ({ page }) => {
+    await seed(page, { id: 'error001', status: 'error', progress: 'HTTP Error 404', url: 'https://fixture.invalid/missing' });
+    await page.locator('#accountMenuButton').click();
+    await page.locator('#attemptHistoryButton').click();
+    const row = page.locator('.attempt-row');
+    await row.locator('summary').click();
+    await expect(row.locator('.attempt-details')).toContainText('404');
+    let calls = 0;
+    await page.route('**/api/retry/error001', route => {
+        calls++;
+        return route.fulfill({ json: { id: 'error001' } });
     });
-    await page.route('**/api/download', async route => {
-        calls.push(route.request().postDataJSON().url);
-        await route.fulfill({ status: 200, contentType: 'application/json', body: '{"id":"retry001"}' });
-    });
-    await row.getByRole('button', { name: 'Close info', exact: true }).click();
-    await row.locator('.kebab-btn').click();
-    await row.getByRole('button', { name: 'Reload', exact: true }).click();
-    await expect.poll(() => calls.length).toBe(2);
-    expect(calls).toEqual(['remove', url]);
+    await row.getByRole('button', { name: 'Retry', exact: true }).click();
+    await expect.poll(() => calls).toBe(1);
 });
 
-test('stored URL remains data for Open, Reload, Continue, and Info Copy actions', async ({ page }) => {
+test('attempt source remains escaped data and Continue keeps the stored URL', async ({ page }) => {
     const url = "https://fixture.invalid/a');window.__injected=1;//<b>";
-    for (const [id, status] of [['safe-error', 'error'], ['safe-cancel', 'cancelled']]) {
-        await seed(page, { id, status, progress: 'fixture error', url });
-    }
+    await seed(page, { id: 'safe-error', status: 'error', progress: 'fixture error', url });
+    await seed(page, { id: 'safe-cancel', status: 'cancelled', progress: 'fixture error', url });
     await refresh(page);
-    await refresh(page);
-    const errorRow = page.locator('[data-row-id="safe-error"]');
-    const actions = errorRow.locator('[data-url-action]');
-    await expect(actions).toHaveCount(3);
-    for (const action of await actions.all()) {
-        await expect(action).not.toHaveAttribute('onclick', /./);
-        expect(await action.getAttribute('data-url')).toBe(url);
-    }
     await openCurrent(page);
     const continueAction = page.locator('[data-row-id="safe-cancel"] [data-url-action="continue"]');
     await expect(continueAction).not.toHaveAttribute('onclick', /./);
     expect(await continueAction.getAttribute('data-url')).toBe(url);
+    await page.getByRole('button', { name: 'Close current downloads' }).click();
+    await page.locator('#accountMenuButton').click();
+    await page.locator('#attemptHistoryButton').click();
+    await page.locator('.attempt-row').first().locator('summary').click();
+    await expect(page.locator('.attempt-details').first()).toContainText(url);
     expect(await page.evaluate(() => window.__injected)).toBeUndefined();
 });
 
@@ -531,7 +521,7 @@ test('History preview labels show compact quality and clear new after playback',
 
     await fourK.getByRole('button', { name: 'Play', exact: true }).click();
     await expect.poll(async () => {
-        const rows = await page.request.get('/api/history').then(response => response.json());
+        const rows = await page.request.get('/api/library').then(response => response.json());
         return rows.find(row => row.id === 'quality-4k').view_count;
     }).toBe(1);
     await expect(fourK.locator('.history-preview-new')).toHaveCount(0);
@@ -783,11 +773,11 @@ test('fixed footer reports every stored download', async ({ page }) => {
     expect(footerPosition).toEqual({ position: 'fixed', bottom: 0 });
 });
 
-test('Clear History confirms and deletes stored files', async ({ page }) => {
+test('Delete Library media confirms and deletes stored files', async ({ page }) => {
     await seed(page, { id: 'clear001', status: 'finished', file: true });
     await openSettings(page);
     page.once('dialog', dialog => dialog.accept());
-    await page.getByRole('button', { name: 'Clear History', exact: true }).click();
+    await page.getByRole('button', { name: 'Delete Library media', exact: true }).click();
     await expect(page.locator('[data-row-id="clear001"]')).toHaveCount(0);
     expect((await page.request.get('/api/file/clear001')).status()).toBe(404);
 });
