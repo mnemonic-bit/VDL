@@ -164,6 +164,13 @@ sticky position beneath the page title, but its highlighted entry does not
 follow further scrolling through the options. It should identify the topmost
 visible options section in either scroll direction. Independent reproduction
 and cause remain unconfirmed.
+Issue 52 was reported on 2026-10-22 after a GitHub push failed CodeQL analysis
+with a configuration-version mismatch. Git history confirms that Dependabot
+commit `cadc995` advanced only `analyze` to `4.38.2`, leaving `init` at
+`4.38.0`; both had matched before that commit. Version `0.45.1` aligns both
+pins to `4.38.2`, groups future CodeQL updates, and checks full-SHA equality
+per job in the existing deterministic validation gate. Hosted analysis and
+confirmation of the live required-check ruleset remain outstanding.
 
 ## Bug reports
 
@@ -218,6 +225,7 @@ and cause remain unconfirmed.
 - [Bug 0049 — Opening another video can reuse the previous playback position](bug-0049-next-video-reuses-previous-playback-position.md)
 - [Bug 0050 — Number-input buttons and checkboxes do not match the dark theme](bug-0050-number-input-buttons-and-checkboxes-ignore-dark-theme.md)
 - [Bug 0051 — Settings quick-index highlight does not follow scrolling](bug-0051-settings-quick-index-highlight-does-not-follow-scrolling.md)
+- [Bug 0052 — Dependabot CodeQL updates can desynchronize action versions](bug-0052-dependabot-codeql-updates-can-desynchronize-action-versions.md)
 
 ## Accepted UI decisions
 

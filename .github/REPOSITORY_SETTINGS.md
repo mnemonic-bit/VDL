@@ -37,6 +37,15 @@ paid trial or paid-only security control.
   request and pass the checks.
 
 The deterministic check is reproduced locally with `./tests/run-all.sh --all`.
+Its workflow also validates CodeQL pins before the application tests. Keep
+`Validation / Deterministic gate` required on `main`, including for Dependabot
+pull requests: the CodeQL revision check fails this existing required status
+when any job mixes revisions or uses a mutable CodeQL ref. No additional status
+check is needed. Confirm the live ruleset has this requirement; workflow files
+alone cannot enforce a merge restriction. Run the same pin check locally with
+`npm ci && node scripts/check-codeql-pins.cjs` and its regression tests with
+`node --test tests/codeql-pins.test.cjs`.
+
 CodeQL result upload, GHCR publication, GitHub Releases, and OIDC-backed
 attestation have no local equivalent because they are GitHub services. The
 container smoke and both application architectures remain locally reproducible
@@ -52,6 +61,8 @@ with Docker/Podman and QEMU-capable Docker respectively.
 - Confirm public-repository secret scanning and push protection are enabled.
 - Use this repository's advanced CodeQL workflow; do not also enable CodeQL
   default setup. Require the two CodeQL checks in the `main` ruleset.
+- Keep CodeQL Action updates in the `codeql` Dependabot group. All CodeQL
+  subactions within a job must retain the same full commit SHA.
 - Do not enable paid-only secret validity, custom-pattern, campaign, security
   overview, or security merge-protection controls.
 

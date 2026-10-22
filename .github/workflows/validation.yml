@@ -32,6 +32,14 @@ jobs:
                   node-version: "24.8.0"
                   package-manager-cache: false
 
+            - name: Install workflow and extension tooling
+              run: npm ci
+
+            - name: Validate CodeQL action pins
+              run: |
+                  node scripts/check-codeql-pins.cjs
+                  node --test tests/codeql-pins.test.cjs
+
             - name: Install native dependencies
               run: |
                   sudo apt-get update
@@ -46,7 +54,6 @@ jobs:
               env:
                   BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
               run: |
-                  npm ci
                   npm run extension:lint
                   npm run extension:build -- --artifacts-dir "$RUNNER_TEMP/extension-build"
                   python scripts/extension_release.py validate --base-ref "$BASE_REF" \

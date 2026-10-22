@@ -39,6 +39,19 @@ This check contacts the Python package index but never installs the downloaded
 wheels. The validation workflow runs it before the multi-platform publication
 job can start.
 
+Validate the CodeQL Action revisions and exercise the one-step-update
+regression before changing workflow dependencies:
+
+```bash
+npm ci
+node scripts/check-codeql-pins.cjs
+node --test tests/codeql-pins.test.cjs
+```
+
+The validation workflow runs both commands on every pull request to `main`,
+including Dependabot updates. They use the root development tooling; no YAML
+parser is added to the application or container dependencies.
+
 Install native dependencies with `requirements.txt`. Browser setup is:
 
 ```bash

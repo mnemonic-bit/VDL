@@ -6,6 +6,7 @@
     "extension:build": "web-ext build --source-dir browser-extension/src"
   },
   "devDependencies": {
-    "web-ext": "10.8.0"
+    "web-ext": "10.8.0",
+    "yaml": "2.9.1"
   }
 }
