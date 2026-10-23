@@ -171,14 +171,17 @@ commit `cadc995` advanced only `analyze` to `4.38.2`, leaving `init` at
 pins to `4.38.2`, groups future CodeQL updates, and checks full-SHA equality
 per job in the existing deterministic validation gate. Hosted analysis and
 confirmation of the live required-check ruleset remain outstanding.
-Issue 53 was reported and investigated on 2026-10-23. Authenticated requests
+Issue 53 was reported and corrected on 2026-10-23. Authenticated requests
 to `/api/current-downloads` can fail with `sqlite3.OperationalError: database
 is locked` in the user lookup before the endpoint handler runs. Controlled
 reproductions confirm the exact traceback and rollback-journal reader/writer
-conflicts; WAL removed the large-write conflict in one comparison. A concurrent
-ingest import is suspected by the reporter but remains unconfirmed. The report
-also records the lack of active-import progress in Current Downloads and the
-server-log-only batch counts. The production lock holder and a fix remain open.
+conflicts. Version `0.46.1` enables WAL, bounds SQLite lock waits, returns
+retryable 503 responses for uncaught contention without bypassing account
+checks, and adds safe operation/commit diagnostics. The client retries affected
+reads twice and preserves rows with a visible error if refresh still fails.
+Concurrency regressions cover large writes, old readers, ingest publication,
+authorization recovery, and atomic rollback. The production lock holder remains
+unknown; active-import progress UI remains follow-up work.
 Issue 54 was reported and investigated on 2026-10-23. With approximately
 2,000 Library videos, slow collection refreshes can overlap without a bound,
 delay accepted Current Downloads, replace thumbnails together, and leave a

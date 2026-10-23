@@ -52,7 +52,10 @@ def start_fixture(port):
                 process.wait(5)
             except subprocess.TimeoutExpired:
                 process.kill()
-            for path in (env["DOWNLOADS_DB"], env["DOWNLOADS_DIR"]):
+            for path in (
+                env["DOWNLOADS_DB"], env["DOWNLOADS_DB"] + "-wal",
+                env["DOWNLOADS_DB"] + "-shm", env["DOWNLOADS_DIR"],
+            ):
                 if os.path.isdir(path):
                     shutil.rmtree(path, ignore_errors=True)
                 else:

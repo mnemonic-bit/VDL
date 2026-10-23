@@ -1,11 +1,12 @@
-## 53. [Open] Database locks fail authenticated API requests
+## 53. [Resolved] Database locks fail authenticated API requests
 
 **Severity:** Medium — authenticated requests can fail and leave the UI stale.
 
-**Status:** Open; reported and investigated on 2026-10-23. The exact traceback
-is reproduced against an isolated database. The operation holding the lock in
-the reported deployment remains unknown; concurrent ingest is a user-reported
-possibility, not a confirmed cause. No application fix has been applied.
+**Status:** Correction implemented in `0.46.1` on 2026-10-23; verification is
+recorded below. The exact traceback was reproduced against an isolated
+database. The operation holding the lock in the reported deployment remains
+unknown; concurrent ingest is a user-reported possibility, not a confirmed
+cause.
 
 ### Reported behavior
 
@@ -104,9 +105,13 @@ validated as a complete production fix.
 
 ### Minimal reproduction
 
+The following is the original reproduction against version `0.46.0`.
 Run from the repository root after installing dependencies into `.venv`.
 The command uses a disposable database. It deliberately exits with the
-reported exception after roughly five seconds on the current code:
+reported exception after roughly five seconds on that version. With the fix,
+startup enables WAL and this writer no longer blocks the authentication read.
+The permanent regression suite separately forces DELETE mode to test exhausted
+lock waits and the retryable response:
 
 ```bash
 .venv/bin/python - <<'PY'
@@ -225,9 +230,64 @@ established as the reported lock holder.
   representative library sizes and storage. A fix must distinguish the forced
   lock reproduction from a representative workload reproduction.
 
-No permanent regression tests or application changes were added during this
-investigation. Temporary probes were removed. This report is documentation
-only; `VERSION` is unchanged and no fix or coverage-gate pass is claimed.
+The initial investigation added no application changes. Version `0.46.1`
+implements the database-contention correction described below; the earlier
+measurements and unknown production lock holder remain historical evidence.
+
+### Implementation in 0.46.1
+
+- `init_db()` enables and verifies WAL before schema work. Unsupported or
+  unavailable WAL storage produces a clear startup error. The shared `db()`
+  helper uses an explicit one-second SQLite busy timeout, rolls back failed
+  operations, and closes connections even when setup fails. Media allowlist
+  reads now use that same helper.
+- Uncaught SQLite BUSY/LOCKED errors, including the authentication-hook lookup,
+  return HTTP 503 with `code: "database_busy"`, `retryable: true`,
+  `Retry-After: 1`, and `Cache-Control: no-store`. Extended SQLite result codes
+  are recognized. Other database errors keep their normal failure behavior.
+  The handler preserves the signed session without authorizing the request;
+  subsequent reads still enforce suspension and the current session version.
+- Slow operations and busy failures record UTC time, caller operation, thread
+  name/id, execution and commit durations, and SQLite result name/code. The
+  new diagnostics omit SQL, parameters, paths, and exception messages. Ingest
+  logs add matching timestamps, thread ids, attempt ids, and batch outcomes.
+- Password derivation for combined user updates now happens before the first
+  database write. Media copying, hashing, and probing remain outside ingest
+  publication transactions.
+- The client retries explicitly marked database-busy GET responses at most
+  twice, honoring `Retry-After` with a two-second delay cap. It never replays
+  mutations, preserves cancellation and login redirection, and leaves other
+  response handling to callers. Exhausted collection refreshes retain existing
+  rows and show a useful error; initial failures no longer imply an empty
+  library. A later successful refresh clears its own error message.
+- Storage guidance covers local filesystems, WAL sidecars, stopped-directory
+  backups, and SQLite's live backup API. Runtime sidecars are excluded from Git
+  and container build contexts.
+
+The production incident's lock holder remains unknown. This correction does
+not claim to reproduce the deployment or eliminate every SQLite busy condition.
+Import phase/byte-progress and batch-count UI remain follow-up work; the new
+logs provide correlation for this bug. The broader live-refresh scheduler,
+Library query cost, and rendering defects remain tracked in
+[bug 0054](bug-0054-live-refresh-overload-stalls-download-ui.md).
+
+### Verification
+
+- The new forced-lock authentication regression failed before the fix with
+  the reported traceback after about five seconds. The permanent suite now
+  confirms a bounded 503, preserved session, recovery, and fresh authorization.
+- `VDL_PYTHON=/tmp/vdl-bug53-py312/bin/python ./tests/run-all.sh --unit`:
+  Python 3.12.14, 311 tests, five intentional media skips, passing;
+  `vdl.py` coverage **91.3% (4821/5281)**, above the required 90% minimum.
+- `node --test tests/*.test.cjs`: 18 passing, including eight read-recovery,
+  mutation-safety, cancellation, and authentication regressions.
+- `VDL_PYTHON=/tmp/vdl-bug53-py312/bin/python ./tests/run-all.sh --browser`:
+  all 216 browser tests passing, including the three new contention/recovery
+  cases.
+
+The backend's synthetic concurrent workload uses 24 existing Library fixtures,
+eight serial ingest publications, and twelve download-progress updates. This
+is a controlled application regression, not a deployed workload capture.
 
 ### Source references
 

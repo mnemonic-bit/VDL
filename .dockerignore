@@ -4,6 +4,8 @@ node_modules/
 __pycache__/
 *.py[cod]
 downloads.db
+downloads.db-wal
+downloads.db-shm
 media/
 tests/
 *.log

@@ -7,6 +7,8 @@ __pycache__/
 media/
 
 downloads.db
+downloads.db-wal
+downloads.db-shm
 
 # for OpenCode
 .sisyphus/

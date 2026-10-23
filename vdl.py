@@ -26,6 +26,7 @@ import mimetypes
 import copy
 import secrets
 import stat
+import sys
 import tempfile
 import unicodedata
 import zipfile
@@ -481,21 +482,94 @@ _worker_hosts = {}
 _live_worker_ids = set()
 
 
+DB_BUSY_TIMEOUT_SECONDS = 1.0
+DB_SLOW_TRANSACTION_SECONDS = 0.25
+
+
+def _is_database_busy(error):
+    code = getattr(error, 'sqlite_errorcode', None)
+    if code is not None:
+        # Extended result codes retain the primary result in the low byte.
+        return code & 0xff in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+    return str(error).lower() in ('database is locked', 'database table is locked')
+
+
+@app.errorhandler(sqlite3.OperationalError)
+def database_operation_failed(error):
+    if not _is_database_busy(error):
+        raise error
+    # In particular, an unavailable account lookup is not an invalid session.
+    # Leave the cookie intact, but never authorize from cached account state.
+    response = jsonify(error='Database is busy; please retry shortly',
+                       code='database_busy', retryable=True)
+    response.status_code = 503
+    response.headers['Retry-After'] = '1'
+    response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
 @contextmanager
 def db():
-    """Yield a sqlite3 connection with row factory; commits on clean exit."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
+    """Bound lock waits and atomically commit or roll back each operation."""
+    # Capture only the caller's function name, never SQL, parameters, or locals.
+    operation = sys._getframe(2).f_code.co_name
+    started = time.perf_counter()
+    execution_seconds = commit_seconds = 0.0
+    phase = 'execution'
+    failure = None
+    conn = None
     try:
+        conn = sqlite3.connect(DB_PATH, timeout=DB_BUSY_TIMEOUT_SECONDS)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
         yield conn
+        execution_seconds = time.perf_counter() - started
+        phase = 'commit'
+        started = time.perf_counter()
         conn.commit()
+        commit_seconds = time.perf_counter() - started
+    except BaseException as error:
+        failure = error
+        if conn is not None:
+            conn.rollback()
+        raise
     finally:
-        conn.close()
+        elapsed = time.perf_counter() - started
+        if phase == 'execution':
+            execution_seconds = elapsed
+        else:
+            commit_seconds = elapsed
+        if conn is not None:
+            conn.close()
+        busy = isinstance(failure, sqlite3.Error) and _is_database_busy(failure)
+        if (busy or execution_seconds >= DB_SLOW_TRANSACTION_SECONDS
+                or commit_seconds >= DB_SLOW_TRANSACTION_SECONDS):
+            app.logger.warning(
+                'sqlite timestamp=%s operation=%s thread=%s thread_name=%s phase=%s '
+                'execution_seconds=%.3f commit_seconds=%.3f result=%s code=%s',
+                time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                operation, threading.get_ident(), threading.current_thread().name, phase,
+                execution_seconds, commit_seconds,
+                getattr(failure, 'sqlite_errorname', 'busy' if busy else
+                        'error' if failure is not None else 'ok'),
+                getattr(failure, 'sqlite_errorcode', None),
+            )
 
 
 def init_db():
     with db() as conn:
+        try:
+            mode = conn.execute('PRAGMA journal_mode = WAL').fetchone()[0]
+        except sqlite3.Error as error:
+            raise RuntimeError(
+                'Unable to enable SQLite WAL; use writable local storage '
+                'that supports WAL shared memory and stop competing database users'
+            ) from error
+        if mode.lower() != 'wal':
+            raise RuntimeError(
+                'SQLite WAL is required; use writable local storage '
+                'that supports WAL shared memory'
+            )
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS downloads (
                 id           TEXT PRIMARY KEY,
@@ -3240,6 +3314,10 @@ def db_update_user(user_id, *, username=None, name=None, password=None,
                 and not _db_other_active_admin_exists(conn, user_id)):
             raise ValueError('At least one active administrator is required')
 
+        # Password derivation can be slow. Complete it before the first write
+        # acquires SQLite's writer lock, including combined profile updates.
+        password_hash = (generate_password_hash(_validated_password(password))
+                         if password is not None else None)
         if username is not None:
             username = _validated_username(username)
             try:
@@ -3269,9 +3347,6 @@ def db_update_user(user_id, *, username=None, name=None, password=None,
                 (int(suspended), user_id),
             )
         if password is not None:
-            password_hash = generate_password_hash(
-                _validated_password(password)
-            )
             conn.execute(
                 "UPDATE users SET password_hash = ?, "
                 "session_version = session_version + 1 WHERE id = ?",
@@ -4394,6 +4469,17 @@ class IngestSourceChanged(Exception):
     """A captured source no longer matches its startup snapshot."""
 
 
+def _log_ingest_event(event, download_id='-', counts=None):
+    # Correlate database timings without repeating source paths or exception
+    # messages, which may contain private metadata or signed URLs.
+    print(
+        f'VDL ingest: timestamp={time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())} '
+        f'thread={threading.get_ident()} event={event} download_id={download_id}'
+        + (f' counts={counts}' if counts is not None else ''),
+        flush=True,
+    )
+
+
 def _ingest_signature(metadata):
     return (
         int(metadata.st_dev),
@@ -4513,6 +4599,7 @@ def _ingest_watched_file(source_path, expected_signature, *,
     descriptor = None
     with _db_lock, db() as conn:
         download_history.start_mounted(conn, download_id, original_name)
+    _log_ingest_event('attempt-start', download_id)
     event_bus.publish('change', {'reason': 'import-start', 'id': download_id})
     try:
         output_dir = os.path.abspath(_prepare_download_directory(
@@ -4585,12 +4672,14 @@ def _ingest_watched_file(source_path, expected_signature, *,
             folder_tags=folder_tags,
         )
         registered = True
+        _log_ingest_event('published', download_id)
         print(
             f'VDL ingest: added {original_name!r} as {download_id}',
             flush=True,
         )
         return download_id
     except Exception as exc:
+        _log_ingest_event('attempt-failed', download_id)
         with _db_lock, db() as conn:
             download_history.fail_mounted(conn, download_id, exc)
         event_bus.publish('change', {'reason': 'import-error', 'id': download_id})
@@ -4669,10 +4758,12 @@ class IngestStartupImporter:
             'enumerated': 0, 'imported': 0, 'receipt-skipped': 0,
             'changed/missing': 0, 'failed': 0,
         }
+        _log_ingest_event('batch-start')
         print(f'VDL ingest: startup scan beginning {self.directory!r}', flush=True)
         try:
             snapshot = _snapshot_ingest_files(self.directory)
         except OSError as exc:
+            _log_ingest_event('batch-failed', counts=counts)
             print(f'VDL ingest: unable to scan {self.directory!r}: {exc}', flush=True)
             print(f'VDL ingest: startup scan failed; {counts}', flush=True)
             return
@@ -4683,6 +4774,7 @@ class IngestStartupImporter:
             db_prune_ingest_receipts(self.directory, visible_paths)
             receipts = db_get_ingest_receipts(self.directory)
         except Exception as exc:
+            _log_ingest_event('batch-failed', counts=counts)
             print(f'VDL ingest: receipt reconciliation failed: {exc}', flush=True)
             print(f'VDL ingest: startup scan failed; {counts}', flush=True)
             return
@@ -4715,6 +4807,7 @@ class IngestStartupImporter:
                 print(f'VDL ingest: could not add {relative_path!r}: {exc}', flush=True)
             else:
                 counts['imported'] += 1
+        _log_ingest_event('batch-complete', counts=counts)
         print(f'VDL ingest: startup scan complete; {counts}', flush=True)
 
 
@@ -6701,7 +6794,7 @@ def _is_allowed_download_path(path):
     # change, including rows whose worker did not reach a finished state.
     prefs = db_get_preferences()
     allowed_bases = {os.path.realpath(prefs.get('download_dir', '.'))}
-    with sqlite3.connect(DB_PATH) as conn:
+    with db() as conn:
         rows = conn.execute(
             "SELECT DISTINCT output_dir FROM downloads "
             "WHERE output_dir IS NOT NULL"

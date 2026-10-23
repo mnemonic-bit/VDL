@@ -269,6 +269,26 @@ both volumes while VDL is stopped; `/data` contains users, password hashes,
 session signing state, download history, and preferences, while `/downloads`
 contains completed media and resumable partials.
 
+VDL enables SQLite write-ahead logging (WAL) during startup so background
+writes can coexist with authenticated reads. Keep the database on a local
+filesystem that supports SQLite shared-memory locking; do not put `/data` or
+`DOWNLOADS_DB` on NFS or SMB. The database directory must be writable so SQLite
+can create its `-wal` and `-shm` sidecar files. Startup fails if WAL cannot be
+enabled. See [SQLite's WAL requirements](https://www.sqlite.org/wal.html).
+
+Stop all processes using the database before copying the entire data directory,
+including any sidecar files. Copying only `downloads.db` from a running server
+can omit committed changes in its WAL. For a live database backup, use the
+[SQLite backup API](https://www.sqlite.org/backup.html) instead.
+
+Database lock waits are limited to one second per operation. Unhandled lock
+errors, including account lookups, return HTTP 503 with `code: "database_busy"`
+and `Retry-After: 1`; account checks still require a fresh database read. The UI
+retries affected reads up to twice and displays an error if contention persists.
+Actions that change data are never replayed automatically. Slow database
+operations and lock failures log the operation, thread, execution/commit
+timings, and SQLite result code without SQL parameters.
+
 Upgrades are immutable and reviewed: update image digests and dependency pins,
 update `requirements-container.constraints`, regenerate
 `requirements-container.txt` for both `manylinux_2_17_x86_64` and

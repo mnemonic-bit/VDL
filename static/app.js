@@ -136,19 +136,44 @@ function hideServerStatus() {
     document.getElementById('versionFooter').classList.remove('server-unavailable');
 }
 
-function apiFetch(url, options) {
-    return fetch(url, options).then(res => {
-        hideServerStatus();
-        if (res.status === 401) {
-            window.location.assign('/login');
-            throw new Error('Your session has ended. Sign in again.');
+async function apiFetch(url, options) {
+    const safeRead = (options?.method || 'GET').toUpperCase() === 'GET';
+    try {
+        for (let retry = 0; ; retry++) {
+            options?.signal?.throwIfAborted();
+            const res = await fetch(url, options);
+            if (res.status === 401) {
+                window.location.assign('/login');
+                throw new Error('Your session has ended. Sign in again.');
+            }
+            if (safeRead && res.status === 503) {
+                const data = await res.clone().json().catch(() => ({}));
+                // Only the server's explicit contention response is safe to
+                // recover automatically. Replaying a mutation can duplicate work.
+                if (data.code === 'database_busy' && data.retryable === true) {
+                    if (retry < 2) {
+                        const retryAfter = res.headers.get('Retry-After');
+                        const seconds = retryAfter === null ? NaN : Number(retryAfter);
+                        const delay = Number.isFinite(seconds)
+                            ? seconds * 1000
+                            : Date.parse(retryAfter) - Date.now();
+                        await new Promise(resolve => setTimeout(
+                            resolve, Number.isFinite(delay)
+                                ? Math.min(2000, Math.max(0, delay)) : 250,
+                        ));
+                        continue;
+                    }
+                    throw new Error(data.error || 'Database is busy. Try again shortly.');
+                }
+            }
+            hideServerStatus();
+            return res;
         }
-        return res;
-    }).catch(err => {
+    } catch (err) {
         if (err.name === 'AbortError') throw err;
         showServerStatus();
         throw err;
-    });
+    }
 }
 
 function hideActionError() {
@@ -3083,7 +3108,17 @@ document.getElementById('duplicatesRefresh').addEventListener('click', async eve
     }
 });
 
+let historyRefreshError = '';
+
 function updateHistoryEmptyState() {
+    if (historyRefreshError) {
+        document.getElementById('historyEmptyTitle').textContent = 'Could not load downloads';
+        document.getElementById('historyEmptyMessage').textContent = historyRefreshError;
+        document.getElementById('historyEmptyAction').hidden = true;
+        document.getElementById('historyEmpty').style.display =
+            historyTotal || visiblePlaylistCount ? 'none' : '';
+        return;
+    }
     const hasFilter = searchTerms.length > 0;
     const playlistValues = searchPlaylistValues();
     const playlistOnly = playlistValues.includes('yes')
@@ -3201,11 +3236,27 @@ function fetchHistory({ sortFavorites = false } = {}) {
         return Promise.resolve();
     }
 
+    const readCollection = url => apiFetch(url).then(async res => {
+        if (!res.ok) {
+            const data = await res.json().catch(() => ({}));
+            throw new Error(data.error || res.statusText || `Request failed (${res.status})`);
+        }
+        return res.json();
+    });
     return Promise.all([
-        apiFetch('/api/library').then(res => res.json()),
-        apiFetch('/api/current-downloads').then(res => res.json()),
+        readCollection('/api/library'),
+        readCollection('/api/current-downloads'),
     ]).then(([library, current]) => library.concat(current))
     .then(data => {
+        if (historyRefreshError) {
+            // A recovered refresh must not dismiss an unrelated action error.
+            for (const id of ['actionError', 'newDownloadError', 'settingsError', 'currentDrawerError']) {
+                if (document.getElementById(`${id}Message`).textContent === historyRefreshError) {
+                    document.getElementById(id).hidden = true;
+                }
+            }
+            historyRefreshError = '';
+        }
         const itemCount = document.getElementById('itemCount');
         itemCount.textContent = `${data.length} ${data.length === 1 ? 'item' : 'items'}`;
         if (historyRefreshBlocked()) {
@@ -3383,6 +3434,12 @@ function fetchHistory({ sortFavorites = false } = {}) {
         } else {
             badge.hidden = true;
         }
+    }).catch(err => {
+        if (err.name === 'AbortError') return;
+        historyRefreshError = `Could not refresh Library and Current Downloads. ${err.message || 'Try again shortly.'}`;
+        showActionError(historyRefreshError);
+        document.getElementById('currentEmpty').textContent = historyRefreshError;
+        updateHistoryEmptyState();
     });
 }
 
