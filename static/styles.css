@@ -1,4 +1,6 @@
 :root {
+    /* Native steppers and unchecked boxes follow the same theme as our surfaces. */
+    color-scheme: light;
     --bg:           #ffffff;
     --fg:           #1a1a1a;
     --muted:        #555555;
@@ -38,6 +40,7 @@
     --drop-panel:   rgba(31,138,59,0.10);
 }
 html[data-theme="dark"] {
+    color-scheme: dark;
     --bg:           #1a1d21;
     --fg:           #e6e6e6;
     --muted:        #a8acb3;

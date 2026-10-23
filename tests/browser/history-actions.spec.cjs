@@ -533,6 +533,11 @@ test('History preview labels show compact quality and clear new after playback',
 });
 
 test('hover previews wait before loading and only play one montage at a time', async ({ page }) => {
+    // Keep thumbnail decoding independent of the hover lifecycle under test.
+    await page.route(/\/api\/thumbnail\/hover0[12](?:\?|$)/, route => route.fulfill({
+        contentType: 'image/svg+xml',
+        body: '<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><rect width="4" height="4" fill="green"/></svg>',
+    }));
     await seed(page, {
         id: 'hover01', status: 'finished', file: true,
         name: 'hover-one.mp4', title: 'Hover one', resolution: '720p',
@@ -561,13 +566,8 @@ test('hover previews wait before loading and only play one montage at a time', a
     const second = page.locator('[data-row-id="hover02"] .history-preview');
     const firstVideo = first.locator('.history-preview-video');
     const secondVideo = second.locator('.history-preview-video');
-    // The browser fixture stores sentinel bytes instead of real video, so its
-    // thumbnail endpoint intentionally fails. Clear that unrelated fallback
-    // state to exercise the hover lifecycle in isolation.
-    await expect(first).toHaveClass(/thumbnail-unavailable/);
-    await expect(second).toHaveClass(/thumbnail-unavailable/);
-    await first.evaluate(element => element.classList.remove('thumbnail-unavailable'));
-    await second.evaluate(element => element.classList.remove('thumbnail-unavailable'));
+    await expect(first).not.toHaveClass(/thumbnail-unavailable/);
+    await expect(second).not.toHaveClass(/thumbnail-unavailable/);
     await expect(firstVideo).not.toHaveAttribute('src', /./);
     await expect(first.locator('.history-preview-quality')).toHaveText('720p');
     await expect(first.locator('.history-preview-quality')).toBeVisible();

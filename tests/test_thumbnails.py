@@ -188,7 +188,10 @@ class ThumbnailTest(AppCase):
                 image.write(b"new-frame")
             return True
 
-        with mock.patch.object(vdl, "generate_video_thumbnail", side_effect=generate) as generator:
+        # A failed source gets a quiet interval before another decode attempt.
+        retry_at = vdl.time.monotonic() + vdl._THUMBNAIL_FAILURE_COOLDOWN + 1
+        with mock.patch.object(vdl.time, "monotonic", return_value=retry_at), \
+                mock.patch.object(vdl, "generate_video_thumbnail", side_effect=generate) as generator:
             first = self.client.get("/api/thumbnail/test0001?v=2")
             second = self.client.get("/api/thumbnail/test0001?v=2")
         self.assertEqual(first.data, b"new-frame")

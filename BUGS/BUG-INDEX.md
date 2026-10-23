@@ -155,15 +155,18 @@ reporter observed this while ingestion was adding and shifting video cards;
 that connection remains unconfirmed. A follow-up report on 2026-10-20 described
 the same apparent timestamp carryover and raised possible network or server
 delay during heavy folder import; reproducibility and cause remain unconfirmed.
-Issue 50 was reported on 2026-10-21. In dark mode, numeric-input up/down
-buttons, including those for Max concurrent downloads, remain light, and
-unchecked checkboxes have white backgrounds despite their green checked
-state. Browser details, independent reproduction, and cause remain unconfirmed.
-Issue 51 was reported on 2026-10-21. The Settings quick-index reaches its
-sticky position beneath the page title, but its highlighted entry does not
-follow further scrolling through the options. It should identify the topmost
-visible options section in either scroll direction. Independent reproduction
-and cause remain unconfirmed.
+Issue 50 was reported on 2026-10-21 and resolved in version `0.46.3` on
+2026-10-23. Numeric-input buttons and unchecked checkboxes retained their light
+native appearance because the page did not declare its effective color scheme.
+Native controls now inherit the selected light or dark scheme. Keyboard,
+persistence, and system-theme regressions pass, with visual verification in
+Chromium, Firefox, and WebKit.
+Issue 51 was reported on 2026-10-21 and resolved in version `0.46.4` on
+2026-10-23. The Settings quick-index only changed after clicks or searches,
+leaving it stale during manual scrolling. It now follows the visible section
+in both directions, accounts for overlapping sticky headers on mobile, and
+reconciles after resizing, filtering, layout changes, and reopening Settings.
+Browser regressions cover desktop/mobile viewports and navigation boundaries.
 Issue 52 was reported on 2026-10-22 after a GitHub push failed CodeQL analysis
 with a configuration-version mismatch. Git history confirms that Dependabot
 commit `cadc995` advanced only `analyze` to `4.38.2`, leaving `init` at
@@ -182,14 +185,18 @@ reads twice and preserves rows with a visible error if refresh still fails.
 Concurrency regressions cover large writes, old readers, ingest publication,
 authorization recovery, and atomic rollback. The production lock holder remains
 unknown; active-import progress UI remains follow-up work.
-Issue 54 was reported and investigated on 2026-10-23. With approximately
-2,000 Library videos, slow collection refreshes can overlap without a bound,
-delay accepted Current Downloads, replace thumbnails together, and leave a
-failed initial load displaying "No downloads yet". Isolated measurements found
-4,002 SQLite connections and 2,000 repeated allowlist scans per 2,000-item
-Library request. Browser reproductions confirm request accumulation, coupled
-rendering, stale-response regression, image replacement, and false-empty UI.
-The production trigger for minute-long waits and application fixes remain open.
+Issue 54 was reported, investigated, and corrected on 2026-10-23. With
+approximately 2,000 Library videos, unbounded overlapping refreshes amplified
+slow responses, hid accepted Current Downloads, and repeatedly replaced
+thumbnails. Version `0.46.2` bounds refreshes per collection, renders Current
+independently, preserves cards and previews, distinguishes loading/failure from
+empty state, and bounds thumbnail generation with capacity-aware retries.
+Request-local directory snapshots reduce a 2,000-item Library response from
+2,000 allowlist scans and 4,002 connections to one scan and three closed
+connections. Status/tag filtering now runs in SQL. Deterministic backend and
+browser regressions cover delayed/failed requests, sustained events, queued
+acceptance, navigation intent, stable images and retained controls. The original
+production trigger for minute-long waits remains unverified.
 
 ## Bug reports
 

@@ -200,8 +200,7 @@ test('Clear History is grouped in the Danger Zone section', async ({ page }) => 
     await expect(dangerZone.getByRole(
         'button', { name: 'Clear History', exact: true })).toBeVisible();
     await page.getByRole('button', { name: 'Danger Zone', exact: true }).click();
-    await expect(page.getByRole('button', { name: 'Danger Zone', exact: true }))
-        .toHaveAttribute('aria-current', 'page');
+    await expect(dangerZone).toBeInViewport();
 });
 
 test('saved full-screen playback preference requests full screen for the overlay', async ({ page }) => {

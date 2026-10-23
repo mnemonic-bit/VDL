@@ -1,14 +1,66 @@
-## 54. [Open] Live refresh overload stalls the download UI
+## 54. [Resolved] Live refresh overload stalls the download UI
 
 **Severity:** High — ordinary progress events can accumulate expensive requests,
 hide accepted downloads, replace thumbnails repeatedly, and leave a failed
 initial load looking like an empty library.
 
-**Status:** Investigated on 2026-10-23 against `acc531f`, version `0.46.0`.
-Several mechanisms are reproduced independently. No application fix is applied.
-The initiating condition and minute-long request timings in the reporter's
-deployment remain unverified. Related database contention is tracked separately
-in [bug 0053](bug-0053-database-locks-fail-authenticated-api-requests.md).
+**Status:** Resolved in version `0.46.2` on 2026-10-23. The application
+amplification defects are fixed and covered by deterministic backend and browser
+regressions. The initiating condition and minute-long request timings in the
+reporter's deployment remain unverified. Database contention was addressed
+separately in [bug 0053](bug-0053-database-locks-fail-authenticated-api-requests.md).
+
+### Implemented repair
+
+- Every collection has one outstanding refresh and one dirty follow-up, shared
+  by SSE, manual refreshes, and action callbacks. Progress is coalesced over
+  150 ms and known Current updates refresh Current alone; a row leaving Current
+  also refreshes Library and Playlists. Attempt-history page/filter changes
+  invalidate older intent without starving refreshes under sustained events.
+- Library and Current render independently. Initial loading, confirmed-empty,
+  and failed refreshes have distinct states; failed reads preserve existing
+  cards. Transient collection failures retry twice with bounded delays. Each
+  collection retains its own failure until it recovers, and unrelated successes
+  cannot clear a failed health check.
+- Cards reconcile by stable id and changed generated markup, preserving healthy
+  thumbnail elements, hover videos, focus, menus, and pressed-action protection.
+  Retained tag editors use delegated handlers; favorite and visibility controls
+  explicitly re-enable after their mutation completes.
+- Trusted directories are snapshotted once per request or background batch,
+  using deterministically closed connections. Realpath confinement, historical
+  worker output directories, and per-user visibility remain enforced. Library
+  and Current filter statuses and associated tags in SQL.
+- Thumbnail cache misses share per-file generation, with at most two concurrent
+  request-triggered decoders and a 30-second failure cooldown. Busy requests
+  return immediately. Image retries distinguish temporary capacity responses
+  from failures, back off and spread capacity retries, and bound repeated
+  decode/network failures without replacing healthy images.
+
+The backend regression checks query and connection counts at different library
+sizes. A local 2,000-item authenticated request now uses **one allowlist scan
+and three closed connections**, versus 2,000 scans and 4,002 connections in the
+original investigation; the traced request took approximately **101 ms**.
+These fixture measurements do not predict deployment latency.
+
+The Python 3.12 unit gate passes with **91.4%** `vdl.py` line coverage
+(4,882/5,342 executable lines; required minimum 90%). Permanent regressions live
+in `tests/test_live_refresh.py` and
+`tests/browser/live-refresh-overload.spec.cjs`; existing interaction suites
+cover the preserved controls and menus. The final related browser run passes
+all 58 checks, including ten new overload regressions; all 20 standalone
+JavaScript checks also pass.
+
+Library still returns its full visible collection and stored format metadata;
+backend pagination/projection, progress persistence sampling, and overall probe
+extraction budgets remain possible future scaling work. None is required to
+bound the repaired refresh pipeline. Production timing correlation is still
+needed to identify the deployment's original slowdown.
+
+### Historical investigation
+
+The sections below record the diagnosis against `acc531f`, version `0.46.0`,
+before this repair. Their source line references and expected failing outcomes
+refer to that revision.
 
 ### Report and conclusion
 

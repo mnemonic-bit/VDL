@@ -13,6 +13,183 @@ function thumbnailUrl(id) {
     return `/api/thumbnail/${encodeURIComponent(id)}?v=${THUMBNAIL_CACHE_VERSION}`;
 }
 
+// Each collection owns its request and one dirty bit, including calls from
+// actions and manual refreshes. Slow Library reads must not stall Current.
+const collectionRefreshes = new Map();
+const collectionErrors = new Map();
+const collectionSnapshots = { library: [], current: [] };
+let libraryLoaded = false;
+let currentLoaded = false;
+let requestedFavoriteSort = false;
+
+function coordinateRefresh(key, load) {
+    let state = collectionRefreshes.get(key);
+    if (!state) {
+        state = { dirty: false, promise: null };
+        collectionRefreshes.set(key, state);
+    }
+    state.dirty = true;
+    if (state.promise) return state.promise;
+    state.promise = (async () => {
+        do {
+            state.dirty = false;
+            await load();
+            if (state.dirty) await new Promise(resolve => setTimeout(resolve, 150));
+        } while (state.dirty);
+    })().finally(() => { state.promise = null; });
+    return state.promise;
+}
+
+function updateCollectionError(key, message = '') {
+    const previous = historyRefreshError;
+    if (message) collectionErrors.set(key, message);
+    else collectionErrors.delete(key);
+    historyRefreshError = [...collectionErrors.values()].join(' ');
+    if (previous) {
+        for (const id of ['actionError', 'newDownloadError', 'settingsError', 'currentDrawerError']) {
+            if (document.getElementById(`${id}Message`).textContent === previous) {
+                document.getElementById(id).hidden = true;
+            }
+        }
+    }
+    if (historyRefreshError) showActionError(historyRefreshError);
+    updateHistoryEmptyState();
+}
+
+async function readCollection(url) {
+    for (let retry = 0; ; retry++) {
+        try {
+            const response = await apiFetch(url);
+            if (!response.ok) {
+                const data = await response.json().catch(() => ({}));
+                throw Object.assign(new Error(data.error || response.statusText || `Request failed (${response.status})`), {
+                    retryable: response.status >= 500 && data.code !== 'database_busy',
+                });
+            }
+            const data = await response.json();
+            if (!Array.isArray(data)) throw new Error('Invalid collection response.');
+            return data;
+        } catch (error) {
+            if (error.name === 'AbortError' || error.retryable === false || retry >= 2) throw error;
+            await new Promise(resolve => setTimeout(resolve, 500 * (retry + 1)));
+        }
+    }
+}
+
+const renderedTemplates = new WeakMap();
+
+// Compare generated markup with its previous version, rather than the live
+// DOM: hover playback, focus, image failures and animations own runtime state.
+function patchRenderedNode(node, before, after) {
+    if (before.isEqualNode(after)) return;
+    if (before.nodeType !== after.nodeType || before.nodeName !== after.nodeName) {
+        if (node.contains?.(activeHoverPreview) || node.contains?.(pendingHoverPreview)) stopHoverPreview();
+        node.replaceWith(after.cloneNode(true));
+        return;
+    }
+    if (after.nodeType !== Node.ELEMENT_NODE) {
+        node.nodeValue = after.nodeValue;
+        return;
+    }
+    for (const attr of before.attributes) {
+        if (!after.hasAttribute(attr.name)) node.removeAttribute(attr.name);
+    }
+    for (const attr of after.attributes) {
+        if (before.getAttribute(attr.name) === attr.value) continue;
+        if (attr.name === 'class') {
+            const oldClasses = new Set(before.classList);
+            const newClasses = new Set(after.classList);
+            for (const name of oldClasses) if (!newClasses.has(name)) node.classList.remove(name);
+            for (const name of newClasses) if (!oldClasses.has(name)) node.classList.add(name);
+        } else {
+            node.setAttribute(attr.name, attr.value);
+        }
+    }
+    const oldChildren = [...before.childNodes];
+    const newChildren = [...after.childNodes];
+    const liveChildren = [...node.childNodes];
+    for (let i = 0; i < Math.max(oldChildren.length, newChildren.length); i++) {
+        if (!oldChildren[i]) node.appendChild(newChildren[i].cloneNode(true));
+        else if (!newChildren[i]) liveChildren[i]?.remove();
+        else if (liveChildren[i]) patchRenderedNode(liveChildren[i], oldChildren[i], newChildren[i]);
+    }
+}
+
+function reconcileCards(list, entries, render, idAttribute) {
+    const existing = new Map([...list.children].map(node => [node.getAttribute(idAttribute), node]));
+    entries.forEach((entry, index) => {
+        const id = String(entry.id);
+        let node = existing.get(id);
+        const template = document.createElement('template');
+        template.innerHTML = render(entry).trim();
+        const next = template.content.firstElementChild;
+        const before = node && renderedTemplates.get(node);
+        if (!node || !before) {
+            node = next.cloneNode(true);
+        } else {
+            patchRenderedNode(node, before, next);
+        }
+        renderedTemplates.set(node, next);
+        // Moving an unchanged focused card can blur it or restart its video.
+        if (list.children[index] !== node) list.insertBefore(node, list.children[index] || null);
+        existing.delete(id);
+    });
+    for (const node of existing.values()) {
+        if (node.contains(activeHoverPreview) || node.contains(pendingHoverPreview)) stopHoverPreview();
+        node.remove();
+    }
+}
+
+function retryThumbnail(image) {
+    (image.closest('.history-preview') || image).classList.add('thumbnail-unavailable');
+    scheduleThumbnailRetry(image);
+}
+
+function scheduleThumbnailRetry(image, delay = 1000) {
+    if (image.dataset.thumbnailRetryPending || Number(image.dataset.thumbnailFailures || 0) >= 3) return;
+    image.dataset.thumbnailRetryPending = '1';
+    setTimeout(async () => {
+        if (!image.isConnected) {
+            delete image.dataset.thumbnailRetryPending;
+            return;
+        }
+        try {
+            // Image error events omit HTTP status. HEAD distinguishes decoder
+            // capacity from a failed file, without downloading image bytes.
+            const response = await fetch(image.src, { method: 'HEAD' });
+            delete image.dataset.thumbnailRetryPending;
+            const retryAfter = Number(response.headers.get('Retry-After')) * 1000;
+            if (response.status === 503) {
+                const busy = Number(image.dataset.thumbnailBusy || 0) + 1;
+                image.dataset.thumbnailBusy = String(busy);
+                // Capacity waits don't spend the failure budget. Spread retries
+                // so a large uncached page can eventually fill every thumbnail.
+                scheduleThumbnailRetry(image, Math.max(
+                    retryAfter || 0, Math.min(30000, 1000 * 2 ** Math.min(busy, 5)),
+                ) + Math.random() * 1000);
+            } else if (response.ok) {
+                image.dataset.thumbnailFailures = String(Number(image.dataset.thumbnailFailures || 0) + 1);
+                const url = new URL(image.src);
+                url.searchParams.set('retry', String(Date.now()));
+                image.src = url.href;
+            } else if (response.status !== 401 && response.status !== 403) {
+                image.dataset.thumbnailFailures = String(Number(image.dataset.thumbnailFailures || 0) + 1);
+                scheduleThumbnailRetry(image, Math.max(5000, Math.min(30000, retryAfter || 0)));
+            }
+        } catch (_) {
+            delete image.dataset.thumbnailRetryPending;
+            image.dataset.thumbnailFailures = String(Number(image.dataset.thumbnailFailures || 0) + 1);
+            scheduleThumbnailRetry(image, 5000);
+        }
+    }, delay);
+}
+
+function thumbnailLoaded(image) {
+    delete image.dataset.thumbnailFailures;
+    delete image.dataset.thumbnailBusy;
+    (image.closest('.history-preview') || image).classList.remove('thumbnail-unavailable');
+}
+
 const favicon = document.getElementById('appFavicon');
 const idleFaviconHref = favicon ? favicon.getAttribute('href') : '';
 const appTitleIcon = document.getElementById('appTitleIcon');
@@ -126,12 +303,18 @@ function updateProgressIndicators(downloads) {
     updateFavicon(aggregate);
 }
 
-function showServerStatus() {
+function showServerStatus(source = 'events') {
+    source = source === '/api/health' || source === 'events' ? source : 'api';
+    showServerStatus.failures ||= new Set();
+    showServerStatus.failures.add(source);
     document.getElementById('serverStatus').hidden = false;
     document.getElementById('versionFooter').classList.add('server-unavailable');
 }
 
-function hideServerStatus() {
+function hideServerStatus(source = 'events') {
+    source = source === '/api/health' || source === 'events' ? source : 'api';
+    showServerStatus.failures?.delete(source);
+    if (showServerStatus.failures?.size) return;
     document.getElementById('serverStatus').hidden = true;
     document.getElementById('versionFooter').classList.remove('server-unavailable');
 }
@@ -144,7 +327,7 @@ async function apiFetch(url, options) {
             const res = await fetch(url, options);
             if (res.status === 401) {
                 window.location.assign('/login');
-                throw new Error('Your session has ended. Sign in again.');
+                throw Object.assign(new Error('Your session has ended. Sign in again.'), { retryable: false });
             }
             if (safeRead && res.status === 503) {
                 const data = await res.clone().json().catch(() => ({}));
@@ -163,15 +346,15 @@ async function apiFetch(url, options) {
                         ));
                         continue;
                     }
-                    throw new Error(data.error || 'Database is busy. Try again shortly.');
+                    throw Object.assign(new Error(data.error || 'Database is busy. Try again shortly.'), { retryable: false });
                 }
             }
-            hideServerStatus();
+            hideServerStatus(url);
             return res;
         }
     } catch (err) {
         if (err.name === 'AbortError') throw err;
-        showServerStatus();
+        showServerStatus(url);
         throw err;
     }
 }
@@ -461,7 +644,7 @@ function checkHealth() {
             updateUptime(data && data.uptime_seconds, false);
         })
         .catch(() => {
-            showServerStatus();
+            showServerStatus('/api/health');
             updateApiVersion(null, true);
             updateUptime(null, true);
         });
@@ -1187,8 +1370,13 @@ function tagRemove(id, tag) {
 
 function bindTagEditors() {
     document.querySelectorAll('.tag-display-row').forEach(row => {
-        row.addEventListener('click', () => tagEditStart(row.dataset.tagId));
+        if (row.dataset.tagDisplayBound) return;
+        row.dataset.tagDisplayBound = '1';
+        row.addEventListener('click', () => {
+            if (row.classList.contains('tag-display-row')) tagEditStart(row.dataset.tagId);
+        });
         row.addEventListener('keydown', event => {
+            if (!row.classList.contains('tag-display-row')) return;
             if (event.key === 'Enter' || event.key === ' ') {
                 event.preventDefault();
                 tagEditStart(row.dataset.tagId);
@@ -1196,9 +1384,14 @@ function bindTagEditors() {
         });
     });
     document.querySelectorAll('.tag-editor-shell').forEach(shell => {
+        if (shell.dataset.tagEditorBound) return;
+        shell.dataset.tagEditorBound = '1';
         const id = shell.dataset.tagId;
-        const input = shell.querySelector('.tag-entry-input');
-        input.addEventListener('input', () => {
+        // Children change as chips and suggestions arrive; bind at the shell
+        // so retained editors always act on their current input and buttons.
+        shell.addEventListener('input', event => {
+            if (!event.target.matches('.tag-entry-input')) return;
+            const input = event.target;
             tagDrafts.set(id, input.value);
             const suggestions = shell.querySelector('.tag-entry-suggestions');
             const info = { tags: Array.from(shell.querySelectorAll('[data-remove-tag]')).map(button => button.dataset.removeTag) };
@@ -1206,13 +1399,13 @@ function bindTagEditors() {
             suggestions.innerHTML = html;
             suggestions.hidden = !html;
             input.setAttribute('aria-expanded', String(Boolean(html)));
-            bindTagSuggestionButtons(shell);
         });
-        input.addEventListener('keydown', event => {
+        shell.addEventListener('keydown', event => {
+            if (!event.target.matches('.tag-entry-input')) return;
             if (event.key === 'Enter' || event.key === ',') {
                 event.preventDefault();
                 tagCommit(id);
-            } else if (event.key === 'Backspace' && !input.value) {
+            } else if (event.key === 'Backspace' && !event.target.value) {
                 const buttons = shell.querySelectorAll('[data-remove-tag]');
                 const last = buttons[buttons.length - 1];
                 if (last) {
@@ -1221,41 +1414,33 @@ function bindTagEditors() {
                 }
             } else if (event.key === 'Escape') {
                 event.preventDefault();
+                event.stopPropagation();
                 tagEditStop(id);
             }
         });
-        input.addEventListener('blur', () => {
+        shell.addEventListener('focusout', event => {
+            const input = event.target;
+            if (!input.matches('.tag-entry-input')) return;
             setTimeout(() => {
-                // SSE/API reconciliation can replace the whole row while the
-                // editor remains logically open. Ignore blur from that stale
-                // node; the newly rendered input owns the current session.
-                if (!document.body.contains(shell)) return;
+                // Reconciliation can remove an input while retaining its shell.
+                // A stale blur must not close a newly opened editing session.
+                if (!shell.isConnected || !input.isConnected) return;
                 if (!shell.contains(document.activeElement)) tagEditStop(id);
             }, 0);
         });
-        shell.querySelectorAll('[data-remove-tag]').forEach(button => {
-            button.addEventListener('mousedown', event => event.preventDefault());
-            button.addEventListener('click', event => {
+        shell.addEventListener('mousedown', event => {
+            if (event.target.closest('[data-remove-tag], [data-suggest-tag]')) event.preventDefault();
+        });
+        shell.addEventListener('click', event => {
+            const remove = event.target.closest('[data-remove-tag]');
+            const suggestion = event.target.closest('[data-suggest-tag]');
+            if (remove || suggestion) {
                 event.stopPropagation();
-                tagRemove(id, button.dataset.removeTag);
-            });
-        });
-        bindTagSuggestionButtons(shell);
-        shell.querySelector('.tag-token-input').addEventListener('click', event => {
-            if (!event.target.closest('button')) input.focus();
-        });
-    });
-}
-
-function bindTagSuggestionButtons(shell) {
-    const id = shell.dataset.tagId;
-    shell.querySelectorAll('[data-suggest-tag]').forEach(button => {
-        button.addEventListener('mousedown', event => event.preventDefault());
-        button.addEventListener('click', event => {
-            // Committing rebuilds the suggestions synchronously, detaching the
-            // button before its click can reach the outside-popover handler.
-            event.stopPropagation();
-            tagCommit(id, button.dataset.suggestTag);
+                if (remove) tagRemove(id, remove.dataset.removeTag);
+                else tagCommit(id, suggestion.dataset.suggestTag);
+            } else if (!event.target.closest('button')) {
+                shell.querySelector('.tag-entry-input')?.focus();
+            }
         });
     });
 }
@@ -1440,7 +1625,7 @@ function toggleFavorite(button) {
         .catch(() => {
             button.disabled = false;
             return fetchHistory();
-        });
+        }).finally(() => { button.disabled = false; });
 }
 
 function changeDownloadVisibility(select) {
@@ -1462,7 +1647,7 @@ function changeDownloadVisibility(select) {
             select.value = previous;
             select.disabled = false;
             return fetchHistory();
-        });
+        }).finally(() => { select.disabled = false; });
 }
 
 function clearHistory() {
@@ -2097,7 +2282,7 @@ function renderPlaylistMosaic(playlist) {
     if (!ids.length) {
         return '<div class="playlist-mosaic-empty"><svg aria-hidden="true"><use href="#i-playlist"/></svg><span>No videos yet</span></div>';
     }
-    return ids.map(id => `<img src="${thumbnailUrl(id)}" alt="" loading="lazy" onerror="this.classList.add('thumbnail-unavailable')">`).join('');
+    return ids.map(id => `<img src="${thumbnailUrl(id)}" alt="" loading="lazy" onerror="retryThumbnail(this)" onload="thumbnailLoaded(this)">`).join('');
 }
 
 function renderPlaylistCard(playlist) {
@@ -2133,16 +2318,19 @@ function renderPlaylists() {
     shelf.hidden = visible.length === 0;
     document.getElementById('playlistShelfCount').textContent =
         `${visible.length} ${visible.length === 1 ? 'playlist' : 'playlists'}`;
-    document.getElementById('playlistList').innerHTML = visible.length
-        ? visible.map(renderPlaylistCard).join('')
-        : '';
+    reconcileCards(document.getElementById('playlistList'), visible, renderPlaylistCard, 'data-playlist-id');
     updateHistoryEmptyState();
 }
 
 function fetchPlaylists() {
-    return apiFetch('/api/playlists').then(response => response.json()).then(data => {
-        playlistSummaries = Array.isArray(data) ? data : [];
-        renderPlaylists();
+    return coordinateRefresh('playlists', async () => {
+        try {
+            playlistSummaries = await readCollection('/api/playlists');
+            renderPlaylists();
+            updateCollectionError('playlists');
+        } catch (error) {
+            if (error.name !== 'AbortError') updateCollectionError('playlists', `Could not refresh Playlists. ${error.message}`);
+        }
     });
 }
 
@@ -2468,7 +2656,7 @@ function renderHistoryCard(info) {
                 <div class="history-preview-wrap">
                     <button class="history-preview${mediaDuration ? ' has-preview-duration' : ''}" type="button" data-play-action data-download-id="${escapeAttr(id)}" data-play-label="${escapeAttr(playLabel)}" data-play-ext="${escapeAttr(playExt)}" aria-label="Play">
                         <span class="history-preview-fallback"><svg><use href="#i-camera"/></svg><span>No video preview</span></span>
-                        <img src="${thumbnailUrl(id)}" alt="" loading="lazy" onerror="this.closest('.history-preview').classList.add('thumbnail-unavailable')">
+                        <img src="${thumbnailUrl(id)}" alt="" loading="lazy" onerror="retryThumbnail(this)" onload="thumbnailLoaded(this)">
                         <video class="history-preview-video" muted playsinline loop preload="none" aria-hidden="true"></video>
                         ${newBadge}
                         ${qualityBadge}
@@ -2864,9 +3052,19 @@ function attemptRowHtml(info) {
     </div>`;
 }
 
-async function fetchAttemptHistory() {
+let attemptIntent = '';
+function fetchAttemptHistory() {
+    const intent = JSON.stringify([attemptPage, document.getElementById('attemptSearchInput').value, libraryView]);
+    if (intent !== attemptIntent) {
+        ++attemptRequest;
+        attemptIntent = intent;
+    }
+    return coordinateRefresh('attempts', loadAttemptHistory);
+}
+
+async function loadAttemptHistory() {
     if (!attemptHistoryOpen || libraryView === 'duplicates') return;
-    const generation = ++attemptRequest;
+    const generation = attemptRequest;
     const filter = document.getElementById('attemptSearchInput').value;
     try {
         const response = await apiFetch(`/api/history?${new URLSearchParams({ filter, page: attemptPage, page_size: 20 })}`);
@@ -3047,7 +3245,11 @@ function renderDuplicates(data) {
             : 'No duplicate media found.'}</p>`;
 }
 
-async function fetchDuplicates() {
+function fetchDuplicates() {
+    return coordinateRefresh('duplicates', loadDuplicates);
+}
+
+async function loadDuplicates() {
     if (libraryView !== 'duplicates') return;
     const request = ++duplicatesRequest;
     try {
@@ -3111,6 +3313,13 @@ document.getElementById('duplicatesRefresh').addEventListener('click', async eve
 let historyRefreshError = '';
 
 function updateHistoryEmptyState() {
+    if (!libraryLoaded && !historyRefreshError) {
+        document.getElementById('historyEmptyTitle').textContent = 'Loading Library…';
+        document.getElementById('historyEmptyMessage').textContent = 'Fetching your downloads.';
+        document.getElementById('historyEmptyAction').hidden = true;
+        document.getElementById('historyEmpty').style.display = '';
+        return;
+    }
     if (historyRefreshError) {
         document.getElementById('historyEmptyTitle').textContent = 'Could not load downloads';
         document.getElementById('historyEmptyMessage').textContent = historyRefreshError;
@@ -3173,6 +3382,9 @@ if ('IntersectionObserver' in window) {
 }
 
 function animateInsertedItem(element, pendingAnimations, id) {
+    // A second collection can reconcile before animationstart; the retained
+    // node already owns its natural height and must not measure its collapse.
+    if (element.classList.contains('item-fade-in')) return;
     // Rows vary with their metadata, so animate toward the natural box size
     // instead of leaving every completed row under a guessed height limit.
     const style = getComputedStyle(element);
@@ -3230,217 +3442,222 @@ function goToPage(target) {
 }
 
 function fetchHistory({ sortFavorites = false } = {}) {
+    requestedFavoriteSort ||= sortFavorites;
     if (historyRefreshBlocked()) {
         historyFetchDeferred = true;
         historyFavoriteSortDeferred ||= sortFavorites;
         return Promise.resolve();
     }
+    updateHistoryEmptyState();
+    return Promise.all([fetchDownloadCollection('library'), fetchDownloadCollection('current')]);
+}
 
-    const readCollection = url => apiFetch(url).then(async res => {
-        if (!res.ok) {
-            const data = await res.json().catch(() => ({}));
-            throw new Error(data.error || res.statusText || `Request failed (${res.status})`);
+function fetchDownloadCollection(key) {
+    return coordinateRefresh(key, async () => {
+        try {
+            const data = await readCollection(key === 'library' ? '/api/library' : '/api/current-downloads');
+            const removedCurrent = key === 'current' && collectionSnapshots.current.some(
+                previous => !data.some(info => info.id === previous.id));
+            collectionSnapshots[key] = data;
+            if (key === 'library') libraryLoaded = true;
+            else currentLoaded = true;
+            updateCollectionError(key);
+            const sortFavorites = key === 'library' && requestedFavoriteSort;
+            if (sortFavorites) requestedFavoriteSort = false;
+            renderDownloadCollections({ sortFavorites });
+            if (removedCurrent) {
+                fetchDownloadCollection('library');
+                fetchPlaylists();
+            }
+        } catch (error) {
+            if (error.name === 'AbortError') return;
+            const name = key === 'library' ? 'Library' : 'Current Downloads';
+            updateCollectionError(key, `Could not refresh ${name}. ${error.message || 'Try again shortly.'}`);
+            if (key === 'current') document.getElementById('currentEmpty').textContent = collectionErrors.get(key);
         }
-        return res.json();
     });
-    return Promise.all([
-        readCollection('/api/library'),
-        readCollection('/api/current-downloads'),
-    ]).then(([library, current]) => library.concat(current))
-    .then(data => {
-        if (historyRefreshError) {
-            // A recovered refresh must not dismiss an unrelated action error.
-            for (const id of ['actionError', 'newDownloadError', 'settingsError', 'currentDrawerError']) {
-                if (document.getElementById(`${id}Message`).textContent === historyRefreshError) {
-                    document.getElementById(id).hidden = true;
-                }
-            }
-            historyRefreshError = '';
+}
+
+function renderDownloadCollections({ sortFavorites = false } = {}) {
+    const data = collectionSnapshots.library.concat(collectionSnapshots.current);
+    const itemCount = document.getElementById('itemCount');
+    itemCount.textContent = `${data.length} ${data.length === 1 ? 'item' : 'items'}`;
+    if (historyRefreshBlocked()) {
+        historyFetchDeferred = true;
+        historyFavoriteSortDeferred ||= sortFavorites;
+        return;
+    }
+    updateProgressIndicators(data);
+    const active = data.filter(i => CURRENT_TAB_STATUSES.has(i.status));
+    let historyEntries = data.filter(i => HISTORY_TAB_STATUSES.has(i.status));
+    libraryEntries = historyEntries.slice();
+    renderPlaylists();
+    if (sortFavorites) {
+        historyOrdering = 'favorites_first';
+        // The API is newest-first, and modern stable sorting preserves
+        // that date order inside each favorite group.
+        historyEntries = historyEntries.slice().sort(
+            (left, right) => Number(Boolean(right.favorite))
+                - Number(Boolean(left.favorite)));
+    } else if (historyOrderIds.length) {
+        // Reconciliation must not make a card jump when its star changes.
+        // Newly completed downloads still enter first; known cards retain
+        // the order last chosen by the user or by a filter execution.
+        const knownIds = new Set(historyOrderIds);
+        const byId = new Map(historyEntries.map(info => [String(info.id), info]));
+        const unseen = historyEntries.filter(info => !knownIds.has(String(info.id)));
+        const known = historyOrderIds.map(id => byId.get(id)).filter(Boolean);
+        historyEntries = unseen.concat(known);
+    }
+    historyOrderIds = historyEntries.map(info => String(info.id));
+    refreshAvailableTags(historyEntries);
+    const done = historyEntries.filter(info => matchesSearchFilter(info));
+
+    historyTotal = done.length;
+    const endless = endlessHistoryEnabled();
+    const maxPage = endless
+        ? 0
+        : Math.max(0, Math.ceil(historyTotal / historyPageSize) - 1);
+    if (historyPage > maxPage) historyPage = maxPage;
+    const start = endless ? 0 : historyPage * historyPageSize;
+    const visibleCount = endless ? historyEndlessVisibleCount : historyPageSize;
+    const pageItems = done.slice(start, start + visibleCount);
+    historyPageItems = pageItems;
+    const sequentialAvailable = pageItems.some(
+        info => info.status === 'finished' && info.filename,
+    );
+    const shuffleAvailable = historyEntries.some(
+        info => info.status === 'finished' && info.filename,
+    );
+    document.getElementById('playbackMenuPlayAll').disabled = !sequentialAvailable;
+    document.getElementById('playbackMenuShuffle').disabled = !shuffleAvailable;
+    renderRememberedPlaybackMode();
+    document.getElementById('playbackModeToggle').disabled =
+        !sequentialAvailable && !shuffleAvailable;
+    if (document.getElementById('playbackModeToggle').disabled) {
+        closePlaybackModeMenu();
+    }
+
+    let focusRestore = null;
+    const ae = document.activeElement;
+    if (ae && ae.classList && ae.classList.contains('rename-input')) {
+        const wrap = ae.closest('.rename-wrap');
+        if (wrap && wrap.dataset.renameId) {
+            focusRestore = {
+                id: wrap.dataset.renameId,
+                selStart: ae.selectionStart,
+                selEnd: ae.selectionEnd,
+                value: ae.value,
+            };
+            const cur = renameDrafts.get(focusRestore.id);
+            if (cur) cur.value = ae.value;
         }
-        const itemCount = document.getElementById('itemCount');
-        itemCount.textContent = `${data.length} ${data.length === 1 ? 'item' : 'items'}`;
-        if (historyRefreshBlocked()) {
-            historyFetchDeferred = true;
-            return;
+    } else if (ae && ae.classList && ae.classList.contains('tag-entry-input')) {
+        const shell = ae.closest('.tag-editor-shell');
+        if (shell && shell.dataset.tagId) {
+            focusRestore = {
+                tagId: shell.dataset.tagId,
+                selStart: ae.selectionStart,
+                selEnd: ae.selectionEnd,
+            };
+            tagDrafts.set(focusRestore.tagId, ae.value);
         }
-        updateProgressIndicators(data);
-        const active = data.filter(i => CURRENT_TAB_STATUSES.has(i.status));
-        let historyEntries = data.filter(i => HISTORY_TAB_STATUSES.has(i.status));
-        libraryEntries = historyEntries.slice();
-        renderPlaylists();
-        if (sortFavorites) {
-            historyOrdering = 'favorites_first';
-            // The API is newest-first, and modern stable sorting preserves
-            // that date order inside each favorite group.
-            historyEntries = historyEntries.slice().sort(
-                (left, right) => Number(Boolean(right.favorite))
-                    - Number(Boolean(left.favorite)));
-        } else if (historyOrderIds.length) {
-            // Reconciliation must not make a card jump when its star changes.
-            // Newly completed downloads still enter first; known cards retain
-            // the order last chosen by the user or by a filter execution.
-            const knownIds = new Set(historyOrderIds);
-            const byId = new Map(historyEntries.map(info => [String(info.id), info]));
-            const unseen = historyEntries.filter(info => !knownIds.has(String(info.id)));
-            const known = historyOrderIds.map(id => byId.get(id)).filter(Boolean);
-            historyEntries = unseen.concat(known);
-        }
-        historyOrderIds = historyEntries.map(info => String(info.id));
-        refreshAvailableTags(historyEntries);
-        const done = historyEntries.filter(info => matchesSearchFilter(info));
+    }
 
-        historyTotal = done.length;
-        const endless = endlessHistoryEnabled();
-        const maxPage = endless
-            ? 0
-            : Math.max(0, Math.ceil(historyTotal / historyPageSize) - 1);
-        if (historyPage > maxPage) historyPage = maxPage;
-        const start = endless ? 0 : historyPage * historyPageSize;
-        const visibleCount = endless ? historyEndlessVisibleCount : historyPageSize;
-        const pageItems = done.slice(start, start + visibleCount);
-        historyPageItems = pageItems;
-        const sequentialAvailable = pageItems.some(
-            info => info.status === 'finished' && info.filename,
-        );
-        const shuffleAvailable = historyEntries.some(
-            info => info.status === 'finished' && info.filename,
-        );
-        document.getElementById('playbackMenuPlayAll').disabled = !sequentialAvailable;
-        document.getElementById('playbackMenuShuffle').disabled = !shuffleAvailable;
-        renderRememberedPlaybackMode();
-        document.getElementById('playbackModeToggle').disabled =
-            !sequentialAvailable && !shuffleAvailable;
-        if (document.getElementById('playbackModeToggle').disabled) {
-            closePlaybackModeMenu();
-        }
+    const currentDrawerVisible = document.getElementById('currentDownloadsDrawer').open;
 
-        let focusRestore = null;
-        const ae = document.activeElement;
-        if (ae && ae.classList && ae.classList.contains('rename-input')) {
-            const wrap = ae.closest('.rename-wrap');
-            if (wrap && wrap.dataset.renameId) {
-                focusRestore = {
-                    id: wrap.dataset.renameId,
-                    selStart: ae.selectionStart,
-                    selEnd: ae.selectionEnd,
-                    value: ae.value,
-                };
-                const cur = renameDrafts.get(focusRestore.id);
-                if (cur) cur.value = ae.value;
-            }
-        } else if (ae && ae.classList && ae.classList.contains('tag-entry-input')) {
-            const shell = ae.closest('.tag-editor-shell');
-            if (shell && shell.dataset.tagId) {
-                focusRestore = {
-                    tagId: shell.dataset.tagId,
-                    selStart: ae.selectionStart,
-                    selEnd: ae.selectionEnd,
-                };
-                tagDrafts.set(focusRestore.tagId, ae.value);
-            }
-        }
-
-        const currentDrawerVisible = document.getElementById('currentDownloadsDrawer').open;
-
-        const newActiveIds  = new Set(active.map(i => String(i.id)));
-        const newHistoryIds = new Set(pageItems.map(i => String(i.id)));
-        // An SSE burst can replace a newly inserted node before animationstart.
-        // Retry only that pre-start window; restarting an animation already in
-        // progress makes successive reconciliations keep cards in motion.
-        pendingActiveAnimations.forEach(id => {
-            if (!newActiveIds.has(id)) pendingActiveAnimations.delete(id);
-        });
-        pendingHistoryAnimations.forEach(id => {
-            if (!newHistoryIds.has(id)) pendingHistoryAnimations.delete(id);
-        });
-
-        stopHoverPreview();
-        document.getElementById('activeList').innerHTML  = active.map(i => renderItem(i, false)).join('');
-        document.getElementById('historyList').innerHTML = pageItems.map(i => renderItem(i, true)).join('');
-
-        if (currentDrawerVisible) {
-            newActiveIds.forEach(id => {
-                if (!_renderedActiveIds.has(id) || pendingActiveAnimations.has(id)) {
-                    const el = document.querySelector(`#activeList [data-row-id="${id}"]`);
-                    if (el) animateInsertedItem(el, pendingActiveAnimations, id);
-                }
-            });
-        }
-        newHistoryIds.forEach(id => {
-            if (!_renderedHistoryIds.has(id) || pendingHistoryAnimations.has(id)) {
-                const el = document.querySelector(`#historyList [data-row-id="${id}"]`);
-                if (el) animateInsertedItem(el, pendingHistoryAnimations, id);
-            }
-        });
-
-        _renderedActiveIds  = newActiveIds;
-        _renderedHistoryIds = newHistoryIds;
-
-        bindRenameInputs();
-        bindTagEditors();
-        restoreOpenHistoryInfo();
-
-        if (focusRestore) {
-            const newInput = focusRestore.tagId
-                ? document.querySelector(
-                    `.tag-editor-shell[data-tag-id="${CSS.escape(focusRestore.tagId)}"] .tag-entry-input`)
-                : document.querySelector(
-                    `.rename-wrap[data-rename-id="${focusRestore.id}"] .rename-input`);
-            if (newInput) {
-                newInput.focus();
-                try {
-                    newInput.setSelectionRange(
-                        focusRestore.selStart, focusRestore.selEnd);
-                } catch (e) { }
-            }
-        }
-
-        document.getElementById('currentEmpty').textContent = 'No current downloads.';
-        document.getElementById('currentEmpty').style.display = active.length ? 'none' : '';
-        updateHistoryEmptyState();
-
-        const pager = document.getElementById('historyPager');
-        historyEndlessSentinel.hidden = !endless || pageItems.length >= historyTotal;
-        if (!endless && historyTotal > historyPageSize) {
-            pager.style.display = '';
-            document.getElementById('pagerInfo').textContent =
-                `Page ${historyPage + 1} of ${maxPage + 1} · ${historyTotal} items`;
-            document.getElementById('pagerPrev').disabled = historyPage <= 0;
-            document.getElementById('pagerNext').disabled = historyPage >= maxPage;
-            const showJump = maxPage >= 3;
-            const first = document.getElementById('pagerFirst');
-            const last = document.getElementById('pagerLast');
-            first.style.display = showJump ? '' : 'none';
-            last.style.display  = showJump ? '' : 'none';
-            first.disabled = historyPage <= 0;
-            last.disabled  = historyPage >= maxPage;
-        } else {
-            pager.style.display = 'none';
-        }
-
-        const badge = document.getElementById('currentBadge');
-        const currentButton = document.getElementById('currentDownloadsButton');
-        const currentLabel = `${active.length} ${active.length === 1 ? 'item' : 'items'}`;
-        document.getElementById('currentDrawerCount').textContent = currentLabel;
-        currentButton.hidden = active.length === 0;
-        currentButton.setAttribute(
-            'aria-label', active.length
-                ? `Current downloads, ${currentLabel}`
-                : 'Current downloads, no items',
-        );
-        if (active.length) {
-            badge.textContent = active.length;
-            badge.hidden = false;
-        } else {
-            badge.hidden = true;
-        }
-    }).catch(err => {
-        if (err.name === 'AbortError') return;
-        historyRefreshError = `Could not refresh Library and Current Downloads. ${err.message || 'Try again shortly.'}`;
-        showActionError(historyRefreshError);
-        document.getElementById('currentEmpty').textContent = historyRefreshError;
-        updateHistoryEmptyState();
+    const newActiveIds  = new Set(active.map(i => String(i.id)));
+    const newHistoryIds = new Set(pageItems.map(i => String(i.id)));
+    // An SSE burst can replace a newly inserted node before animationstart.
+    // Retry only that pre-start window; restarting an animation already in
+    // progress makes successive reconciliations keep cards in motion.
+    pendingActiveAnimations.forEach(id => {
+        if (!newActiveIds.has(id)) pendingActiveAnimations.delete(id);
     });
+    pendingHistoryAnimations.forEach(id => {
+        if (!newHistoryIds.has(id)) pendingHistoryAnimations.delete(id);
+    });
+
+    reconcileCards(document.getElementById('activeList'), active, info => renderItem(info, false), 'data-row-id');
+    reconcileCards(document.getElementById('historyList'), pageItems, info => renderItem(info, true), 'data-row-id');
+
+    if (currentDrawerVisible) {
+        newActiveIds.forEach(id => {
+            if (!_renderedActiveIds.has(id) || pendingActiveAnimations.has(id)) {
+                const el = document.querySelector(`#activeList [data-row-id="${id}"]`);
+                if (el) animateInsertedItem(el, pendingActiveAnimations, id);
+            }
+        });
+    }
+    newHistoryIds.forEach(id => {
+        if (!_renderedHistoryIds.has(id) || pendingHistoryAnimations.has(id)) {
+            const el = document.querySelector(`#historyList [data-row-id="${id}"]`);
+            if (el) animateInsertedItem(el, pendingHistoryAnimations, id);
+        }
+    });
+
+    _renderedActiveIds  = newActiveIds;
+    _renderedHistoryIds = newHistoryIds;
+
+    bindRenameInputs();
+    bindTagEditors();
+    restoreOpenHistoryInfo();
+
+    if (focusRestore) {
+        const newInput = focusRestore.tagId
+            ? document.querySelector(
+                `.tag-editor-shell[data-tag-id="${CSS.escape(focusRestore.tagId)}"] .tag-entry-input`)
+            : document.querySelector(
+                `.rename-wrap[data-rename-id="${focusRestore.id}"] .rename-input`);
+        if (newInput) {
+            newInput.focus();
+            try {
+                newInput.setSelectionRange(
+                    focusRestore.selStart, focusRestore.selEnd);
+            } catch (e) { }
+        }
+    }
+
+    document.getElementById('currentEmpty').textContent = collectionErrors.get('current')
+        || (currentLoaded ? 'No current downloads.' : 'Loading Current Downloads…');
+    document.getElementById('currentEmpty').style.display = active.length ? 'none' : '';
+    updateHistoryEmptyState();
+
+    const pager = document.getElementById('historyPager');
+    historyEndlessSentinel.hidden = !endless || pageItems.length >= historyTotal;
+    if (!endless && historyTotal > historyPageSize) {
+        pager.style.display = '';
+        document.getElementById('pagerInfo').textContent =
+            `Page ${historyPage + 1} of ${maxPage + 1} · ${historyTotal} items`;
+        document.getElementById('pagerPrev').disabled = historyPage <= 0;
+        document.getElementById('pagerNext').disabled = historyPage >= maxPage;
+        const showJump = maxPage >= 3;
+        const first = document.getElementById('pagerFirst');
+        const last = document.getElementById('pagerLast');
+        first.style.display = showJump ? '' : 'none';
+        last.style.display  = showJump ? '' : 'none';
+        first.disabled = historyPage <= 0;
+        last.disabled  = historyPage >= maxPage;
+    } else {
+        pager.style.display = 'none';
+    }
+
+    const badge = document.getElementById('currentBadge');
+    const currentButton = document.getElementById('currentDownloadsButton');
+    const currentLabel = `${active.length} ${active.length === 1 ? 'item' : 'items'}`;
+    document.getElementById('currentDrawerCount').textContent = currentLabel;
+    currentButton.hidden = active.length === 0;
+    currentButton.setAttribute(
+        'aria-label', active.length
+            ? `Current downloads, ${currentLabel}`
+            : 'Current downloads, no items',
+    );
+    badge.textContent = active.length;
+    if (active.length) {
+        badge.hidden = false;
+    } else {
+        badge.hidden = true;
+    }
 }
 
 let playerMode = 'overlay';
@@ -4912,11 +5129,8 @@ function openPlaybackSettingsFromPlayer() {
         settingsSearchInput.value = '';
         applySettingsSearch();
         setActiveSettingsSection('playback');
-        document.getElementById('settings-playback').scrollIntoView({
-            behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches
-                ? 'auto' : 'smooth',
-            block: 'start',
-        });
+        scrollToSettingsSection('playback',
+            window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth');
     });
 }
 
@@ -5220,6 +5434,7 @@ function openSettings() {
         page.hidden = false;
         document.body.classList.add('settings-open');
         window.scrollTo({ top: 0 });
+        scheduleSettingsSectionUpdate();
     }).finally(() => {
         settingsOpenPromise = null;
     });
@@ -5252,6 +5467,53 @@ function setActiveSettingsSection(name) {
     });
 }
 
+function settingsContentTop(sticky = false) {
+    const content = document.querySelector('.settings-content').getBoundingClientRect();
+    let top = 0;
+    // Only headers overlapping the options obscure them; the desktop index
+    // sits alongside them, while the mobile index covers their top edge.
+    for (const selector of ['.app-header', '.settings-page-header', '.settings-nav']) {
+        const element = document.querySelector(selector);
+        const bounds = element.getBoundingClientRect();
+        if (bounds.left < content.right && bounds.right > content.left) {
+            const stickyTop = parseFloat(getComputedStyle(element).top);
+            top = Math.max(top, sticky && Number.isFinite(stickyTop)
+                ? stickyTop + bounds.height : bounds.bottom);
+        }
+    }
+    return top;
+}
+
+function updateActiveSettingsSection() {
+    if (document.getElementById('settingsPage').hidden) return;
+    const visible = settingsSections.filter(section => !section.hidden);
+    const top = settingsContentTop() + 1;
+    const current = visible.find(section => section.getBoundingClientRect().bottom > top);
+    setActiveSettingsSection(current?.dataset.settingsName);
+}
+
+let settingsSectionFrame = null;
+
+function scheduleSettingsSectionUpdate() {
+    if (document.getElementById('settingsPage').hidden || settingsSectionFrame !== null) return;
+    settingsSectionFrame = requestAnimationFrame(() => {
+        settingsSectionFrame = null;
+        updateActiveSettingsSection();
+    });
+}
+
+function scrollToSettingsSection(name, behavior) {
+    const section = document.getElementById(`settings-${name}`);
+    window.scrollBy({ top: section.getBoundingClientRect().top - settingsContentTop(true), behavior });
+    scheduleSettingsSectionUpdate();
+}
+
+window.addEventListener('scroll', scheduleSettingsSectionUpdate, { passive: true });
+window.addEventListener('resize', scheduleSettingsSectionUpdate);
+if ('ResizeObserver' in window) {
+    new ResizeObserver(scheduleSettingsSectionUpdate).observe(document.querySelector('.settings-content'));
+}
+
 function applySettingsSearch() {
     const terms = settingsSearchInput.value.toLocaleLowerCase().trim()
         .split(/\s+/).filter(Boolean);
@@ -5279,6 +5541,7 @@ function applySettingsSearch() {
     if (terms.length > 0 && firstMatchingSection !== null) {
         setActiveSettingsSection(firstMatchingSection);
     }
+    scheduleSettingsSectionUpdate();
 }
 
 settingsNavButtons.forEach(button => {
@@ -5288,11 +5551,8 @@ settingsNavButtons.forEach(button => {
         const name = button.dataset.settingsSection;
         if (name !== 'browser-extension') clearExtensionPairing();
         setActiveSettingsSection(name);
-        document.getElementById(`settings-${name}`).scrollIntoView({
-            behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches
-                ? 'auto' : 'smooth',
-            block: 'start',
-        });
+        scrollToSettingsSection(name,
+            window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth');
     });
 });
 
@@ -5995,8 +6255,10 @@ loadPreferences();
 
 let pendingFetch = false;
 let pendingFavoriteSort = false;
-function scheduleFetch({ sortFavorites = false } = {}) {
+let pendingFullRefresh = false;
+function scheduleFetch({ sortFavorites = false, currentOnly = false } = {}) {
     pendingFavoriteSort ||= sortFavorites;
+    pendingFullRefresh ||= !currentOnly;
     if (pendingFetch) return;
     pendingFetch = true;
     // Firefox pauses animation frames in background tabs, which is exactly
@@ -6005,19 +6267,34 @@ function scheduleFetch({ sortFavorites = false } = {}) {
         pendingFetch = false;
         const applyFavoriteSort = pendingFavoriteSort;
         pendingFavoriteSort = false;
-        fetchHistory({ sortFavorites: applyFavoriteSort });
-        fetchPlaylists();
+        const fullRefresh = pendingFullRefresh;
+        pendingFullRefresh = false;
+        if (fullRefresh) {
+            fetchHistory({ sortFavorites: applyFavoriteSort });
+            fetchPlaylists();
+        } else {
+            fetchDownloadCollection('current');
+        }
         if (attemptHistoryOpen) {
             if (libraryView === 'duplicates') fetchDuplicates();
             else fetchAttemptHistory();
         }
-    }, 0);
+    }, 150);
 }
 
 function connectEventStream() {
     const es = new EventSource('/api/events');
-    es.addEventListener('ready', scheduleFetch);
-    es.addEventListener('change', scheduleFetch);
+    es.addEventListener('ready', () => {
+        hideServerStatus('events');
+        scheduleFetch();
+    });
+    es.addEventListener('change', event => {
+        let change;
+        try { change = JSON.parse(event.data); } catch (_) { /* Reconcile unknown events fully. */ }
+        const currentOnly = change?.reason === 'update'
+            && collectionSnapshots.current.some(info => String(info.id) === String(change.id));
+        scheduleFetch({ currentOnly });
+    });
     es.addEventListener('playlist-progress', fetchPlaylists);
     es.addEventListener('error', () => {
         showServerStatus();

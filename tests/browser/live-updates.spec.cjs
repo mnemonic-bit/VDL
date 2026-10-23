@@ -401,6 +401,13 @@ test('closing a row menu reconciles a deferred live update', async ({ page }) =>
 
 test('History insertion animates occupied space before visibility', async ({ page }) => {
     await page.evaluate(() => {
+        const render = renderDownloadCollections;
+        // Independent Current and Library responses can reconcile the retained
+        // card twice before animationstart. Exercise that timing deliberately.
+        renderDownloadCollections = (...args) => {
+            render(...args);
+            render(...args);
+        };
         window.__historyAnimations = [];
         document.addEventListener('animationstart', event => {
             if (event.target.matches('#historyList .history-card')) {

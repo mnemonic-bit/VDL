@@ -7,7 +7,7 @@ import io
 import ipaddress
 
 from flask import (
-    Flask, Response, abort, g, jsonify, redirect, render_template, request,
+    Flask, Response, abort, g, has_request_context, jsonify, redirect, render_template, request,
     send_file, session, stream_with_context, url_for,
 )
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -455,6 +455,12 @@ _upload_lock = threading.Lock()
 # Serialising that work keeps a burst of first-time hovers from saturating the
 # host while cached previews continue to bypass the lock entirely.
 _preview_generation_lock = threading.Lock()
+_thumbnail_generation_lock = threading.Lock()
+_thumbnail_generation_active = set()
+_thumbnail_generation_failures = {}
+_THUMBNAIL_GENERATION_LIMIT = 2
+_THUMBNAIL_FAILURE_COOLDOWN = 30
+_THUMBNAIL_FAILURE_LIMIT = 256
 _NO_UPDATE = object()
 
 # Endless playback is disposable navigation state. Keeping it outside SQLite
@@ -1504,16 +1510,21 @@ def db_clear_library():
     return rows, files_deleted
 
 
-def db_list_downloads(user_id=None, is_admin=False):
+def db_list_downloads(user_id=None, is_admin=False, statuses=None):
     with db() as conn:
-        visibility_sql = ""
-        values = ()
+        conditions = []
+        values = []
         if user_id is not None and not is_admin:
-            visibility_sql = (
-                "WHERE downloads.visibility = 'public' "
-                "OR downloads.owner_user_id = ? "
+            conditions.append(
+                "(downloads.visibility = 'public' OR downloads.owner_user_id = ?)"
             )
-            values = (user_id,)
+            values.append(user_id)
+        if statuses is not None:
+            conditions.append(
+                "downloads.status IN (" + ",".join("?" for _ in statuses) + ")"
+            )
+            values.extend(statuses)
+        visibility_sql = "WHERE " + " AND ".join(conditions) + " " if conditions else ""
         rows = conn.execute(
             "SELECT downloads.id, url, status, progress, "
             "downloads.created_at, "
@@ -1537,7 +1548,10 @@ def db_list_downloads(user_id=None, is_admin=False):
             "SELECT download_tags.download_id, tags.name "
             "FROM download_tags "
             "JOIN tags ON tags.id = download_tags.tag_id "
-            "ORDER BY tags.name COLLATE NOCASE, tags.name"
+            "JOIN downloads ON downloads.id = download_tags.download_id "
+            + visibility_sql
+            + "ORDER BY tags.name COLLATE NOCASE, tags.name",
+            values,
         ):
             tags_by_download.setdefault(row["download_id"], []).append(
                 row["name"]
@@ -1586,9 +1600,10 @@ def _hash_backfill_once():
             "WHERE downloads.status = 'finished' ORDER BY downloads.created_at"
         )]
     changed = False
+    allowed_bases = _trusted_download_directories()
     for candidate in candidates:
         download_id, filename = candidate['id'], candidate['filename']
-        identity = _current_file_identity(filename)
+        identity = _current_file_identity(filename, allowed_bases)
         recorded = (
             candidate['device'], candidate['inode'],
             candidate['byte_size'], candidate['mtime_ns'],
@@ -1600,8 +1615,8 @@ def _hash_backfill_once():
         try:
             if identity is None:
                 raise OSError('Media is missing or outside the library')
-            digest, hashed_identity = _hash_final_file(filename)
-            if _current_file_identity(filename) != hashed_identity:
+            digest, hashed_identity = _hash_final_file(filename, allowed_bases)
+            if _current_file_identity(filename, allowed_bases) != hashed_identity:
                 raise OSError('Media changed while hashing')
         except (OSError, ValueError):
             state = 'unavailable'
@@ -1917,20 +1932,23 @@ def _matches_history_filter(entry, normalized_filter):
     )
 
 
-def _playable_library_entry(entry):
+def _playable_library_entry(entry, allowed_bases=None):
     if entry.get('status') != 'finished':
         return False
     filename = entry.get('filename')
     if not filename or not os.path.isfile(filename):
         return False
-    return _is_allowed_download_path(os.path.realpath(filename))
+    return _is_allowed_download_path(filename, allowed_bases)
 
 
 def resolve_library_selection(user_id, is_admin, normalized_filter, ordering):
     """Return the current canonical, visible, browser-playable selection."""
+    allowed_bases = _trusted_download_directories()
     entries = [
-        entry for entry in db_list_downloads(user_id, is_admin=is_admin)
-        if _playable_library_entry(entry)
+        entry for entry in db_list_downloads(
+            user_id, is_admin=is_admin, statuses=('finished',),
+        )
+        if _playable_library_entry(entry, allowed_bases)
         and _matches_history_filter(entry, normalized_filter)
     ]
     if ordering == 'favorites_first':
@@ -1987,7 +2005,8 @@ def resolve_shuffle_pool(user_id, is_admin, minimum_height,
     """Resolve the live authorized pool and whether legacy metadata blocks it."""
     candidates = []
     metadata_pending = False
-    for entry in db_list_downloads(user_id, is_admin=is_admin):
+    allowed_bases = _trusted_download_directories()
+    for entry in db_list_downloads(user_id, is_admin=is_admin, statuses=('finished',)):
         if entry.get('status') != 'finished':
             continue
         filename = entry.get('filename')
@@ -1996,7 +2015,7 @@ def resolve_shuffle_pool(user_id, is_admin, minimum_height,
         if Path(filename).suffix.lower() not in BROWSER_VIDEO_EXTENSIONS:
             continue
         real_path = os.path.realpath(filename)
-        if not _is_allowed_download_path(real_path):
+        if not _is_allowed_download_path(real_path, allowed_bases):
             continue
 
         height = _history_quality_height(entry.get('resolution'))
@@ -4432,9 +4451,9 @@ def _file_identity(metadata):
     )
 
 
-def _hash_final_file(path):
+def _hash_final_file(path, allowed_bases=None):
     """Read one allowed regular artifact in bounded chunks and detect races."""
-    if not _is_allowed_download_path(path):
+    if not _is_allowed_download_path(path, allowed_bases):
         raise PermissionError('Media path is outside the library')
     flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0)
     descriptor = os.open(path, flags)
@@ -4448,13 +4467,13 @@ def _hash_final_file(path):
         identity = _file_identity(before)
         if (_file_identity(os.fstat(source.fileno())) != identity
                 or _file_identity(os.stat(path, follow_symlinks=False)) != identity
-                or not _is_allowed_download_path(path)):
+                or not _is_allowed_download_path(path, allowed_bases)):
             raise OSError('Media changed while hashing')
     return digest.hexdigest(), identity
 
 
-def _current_file_identity(path):
-    if not path or not _is_allowed_download_path(path):
+def _current_file_identity(path, allowed_bases=None):
+    if not path or not _is_allowed_download_path(path, allowed_bases):
         return None
     try:
         metadata = os.stat(path, follow_symlinks=False)
@@ -5930,6 +5949,7 @@ def get_library():
     return jsonify([
         _public_download_entry(entry) for entry in db_list_downloads(
             g.current_user['id'], is_admin='admin' in g.current_user['roles'],
+            statuses=('finished',),
         ) if _playable_library_entry(entry)
     ])
 
@@ -5939,7 +5959,8 @@ def get_current_downloads():
     return jsonify([
         _public_download_entry(entry) for entry in db_list_downloads(
             g.current_user['id'], is_admin='admin' in g.current_user['roles'],
-        ) if entry['status'] in ('starting', 'downloading', 'paused', 'cancelled', 'interrupted')
+            statuses=('starting', 'downloading', 'paused', 'cancelled', 'interrupted'),
+        )
     ])
 
 
@@ -6785,26 +6806,38 @@ def events():
     return resp
 
 
-def _is_allowed_download_path(path):
-    """Confine media and previews to directories captured by download workers."""
-    real = os.path.realpath(path)
-    # Worker snapshots are independent of the later filename reported by
-    # yt-dlp, so a corrupted filename cannot authorize its own directory.
-    # Retaining every snapshot keeps old downloads playable after preferences
-    # change, including rows whose worker did not reach a finished state.
-    prefs = db_get_preferences()
-    allowed_bases = {os.path.realpath(prefs.get('download_dir', '.'))}
+def _trusted_download_directories():
+    """Snapshot trusted roots once, independently of the filenames being checked."""
+    if has_request_context() and hasattr(g, 'download_path_bases'):
+        return g.download_path_bases
+    # Workers capture output_dir before yt-dlp reports a filename. Retaining
+    # those roots keeps old media playable after the preference changes, while
+    # preventing a corrupted filename from authorizing its own directory.
     with db() as conn:
+        preference = conn.execute(
+            "SELECT value FROM preferences WHERE key = 'download_dir'"
+        ).fetchone()
         rows = conn.execute(
             "SELECT DISTINCT output_dir FROM downloads "
             "WHERE output_dir IS NOT NULL"
         ).fetchall()
+    allowed_bases = {os.path.realpath(preference[0] if preference else '.')}
     for (output_dir,) in rows:
         try:
             allowed_bases.add(os.path.realpath(output_dir))
         except (TypeError, ValueError):
             continue
+    snapshot = frozenset(allowed_bases)
+    if has_request_context():
+        g.download_path_bases = snapshot
+    return snapshot
 
+
+def _is_allowed_download_path(path, allowed_bases=None):
+    """Confine media and previews to directories captured by download workers."""
+    real = os.path.realpath(path)
+    if allowed_bases is None:
+        allowed_bases = _trusted_download_directories()
     try:
         return any(
             os.path.commonpath([real, base]) == base
@@ -6859,6 +6892,42 @@ def stream_file(download_id):
     )
 
 
+def _ensure_video_thumbnail(media_path, thumbnail_path):
+    """Keep slow cache misses from multiplying decoder work or waiting threads."""
+    key = os.path.realpath(thumbnail_path)
+    with _thumbnail_generation_lock:
+        if os.path.isfile(thumbnail_path):
+            return None
+        now = time.monotonic()
+        for failed_key, retry_at in list(_thumbnail_generation_failures.items()):
+            if retry_at <= now:
+                del _thumbnail_generation_failures[failed_key]
+        retry_at = _thumbnail_generation_failures.get(key)
+        if retry_at is not None:
+            return 404, max(1, math.ceil(retry_at - now))
+        if (key in _thumbnail_generation_active
+                or len(_thumbnail_generation_active) >= _THUMBNAIL_GENERATION_LIMIT):
+            return 503, 1
+        _thumbnail_generation_active.add(key)
+    generated = False
+    try:
+        generated = generate_video_thumbnail(media_path, thumbnail_path)
+    finally:
+        with _thumbnail_generation_lock:
+            _thumbnail_generation_active.remove(key)
+            if not generated:
+                # Bound retry bookkeeping even for libraries full of media
+                # that ffmpeg cannot decode. Expiration permits later recovery.
+                if len(_thumbnail_generation_failures) >= _THUMBNAIL_FAILURE_LIMIT:
+                    del _thumbnail_generation_failures[next(iter(_thumbnail_generation_failures))]
+                _thumbnail_generation_failures[key] = (
+                    time.monotonic() + _THUMBNAIL_FAILURE_COOLDOWN
+                )
+    if not generated:
+        return 404, _THUMBNAIL_FAILURE_COOLDOWN
+    return None
+
+
 @app.route('/api/thumbnail/<download_id>', methods=['GET'])
 def stream_thumbnail(download_id):
     """Serve a cached local preview, generating one for older video rows."""
@@ -6875,9 +6944,12 @@ def stream_thumbnail(download_id):
     thumbnail_path = _thumbnail_path(entry, fallback_dir)
     if not thumbnail_path or not _is_allowed_download_path(thumbnail_path):
         abort(403)
-    if (not os.path.isfile(thumbnail_path)
-            and not generate_video_thumbnail(media_path, thumbnail_path)):
-        abort(404)
+    retry = _ensure_video_thumbnail(media_path, thumbnail_path)
+    if retry is not None:
+        status, delay = retry
+        return Response(status=status, headers={
+            'Retry-After': str(delay), 'Cache-Control': 'no-store',
+        })
     return send_file(
         thumbnail_path,
         mimetype='image/jpeg',

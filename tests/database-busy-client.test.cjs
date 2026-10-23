@@ -5,7 +5,7 @@ const test = require('node:test');
 const vm = require('node:vm');
 
 const app = fs.readFileSync(path.join(__dirname, '../static/app.js'), 'utf8');
-const source = app.slice(app.indexOf('function showServerStatus()'), app.indexOf('function hideActionError()'));
+const source = app.slice(app.indexOf('function showServerStatus('), app.indexOf('function hideActionError()'));
 
 function harness(replies, { onDelay = () => {} } = {}) {
     const delays = [];
@@ -111,4 +111,22 @@ test('reads cancelled during the retry wait are not replayed', async () => {
     await assert.rejects(client.apiFetch('/api/library', { signal: controller.signal }), { name: 'AbortError' });
     assert.equal(client.requests.length, 1);
     assert.notEqual(client.elements.get('serverStatus')?.hidden, false);
+});
+
+
+test('successful unrelated reads preserve health failure until health itself recovers', async () => {
+    const client = harness([new Error('Health unavailable'), new Response('[]'), new Response('{}')]);
+    await assert.rejects(client.apiFetch('/api/health'), /Health unavailable/);
+    await client.apiFetch('/api/current-downloads');
+    assert.equal(client.elements.get('serverStatus').hidden, false);
+    await client.apiFetch('/api/health');
+    assert.equal(client.elements.get('serverStatus').hidden, true);
+});
+
+
+test('ordinary request failures recover when another API request succeeds', async () => {
+    const client = harness([new Error('Connection interrupted'), new Response('[]')]);
+    await assert.rejects(client.apiFetch('/api/history?page=2'), /Connection interrupted/);
+    await client.apiFetch('/api/history?page=1');
+    assert.equal(client.elements.get('serverStatus').hidden, true);
 });

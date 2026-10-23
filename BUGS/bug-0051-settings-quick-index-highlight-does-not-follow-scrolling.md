@@ -1,8 +1,9 @@
-## 51. [Open] Settings quick-index highlight does not follow scrolling
+## 51. [Resolved] Settings quick-index highlight does not follow scrolling
 
 **Severity:** Low — navigation feedback is misleading
 
-**Status:** Open; reported on 2026-10-21. Not yet independently reproduced.
+**Status:** Resolved in version `0.46.4` on 2026-10-23. Independently reproduced
+in the deterministic browser fixture before the fix.
 
 The left-hand quick-index on the Settings page scrolls upward until it sits
 directly below the **Settings** title, then remains there while the user
@@ -58,4 +59,33 @@ reaches that position, the highlight should move to that section.
   heights. Include a browser regression covering downward and upward
   scrolling across multiple sections.
 
-This report changes documentation only and does not change `VERSION`.
+### Resolution
+
+The active entry previously changed only on navigation clicks and searches;
+no scroll listener kept it synchronized with the visible options. Scrolling
+from General into Playback left General marked `aria-current="page"`.
+
+The index now updates once per animation frame during document scrolling,
+resizing, and Settings content size changes. It identifies the section at the
+top of the options area, accounting for headers that overlap the content and
+the mobile index. Tall sections remain current after their headings leave
+view. At the page bottom, the highlight still reflects the topmost visible
+section. Hidden search results are excluded; no match clears the active
+entry. Opening Settings and changing search results also reconcile the index.
+Section buttons and the player's Playback Settings action scroll to the same
+visible-content boundary, preserving subsequent manual scroll tracking.
+
+### Verification
+
+- `tests/browser/settings-regressions.spec.cjs` reproduces the original failure
+  and covers upward/downward scrolling, tall sections, page start/end, section
+  navigation followed by manual scrolling, search/no-results, and reopening.
+- Viewports: desktop `1000x500` and `1000x800`, mobile `390x650`.
+- Existing `tests/browser/preferences.spec.cjs` remains covered, including
+  section navigation, searching, sticky-header layout, and saving preferences.
+- Smooth navigation and same-page resizing across desktop/mobile layouts are
+  covered, including the 560px breakpoint and short final sections.
+- All 16 combined Settings controls, navigation, and Preferences browser checks
+  pass in Chromium, Firefox, and WebKit (48 passing cases).
+- Required unit gate passed with Python 3.12.14: 319 tests, five optional media
+  tests skipped, and `vdl.py` line coverage of 91.4% (minimum 90%).

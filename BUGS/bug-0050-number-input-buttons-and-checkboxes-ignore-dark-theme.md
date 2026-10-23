@@ -1,8 +1,8 @@
-## 50. [Open] Number-input buttons and checkboxes do not match the dark theme
+## 50. [Resolved] Number-input buttons and checkboxes do not match the dark theme
 
 **Severity:** Low — visual inconsistency
 
-**Status:** Open; reported on 2026-10-21. Not yet independently reproduced.
+**Status:** Resolved in 0.46.3; reported on 2026-10-21, reproduced and fixed on 2026-10-23.
 
 In dark mode, some form controls retain light backgrounds even though the
 surrounding page and input fields use the dark theme. The reporter observed
@@ -53,4 +53,37 @@ application's green accent.
   include visual inspection of native controls rather than relying solely on
   computed CSS values.
 
-This report changes documentation only and does not change `VERSION`.
+### Cause and resolution
+
+The page changed its custom colors through `data-theme` but never set CSS
+`color-scheme`. Native controls therefore kept the browser's default light
+rendering inside the dark page. The initial Chromium regression failed with
+`color-scheme: normal` on **Max concurrent downloads**.
+
+The root now declares `color-scheme: light`, with `color-scheme: dark` on the
+existing dark-theme selector. Native number steppers and checkboxes inherit
+the selected theme throughout the application. Their native behavior and the
+existing green checkbox accent remain intact; the existing theme switch also
+updates these native surfaces immediately.
+
+### Verification
+
+- Reproduced against 0.46.2 on Linux 6.12.95 x86_64 using Chromium
+  153.0.8010.12. The original reporter's browser and operating system remain
+  unknown.
+- `tests/browser/settings-controls.spec.cjs` passed both tests in Chromium
+  153.0.8010.12, Firefox 155.0, and WebKit 26.6 (six passing cases total).
+- Visually inspected screenshot attachments from every engine in both themes:
+  hovered number steppers, focused unchecked and checked checkboxes, and
+  disabled unchecked checkboxes. Dark steppers have dark surfaces with visible
+  arrows; unchecked boxes have dark surfaces; checked boxes retain green
+  backgrounds and visible check marks. Disabled checkboxes remain visibly dim.
+  Light-theme controls retain appropriate light surfaces.
+- Browser checks exercise ArrowUp/ArrowDown numeric input and Space checkbox
+  operation, immediate light/dark switching, saved dark-theme appearance after
+  reload, and live changes to the operating-system theme in system mode.
+- The browser test retains screenshots as test attachments for visual review;
+  computed `color-scheme` checks supplement that visual verification.
+- Required unit gate: `./tests/run-all.sh --unit` passed with Python 3.12.14
+  selected through `VDL_PYTHON` (319 tests, five optional
+  media tests skipped); `vdl.py` line coverage is 91.4%, above the 90% minimum.
