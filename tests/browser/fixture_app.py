@@ -17,6 +17,10 @@ from tests.support.fake_ytdlp import FakeYoutubeDL  # noqa: E402
 
 vdl.yt_dlp.YoutubeDL = FakeYoutubeDL
 vdl.ffprobe_resolution = lambda _path: "360p"
+# Most fixture rows contain dummy video bytes. Native extraction makes bulk
+# seeding depend on ffmpeg availability and CPU scheduling; the unit and media
+# tiers exercise real thumbnail generation.
+vdl.generate_video_thumbnail = lambda *_: False
 upload_inspection_gate = threading.Event()
 upload_inspection_gate.set()
 

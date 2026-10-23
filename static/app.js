@@ -5383,7 +5383,7 @@ function extensionPackageAction() {
     if (bundledExtension.signed) {
         extensionStatus('Firefox should show an Add confirmation. If it does not, right-click the install button, save the XPI, then install it from about:addons.');
     } else {
-        extensionStatus('Downloading the unsigned development XPI. Firefox Release cannot install it; use about:debugging for temporary testing or ask the operator for an AMO-signed package.');
+        extensionStatus('Downloading the unsigned development XPI. Extract it and follow the temporary-loading instructions below. Repeat temporary loading after Firefox restarts.');
     }
 }
 
@@ -5440,6 +5440,10 @@ function loadExtensionConnections() {
                 : 'Pairing is disabled here. Use HTTPS or ask the operator to allow this local IPv4 CIDR.';
         bundledExtension = data.bundled_extension;
         const install = document.getElementById('extensionInstallLink');
+        const unsignedHelp = document.getElementById('extensionUnsignedHelp');
+        unsignedHelp.hidden = !bundledExtension || bundledExtension.signed;
+        unsignedHelp.dataset.settingAvailable = String(!unsignedHelp.hidden);
+        if (unsignedHelp.hidden) unsignedHelp.open = false;
         if (bundledExtension) {
             install.href = bundledExtension.signed
                 ? bundledExtension.url : bundledExtension.download_url;
@@ -5449,9 +5453,10 @@ function loadExtensionConnections() {
             install.classList.remove('disabled');
             document.getElementById('extensionInstallHint').textContent = bundledExtension.signed
                 ? 'Firefox will show an Add confirmation. Installation and pairing are separate steps.'
-                : 'This bundled development package is not Mozilla-signed, so Firefox Release cannot install it. Download it only for temporary testing, or ask the operator for a signed package.';
+                : 'This bundled development package is not Mozilla-signed. Download it for temporary testing and follow the instructions below; downloading alone does not install it.';
         } else {
             install.removeAttribute('href');
+            install.removeAttribute('download');
             install.setAttribute('aria-disabled', 'true');
             install.classList.add('disabled');
             document.getElementById('extensionInstallHint').textContent = 'The bundled extension failed its integrity check. Contact the VDL operator.';
@@ -5464,7 +5469,9 @@ function loadExtensionConnections() {
         ));
         install.textContent = bundledExtension && !bundledExtension.signed
             ? 'Download unsigned XPI'
-            : needsUpdate ? 'Update Firefox extension' : 'Install Firefox extension';
+            : !bundledExtension ? 'Extension unavailable'
+                : needsUpdate ? 'Update Firefox extension' : 'Install Firefox extension';
+        applySettingsSearch();
     });
 }
 

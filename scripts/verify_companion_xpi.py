@@ -45,7 +45,7 @@ def _safe_member_name(name):
 
 
 def verify(source=SOURCE, package=PACKAGE, checksum=CHECKSUM, *, require_signed=False,
-           require_identity=False):
+           require_identity=False, expected_signed=None):
     if source.is_symlink() or not source.is_dir():
         raise ValueError('Extension source must be a real directory')
     expected_line = checksum.read_text(encoding='ascii')
@@ -108,6 +108,8 @@ def verify(source=SOURCE, package=PACKAGE, checksum=CHECKSUM, *, require_signed=
             raise ValueError('XPI contains unexpected or incomplete signature metadata')
         if require_signed and not SIGNATURE_FILES.issubset(signature):
             raise ValueError('XPI lacks Mozilla signature metadata')
+        if expected_signed is not None and bool(signature) != expected_signed:
+            raise ValueError('XPI signature state differs from the expected package type')
         if archive.testzip() is not None:
             raise ValueError('XPI contains a corrupt archive member')
         if require_identity:

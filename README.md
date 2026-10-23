@@ -402,14 +402,19 @@ needed for pairing: Settings uses the browser's authoritative
 
 To use the companion:
 
-1. Open VDL Settings → Browser Extension and install the bundled XPI. Firefox
-   always displays its own Add confirmation.
+1. Open VDL Settings → Browser Extension. For **Install Firefox extension** or
+   **Update Firefox extension**, accept Firefox's Add confirmation. For
+   **Download unsigned XPI**, follow Settings' temporary-loading instructions
+   and repeat loading after Firefox restarts. See the
+   [package installation guide](browser-extension/README.md#install-the-bundled-package).
 2. Create and copy the five-minute pairing string, paste it into the extension
    onboarding page, verify the exact destination origin, and confirm pairing.
 3. Open a signed-in video page and click **Download current page with VDL**.
    Firefox asks for access the first time each website host is used.
-4. Install a newer bundled XPI when Settings reports an update. The stable
-   add-on identity updates the existing installation in place.
+4. Install a newer signed bundled XPI when Settings reports an update. The stable
+   add-on identity updates the existing installation in place. A compatible
+   installed signed extension keeps working when the server bundles an unsigned
+   package.
 5. Use **Revoke** in VDL Settings or **Unpair** in the extension options to end
    a connection. Signing out of the VDL web UI alone does not revoke it.
 

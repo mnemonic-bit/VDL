@@ -520,10 +520,22 @@
                         <div class="setting-item" data-setting-keywords="firefox install update extension companion addon browser">
                             <div class="setting-copy">
                                 <strong>Install VDL Companion</strong>
-                                <span id="extensionInstallHint">Firefox will show an Add confirmation. Installation and pairing are separate steps.</span>
+                                <span id="extensionInstallHint">Checking the bundled extension package…</span>
                             </div>
-                            <a id="extensionInstallLink" class="settings-button-link" href="/browser-extension/vdl-companion-firefox.xpi" onclick="extensionPackageAction()">Install Firefox extension</a>
+                            <a id="extensionInstallLink" class="settings-button-link disabled" aria-disabled="true" onclick="extensionPackageAction()">Checking extension…</a>
                         </div>
+                        <details id="extensionUnsignedHelp" class="extension-pairing-details" hidden data-setting-available="false" data-setting-keywords="unsigned temporary debugging manifest restart testing">
+                            <summary>Temporarily load the unsigned extension</summary>
+                            <p>This development/testing package requires temporary loading in Firefox:</p>
+                            <ol>
+                                <li>Download the XPI and extract it into a local folder. If needed, rename the local copy from <code>.xpi</code> to <code>.zip</code> before extraction.</li>
+                                <li>Open <code>about:debugging</code> in Firefox and choose <strong>This Firefox</strong>.</li>
+                                <li>Choose <strong>Load Temporary Add-on</strong> and select the extracted <code>manifest.json</code>.</li>
+                                <li>Open the VDL Companion toolbar action and use the pairing flow below.</li>
+                            </ol>
+                            <p>Temporary loading lasts only until Firefox restarts. Repeat these steps after each restart.</p>
+                            <p>A compatible signed companion already installed in Firefox can continue using its existing connection.</p>
+                        </details>
                         <div class="setting-item extension-pairing-item" data-setting-keywords="pair connect code string https localhost loopback private network cidr copy invalidate">
                             <div class="setting-copy">
                                 <strong>Pair this Firefox profile</strong>

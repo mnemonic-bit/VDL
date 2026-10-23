@@ -68,7 +68,7 @@ test('Browser Extension settings allow operator-approved private HTTP pairing', 
         await packageLink.click();
         const packageDownload = await downloadPromise;
         expect(packageDownload.suggestedFilename()).toBe('vdl-companion-firefox.xpi');
-        await expect(page.locator('#extensionStatus')).toContainText('Firefox Release cannot install it');
+        await expect(page.locator('#extensionStatus')).toContainText('temporary-loading instructions');
         await packageDownload.cancel();
     }
     await expect(page.locator('#extensionNoConnections')).toBeVisible();
@@ -154,5 +154,93 @@ test('Firefox companion downloads reconcile while the VDL tab has no animation f
         await expect(page.locator(`#activeList [data-row-id="${id}"]`)).toBeVisible();
     } finally {
         await page.request.post('/__test__/release-downloads');
+    }
+});
+
+
+test('package state transitions refresh one action and temporary help without revoking connections', async ({ page }) => {
+    await pairCompanion(page);
+    const state = await (await page.request.get('/api/extension/connections')).json();
+    let selected = { ...state.bundled_extension, version: '9.0.0', signed: true };
+    await page.route('**/api/extension/connections', route => route.fulfill({
+        json: { ...state, bundled_extension: selected },
+    }));
+    await openSettings(page);
+    await page.getByRole('button', { name: 'Browser Extension' }).click();
+    const action = page.locator('#extensionInstallLink');
+    const help = page.locator('#extensionUnsignedHelp');
+    await expect(action).toHaveText('Update Firefox extension');
+    await expect(action).toHaveAttribute('href', state.bundled_extension.url);
+    await expect(action).not.toHaveAttribute('download');
+    await expect(help).toBeHidden();
+    await expect(page.locator('.extension-connection')).toHaveCount(state.connections.length);
+
+    selected = { ...selected, signed: false };
+    await page.evaluate(() => loadExtensionConnections());
+    await expect(action).toHaveText('Download unsigned XPI');
+    await expect(action).toHaveAttribute('href', state.bundled_extension.download_url);
+    await expect(action).toHaveAttribute('download', 'vdl-companion-firefox.xpi');
+    await expect(help).toBeVisible();
+    await help.locator('summary').click();
+    for (const instruction of ['extract', '.zip', 'about:debugging', 'This Firefox',
+        'Load Temporary Add-on', 'manifest.json', 'toolbar action', 'until Firefox restarts',
+        'Repeat these steps after each restart', 'existing connection']) {
+        await expect(help).toContainText(instruction);
+    }
+    await expect(page.locator('.extension-connection')).toHaveCount(state.connections.length);
+    await expect(page.locator('#extensionCreatePairing')).toBeEnabled();
+
+    selected = null;
+    await page.evaluate(() => loadExtensionConnections());
+    await expect(action).toHaveText('Extension unavailable');
+    await expect(action).toHaveAttribute('aria-disabled', 'true');
+    await expect(action).not.toHaveAttribute('href');
+    await expect(action).not.toHaveAttribute('download');
+    await expect(help).toBeHidden();
+    await expect(page.locator('#extensionInstallHint')).toContainText('integrity check');
+    await expect(page.locator('#extensionCreatePairing')).toBeEnabled();
+
+    selected = { ...state.bundled_extension, signed: true };
+    await page.evaluate(() => loadExtensionConnections());
+    await expect(action).toHaveText('Install Firefox extension');
+    await expect(action).not.toHaveAttribute('aria-disabled');
+    await expect(action).not.toHaveAttribute('download');
+    await expect(help).toBeHidden();
+    expect(await help.evaluate(element => element.open)).toBe(false);
+    await expect(page.locator('.extension-connection')).toHaveCount(state.connections.length);
+    // Confirm the connection survives on the server, independently of the UI fixture.
+    const actual = await (await page.request.get('/api/extension/connections')).json();
+    expect(actual.connections.map(connection => connection.id)).toEqual(
+        state.connections.map(connection => connection.id),
+    );
+});
+
+test('extension action stays disabled until verified package metadata arrives', async ({ page }) => {
+    const state = await (await page.request.get('/api/extension/connections')).json();
+    let releaseMetadata;
+    const metadataReady = new Promise(resolve => { releaseMetadata = resolve; });
+    await page.route('**/api/extension/connections', async route => {
+        await metadataReady;
+        await route.fulfill({ json: state });
+    });
+    try {
+        await page.reload();
+        await page.locator('#accountMenuButton').click();
+        await page.locator('#settingsButton').click();
+        const action = page.locator('#extensionInstallLink');
+        await expect(action).toHaveText('Checking extension…');
+        await expect(action).toHaveAttribute('aria-disabled', 'true');
+        await expect(action).not.toHaveAttribute('href');
+        await expect(action).not.toHaveAttribute('download');
+        await expect(page.locator('#extensionUnsignedHelp')).toBeHidden();
+        releaseMetadata();
+        await expect(action).not.toHaveAttribute('aria-disabled');
+        await expect(action).toHaveAttribute('href', state.bundled_extension.signed
+            ? state.bundled_extension.url : state.bundled_extension.download_url);
+        await expect(page.locator('#settingsPage')).toBeVisible();
+        await page.getByRole('button', { name: 'Browser Extension' }).click();
+        await expect(action).toBeVisible();
+    } finally {
+        releaseMetadata();
     }
 });

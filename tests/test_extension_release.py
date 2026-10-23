@@ -1,6 +1,10 @@
 import hashlib
 import io
 import json
+import errno
+import socket
+import ssl
+import subprocess
 from pathlib import Path
 import tempfile
 import unittest
@@ -40,6 +44,17 @@ class ExtensionReleaseTest(unittest.TestCase):
         for patch in self.patches:
             patch.start()
             self.addCleanup(patch.stop)
+        self.unsigned_bytes = self.make_unsigned()
+
+    def make_unsigned(self):
+        with zipfile.ZipFile(self.package, 'w') as archive:
+            for source_file in self.source.rglob('*'):
+                if source_file.is_file():
+                    archive.write(source_file, source_file.relative_to(self.source))
+        data = self.package.read_bytes()
+        self.checksum.write_text(hashlib.sha256(data).hexdigest()
+                                 + f'  {release.XPI_NAME}\n')
+        return data
 
     def signed_bytes(self):
         path = self.root / 'fixture.xpi'
@@ -104,18 +119,33 @@ class ExtensionReleaseTest(unittest.TestCase):
         self.assertEqual(lookup.call_count, 2)
         submit.assert_called_once()
 
-    def test_pending_or_wrong_channel_never_publishes(self):
+    def test_pending_falls_back_without_submission_but_wrong_channel_blocks(self):
         data = self.signed_bytes()
         with mock.patch.object(release, 'lookup_version',
-                               return_value=self.amo_version(data, status='unreviewed')):
-            with self.assertRaisesRegex(release.ReleaseError, 'pending'):
-                release.sign(self.root / 'pending', 'owner/repo', 'a' * 40,
-                             'issuer', 'secret')
+                               return_value=self.amo_version(data, status='unreviewed')), \
+                mock.patch.object(release.subprocess, 'run') as submit:
+            output = self.root / 'pending'
+            release.sign(output, 'owner/repo', 'a' * 40, 'issuer', 'secret')
+            self.assertEqual((output / release.XPI_NAME).read_bytes(), self.unsigned_bytes)
+            self.assertEqual(release.stage(output, 'owner/repo', 'a' * 40)['resolution_reason'],
+                             'pending_review')
+            submit.assert_not_called()
         with mock.patch.object(release, 'lookup_version',
                                return_value=self.amo_version(data, channel='listed')):
             with self.assertRaisesRegex(release.ReleaseError, 'not unlisted'):
                 release.sign(self.root / 'listed', 'owner/repo', 'a' * 40,
                              'issuer', 'secret')
+
+    def test_pending_version_without_a_signed_download_still_resolves_unsigned(self):
+        value = self.amo_version(b'', status='unreviewed')
+        value['file'].update(url=None, hash=None, is_mozilla_signed_extension=False)
+        with mock.patch.object(release, 'lookup_version', return_value=value), \
+                mock.patch.object(release.subprocess, 'run') as submit:
+            output = self.root / 'pending'
+            release.sign(output, 'owner/repo', 'a' * 40, 'issuer', 'secret')
+            self.assertEqual(release.stage(output, 'owner/repo', 'a' * 40)['resolution_reason'],
+                             'pending_review')
+            submit.assert_not_called()
 
     def test_stage_rejects_tampered_artifact(self):
         data = self.signed_bytes()
@@ -181,6 +211,253 @@ class ExtensionReleaseTest(unittest.TestCase):
             with self.assertRaisesRegex(release.ReleaseError, 'SHA-256'):
                 release.download_signed_file(file)
         self.assertEqual(opener.open.call_args.args[0], file['url'])
+
+    def metadata(self, output):
+        return json.loads((output / 'extension-metadata.json').read_text())
+
+    def test_missing_and_partial_credentials_never_contact_amo(self):
+        for index, credentials in enumerate(((None, None), ('', ''), ('issuer', ''), ('', 'secret'))):
+            with self.subTest(credentials=index), \
+                    mock.patch.object(release, 'lookup_version') as lookup, \
+                    mock.patch.object(release.subprocess, 'run') as submit:
+                output = self.root / str(index)
+                release.sign(output, 'owner/repo', 'a' * 40, *credentials)
+                metadata = release.stage(output, 'owner/repo', 'a' * 40)
+                self.assertIs(metadata['signed'], False)
+                self.assertNotIn('amo_file_id', metadata)
+                self.assertEqual(metadata['resolution_reason'],
+                                 'missing_credentials' if index < 2 else 'incomplete_credentials')
+                self.assertEqual(self.package.read_bytes(), self.unsigned_bytes)
+                lookup.assert_not_called()
+                submit.assert_not_called()
+
+    def test_lookup_classifies_availability_without_using_error_text(self):
+        cases = [
+            (error.HTTPError('https://amo', status, 'secret', {}, None),
+             'amo_authentication' if status in (401, 403) else 'amo_unavailable')
+            for status in (401, 403, 408, 429, 500, 503)
+        ] + [(error.URLError(cause), 'amo_unavailable') for cause in (
+            TimeoutError('secret'), ConnectionRefusedError('secret'),
+            socket.gaierror(-2, 'secret'), OSError(errno.ENETUNREACH, 'secret'),
+        )]
+        for exc, reason in cases:
+            with self.subTest(exc=type(exc), reason=reason):
+                opener = mock.Mock()
+                opener.open.side_effect = exc
+                with mock.patch.object(release.request, 'build_opener', return_value=opener):
+                    output = self.root / 'available-artifact'
+                    release.sign(output, 'owner/repo', 'a' * 40, 'issuer', 'secret')
+                    self.assertEqual(self.metadata(output)['resolution_reason'], reason)
+                    release.stage(output, 'owner/repo', 'a' * 40)
+                    for path in output.iterdir():
+                        path.unlink()
+                    output.rmdir()
+
+    def test_tls_redirect_unknown_transport_and_malformed_response_block(self):
+        for exc in (error.URLError(ssl.SSLCertVerificationError('certificate')),
+                    ssl.SSLError('TLS'), error.URLError('unclassified'),
+                    error.HTTPError('https://amo', 302, 'redirect', {}, None),
+                    error.HTTPError('https://amo', 400, 'invalid', {}, None)):
+            with self.subTest(exc=type(exc)):
+                opener = mock.Mock()
+                opener.open.side_effect = exc
+                with mock.patch.object(release.request, 'build_opener', return_value=opener):
+                    with self.assertRaises(release.ReleaseError) as result:
+                        release.sign(self.root / 'blocked', 'owner/repo', 'a' * 40, 'issuer', 'secret')
+                    self.assertNotIsInstance(result.exception, release.SigningUnavailable)
+                    self.assertFalse((self.root / 'blocked').exists())
+        for body in (b'not json', b'[]', b'{"version":"0.0"}'):
+            response = mock.Mock(url=release.API_ROOT + 'addons/addon/'
+                                 + release.parse.quote(release.EXTENSION_ID, safe='')
+                                 + '/versions/v1.2.3/')
+            response.read.return_value = body
+            opener = mock.Mock()
+            opener.open.return_value = mock.MagicMock()
+            opener.open.return_value.__enter__.return_value = response
+            with mock.patch.object(release.request, 'build_opener', return_value=opener):
+                with self.assertRaises((release.ReleaseError, ValueError)):
+                    release.sign(self.root / 'blocked', 'owner/repo', 'a' * 40, 'issuer', 'secret')
+
+    def test_download_availability_falls_back_but_tls_and_hash_failures_block(self):
+        data = self.signed_bytes()
+        for index, exc in enumerate((error.HTTPError('https://amo', 503, 'secret', {}, None),
+                                     error.URLError(TimeoutError('secret')),
+                                     error.URLError(ssl.SSLCertVerificationError('secret')),
+                                     error.HTTPError('https://amo', 404, 'secret', {}, None))):
+            opener = mock.Mock()
+            opener.open.side_effect = exc
+            output = self.root / str(index)
+            with mock.patch.object(release, 'lookup_version', return_value=self.amo_version(data)), \
+                    mock.patch.object(release.request, 'build_opener', return_value=opener):
+                if index < 2:
+                    release.sign(output, 'owner/repo', 'a' * 40, 'issuer', 'secret')
+                    self.assertEqual(release.stage(output, 'owner/repo', 'a' * 40)['resolution_reason'],
+                                     'signed_download_unavailable')
+                else:
+                    with self.assertRaises(release.ReleaseError):
+                        release.sign(output, 'owner/repo', 'a' * 40, 'issuer', 'secret')
+                    self.assertFalse(output.exists())
+
+    def test_submission_requires_authoritative_result_and_is_bounded(self):
+        data = self.signed_bytes()
+        pending = self.amo_version(data, status='unreviewed')
+        for index, after in enumerate((pending, None, self.amo_version(data, status='disabled'))):
+            output = self.root / str(index) / 'artifact'
+            output.parent.mkdir()
+            with mock.patch.object(release, 'lookup_version', side_effect=[None, after]), \
+                    mock.patch.object(release.subprocess, 'run', return_value=mock.Mock(returncode=1)) as submit:
+                if index == 0:
+                    release.sign(output, 'owner/repo', 'a' * 40, 'issuer', 'secret')
+                    self.assertEqual(self.metadata(output)['resolution_reason'], 'pending_review')
+                else:
+                    with self.assertRaises(release.ReleaseError):
+                        release.sign(output, 'owner/repo', 'a' * 40, 'issuer', 'secret')
+                    self.assertFalse(output.exists())
+                self.assertLess(submit.call_args.kwargs['timeout'], 45 * 60)
+                submit.assert_called_once()
+        with mock.patch.object(release, 'lookup_version', return_value=None), \
+                mock.patch.object(release.subprocess, 'run', side_effect=subprocess.TimeoutExpired('web-ext', 1920)):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                release.sign(self.root / 'timeout', 'owner/repo', 'a' * 40, 'issuer', 'secret')
+
+    def test_metadata_cannot_change_package_state_or_provenance(self):
+        output = self.root / 'artifact'
+        release.sign(output, 'owner/repo', 'a' * 40, None, None)
+        original = self.metadata(output)
+        path = output / 'extension-metadata.json'
+        changes = [dict(schema=1), dict(signed=0), dict(signed=True),
+                   dict(resolution_reason='approved'), dict(amo_file_id=17),
+                   dict(extra='field'), dict(extension_version='9.0'),
+                   dict(source_sha256='0' * 64), dict(repository='other/repo')]
+        for change in changes:
+            with self.subTest(change=change):
+                path.write_text(json.dumps(original | change))
+                with self.assertRaises(release.ReleaseError):
+                    release.stage(output, 'owner/repo', 'a' * 40)
+        for key in original:
+            path.write_text(json.dumps({k: v for k, v in original.items() if k != key}))
+            with self.assertRaises(release.ReleaseError):
+                release.stage(output, 'owner/repo', 'a' * 40)
+        path.write_text(json.dumps(original))
+        # Valid signed contents and checksum still cannot masquerade as unsigned.
+        data = self.signed_bytes()
+        (output / release.XPI_NAME).write_bytes(data)
+        digest = hashlib.sha256(data).hexdigest()
+        (output / (release.XPI_NAME + '.sha256')).write_text(f'{digest}  {release.XPI_NAME}\n')
+        original['xpi_sha256'] = digest
+        path.write_text(json.dumps(original))
+        with self.assertRaisesRegex(ValueError, 'signature state'):
+            release.stage(output, 'owner/repo', 'a' * 40)
+
+    def test_invalid_unsigned_source_package_blocks_even_with_approved_amo_version(self):
+        for index, data in enumerate((b'corrupt', self.signed_bytes())):
+            self.package.write_bytes(data)
+            self.checksum.write_text(hashlib.sha256(data).hexdigest() + f'  {release.XPI_NAME}\n')
+            with mock.patch.object(release, 'lookup_version') as lookup:
+                with self.assertRaises((ValueError, zipfile.BadZipFile)):
+                    release.sign(self.root / str(index), 'owner/repo', 'a' * 40, 'issuer', 'secret')
+                lookup.assert_not_called()
+
+    def test_rejected_invalid_or_malformed_metadata_never_falls_back(self):
+        data = self.signed_bytes()
+        cases = [
+            {'version': '9.0'}, {'channel': 'enterprise'}, {'guid': 'other'},
+            {'is_disabled': True}, {'is_disabled': 0}, {'valid': 'false'}, {'valid': False}, {'validation': {'errors': 1}},
+            {'file': None}, {'file': {'status': 'disabled'}},
+            {'file': {'status': 'rejected'}}, {'file': {'status': 'invalid'}},
+            {'file': {'is_mozilla_signed_extension': False}},
+            {'file': {'url': 'https://example.invalid/xpi'}},
+            {'file': {'url': 'https://addons.mozilla.org:invalid/xpi'}},
+            {'file': {'hash': 'sha1:invalid'}}, {'file': {'id': True}},
+            {'file': {'status': 'unreviewed', 'url': 'http://addons.mozilla.org/xpi'}},
+        ]
+        for index, change in enumerate(cases):
+            value = self.amo_version(data)
+            if isinstance(change.get('file'), dict):
+                value['file'].update(change['file'])
+            else:
+                value.update(change)
+            with self.subTest(change=change), \
+                    mock.patch.object(release, 'lookup_version', return_value=value), \
+                    mock.patch.object(release, 'download_signed_file') as download:
+                with self.assertRaises(release.ReleaseError) as result:
+                    release.sign(self.root / str(index), 'owner/repo', 'a' * 40, 'issuer', 'secret')
+                self.assertNotIsInstance(result.exception, release.SigningUnavailable)
+                download.assert_not_called()
+                self.assertFalse((self.root / str(index)).exists())
+
+    def test_approved_downloads_must_keep_source_archive_and_signature_integrity(self):
+        for index, mode in enumerate(('unsigned', 'modified', 'unsafe', 'corrupt')):
+            self.make_unsigned()
+            candidate = self.root / 'bad.xpi'
+            if mode == 'corrupt':
+                candidate.write_bytes(b'broken zip')
+            else:
+                with zipfile.ZipFile(candidate, 'w') as archive:
+                    for path in self.source.rglob('*'):
+                        if path.is_file():
+                            archive.writestr(path.relative_to(self.source).as_posix(),
+                                             b'altered' if mode == 'modified' else path.read_bytes())
+                    if mode != 'unsigned':
+                        for name in ('manifest.mf', 'mozilla.sf', 'mozilla.rsa'):
+                            archive.writestr('META-INF/' + name, 'fixture')
+                    if mode == 'unsafe':
+                        archive.writestr('../escape', 'fixture')
+            data = candidate.read_bytes()
+            output = self.root / str(index)
+            with self.subTest(mode=mode), \
+                    mock.patch.object(release, 'lookup_version', return_value=self.amo_version(data)), \
+                    mock.patch.object(release, 'download_signed_file', return_value=data):
+                with self.assertRaises((ValueError, zipfile.BadZipFile)):
+                    release.sign(output, 'owner/repo', 'a' * 40, 'issuer', 'secret')
+                self.assertFalse((output / 'extension-metadata.json').exists())
+
+    def test_missing_artifact_and_signed_provenance_mismatch_block_staging(self):
+        with self.assertRaises(OSError):
+            release.stage(self.root / 'absent', 'owner/repo', 'a' * 40)
+        data = self.signed_bytes()
+        output = self.root / 'artifact'
+        with mock.patch.object(release, 'lookup_version', return_value=self.amo_version(data)), \
+                mock.patch.object(release, 'download_signed_file', return_value=data):
+            release.sign(output, 'owner/repo', 'a' * 40, 'issuer', 'secret')
+        original = self.metadata(output)
+        path = output / 'extension-metadata.json'
+        for change in ({'amo_sha256': '0' * 64}, {'amo_file_id': False},
+                       {'amo_file_url': 'http://addons.mozilla.org/xpi'},
+                       {'resolution_reason': 'pending_review'}, {'channel': 'listed'},
+                       {'signed': False}):
+            path.write_text(json.dumps(original | change))
+            with self.assertRaises(release.ReleaseError):
+                release.stage(output, 'owner/repo', 'a' * 40)
+
+    def test_unknown_and_tooling_errors_produce_no_resolution_artifact_or_secret_log(self):
+        for index, exc in enumerate((RuntimeError('credential-bearing secret'),
+                                     OSError('credential-bearing secret'),
+                                     subprocess.TimeoutExpired('credential-bearing secret', 1))):
+            output = self.root / str(index)
+            with mock.patch.object(release.sys, 'argv', ['extension_release.py', 'sign', '--output', str(output)]), \
+                    mock.patch.dict(release.os.environ, {'GITHUB_REPOSITORY': 'owner/repo',
+                                                       'GITHUB_SHA': 'a' * 40,
+                                                       'WEB_EXT_API_KEY': 'issuer',
+                                                       'WEB_EXT_API_SECRET': 'secret'}), \
+                    mock.patch.object(release, 'resolve_signed', side_effect=exc), \
+                    mock.patch.object(release.sys, 'stderr', new_callable=io.StringIO) as stderr:
+                self.assertEqual(release.main(), 1)
+                self.assertNotIn('credential-bearing', stderr.getvalue())
+                self.assertFalse(output.exists())
+
+    def test_summary_is_sanitized_and_actionable(self):
+        summary = self.root / 'summary.md'
+        with mock.patch.dict(release.os.environ, {'GITHUB_STEP_SUMMARY': str(summary)}), \
+                mock.patch.object(release, 'lookup_version', side_effect=release.SigningUnavailable('amo_authentication')):
+            release.sign(self.root / 'auth', 'owner/repo', 'a' * 40, 'private issuer', 'private secret')
+            release.sign(self.root / 'missing', 'owner/repo', 'a' * 40, None, None)
+        text = summary.read_text()
+        for expected in ('unsigned', '1.2.3', 'a' * 40, 'ownership', 'AMO_JWT_ISSUER',
+                         'AMO_JWT_SECRET', 'amo-signing', 'REPOSITORY_SETTINGS.md', 'later application release'):
+            self.assertIn(expected, text)
+        self.assertNotIn('private secret', text)
+        self.assertNotIn('private issuer', text)
 
 
 if __name__ == '__main__':

@@ -2,7 +2,8 @@
 
 **Source:** User-requested feature
 **Status:** Implemented
-**Last refined:** 2026-10-04
+**Last refined:** 2026-10-23
+**Updated by:** [Feature 0043, Optional signing](feature-0043-make-firefox-extension-signing-optional.md)
 **Extends:** Feature 0014, Make the repository GitHub-ready; Feature 0026, Download authenticated pages with a Firefox companion
 
 ## Decision summary
@@ -19,22 +20,20 @@ AMO. It submits the source only when that version does not exist, waits for a
 bounded period, and otherwise downloads the already approved version. It then
 verifies Mozilla's metadata and hash, proves that the signed archive differs
 from the reviewed source only by allowed signature metadata, and passes the
-signed XPI and its checksum to `publish` as a commit-bound workflow artifact.
+selected XPI and its checksum to `publish` as a commit-bound workflow artifact.
 
-Mozilla review is asynchronous and may outlive a GitHub-hosted job. A pending
-review therefore blocks container publication without falling back to the
-checked-in unsigned package. A maintainer reruns the failed workflow after AMO
-approval; the rerun queries the existing ID and version before attempting any
-submission, so it downloads the approved result instead of creating a
-duplicate. A scheduled resume workflow is deliberately deferred until manual
-reruns prove burdensome.
+[Feature 0043](feature-0043-make-firefox-extension-signing-optional.md)
+supersedes the original mandatory-signing release policy. Recognized signing
+availability failures, missing credentials, and pending review select a verified
+unsigned development package. Integrity and unclassified failures still block
+publication. Existing versions are never resubmitted. A later application
+release/commit can retrieve the now-approved exact version without changing
+unchanged extension source or replacing immutable image tags.
 
-The published container remains the user-facing distribution mechanism. An
-authenticated desktop-Firefox user opens VDL Settings, chooses **Install
-Firefox extension**, and accepts Firefox's required **Add** confirmation. The
-extension is not publicly listed on AMO, and AMO credentials never enter the
-repository, workflow artifact, Docker build context, image, or running
-container.
+The published container remains the user-facing distribution mechanism. Signed
+packages use Firefox's normal Add confirmation; unsigned packages use the
+single **Download unsigned XPI** action and temporary-loading instructions.
+AMO credentials never enter artifacts, Docker builds, images, or runtime.
 
 The supporting research and primary-source citations are recorded in
 [`research/firefox-unlisted-signing-ci.md`](../research/firefox-unlisted-signing-ci.md).
@@ -43,31 +42,32 @@ The supporting research and primary-source citations are recorded in
 
 For a user of an official VDL container image:
 
-1. The bundled `vdl-companion-firefox.xpi` is signed by Mozilla and installable
-   in Firefox Release and ESR 140 or later.
-2. The user installs it directly from VDL's Browser Extension settings section;
-   there is no AMO listing to find and no separate download site.
-3. Firefox shows its normal installation and permission confirmation. VDL does
-   not claim or attempt silent installation.
+1. The bundled XPI is verified against source. A signed package supports normal
+   Firefox installation; unsigned fallback supports temporary testing.
+2. VDL Settings offers one install/update action for signed packages, or
+   **Download unsigned XPI** with temporary-loading instructions for unsigned
+   packages. No AMO listing or separate download site is needed.
+3. Signed packages use Firefox's normal installation confirmation. Unsigned
+   packages load temporarily through `about:debugging` until Firefox restarts.
+   VDL does not claim or attempt silent installation.
 4. Installation and pairing remain separate. After installation, the existing
    short-lived pairing-string flow connects that Firefox profile to VDL.
 
 Native development checkouts continue to carry an explicitly unsigned
 development XPI. Temporary installation and the existing unsigned-package UI
-remain available for development, while a published image must never contain
-that development artifact.
+remain available in development and published unsigned fallback images.
 
 ## Goals
 
 - Produce a Mozilla-signed, unlisted XPI from the reviewed
   `browser-extension/src/` tree.
-- Make every published `main`, commit-SHA, version, and `latest` image contain
-  a verified signed XPI.
+- Make every published image contain exactly one verified signed or explicitly
+  classified unsigned package, as specified by Feature 0043.
 - Keep pull-request validation deterministic and free of AMO credentials.
 - Make the signing operation idempotent by fixed add-on ID and manifest
   version.
-- Fail closed when AMO validation, review, signing, download, or local
-  verification is incomplete.
+- Fail closed on rejection, validation, integrity, unsafe transport and unknown
+  errors; permit only Feature 0043's classified availability fallbacks.
 - Isolate AMO credentials from the existing high-privilege image-publishing
   job.
 - Preserve the current Dockerfile handoff, backend integrity check, fixed XPI
@@ -188,7 +188,7 @@ Credentials are supplied only through the two documented environment
 variables. The exact 30-minute wait may be adjusted downward if runner cost or
 feedback warrants it, but it must remain bounded and below the job timeout.
 `--approval-timeout=0` is not used because disabling the approval wait does not
-produce the signed XPI required by the next job.
+produce a final verified resolution for the next job.
 
 ## Pull-request validation
 
@@ -229,15 +229,14 @@ validation
 ```
 
 `sign-extension` runs for every trusted `main` publication, not only when the
-extension changed. This guarantees that every image build receives a signed
-artifact. An unchanged extension version follows the inexpensive AMO
+extension changed. This guarantees that every image build receives a verified
+selected-package artifact. An unchanged extension version follows the inexpensive AMO
 lookup/download path and is never resubmitted.
 
 Retain the existing `push` trigger for `main`. Add `workflow_dispatch` so a
 maintainer can start recovery for the current trusted ref when an earlier run
-or its artifacts are no longer rerunnable. GitHub's ordinary **Re-run failed
-jobs** operation remains the preferred response to a pending review because it
-preserves the original commit.
+or its artifacts are no longer rerunnable. For pending-review unsigned publication, use a new application release/commit
+after approval. Do not replace existing immutable commit or version tags.
 
 ### Job permissions and environment
 
@@ -267,12 +266,13 @@ version before invoking `web-ext`.
 | Add-on/version absent | Run `web-ext sign --channel=unlisted` once and wait for the bounded approval period. |
 | Upload validation in progress | Poll only within the remaining bounded wait. |
 | Validation failed | Fail and surface the validation URL/result without exposing credentials. |
-| Version awaiting review | Fail the signing gate with an explicit pending-review summary and rerun instructions. |
+| Version awaiting review | Select verified unsigned fallback with a pending-review summary; never resubmit. |
 | Version rejected, disabled, or blocked | Fail permanently for that run; do not submit the same version again. |
 | Approved, unlisted, Mozilla-signed version | Download the existing signed file and continue to local verification. |
 | Existing listed or enterprise version | Fail because its channel violates the release contract. |
-| Authentication or ownership failure | Fail with an environment/ownership diagnostic. |
-| Rate limit, AMO outage, invalid response, or download failure | Fail as transient; never use the development XPI. |
+| Missing credentials or authentication/ownership failure | Select verified unsigned fallback with setup/ownership guidance. |
+| Rate limit, AMO outage, ordinary network failure, transient signed-download failure | Select verified unsigned fallback. |
+| Invalid response, unsafe transport, TLS failure, integrity or unknown error | Block publication. |
 
 HTTP 404 is treated as absence only when it is the authenticated, exact-version
 lookup response. A CDN download 404, an add-on ownership failure, or a malformed
@@ -332,7 +332,9 @@ extension-metadata.json
 
 ```json
 {
-  "schema": 1,
+  "schema": 2,
+  "signed": true,
+  "resolution_reason": "approved",
   "repository": "owner/repository",
   "source_commit": "40 lowercase hexadecimal characters",
   "extension_id": "{9f743f7e-c0b3-4b99-9e58-6434d3c883d4}",
@@ -340,10 +342,15 @@ extension-metadata.json
   "channel": "unlisted",
   "source_sha256": "64 lowercase hexadecimal characters",
   "xpi_sha256": "64 lowercase hexadecimal characters",
+  "amo_sha256": "64 lowercase hexadecimal characters",
   "amo_file_id": 123,
   "amo_file_url": "https://..."
 }
 ```
+
+Unsigned schema-2 metadata sets `signed: false`, records an allowed Feature 0043
+resolution reason and omits `channel` and all `amo_*` provenance fields. Missing,
+unknown or contradictory fields block staging.
 
 The repository value is taken from trusted workflow context, not a package or
 API response. The AMO URL is provenance metadata, never a later unverified
@@ -381,39 +388,27 @@ secret mount, package, or network access.
 Both platform smoke tests must inspect the built image and require that:
 
 - the bundled XPI checksum is valid;
-- the XPI contains the expected Mozilla signature entries;
+- the XPI signature state exactly matches the selected artifact metadata;
 - its manifest ID and version are correct;
 - the public route serves byte-for-byte the same XPI;
 - the response remains `application/x-xpinstall`, inline for installation,
   `no-store`, and `nosniff`; and
-- backend package metadata reports `signed: true`.
+- backend package metadata reports the exact expected `signed` boolean.
+  Both architectures also compare the selected artifact SHA-256.
 
 Only after both image variants pass may the existing workflow push tags,
 attest images, or create a GitHub Release.
 
 ## Pending review and retry behavior
 
-The normal first-submission path waits up to the configured bounded approval
-timeout. If AMO has not approved the version:
-
-- the signing job fails before `publish` starts;
-- its step summary states the add-on ID, version, non-secret AMO status, and
-  that the maintainer should rerun after approval;
-- no XPI artifact is uploaded unless the complete verification gate passed;
-- no container tag, attestation, Git tag, or GitHub Release is published; and
-- the checked-in development XPI is never used as a fallback.
-
-On rerun, the exact-version lookup happens first. An approved version is
-downloaded and publication proceeds. A still-pending version fails again
-without submitting another upload. A rejected version remains a hard failure;
-the maintainer corrects the source, increments the extension version, and
-merges a new change.
-
-If repeated manual reruns become an operational problem, a later feature may
-add a scheduled poll/resume workflow. That workflow must reuse the same
-resolver and verifier, operate only on trusted `main` commits, and explicitly
-bind any resumed publication to a current commit whose manifest version and
-source digest match the approved AMO file.
+The first-submission path waits for a bounded period. A known pending-review
+state selects a verified unsigned artifact and reports its reason. It never
+resubmits an existing version. A later application release/commit resolves the
+same exact version again and can bundle its now-approved signed package.
+Existing immutable tags are retained. Rejected or disabled versions, failed
+validation, integrity violations and unknown errors remain blocking. There is
+no background polling or strict-signing option in this implementation; see
+[Feature 0043](feature-0043-make-firefox-extension-signing-optional.md).
 
 ## Repository documentation
 
@@ -423,7 +418,7 @@ Update `browser-extension/README.md` to describe:
 - the automated unlisted signing contract;
 - required extension-version increments;
 - the protected-environment setup and credential rotation path;
-- the pending-review rerun procedure;
+- unsigned fallback reasons and the later signed-publication procedure;
 - the strict signed-source verification rule;
 - the difference between local development artifacts and published-image
   artifacts; and
@@ -457,8 +452,8 @@ Exercise the resolver and verifier without contacting AMO:
 
 - exact approved unlisted version selects download;
 - absent version selects one submission;
-- pending, rejected, disabled, listed, enterprise, ownership, authentication,
-  rate-limit, malformed-response, and transient-error states fail correctly;
+- classified availability states select unsigned; rejection, disabled versions,
+  wrong channel, malformed responses, TLS, integrity and unknown failures block;
 - a rerun of a pending or approved version never submits again;
 - AMO hash mismatch is rejected;
 - manifest ID or version mismatch is rejected;
@@ -481,8 +476,8 @@ unapproved origin.
 - Exercise artifact creation and consumption with a synthetic signed-XPI
   fixture containing the expected signature paths; this proves orchestration,
   not Mozilla signature validity.
-- Extend `tests/container/smoke.sh` to reject an unsigned production image and
-  to compare the served bytes with the staged signed fixture.
+- Container smoke tests require the exact selected signed/unsigned state and
+  compare served bytes with the selected artifact SHA-256.
 - Preserve the unit test that identifies the tracked development XPI as
   unsigned and its synthetic signed-package test.
 - Add browser coverage for the signed package state: the Settings link is
@@ -497,13 +492,14 @@ use production AMO credentials in pull-request tests.
 - Pull requests lint and package the extension without AMO access or secrets.
 - A packaged extension-source change without a manifest-version increment is
   rejected before merge.
-- Every trusted `main` publication resolves the exact AMO ID/version before
-  Docker build.
+- Every trusted publication verifies the exact source package before Docker
+  build and attempts the exact AMO ID/version when both credentials exist.
 - A new version is submitted to AMO as `unlisted` at most once.
 - An already approved version is downloaded rather than resubmitted.
-- A pending or rejected version prevents every image push and release action.
-- A rerun after approval downloads, verifies, and packages the existing AMO
-  version successfully.
+- Pending review selects verified unsigned fallback; rejected versions block
+  every publication action.
+- A later application publication after approval downloads and verifies the
+  existing exact AMO version, without replacing an immutable image tag.
 - The signing job has no package, release, attestation, or OIDC write access.
 - The publishing job never receives AMO credentials.
 - The signed XPI matches AMO's hash and the reviewed source outside
@@ -511,7 +507,7 @@ use production AMO credentials in pull-request tests.
 - The commit-bound artifact contains only the XPI, checksum, and non-secret
   metadata.
 - Both published architectures contain and serve the exact verified XPI.
-- Production container smoke tests require `signed: true`.
+- Container tests require the exact expected signature state and package hash.
 - The Docker build contains no AMO access and fails if its staged checksum is
   absent or mismatched.
 - An official container's Preferences link initiates Firefox's normal install

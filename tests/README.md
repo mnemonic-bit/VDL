@@ -39,13 +39,29 @@ This check contacts the Python package index but never installs the downloaded
 wheels. The validation workflow runs it before the multi-platform publication
 job can start.
 
+Exercise both signed and unsigned release artifacts through independent staging,
+image builds, served bytes, checksum, identity/version and signature-state checks:
+
+```bash
+CONTAINER_ENGINE=podman python3 tests/container/check-companion-states.py
+# Requires QEMU/binfmt support on an amd64 host:
+CONTAINER_ENGINE=docker python3 tests/container/check-companion-states.py --platform linux/arm64
+```
+
+These signatures are synthetic fixtures and cannot prove Mozilla signature
+validity. Test a real signed XPI manually in Firefox before claiming normal
+installation works. For an existing image, `tests/container/smoke.sh` accepts
+`VDL_EXPECT_COMPANION_SIGNED=true|false` and `VDL_EXPECT_COMPANION_SHA256`; both
+are supplied by verified artifact staging in the publisher. Local defaults
+expect the checked-in unsigned package and its checksum.
+
 Validate the CodeQL Action revisions and exercise the one-step-update
 regression before changing workflow dependencies:
 
 ```bash
 npm ci
 node scripts/check-codeql-pins.cjs
-node --test tests/codeql-pins.test.cjs
+node --test tests/*.test.cjs
 ```
 
 The validation workflow runs both commands on every pull request to `main`,

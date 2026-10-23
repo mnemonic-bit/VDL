@@ -68,14 +68,34 @@ with Docker/Podman and QEMU-capable Docker respectively.
 
 ## First image publication
 
-Before any `main` image can publish, create a GitHub environment named
-`amo-signing`, restrict deployment branches to `main`, and add environment
-secrets `AMO_JWT_ISSUER` and `AMO_JWT_SECRET` from the AMO developer account
-that owns the fixed VDL add-on ID. A required reviewer is optional. Rotate
-the AMO secret in the Developer Hub and replace the environment secret if it
-may have been exposed. A pending Mozilla review fails the signing job; rerun
-that failed workflow after approval. The signing job has read-only repository
-permission, and the separate publication job does not receive these secrets.
+AMO setup is optional. With no credentials, or only one credential, the trusted
+workflow makes no AMO requests and publishes a verified unsigned development
+companion. Ordinary VDL features remain available. Settings labels this package
+**Download unsigned XPI**, with temporary Firefox loading instructions; it is
+not a normally installable Firefox extension.
+
+To enable best-effort signing, create a GitHub environment named `amo-signing`,
+restrict deployment branches to `main`, and add both environment secrets
+`AMO_JWT_ISSUER` and `AMO_JWT_SECRET` from the AMO developer account that owns
+the fixed VDL add-on ID. A required reviewer is optional. Rotate the secret in
+the Developer Hub and replace it in the environment after suspected exposure.
+Only the AMO resolution step receives these secrets; its job has read-only
+repository permission, and the publisher receives no AMO credentials.
+
+The workflow summary identifies the package type, extension ID/version, source
+commit, and stable resolution reason. Missing/incomplete credentials,
+authentication/ownership failure, rate limiting, service or ordinary network
+failure, pending review, and transient signed-download failure select verified
+unsigned output. Check credential validity and add-on ownership for an
+authentication warning. Integrity, TLS, unsafe redirect, rejection, validation,
+metadata, tooling, artifact, and unknown failures block publication. See
+[Feature 0043](../FEATURES/feature-0043-make-firefox-extension-signing-optional.md).
+
+Approval or added credentials do not change an existing image. Publish a new
+application release/commit to bundle the now-signed exact extension version;
+unchanged extension source needs no extension-version bump. Existing commit
+and version tags remain immutable; rerunning an already published commit is
+not a supported way to replace an unsigned companion.
 
 The first successful `Main` run pushes `main` and a full-commit-SHA tag, then
 checks the SHA tag without registry credentials. A new GHCR package may default
@@ -85,7 +105,10 @@ to private and make that run stop before creating version tags or a Release.
 2. Confirm the package is connected to this repository. The image's OCI source
    label should establish the connection automatically; add it manually if it
    does not.
-3. Rerun the failed `Main` workflow. Its anonymous access check must pass before
+3. Publish a new commit to `main` after making the package public. The already
+   published SHA tag is immutable, so its workflow cannot replace that image.
+   If no version tag or Release was created, keep that application version for
+   this recovery commit. The anonymous access check must pass before
    attestations, `v<VERSION>`, `latest`, and the GitHub Release are created.
 4. From a logged-out shell, run
    `docker pull ghcr.io/mnemonic-bit/vdl:<full-commit-sha>`.

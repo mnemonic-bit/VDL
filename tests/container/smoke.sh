@@ -80,10 +80,14 @@ for attempt in $(seq 1 40); do
     sleep 0.25
 done
 
-"$engine" exec -e "VDL_REQUIRE_SIGNED_COMPANION=${VDL_REQUIRE_SIGNED_COMPANION:-0}" "$name" python - <<'PY'
+"$engine" exec -i \
+    -e "VDL_EXPECT_COMPANION_SIGNED=${VDL_EXPECT_COMPANION_SIGNED-false}" \
+    -e "VDL_EXPECT_COMPANION_SHA256=${VDL_EXPECT_COMPANION_SHA256-$(cut -d " " -f1 "$root/browser-extension/dist/vdl-companion-firefox.xpi.sha256")}" \
+    "$name" python - <<'PY'
 import hashlib
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 import zipfile
@@ -131,8 +135,15 @@ with zipfile.ZipFile(package_path) as archive:
         '{9f743f7e-c0b3-4b99-9e58-6434d3c883d4}'
     )
     assert manifest['version'] == vdl.COMPANION_PACKAGE_VERSION
-if os.environ['VDL_REQUIRE_SIGNED_COMPANION'] == '1':
-    assert vdl._bundled_extension()['signed'] is True
+expected_signed = os.environ['VDL_EXPECT_COMPANION_SIGNED']
+assert expected_signed in ('true', 'false'), 'explicit expected package state is required'
+state = vdl._bundled_extension()
+assert state is not None, 'bundled package failed integrity verification'
+assert state['signed'] is (expected_signed == 'true'), state
+selected_hash = os.environ['VDL_EXPECT_COMPANION_SHA256']
+assert re.fullmatch(r'[0-9a-f]{64}', selected_hash), 'expected selected hash is required'
+assert hashlib.sha256(package).hexdigest() == selected_hash, 'wrong selected package'
+
 
 try:
     urllib.request.urlopen(
@@ -144,7 +155,7 @@ else:
     raise AssertionError('companion management was available without authentication')
 PY
 
-"$engine" exec "$name" python - <<'PY'
+"$engine" exec -i "$name" python - <<'PY'
 import json
 import os
 import subprocess
@@ -286,7 +297,7 @@ PY
 "$engine" run --rm --entrypoint sh \
     -v "$ingest_volume:/ingest" "$image" -c \
     'mkdir -p /ingest/Second && cp /ingest/First/watched-folder.mp4 /ingest/Second/watched-folder.mp4'
-"$engine" exec "$name" python - <<'PY'
+"$engine" exec -i "$name" python - <<'PY'
 import http.cookiejar
 import json
 import urllib.parse
@@ -309,7 +320,7 @@ assert len(rows) == 1, rows
 assert rows[0]['tags'] == ['First'], rows
 PY
 
-"$engine" exec "$name" python - <<'PY'
+"$engine" exec -i "$name" python - <<'PY'
 import json
 import http.cookiejar
 import sqlite3
@@ -361,7 +372,7 @@ for attempt in $(seq 1 40); do
     fi
     sleep 0.25
 done
-"$engine" exec "$name" python - <<'PY'
+"$engine" exec -i "$name" python - <<'PY'
 import json
 import http.cookiejar
 import os
@@ -436,7 +447,7 @@ for attempt in $(seq 1 40); do
     fi
     sleep 0.25
 done
-"$engine" exec "$name" python - <<'PY'
+"$engine" exec -i "$name" python - <<'PY'
 import http.cookiejar
 import json
 import urllib.parse
