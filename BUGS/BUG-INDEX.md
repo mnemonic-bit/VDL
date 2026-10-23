@@ -171,6 +171,22 @@ commit `cadc995` advanced only `analyze` to `4.38.2`, leaving `init` at
 pins to `4.38.2`, groups future CodeQL updates, and checks full-SHA equality
 per job in the existing deterministic validation gate. Hosted analysis and
 confirmation of the live required-check ruleset remain outstanding.
+Issue 53 was reported and investigated on 2026-10-23. Authenticated requests
+to `/api/current-downloads` can fail with `sqlite3.OperationalError: database
+is locked` in the user lookup before the endpoint handler runs. Controlled
+reproductions confirm the exact traceback and rollback-journal reader/writer
+conflicts; WAL removed the large-write conflict in one comparison. A concurrent
+ingest import is suspected by the reporter but remains unconfirmed. The report
+also records the lack of active-import progress in Current Downloads and the
+server-log-only batch counts. The production lock holder and a fix remain open.
+Issue 54 was reported and investigated on 2026-10-23. With approximately
+2,000 Library videos, slow collection refreshes can overlap without a bound,
+delay accepted Current Downloads, replace thumbnails together, and leave a
+failed initial load displaying "No downloads yet". Isolated measurements found
+4,002 SQLite connections and 2,000 repeated allowlist scans per 2,000-item
+Library request. Browser reproductions confirm request accumulation, coupled
+rendering, stale-response regression, image replacement, and false-empty UI.
+The production trigger for minute-long waits and application fixes remain open.
 
 ## Bug reports
 
@@ -226,6 +242,8 @@ confirmation of the live required-check ruleset remain outstanding.
 - [Bug 0050 — Number-input buttons and checkboxes do not match the dark theme](bug-0050-number-input-buttons-and-checkboxes-ignore-dark-theme.md)
 - [Bug 0051 — Settings quick-index highlight does not follow scrolling](bug-0051-settings-quick-index-highlight-does-not-follow-scrolling.md)
 - [Bug 0052 — Dependabot CodeQL updates can desynchronize action versions](bug-0052-dependabot-codeql-updates-can-desynchronize-action-versions.md)
+- [Bug 0053 — Database locks fail authenticated API requests](bug-0053-database-locks-fail-authenticated-api-requests.md)
+- [Bug 0054 — Live refresh overload stalls the download UI](bug-0054-live-refresh-overload-stalls-download-ui.md)
 
 ## Accepted UI decisions
 
