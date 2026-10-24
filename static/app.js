@@ -3382,6 +3382,12 @@ if ('IntersectionObserver' in window) {
 }
 
 function animateInsertedItem(element, pendingAnimations, id) {
+    // Hidden collections have no layout to measure. Animating them from a
+    // zero-height target on return can expose the endless-scroll sentinel.
+    if (!element.getClientRects().length) {
+        pendingAnimations.delete(id);
+        return;
+    }
     // A second collection can reconcile before animationstart; the retained
     // node already owns its natural height and must not measure its collapse.
     if (element.classList.contains('item-fade-in')) return;

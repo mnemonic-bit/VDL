@@ -197,6 +197,12 @@ connections. Status/tag filtering now runs in SQL. Deterministic backend and
 browser regressions cover delayed/failed requests, sustained events, queued
 acceptance, navigation intent, stable images and retained controls. The original
 production trigger for minute-long waits remains unverified.
+Issue 55 was reported by GitHub Actions and reproduced on 2026-10-24. Cards
+received while Settings hid the Library were measured at zero height for their
+entrance animations. Returning briefly exposed the endless-scroll sentinel and
+loaded 20 cards instead of the initial 10. Version `0.46.5` skips insertion
+animations for elements without layout boxes, with a browser regression for
+hidden arrivals and subsequent scrolling.
 
 ## Bug reports
 
@@ -254,6 +260,7 @@ production trigger for minute-long waits remains unverified.
 - [Bug 0052 — Dependabot CodeQL updates can desynchronize action versions](bug-0052-dependabot-codeql-updates-can-desynchronize-action-versions.md)
 - [Bug 0053 — Database locks fail authenticated API requests](bug-0053-database-locks-fail-authenticated-api-requests.md)
 - [Bug 0054 — Live refresh overload stalls the download UI](bug-0054-live-refresh-overload-stalls-download-ui.md)
+- [Bug 0055 — Hidden card animations trigger endless scrolling on return from Settings](bug-0055-hidden-card-animations-trigger-endless-scroll.md)
 
 ## Accepted UI decisions
 

@@ -95,3 +95,27 @@ test('endless scrolling reveals the next batch at the end of the library', async
     await expect(cards).toHaveCount(21);
     await expect(sentinel).toBeHidden();
 });
+
+test('endless scrolling keeps its first batch when cards arrive while Settings is open', async ({ page }) => {
+    await page.setViewportSize({ width: 800, height: 400 });
+    await openSettings(page);
+    await page.locator('#prefPageSize').selectOption('endless');
+    await page.locator('#saveBtn').click();
+    await expect(page.locator('#saveBtn')).toContainText('Saved');
+
+    for (let index = 1; index <= 21; index += 1) {
+        await seed(page, {
+            id: `hidden${String(index).padStart(4, '0')}`,
+            status: 'finished',
+        });
+    }
+    await refresh(page);
+    await expect(page.locator('#historyList .item-fade-in')).toHaveCount(0);
+    await page.getByRole('button', { name: 'Back to videos', exact: true }).click();
+
+    const cards = page.locator('#historyList [data-row-id]');
+    await expect(page.locator('#historyList .item-fade-in')).toHaveCount(0);
+    await expect(cards).toHaveCount(10);
+    await page.locator('#historyEndlessSentinel').scrollIntoViewIfNeeded();
+    await expect.poll(() => cards.count()).toBeGreaterThanOrEqual(20);
+});
