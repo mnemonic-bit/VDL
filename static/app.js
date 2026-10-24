@@ -2968,6 +2968,7 @@ const DEFAULT_HISTORY_PAGE_SIZE = 10;
 const HISTORY_PAGE_SIZES = new Set([5, 10, 20, 50]);
 const HISTORY_ENDLESS_MODE = 'endless';
 const HISTORY_ENDLESS_BATCH_SIZE = 10;
+const HISTORY_ENDLESS_PREFETCH_MARGIN = 160;
 const ENDLESS_PLAYBACK_PAGE_SIZE = 100;
 let historyPageSize = DEFAULT_HISTORY_PAGE_SIZE;
 let historyPage = 0;
@@ -3351,17 +3352,36 @@ function endlessHistoryEnabled() {
     return historyPageSize === HISTORY_ENDLESS_MODE;
 }
 
-function loadNextEndlessHistoryBatch() {
+async function loadNextEndlessHistoryBatch() {
     if (!endlessHistoryEnabled() || historyEndlessLoadPending
             || historyEndlessVisibleCount >= historyTotal) return;
     historyEndlessLoadPending = true;
-    historyEndlessVisibleCount = Math.min(
-        historyTotal,
-        historyEndlessVisibleCount + HISTORY_ENDLESS_BATCH_SIZE,
-    );
-    fetchHistory().finally(() => {
+    try {
+        // Entrance animations temporarily collapse the library. Wait for its
+        // layout to settle, including any cards added by a concurrent refresh.
+        while (true) {
+            const animations = document.getElementById('historyList')
+                .getAnimations({ subtree: true })
+                .filter(animation => animation.animationName === 'item-fade-in'
+                    && animation.playState !== 'finished');
+            if (!animations.length) break;
+            await Promise.all(animations.map(animation => animation.finished.catch(() => {})));
+        }
+        // Observer entries describe an earlier frame; navigation and animation
+        // completion can both move the sentinel before this callback resumes.
+        if (!endlessHistoryEnabled() || historyEndlessVisibleCount >= historyTotal
+                || !historyEndlessSentinel.getClientRects().length) return;
+        const bounds = historyEndlessSentinel.getBoundingClientRect();
+        if (bounds.top > window.innerHeight + HISTORY_ENDLESS_PREFETCH_MARGIN
+                || bounds.bottom < 0) return;
+        historyEndlessVisibleCount = Math.min(
+            historyTotal,
+            historyEndlessVisibleCount + HISTORY_ENDLESS_BATCH_SIZE,
+        );
+        await fetchHistory();
+    } finally {
         historyEndlessLoadPending = false;
-    });
+    }
 }
 
 const historyEndlessSentinel = document.getElementById('historyEndlessSentinel');
@@ -3370,15 +3390,10 @@ if ('IntersectionObserver' in window) {
         if (entries.some(entry => entry.isIntersecting)) {
             loadNextEndlessHistoryBatch();
         }
-    }, { rootMargin: '0px 0px 160px' });
+    }, { rootMargin: `0px 0px ${HISTORY_ENDLESS_PREFETCH_MARGIN}px` });
     historyEndlessObserver.observe(historyEndlessSentinel);
 } else {
-    window.addEventListener('scroll', () => {
-        if (historyEndlessSentinel.getBoundingClientRect().top
-                <= window.innerHeight + 160) {
-            loadNextEndlessHistoryBatch();
-        }
-    }, { passive: true });
+    window.addEventListener('scroll', loadNextEndlessHistoryBatch, { passive: true });
 }
 
 function animateInsertedItem(element, pendingAnimations, id) {

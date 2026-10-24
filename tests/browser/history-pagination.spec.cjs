@@ -119,3 +119,53 @@ test('endless scrolling keeps its first batch when cards arrive while Settings i
     await page.locator('#historyEndlessSentinel').scrollIntoViewIfNeeded();
     await expect.poll(() => cards.count()).toBeGreaterThanOrEqual(20);
 });
+
+for (const trigger of ['observer', 'scroll fallback']) {
+    test(`endless scrolling rechecks the sentinel after visible card animations finish (${trigger})`, async ({ page }) => {
+        await page.setViewportSize({ width: 800, height: 400 });
+        await page.addInitScript(useFallback => {
+            window.__testIntersectionObserver = window.IntersectionObserver;
+            if (useFallback) delete window.IntersectionObserver;
+        }, trigger === 'scroll fallback');
+        for (let index = 1; index <= 21; index += 1) {
+            await seed(page, {
+                id: `animated${String(index).padStart(4, '0')}`,
+                status: 'finished',
+            });
+        }
+        await page.request.post('/__test__/preferences', {
+            data: { history_page_size: 'endless' },
+        });
+        await page.route('**/static/styles.css*', async route => {
+            const response = await route.fetch();
+            // Hold the real entrance animation at its collapsed first frame so
+            // observer delivery cannot depend on the runner's rendering speed.
+            await route.fulfill({
+                response,
+                body: `${await response.text()}\n#historyList .item-fade-in { animation-play-state: paused; }`,
+            });
+        });
+        await page.reload();
+        const cards = page.locator('#historyList [data-row-id]');
+        const sentinel = page.locator('#historyEndlessSentinel');
+        await expect(sentinel).toBeInViewport();
+        await sentinel.evaluate(element => new Promise(resolve => {
+            const observer = new window.__testIntersectionObserver(entries => {
+                if (!entries.some(entry => entry.isIntersecting)) return;
+                observer.disconnect();
+                resolve();
+            });
+            observer.observe(element);
+        }));
+        await page.evaluate(() => window.dispatchEvent(new Event('scroll')));
+        await page.evaluate(async () => {
+            document.getElementById('historyList').getAnimations({ subtree: true })
+                .forEach(animation => animation.finish());
+            await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        });
+        await expect(page.locator('#historyList .item-fade-in')).toHaveCount(0);
+        await expect(cards).toHaveCount(10);
+        await sentinel.scrollIntoViewIfNeeded();
+        await expect.poll(() => cards.count()).toBeGreaterThanOrEqual(20);
+    });
+}

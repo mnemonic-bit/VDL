@@ -4,6 +4,11 @@
 
 **Status:** Resolved in version `0.46.5` on 2026-10-24.
 
+**Follow-up:** [Bug 0057](bug-0057-visible-card-animations-trigger-endless-scroll.md)
+records the same symptom from visible cards during their normal entrance
+animations. The fix here covers hidden arrivals; the later loader fix waits
+for visible animations and rechecks the sentinel's current position.
+
 GitHub Actions intermittently failed the endless-scroll browser test because
 the Library already contained 20 cards when the first batch should contain 10.
 
