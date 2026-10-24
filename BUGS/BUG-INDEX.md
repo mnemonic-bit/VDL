@@ -203,6 +203,12 @@ entrance animations. Returning briefly exposed the endless-scroll sentinel and
 loaded 20 cards instead of the initial 10. Version `0.46.5` skips insertion
 animations for elements without layout boxes, with a browser regression for
 hidden arrivals and subsequent scrolling.
+Issue 56 was reported by GitHub Actions and reproduced on 2026-10-24. The
+download-options debounce test installed Playwright's clock without pausing
+it, allowing interactions and assertions to advance time past the deadline.
+Version `0.46.6` pauses the clock before URL input so explicit time steps
+control the test. The corrected test passed 20 consecutive local runs;
+confirmation on the hosted runner remains outstanding.
 
 ## Bug reports
 
@@ -261,6 +267,7 @@ hidden arrivals and subsequent scrolling.
 - [Bug 0053 — Database locks fail authenticated API requests](bug-0053-database-locks-fail-authenticated-api-requests.md)
 - [Bug 0054 — Live refresh overload stalls the download UI](bug-0054-live-refresh-overload-stalls-download-ui.md)
 - [Bug 0055 — Hidden card animations trigger endless scrolling on return from Settings](bug-0055-hidden-card-animations-trigger-endless-scroll.md)
+- [Bug 0056 — Debounce browser test clock kept advancing between explicit time steps](bug-0056-debounce-browser-test-clock-kept-advancing.md)
 
 ## Accepted UI decisions
 

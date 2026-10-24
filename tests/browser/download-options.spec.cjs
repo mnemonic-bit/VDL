@@ -110,7 +110,10 @@ async function expectDependentControlsDisabled(page) {
 const readyProbe = { title: 'Ready video', resolutions: ['720p'], containers: ['mp4'] };
 
 test('checking starts during debounce and stays busy until metadata arrives', async ({ page }) => {
-    await page.clock.install();
+    await page.clock.install({ time: new Date('2026-01-01T00:00:00Z') });
+    // Installing the clock still lets time pass during assertions and input.
+    // Pause before typing so only runFor advances the debounce deadline.
+    await page.clock.pauseAt(new Date('2026-01-01T00:00:01Z'));
     let pendingProbe;
     let submissions = 0;
     await page.route('**/api/probe', route => { pendingProbe = route; });
