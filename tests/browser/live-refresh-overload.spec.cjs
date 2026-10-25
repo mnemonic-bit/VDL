@@ -89,7 +89,7 @@ test('progress refresh preserves an unchanged Library thumbnail and its active h
         body: '<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><rect width="4" height="4" fill="green"/></svg>',
     }));
     await seed(page, { id: 'other-library-card', status: 'finished', title: 'Other Library card' });
-    await seed(page, { id: 'stable-preview', status: 'finished', title: 'Stable Library card' });
+    await seed(page, { id: 'stable-preview', status: 'finished', thumbnail: true, montage: true, title: 'Stable Library card' });
     await seed(page, { id: 'changing-progress', status: 'downloading', progress: '1%' });
     await refresh(page);
     const preview = page.locator('#historyList [data-row-id="stable-preview"] .history-preview');
@@ -104,7 +104,7 @@ test('progress refresh preserves an unchanged Library thumbnail and its active h
     await seed(page, { id: 'changing-progress', status: 'downloading', progress: '35%' });
     await refresh(page);
     await seed(page, { id: 'other-library-card', status: 'finished', title: 'Updated other card' });
-    await seed(page, { id: 'stable-preview', status: 'finished', title: 'Updated active preview title' });
+    await seed(page, { id: 'stable-preview', status: 'finished', thumbnail: true, montage: true, title: 'Updated active preview title' });
     await refresh(page);
     await expect(page.locator('#historyList [data-row-id="other-library-card"]')).toContainText('Updated other card');
     await expect(page.locator('#historyList [data-row-id="stable-preview"]')).toContainText('Updated active preview title');
@@ -268,50 +268,7 @@ test('delayed History refreshes retain a newer page and filter intent', async ({
     }
 });
 
-test('busy thumbnails recover beyond the failure budget while healthy images retain their nodes', async ({ page }) => {
-    test.setTimeout(20_000);
-    await page.setViewportSize({ width: 1280, height: 1400 });
-    await page.clock.install();
-    const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><rect width="4" height="4" fill="green"/></svg>';
-    const ids = Array.from({ length: 6 }, (_, index) => `busy-thumbnail-${index}`);
-    const heads = Object.fromEntries(ids.map(id => [id, 0]));
-    const gets = Object.fromEntries(ids.map(id => [id, 0]));
-    await page.route('**/api/thumbnail/**', async route => {
-        const id = decodeURIComponent(new URL(route.request().url()).pathname.split('/').pop());
-        if (id === 'healthy-thumbnail') return route.fulfill({ contentType: 'image/svg+xml', body: svg });
-        if (route.request().method() === 'HEAD') heads[id]++;
-        else gets[id]++;
-        if (heads[id] <= 4) {
-            return route.fulfill({ status: 503, headers: { 'Retry-After': '1' } });
-        }
-        return route.fulfill({ contentType: 'image/svg+xml', body: svg });
-    });
-    for (const id of [...ids, 'healthy-thumbnail']) {
-        await seed(page, { id, status: 'finished' });
-    }
-    await refresh(page);
-    const healthy = page.locator('#historyList [data-row-id="healthy-thumbnail"] img');
-    await expect.poll(() => healthy.evaluate(image => image.complete && image.naturalWidth > 0)).toBe(true);
-    await healthy.evaluate(image => { window.__healthyThumbnail = image; });
-    await expect.poll(() => ids.every(id => gets[id] >= 1)).toBe(true);
-    // Every image remains busy for four HEAD responses, beyond the three
-    // decoder-failure attempts. Capacity waits must preserve eventual recovery.
-    for (let attempt = 1; attempt <= 5; attempt++) {
-        await page.clock.fastForward(31_001);
-        await expect.poll(() => ids.every(id => heads[id] >= attempt)).toBe(true);
-    }
-    for (const id of ids) {
-        const image = page.locator(`#historyList [data-row-id="${id}"] img`);
-        await expect.poll(() => image.evaluate(element => element.complete && element.naturalWidth > 0)).toBe(true);
-        await expect(image.locator('..')).not.toHaveClass(/thumbnail-unavailable/);
-        expect(gets[id]).toBe(2);
-        expect(heads[id]).toBe(5);
-    }
-    await refresh(page);
-    expect(await healthy.evaluate(image => image === window.__healthyThumbnail)).toBe(true);
-});
-
-test('undecodable thumbnails stop retrying after a bounded number of successful HEAD responses', async ({ page }) => {
+test('undecodable ready thumbnails stop after bounded transport recovery without HEAD probes', async ({ page }) => {
     await page.clock.install();
     let gets = 0;
     let heads = 0;
@@ -320,7 +277,7 @@ test('undecodable thumbnails stop retrying after a bounded number of successful 
         else gets++;
         await route.fulfill({ status: 200, contentType: 'image/jpeg', body: 'not a decodable image' });
     });
-    await seed(page, { id: 'corrupt-thumbnail', status: 'finished' });
+    await seed(page, { id: 'corrupt-thumbnail', status: 'finished', thumbnail: true });
     await refresh(page);
     const preview = page.locator('#historyList [data-row-id="corrupt-thumbnail"] .history-preview');
     await expect(preview).toHaveClass(/thumbnail-unavailable/);
@@ -329,11 +286,11 @@ test('undecodable thumbnails stop retrying after a bounded number of successful 
         await expect.poll(() => gets).toBeGreaterThanOrEqual(attempt + 1);
     }
     await page.clock.fastForward(60_000);
-    expect(heads).toBe(3);
+    expect(heads).toBe(0);
     expect(gets).toBe(4);
     await refresh(page);
     await page.clock.fastForward(60_000);
-    expect(heads).toBe(3);
+    expect(heads).toBe(0);
     expect(gets).toBe(4);
     await expect(preview).toHaveClass(/thumbnail-unavailable/);
 });

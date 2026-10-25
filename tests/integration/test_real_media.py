@@ -3,6 +3,7 @@ import shutil
 import threading
 import time
 import unittest
+from unittest import mock
 
 import vdl
 from tests.support.app_case import AppCase
@@ -75,6 +76,34 @@ class RealMediaIntegrationTest(AppCase):
             filesize=os.path.getsize(media_path),
             finished_at=time.time(),
         )
+
+        pending = self.client.get("/api/preview/preview1")
+        self.assertEqual(pending.status_code, 202)
+        commands = []
+        native_run = vdl.subprocess.run
+
+        def record(command, **kwargs):
+            commands.append(command)
+            return native_run(command, **kwargs)
+
+        with mock.patch.object(vdl.subprocess, "run", side_effect=record):
+            queue = vdl._get_asset_queue()
+            self.assertTrue(queue.step())
+            self.assertTrue(queue.step())
+
+        thumbnail_path = vdl._thumbnail_path(vdl.db_get_download("preview1"))
+        with open(thumbnail_path, "rb") as image:
+            self.assertEqual(image.read(2), b"\xff\xd8")
+        ffmpeg_commands = [command for command in commands if command[0] == "ffmpeg"]
+        self.assertEqual(len(ffmpeg_commands), 2)
+        for command in ffmpeg_commands:
+            for flag in ("-filter_threads", "-filter_complex_threads"):
+                self.assertEqual(command[command.index(flag) + 1], "1")
+            self.assertEqual(command[command.index("-threads") + 1], "1")
+        montage_command = next(command for command in ffmpeg_commands if "-filter_complex" in command)
+        for index, argument in enumerate(montage_command):
+            if argument == "-i":
+                self.assertIn("-threads", montage_command[max(0, index - 8):index])
 
         first = self.client.get("/api/preview/preview1")
         self.assertEqual(first.status_code, 200)

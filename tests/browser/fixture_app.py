@@ -125,10 +125,23 @@ def test_row():
         updates.setdefault("finished_at", time.time())
     if updates:
         vdl.db_update_download(download_id, **updates)
+    if filename and data.get("montage"):
+        with open(vdl._preview_path(vdl.db_get_download(download_id)), "wb") as montage:
+            montage.write(b"cached-montage")
     if filename and data.get("thumbnail"):
         thumbnail_path = vdl._thumbnail_path(vdl.db_get_download(download_id))
         with open(thumbnail_path, "wb") as image:
             image.write(b"\xff\xd8cached-frame\xff\xd9")
+    # Mark explicit fixture sidecars against the newly published source. Normal
+    # publication registers work before these deterministic test bytes are added.
+    for kind, flag in (("thumbnail", "thumbnail"), ("montage", "montage")):
+        if filename and data.get(flag):
+            with vdl._db_lock, vdl.db() as connection:
+                connection.execute(
+                    "UPDATE generated_assets SET state='ready', source=? "
+                    "WHERE download_id=? AND kind=?",
+                    (vdl.AssetQueue._identity(filename), download_id, kind),
+                )
     if data.get("visibility") in ("public", "private"):
         vdl.db_set_download_visibility(download_id, data["visibility"])
     if data.get("browser_authenticated") is True:

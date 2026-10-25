@@ -30,6 +30,22 @@ class IngestFolderTest(AppCase):
     def run_import(self):
         vdl.IngestStartupImporter(self.ingest_dir).run(threading.Event())
 
+    def test_mounted_publication_queues_assets_and_preserves_receipt_without_extracting(self):
+        source = self.source('validated-video.unknown')
+        with mock.patch.object(vdl, 'inspect_uploaded_video', return_value='720p'), \
+                mock.patch.object(vdl, 'generate_video_thumbnail') as thumbnail, \
+                mock.patch.object(vdl, 'generate_video_preview') as montage:
+            download_id = self.ingest(source)
+        thumbnail.assert_not_called()
+        montage.assert_not_called()
+        self.assertEqual(vdl.db_get_download(download_id)['status'], 'finished')
+        self.assertIn(source, vdl.db_get_ingest_receipts(self.ingest_dir))
+        with vdl.db() as conn:
+            rows = conn.execute('SELECT kind,state FROM generated_assets WHERE download_id=? '
+                                'ORDER BY sequence', (download_id,)).fetchall()
+        self.assertEqual([(row['kind'], row['state']) for row in rows],
+                         [('thumbnail', 'queued'), ('montage', 'queued')])
+
     def test_snapshot_is_recursive_sorted_and_excludes_hidden_temporary_and_symlinks(self):
         nested = self.source('Season/Part/Movie.MP4')
         root = self.source('root.unknown')

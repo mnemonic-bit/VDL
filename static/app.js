@@ -141,52 +141,177 @@ function reconcileCards(list, entries, render, idAttribute) {
 }
 
 function retryThumbnail(image) {
-    (image.closest('.history-preview') || image).classList.add('thumbnail-unavailable');
+    const preview = image.closest('.history-preview');
+    (preview || image).classList.add('thumbnail-unavailable');
+    if (preview) preview.querySelector('.history-preview-fallback > span').textContent = 'Preview unavailable';
     scheduleThumbnailRetry(image);
 }
 
 function scheduleThumbnailRetry(image, delay = 1000) {
+    // Ready images can still suffer transport or decoding failures. Recovery
+    // is bounded and never probes pending generation with per-image HEADs.
     if (image.dataset.thumbnailRetryPending || Number(image.dataset.thumbnailFailures || 0) >= 3) return;
     image.dataset.thumbnailRetryPending = '1';
-    setTimeout(async () => {
-        if (!image.isConnected) {
-            delete image.dataset.thumbnailRetryPending;
-            return;
-        }
-        try {
-            // Image error events omit HTTP status. HEAD distinguishes decoder
-            // capacity from a failed file, without downloading image bytes.
-            const response = await fetch(image.src, { method: 'HEAD' });
-            delete image.dataset.thumbnailRetryPending;
-            const retryAfter = Number(response.headers.get('Retry-After')) * 1000;
-            if (response.status === 503) {
-                const busy = Number(image.dataset.thumbnailBusy || 0) + 1;
-                image.dataset.thumbnailBusy = String(busy);
-                // Capacity waits don't spend the failure budget. Spread retries
-                // so a large uncached page can eventually fill every thumbnail.
-                scheduleThumbnailRetry(image, Math.max(
-                    retryAfter || 0, Math.min(30000, 1000 * 2 ** Math.min(busy, 5)),
-                ) + Math.random() * 1000);
-            } else if (response.ok) {
-                image.dataset.thumbnailFailures = String(Number(image.dataset.thumbnailFailures || 0) + 1);
-                const url = new URL(image.src);
-                url.searchParams.set('retry', String(Date.now()));
-                image.src = url.href;
-            } else if (response.status !== 401 && response.status !== 403) {
-                image.dataset.thumbnailFailures = String(Number(image.dataset.thumbnailFailures || 0) + 1);
-                scheduleThumbnailRetry(image, Math.max(5000, Math.min(30000, retryAfter || 0)));
-            }
-        } catch (_) {
-            delete image.dataset.thumbnailRetryPending;
-            image.dataset.thumbnailFailures = String(Number(image.dataset.thumbnailFailures || 0) + 1);
-            scheduleThumbnailRetry(image, 5000);
-        }
+    setTimeout(() => {
+        delete image.dataset.thumbnailRetryPending;
+        if (!image.isConnected || image.dataset.assetState !== 'ready') return;
+        image.dataset.thumbnailFailures = String(Number(image.dataset.thumbnailFailures || 0) + 1);
+        const url = new URL(thumbnailUrl(image.dataset.assetId), location.href);
+        url.searchParams.set('retry', String(Date.now()));
+        image.src = url.href;
     }, delay);
 }
 
+function assetState(id, kind = 'thumbnail') {
+    return collectionSnapshots.library.find(info => String(info.id) === String(id))?.assets?.[kind] || 'queued';
+}
+
+function hasVideoAssets(info) {
+    return Boolean(info && (info.assets?.thumbnail
+        || PLAYLIST_VIDEO_EXTENSIONS.has((info.filename || '').split('.').pop().toLowerCase())));
+}
+
+function assetImage(id, attributes = '') {
+    const state = assetState(id);
+    const source = state === 'ready' ? ` src="${thumbnailUrl(id)}"` : '';
+    return `<img data-asset-id="${escapeAttr(id)}" data-asset-state="${state}"${source} alt="" ${attributes} onerror="retryThumbnail(this)" onload="thumbnailLoaded(this)">`;
+}
+
+const assetDemand = {
+    tab: globalThis.crypto?.randomUUID?.() || `tab-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    revision: 0, timer: null, inFlight: false, latest: null, signature: null,
+};
+let intentionalHoverPreview = null;
+let assetViewportObserver = null;
+const observedAssetCards = new Set();
+
+function visibleAssetIds() {
+    if (document.hidden || document.getElementById('tab-history').hidden) return [];
+    const cards = [...document.querySelectorAll('#historyList [data-row-id]')];
+    return cards.filter(card => {
+        if (!card.querySelector('[data-play-action][data-play-ext]')) return false;
+        if (!hasVideoAssets(collectionSnapshots.library.find(info => String(info.id) === card.dataset.rowId))) return false;
+        if (!endlessHistoryEnabled()) return true;
+        const bounds = card.getBoundingClientRect();
+        return bounds.bottom >= -160 && bounds.top <= innerHeight + 160;
+    }).slice(0, 200).map(card => card.dataset.rowId);
+}
+
+function updateAssetViewport() {
+    if (!assetViewportObserver && 'IntersectionObserver' in window) {
+        assetViewportObserver = new IntersectionObserver(() => scheduleAssetDemand(), { rootMargin: '160px' });
+    }
+    const cards = new Set(document.querySelectorAll('#historyList [data-row-id]'));
+    for (const card of observedAssetCards) {
+        if (!cards.has(card)) {
+            assetViewportObserver?.unobserve(card);
+            observedAssetCards.delete(card);
+        }
+    }
+    for (const card of cards) {
+        if (!observedAssetCards.has(card)) {
+            assetViewportObserver?.observe(card);
+            observedAssetCards.add(card);
+        }
+    }
+    scheduleAssetDemand();
+}
+
+function scheduleAssetDemand({ reconcile = false, interaction = true } = {}) {
+    const ids = visibleAssetIds();
+    const hoverId = intentionalHoverPreview?.dataset.downloadId;
+    const hovered = ids.includes(hoverId) ? hoverId : null;
+    const signature = JSON.stringify([ids, hovered]);
+    if (!reconcile && signature === assetDemand.signature) return;
+    assetDemand.signature = signature;
+    interaction ||= Boolean(assetDemand.latest?.interaction);
+    assetDemand.latest = { tab_id: assetDemand.tab, revision: ++assetDemand.revision, ids, hovered_id: hovered, interaction };
+    if (assetDemand.timer !== null) return;
+    assetDemand.timer = setTimeout(() => {
+        assetDemand.timer = null;
+        flushAssetDemand();
+    }, 150);
+}
+
+async function flushAssetDemand() {
+    if (assetDemand.inFlight || !assetDemand.latest) return;
+    const demand = assetDemand.latest;
+    assetDemand.latest = null;
+    assetDemand.inFlight = true;
+    try {
+        const response = await apiFetch('/api/assets/demand', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(demand), keepalive: demand.ids.length === 0,
+        });
+        if (response.ok) {
+            const data = await response.json();
+            if (demand.revision === assetDemand.revision) applyAssetReadiness(data.assets || {});
+        }
+    } catch (_) { /* Focus, navigation and SSE reconnect reconcile transport failures. */ }
+    finally {
+        assetDemand.inFlight = false;
+        if (assetDemand.latest && assetDemand.timer === null) {
+            assetDemand.timer = setTimeout(() => {
+                assetDemand.timer = null;
+                flushAssetDemand();
+            }, 150);
+        }
+    }
+}
+
+function applyAssetReadiness(assets) {
+    for (const [id, readiness] of Object.entries(assets)) {
+        const info = collectionSnapshots.library.find(item => String(item.id) === id);
+        if (!info) continue;
+        info.assets = readiness;
+        // Only changed cards are patched. The retained template protects live
+        // image/hover elements from unrelated readiness and progress events.
+        const card = document.querySelector(`#historyList [data-row-id="${CSS.escape(id)}"]`);
+        if (card && renderedTemplates.has(card)) {
+            const template = document.createElement('template');
+            template.innerHTML = renderItem(info, true).trim();
+            const next = template.content.firstElementChild;
+            patchRenderedNode(card, renderedTemplates.get(card), next);
+            renderedTemplates.set(card, next);
+        }
+        for (const image of document.querySelectorAll(`img[data-asset-id="${CSS.escape(id)}"]`)) {
+            const previous = image.dataset.assetState;
+            image.dataset.assetState = readiness.thumbnail;
+            if (readiness.thumbnail === 'ready') {
+                if (previous !== 'ready' || !image.hasAttribute('src')) image.src = thumbnailUrl(id);
+            } else {
+                image.removeAttribute('src');
+            }
+        }
+    }
+    if (intentionalHoverPreview && !intentionalHoverPreview.isConnected) intentionalHoverPreview = null;
+    if (intentionalHoverPreview && !activeHoverPreview
+            && assetState(intentionalHoverPreview.dataset.downloadId, 'montage') === 'ready') {
+        startHoverPreview(intentionalHoverPreview, false);
+    }
+}
+
+let lastAssetInteraction = 0;
+function renewAssetDemand() {
+    const now = Date.now();
+    if (now - lastAssetInteraction < 1000) return;
+    lastAssetInteraction = now;
+    scheduleAssetDemand({ reconcile: true });
+}
+
+window.addEventListener('scroll', renewAssetDemand, { passive: true });
+window.addEventListener('focus', () => scheduleAssetDemand({ reconcile: true }));
+document.addEventListener('visibilitychange', () => scheduleAssetDemand({ reconcile: true }));
+window.addEventListener('pagehide', () => {
+    // This also clears demand for form-based logout and ordinary navigation.
+    assetDemand.latest = { tab_id: assetDemand.tab, revision: ++assetDemand.revision, ids: [], hovered_id: null };
+    if (assetDemand.timer !== null) clearTimeout(assetDemand.timer);
+    assetDemand.timer = null;
+    flushAssetDemand();
+});
+
 function thumbnailLoaded(image) {
     delete image.dataset.thumbnailFailures;
-    delete image.dataset.thumbnailBusy;
     (image.closest('.history-preview') || image).classList.remove('thumbnail-unavailable');
 }
 
@@ -1934,8 +2059,12 @@ function hoverPreviewsEnabled() {
         && !window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 }
 
-function stopHoverPreview(preview = activeHoverPreview || pendingHoverPreview) {
+function stopHoverPreview(preview = activeHoverPreview || pendingHoverPreview || intentionalHoverPreview) {
     if (!preview) return;
+    if (intentionalHoverPreview === preview) {
+        intentionalHoverPreview = null;
+        scheduleAssetDemand({ reconcile: true });
+    }
     if (pendingHoverPreview === preview) {
         clearTimeout(hoverPreviewTimer);
         hoverPreviewTimer = null;
@@ -1954,7 +2083,7 @@ function stopHoverPreview(preview = activeHoverPreview || pendingHoverPreview) {
     if (activeHoverPreview === preview) activeHoverPreview = null;
 }
 
-function startHoverPreview(preview) {
+function startHoverPreview(preview, interaction = true) {
     hoverPreviewTimer = null;
     pendingHoverPreview = null;
     const hoverRegion = preview.closest('.history-preview-wrap') || preview;
@@ -1963,8 +2092,11 @@ function startHoverPreview(preview) {
     if (activeHoverPreview && activeHoverPreview !== preview) {
         stopHoverPreview(activeHoverPreview);
     }
+    intentionalHoverPreview = preview;
+    scheduleAssetDemand({ reconcile: true, interaction });
+    if (assetState(preview.dataset.downloadId, 'montage') !== 'ready') return;
     const video = preview.querySelector('.history-preview-video');
-    if (!video) return;
+    if (!video || activeHoverPreview === preview) return;
 
     activeHoverPreview = preview;
     preview.classList.add('preview-loading');
@@ -1989,11 +2121,11 @@ function startHoverPreview(preview) {
 }
 
 function scheduleHoverPreview(preview) {
-    if (!hoverPreviewsEnabled() || preview.classList.contains('thumbnail-unavailable')) return;
+    if (!hoverPreviewsEnabled() || !hasVideoAssets(collectionSnapshots.library.find(info => String(info.id) === preview.dataset.downloadId))) return;
     if (pendingHoverPreview && pendingHoverPreview !== preview) {
         stopHoverPreview(pendingHoverPreview);
     }
-    if (activeHoverPreview === preview || pendingHoverPreview === preview) return;
+    if (activeHoverPreview === preview || pendingHoverPreview === preview || intentionalHoverPreview === preview) return;
     pendingHoverPreview = preview;
     hoverPreviewTimer = setTimeout(
         () => startHoverPreview(preview),
@@ -2294,7 +2426,7 @@ function renderPlaylistMosaic(playlist) {
     if (!ids.length) {
         return '<div class="playlist-mosaic-empty"><svg aria-hidden="true"><use href="#i-playlist"/></svg><span>No videos yet</span></div>';
     }
-    return ids.map(id => `<img src="${thumbnailUrl(id)}" alt="" loading="lazy" onerror="retryThumbnail(this)" onload="thumbnailLoaded(this)">`).join('');
+    return ids.map(id => assetImage(id, 'loading="lazy"')).join('');
 }
 
 function renderPlaylistCard(playlist) {
@@ -2388,12 +2520,12 @@ function renderPlaylistEditor() {
         && (!query || tagSearchKey(libraryTitle(info)).includes(query))
     ));
     document.getElementById('playlistAvailable').innerHTML = available.length
-        ? available.map(info => `<button type="button" class="playlist-picker-row" onclick="playlistEditorAdd('${escapeAttr(info.id)}')"><img src="${thumbnailUrl(info.id)}" alt=""><span>${escapeHtml(libraryTitle(info))}</span><svg aria-hidden="true"><use href="#i-plus"/></svg></button>`).join('')
+        ? available.map(info => `<button type="button" class="playlist-picker-row" onclick="playlistEditorAdd('${escapeAttr(info.id)}')">${assetImage(info.id)}<span>${escapeHtml(libraryTitle(info))}</span><svg aria-hidden="true"><use href="#i-plus"/></svg></button>`).join('')
         : '<p>No available videos match.</p>';
     document.getElementById('playlistSelected').innerHTML = playlistEditorDraft.items.length
         ? playlistEditorDraft.items.map((item, index) => `<div class="playlist-selected-row${item.unavailable ? ' is-unavailable' : ''}" draggable="${!item.unavailable}" data-playlist-index="${index}">
             <span class="playlist-drag-handle" aria-hidden="true">⋮⋮</span>
-            ${item.id ? `<img src="${thumbnailUrl(item.id)}" alt="">` : '<span class="playlist-unavailable-thumb"><svg><use href="#i-camera"/></svg></span>'}
+            ${item.id ? assetImage(item.id) : '<span class="playlist-unavailable-thumb"><svg><use href="#i-camera"/></svg></span>'}
             <span class="playlist-selected-title"><span>${index + 1}</span>${escapeHtml(item.title || 'Unavailable video')}</span>
             <span class="playlist-order-actions">
                 <button type="button" onclick="playlistEditorMove(${index}, -1)" ${index === 0 ? 'disabled' : ''} aria-label="Move ${escapeAttr(item.title || 'video')} up">↑</button>
@@ -2660,15 +2792,18 @@ function renderHistoryCard(info) {
     const durationBadge = mediaDuration
         ? `<span class="history-preview-label history-preview-duration">${mediaDuration}</span>`
         : '';
+    const videoPreview = hasVideoAssets(info);
+    const thumbnailState = videoPreview ? (info.assets?.thumbnail || 'queued') : 'failed';
+    const thumbnailStatus = thumbnailState === 'failed' ? 'Preview unavailable' : 'Preparing preview';
     let preview;
     if (hasPlay) {
         const playLabel = displayFilename(info);
         const playExt = info.filename.split('.').pop().toLowerCase();
         preview = `
                 <div class="history-preview-wrap">
-                    <button class="history-preview${mediaDuration ? ' has-preview-duration' : ''}" type="button" data-play-action data-download-id="${escapeAttr(id)}" data-play-label="${escapeAttr(playLabel)}" data-play-ext="${escapeAttr(playExt)}" aria-label="Play">
-                        <span class="history-preview-fallback"><svg><use href="#i-camera"/></svg><span>No video preview</span></span>
-                        <img src="${thumbnailUrl(id)}" alt="" loading="lazy" onerror="retryThumbnail(this)" onload="thumbnailLoaded(this)">
+                    <button class="history-preview${thumbnailState === 'ready' ? '' : thumbnailState === 'failed' ? ' thumbnail-unavailable' : ' thumbnail-pending'}${mediaDuration ? ' has-preview-duration' : ''}" type="button" data-play-action data-download-id="${escapeAttr(id)}" data-play-label="${escapeAttr(playLabel)}" data-play-ext="${escapeAttr(playExt)}" aria-label="Play">
+                        <span class="history-preview-fallback"><svg><use href="#i-camera"/></svg><span>${thumbnailStatus}</span></span>
+                        ${assetImage(id, 'loading="lazy"')}
                         <video class="history-preview-video" muted playsinline loop preload="none" aria-hidden="true"></video>
                         ${newBadge}
                         ${qualityBadge}
@@ -3014,6 +3149,7 @@ function openAttemptHistory() {
     document.body.classList.remove('settings-open');
     document.body.classList.add('history-open');
     document.getElementById('tab-history').hidden = true;
+    scheduleAssetDemand();
     document.getElementById('attemptHistoryPage').hidden = false;
     window.scrollTo({ top: attemptScrollPosition });
     document.getElementById('attemptHistoryTitle').focus({ preventScroll: true });
@@ -3026,6 +3162,7 @@ function closeAttemptHistory() {
     ++attemptRequest;
     document.getElementById('attemptHistoryPage').hidden = true;
     document.getElementById('tab-history').hidden = false;
+    scheduleAssetDemand({ reconcile: true });
     document.body.classList.remove('history-open');
     window.scrollTo({ top: libraryScrollPosition });
     document.getElementById('accountMenuButton').focus({ preventScroll: true });
@@ -3052,7 +3189,7 @@ function attemptRowHtml(info) {
         result = [info.progress, formatSpeed(info.speed), info.eta == null ? '' : `ETA ${formatEta(info.eta)}`].filter(Boolean).join(' · ');
     }
     const image = info.library_id
-        ? `<img class="attempt-thumbnail" src="${thumbnailUrl(info.library_id)}" alt="" loading="lazy">`
+        ? assetImage(info.library_id, 'class="attempt-thumbnail" loading="lazy"')
         : '<span class="attempt-placeholder" aria-hidden="true"><svg><use href="#i-download"/></svg></span>';
     const action = (name, label) => `<button type="button" data-attempt-action="${name}" data-attempt-id="${escapeAttr(info.id)}">${label}</button>`;
     return `${image}<div class="attempt-copy">
@@ -3226,7 +3363,7 @@ function renderDuplicateMember(info) {
     const details = [duplicateSourceLabel(info), info.resolution, formatBytes(info.filesize)]
         .filter(Boolean).map(value => `<span>${escapeHtml(value)}</span>`).join('');
     return `<article class="duplicate-member" data-duplicate-id="${escapeAttr(id)}">
-                <img src="${thumbnailUrl(id)}" alt="" loading="lazy">
+                ${assetImage(id, 'loading="lazy"')}
                 <div class="duplicate-member-detail">
                     <div class="duplicate-member-title">${escapeHtml(title)}</div>
                     <div class="duplicate-member-filename">${escapeHtml(name)}</div>
@@ -3613,6 +3750,7 @@ function renderDownloadCollections({ sortFavorites = false } = {}) {
 
     reconcileCards(document.getElementById('activeList'), active, info => renderItem(info, false), 'data-row-id');
     reconcileCards(document.getElementById('historyList'), pageItems, info => renderItem(info, true), 'data-row-id');
+    updateAssetViewport();
 
     if (currentDrawerVisible) {
         newActiveIds.forEach(id => {
@@ -4743,7 +4881,7 @@ function renderPlaylistQueue() {
         }
         return `<button type="button" class="playlist-queue-row${active ? ' is-active' : ''}" data-queue-position="${index}" onclick="selectPlaylistQueueItem('${escapeAttr(item.id)}')" ${active ? 'aria-current="true"' : ''}>
             <span class="playlist-queue-number">${index + 1}</span>
-            <img src="${thumbnailUrl(item.id)}" alt="">
+            ${assetImage(item.id)}
             <span><strong>${escapeHtml(item.title || 'Untitled video')}</strong>${duration ? `<small>${duration}</small>` : ''}</span>
         </button>`;
     }).join('');
@@ -5463,6 +5601,7 @@ function openSettings() {
         loadExtensionConnections(),
     ]).then(() => {
         document.getElementById('tab-history').hidden = true;
+        scheduleAssetDemand();
         document.getElementById('attemptHistoryPage').hidden = true;
         page.hidden = false;
         document.body.classList.add('settings-open');
@@ -5479,6 +5618,7 @@ function closeSettings() {
     if (page.hidden) return;
     page.hidden = true;
     document.getElementById('tab-history').hidden = attemptHistoryOpen;
+    scheduleAssetDemand({ reconcile: true });
     document.getElementById('attemptHistoryPage').hidden = !attemptHistoryOpen;
     document.body.classList.remove('settings-open');
     clearExtensionPairing();
@@ -6320,6 +6460,11 @@ function connectEventStream() {
     es.addEventListener('ready', () => {
         hideServerStatus('events');
         scheduleFetch();
+        scheduleAssetDemand({ reconcile: true, interaction: false });
+    });
+    es.addEventListener('assets', event => {
+        try { applyAssetReadiness(JSON.parse(event.data).assets || {}); } catch (_) { }
+        scheduleAssetDemand({ reconcile: true, interaction: false });
     });
     es.addEventListener('change', event => {
         let change;

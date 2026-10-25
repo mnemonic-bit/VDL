@@ -53,6 +53,21 @@ class UploadTest(AppCase):
         history_row = self.client.get("/api/library").get_json()[0]
         self.assertEqual(history_row["source_type"], "upload")
 
+    def test_upload_publication_queues_assets_without_extracting_them(self):
+        with mock.patch.object(vdl, 'inspect_uploaded_video', return_value='720p'), \
+                mock.patch.object(vdl, 'generate_video_thumbnail') as thumbnail, \
+                mock.patch.object(vdl, 'generate_video_preview') as montage:
+            upload_id, response = self.upload()
+        self.assertEqual(response.status_code, 200)
+        thumbnail.assert_not_called()
+        montage.assert_not_called()
+        with vdl.db() as conn:
+            records = conn.execute('SELECT kind,state FROM generated_assets '
+                                   'WHERE download_id=? ORDER BY sequence', (upload_id,)).fetchall()
+        self.assertEqual([(row['kind'], row['state']) for row in records],
+                         [('thumbnail', 'queued'), ('montage', 'queued')])
+        self.assertEqual(vdl.db_get_download(upload_id)['status'], 'finished')
+
     def test_upload_preserves_an_existing_file_with_a_collision_suffix(self):
         existing = os.path.join(self.download_dir, "desktop-video.mp4")
         with open(existing, "wb") as output:

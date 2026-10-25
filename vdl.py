@@ -36,6 +36,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import download_history
+from asset_generation import AssetQueue
 
 from download_bandwidth import SharedBandwidth, govern_download, canonical_mbps
 
@@ -358,6 +359,7 @@ def _start_user_session(user):
     session.clear()
     session['user_id'] = user['id']
     session['session_version'] = user['session_version']
+    session['asset_session_id'] = secrets.token_hex(16)
 
 # ---------------------------------------------------------------------------
 # Event bus (server -> browser push)
@@ -394,6 +396,19 @@ class EventBus:
             if (owner_user_id is not None
                     and subscriber_user_id != owner_user_id):
                 continue
+            if kind == 'assets':
+                # A slow client needs one bounded reconciliation hint, even
+                # when the worker finishes several cached assets in a burst.
+                with q.mutex:
+                    pending = next((i for i, item in enumerate(q.queue)
+                                    if item[0] == 'assets'), None)
+                    if pending is not None:
+                        previous = q.queue[pending][1] or {}
+                        merged = list(dict.fromkeys(
+                            previous.get('ids', []) + (payload or {}).get('ids', [])
+                        ))[-200:]
+                        q.queue[pending] = ('assets', {'ids': merged})
+                        continue
             try:
                 q.put_nowait(msg)
             except queue.Full:
@@ -451,16 +466,10 @@ BROWSER_VIDEO_EXTENSIONS = {
 # per operation and guard writes with this lock.
 _db_lock = threading.Lock()
 _upload_lock = threading.Lock()
-# Preview generation opens the source seven times and encodes a new asset.
-# Serialising that work keeps a burst of first-time hovers from saturating the
-# host while cached previews continue to bypass the lock entirely.
-_preview_generation_lock = threading.Lock()
-_thumbnail_generation_lock = threading.Lock()
-_thumbnail_generation_active = set()
-_thumbnail_generation_failures = {}
-_THUMBNAIL_GENERATION_LIMIT = 2
-_THUMBNAIL_FAILURE_COOLDOWN = 30
-_THUMBNAIL_FAILURE_LIMIT = 256
+# One queue instance belongs to one database and one serving process.
+_asset_queue = None
+_asset_queue_db = None
+_asset_queue_lock = threading.Lock()
 _NO_UPDATE = object()
 
 # Endless playback is disposable navigation state. Keeping it outside SQLite
@@ -873,6 +882,7 @@ def init_db():
         )
 
         download_history.initialize(conn)
+        AssetQueue.init_schema(conn)
 
         # Any download that was active when the app died is now orphaned.
         # 'paused' counts as active for this purpose -- the worker thread
@@ -979,6 +989,7 @@ def db_insert_ingested_video(download_id, source_path, source_signature,
                  identity[1], identity[3]),
             )
         download_history.record(conn, download_id, create=True)
+    _register_media_assets(download_id)
     event_bus.publish('change', {'reason': 'insert', 'id': download_id})
 
 
@@ -1089,6 +1100,7 @@ def db_update_download(download_id, *, status=None, progress=None,
             and status in download_history.ACTIVE))
     event_bus.publish('change', {'reason': 'update', 'id': download_id})
     if status == 'finished':
+        _register_media_assets(download_id)
         _wake_duplicate_backfill()
 
 
@@ -1378,17 +1390,13 @@ def delete_download_artifacts(entry, fallback_dir=None):
             pass
 
     removed = 0
-    # A first-hover request may still be encoding after the UI asks to remove
-    # its row. Waiting here prevents that request from publishing an orphaned
-    # preview after the artifact scan has already finished.
-    with _preview_generation_lock:
-        for path in candidates:
-            try:
-                os.remove(path)
-                removed += 1
-            except FileNotFoundError:
-                # A postprocessor may already have consumed a temporary file.
-                pass
+    for path in candidates:
+        try:
+            os.remove(path)
+            removed += 1
+        except FileNotFoundError:
+            # A postprocessor may already have consumed a temporary file.
+            pass
     return removed
 
 
@@ -1457,7 +1465,8 @@ def _db_remove_download_from_playlists(conn, download_id):
 
 def db_remove_download_if_inactive(download_id, fallback_dir=None):
     """Atomically remove a non-active, fully stopped download row."""
-    with _worker_condition, _db_lock, db() as conn:
+    assets = _get_asset_queue()
+    with assets.publication_lock, _worker_condition, _db_lock, db() as conn:
         row = conn.execute(
             "SELECT * FROM downloads WHERE id = ?", (download_id,)
         ).fetchone()
@@ -1470,6 +1479,7 @@ def db_remove_download_if_inactive(download_id, fallback_dir=None):
         # Keep the row as a retry handle if filesystem cleanup fails. Holding
         # the state lock also prevents Resume from claiming the same partial
         # files while they are being removed.
+        assets.invalidate([download_id], conn=conn)
         delete_download_artifacts(entry, fallback_dir)
         _db_remove_download_from_playlists(conn, download_id)
         cur = conn.execute(
@@ -1486,13 +1496,15 @@ def db_remove_download_if_inactive(download_id, fallback_dir=None):
 def db_clear_library():
     placeholders = ",".join("?" * len(HISTORY_STATUSES))
     fallback_dir = db_get_preferences().get("download_dir", ".")
-    with _db_lock, db() as conn:
+    assets = _get_asset_queue()
+    with assets.publication_lock, _db_lock, db() as conn:
         entries = [
             dict(r) for r in conn.execute(
                 f"SELECT id, filename, output_dir FROM downloads WHERE status IN ({placeholders})",
                 HISTORY_STATUSES,
             ).fetchall()
         ]
+        assets.invalidate([entry['id'] for entry in entries], conn=conn)
         # If any file cannot be removed, retain all rows so the user can retry
         # instead of losing the only record of the remaining artifacts.
         files_deleted = sum(
@@ -4234,11 +4246,6 @@ def _background_download(url, download_id, cookie_bundle=None):
                 # extractors. ffprobe always reflects the final container.
                 final_res = ffprobe_resolution(final_path)
                 final_duration = _consume_media_probe(final_path, final_res)
-                thumbnail_path = _thumbnail_path(
-                    {**entry, 'filename': final_path}, output_dir,
-                )
-                if thumbnail_path:
-                    generate_video_thumbnail(final_path, thumbnail_path)
                 db_update_download(
                     download_id,
                     status='finished',
@@ -4855,9 +4862,8 @@ _PREVIEW_FRAMES_PER_SECOND = 12
 
 def _preview_path(entry, fallback_dir=None):
     """Return the stable sidecar path for one download's hover preview."""
-    directory = entry.get('output_dir')
-    if not directory and entry.get('filename'):
-        directory = os.path.dirname(os.path.abspath(entry['filename']))
+    directory = (os.path.dirname(os.path.abspath(entry['filename']))
+                 if entry.get('filename') else entry.get('output_dir'))
     if not directory:
         directory = fallback_dir
     if not directory:
@@ -4880,7 +4886,9 @@ def generate_video_thumbnail(media_path, thumbnail_path):
         try:
             result = subprocess.run(
                 [
-                    'ffmpeg', '-v', 'error', '-ss', seek_time, '-i', media_path,
+                    'ffmpeg', '-v', 'error', '-threads', '1',
+                    '-filter_threads', '1', '-filter_complex_threads', '1',
+                    '-ss', seek_time, '-i', media_path, '-threads', '1',
                     '-map', '0:v:0', '-frames:v', '1', '-an', '-sn',
                     '-vf', 'scale=480:-2:force_original_aspect_ratio=decrease',
                     '-q:v', '4', '-f', 'image2', '-y', temporary_path,
@@ -4916,7 +4924,7 @@ def ffprobe_video_duration(path):
     try:
         result = subprocess.run(
             [
-                'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                'ffprobe', '-v', 'error', '-threads', '1', '-select_streams', 'v:0',
                 '-show_entries', 'stream=duration:format=duration',
                 '-of', 'json', path,
             ],
@@ -4978,10 +4986,11 @@ def generate_video_preview(media_path, preview_path):
         return False
 
     temporary_path = f"{preview_path}.{uuid.uuid4().hex}.tmp.mp4"
-    command = ['ffmpeg', '-v', 'error']
+    command = ['ffmpeg', '-v', 'error', '-filter_threads', '1',
+               '-filter_complex_threads', '1']
     for start, length in segments:
         command.extend([
-            '-ss', f'{start:.3f}',
+            '-threads', '1', '-ss', f'{start:.3f}',
             '-t', f'{length:.3f}',
             '-i', media_path,
         ])
@@ -5002,7 +5011,7 @@ def generate_video_preview(media_path, preview_path):
         # concat uses a microsecond time base. Pinning the output cadence keeps
         # x264 from declaring these tiny previews as unsupported level 6.2.
         '-r', str(_PREVIEW_FRAMES_PER_SECOND),
-        '-c:v', 'libx264',
+        '-c:v', 'libx264', '-threads', '1',
         '-preset', 'veryfast',
         '-crf', '28',
         '-pix_fmt', 'yuv420p',
@@ -5096,6 +5105,7 @@ def login():
 
 @app.route('/logout', methods=['POST'])
 def logout():
+    _get_asset_queue().clear_owner(_asset_demand_owner())
     _release_playback_sessions_for_user(session.get('user_id'))
     session.clear()
     return redirect(url_for('login'))
@@ -5946,11 +5956,14 @@ def clear_library():
 
 @app.route('/api/library', methods=['GET'])
 def get_library():
+    entries = [entry for entry in db_list_downloads(
+        g.current_user['id'], is_admin='admin' in g.current_user['roles'],
+        statuses=('finished',),
+    ) if _playable_library_entry(entry)]
+    readiness = _get_asset_queue().readiness_many(entries)
     return jsonify([
-        _public_download_entry(entry) for entry in db_list_downloads(
-            g.current_user['id'], is_admin='admin' in g.current_user['roles'],
-            statuses=('finished',),
-        ) if _playable_library_entry(entry)
+        {**_public_download_entry(entry), 'assets': readiness.get(entry['id'], {})}
+        for entry in entries
     ])
 
 
@@ -6023,14 +6036,16 @@ def retry_download(download_id):
         return jsonify({'error': 'Unknown download id'}), 404
     if entry.get('browser_authenticated') or entry['source_type'] != 'download':
         return jsonify({'error': 'Send this source again to start a new attempt'}), 409
+    assets = _get_asset_queue()
     try:
-        with _worker_condition, _db_lock, db() as conn:
+        with assets.publication_lock, _worker_condition, _db_lock, db() as conn:
             current = conn.execute(
                 'SELECT * FROM downloads WHERE id = ?', (download_id,),
             ).fetchone()
             if (current is None or current['status'] not in TERMINAL_STATUSES
                     or download_id in _live_worker_ids):
                 return jsonify({'error': 'Wait until the current worker has stopped'}), 409
+            assets.invalidate([download_id], conn=conn)
             delete_download_artifacts(
                 dict(current), db_get_preferences().get('download_dir', '.'),
             )
@@ -6040,6 +6055,9 @@ def retry_download(download_id):
                 "total_bytes = NULL, filesize = NULL, speed = 0, eta = NULL "
                 "WHERE id = ?", (download_id,),
             )
+            # The replacement will get a new source identity on publication.
+            conn.execute('DELETE FROM asset_invalidations WHERE download_id=?',
+                         (download_id,))
             download_history.record(conn, download_id, new=True)
     except OSError as exc:
         return jsonify({'error': f'Cleanup failed: {exc}'}), 500
@@ -6779,6 +6797,7 @@ def events():
     """
     KEEPALIVE_SECS = 15
     user_id = g.current_user['id']
+    session_version = session.get('session_version')
 
     def stream():
         q = event_bus.subscribe(user_id)
@@ -6794,6 +6813,20 @@ def events():
                     # TCP connection from being reaped by intermediaries.
                     yield ": keepalive\n\n"
                     continue
+                if kind == 'assets':
+                    user = db_get_user_by_id(user_id)
+                    if (user is None or user['suspended']
+                            or user['session_version'] != session_version):
+                        return
+                    entries = []
+                    for download_id in (payload or {}).get('ids', [])[:200]:
+                        entry = db_get_download(download_id)
+                        if (entry is not None and _asset_eligible(entry)
+                                and (entry.get('visibility') == 'public'
+                                     or entry.get('owner_user_id') == user_id
+                                     or 'admin' in user['roles'])):
+                            entries.append(entry)
+                    payload = {'assets': _get_asset_queue().readiness_many(entries)}
                 data = json.dumps(payload or {})
                 yield f"event: {kind}\ndata: {data}\n\n"
         finally:
@@ -6892,100 +6925,163 @@ def stream_file(download_id):
     )
 
 
-def _ensure_video_thumbnail(media_path, thumbnail_path):
-    """Keep slow cache misses from multiplying decoder work or waiting threads."""
-    key = os.path.realpath(thumbnail_path)
-    with _thumbnail_generation_lock:
-        if os.path.isfile(thumbnail_path):
-            return None
-        now = time.monotonic()
-        for failed_key, retry_at in list(_thumbnail_generation_failures.items()):
-            if retry_at <= now:
-                del _thumbnail_generation_failures[failed_key]
-        retry_at = _thumbnail_generation_failures.get(key)
-        if retry_at is not None:
-            return 404, max(1, math.ceil(retry_at - now))
-        if (key in _thumbnail_generation_active
-                or len(_thumbnail_generation_active) >= _THUMBNAIL_GENERATION_LIMIT):
-            return 503, 1
-        _thumbnail_generation_active.add(key)
-    generated = False
+def _asset_eligible(entry):
+    filename = entry.get('filename')
+    return bool(
+        entry.get('status') == 'finished' and filename
+        and (entry.get('source_type') == 'upload'
+             or os.path.splitext(filename)[1].lower() in BROWSER_VIDEO_EXTENSIONS)
+        and os.path.isfile(filename) and _is_allowed_download_path(filename)
+        and all(_is_allowed_download_path(_asset_path(entry, kind))
+                for kind in ('thumbnail', 'montage'))
+    )
+
+
+def _asset_path(entry, kind):
+    return (_thumbnail_path(entry) if kind == 'thumbnail'
+            else _preview_path(entry))
+
+
+def _generate_asset(kind, source, destination):
+    generator = (generate_video_thumbnail if kind == 'thumbnail'
+                 else generate_video_preview)
+    return generator(source, destination)
+
+
+def _notify_assets(ids):
+    # IDs remain internal until the SSE sender rechecks current authorization.
+    event_bus.publish('assets', {'ids': list(ids)[:200]})
+
+
+def _get_asset_queue():
+    global _asset_queue, _asset_queue_db
+    with _asset_queue_lock:
+        if _asset_queue is None or _asset_queue_db != DB_PATH:
+            if _asset_queue is not None:
+                _asset_queue.stop()
+            _asset_queue = AssetQueue(
+                db=db, db_lock=_db_lock, get_entry=db_get_download,
+                eligible=_asset_eligible, asset_path=_asset_path,
+                generate=_generate_asset,
+                versions={'thumbnail': _THUMBNAIL_CACHE_VERSION,
+                          'montage': _PREVIEW_CACHE_VERSION},
+                notify=_notify_assets, confined=_is_allowed_download_path,
+            )
+            _asset_queue_db = DB_PATH
+        return _asset_queue
+
+
+def _register_media_assets(download_id):
+    # Publication is already committed. Reconciliation closes a missed enqueue
+    # after a crash or transient filesystem/database failure.
     try:
-        generated = generate_video_thumbnail(media_path, thumbnail_path)
-    finally:
-        with _thumbnail_generation_lock:
-            _thumbnail_generation_active.remove(key)
-            if not generated:
-                # Bound retry bookkeeping even for libraries full of media
-                # that ffmpeg cannot decode. Expiration permits later recovery.
-                if len(_thumbnail_generation_failures) >= _THUMBNAIL_FAILURE_LIMIT:
-                    del _thumbnail_generation_failures[next(iter(_thumbnail_generation_failures))]
-                _thumbnail_generation_failures[key] = (
-                    time.monotonic() + _THUMBNAIL_FAILURE_COOLDOWN
-                )
-    if not generated:
-        return 404, _THUMBNAIL_FAILURE_COOLDOWN
-    return None
+        entry = db_get_download(download_id)
+        if entry is not None:
+            _get_asset_queue().register(entry)
+    except (OSError, sqlite3.Error) as error:
+        app.logger.warning('Unable to queue previews for %s: %s', download_id, error)
+
+
+def _asset_demand_owner():
+    if 'asset_session_id' not in session:
+        session['asset_session_id'] = secrets.token_hex(16)
+    return (session.get('user_id'), session.get('session_version'),
+            session['asset_session_id'])
+
+
+@app.route('/api/assets/demand', methods=['POST'])
+def asset_demand():
+    if request.content_length is not None and request.content_length > 32768:
+        return jsonify(error='Asset demand is too large'), 413
+    raw = request.stream.read(32769)
+    if len(raw) > 32768:
+        return jsonify(error='Asset demand is too large'), 413
+    try:
+        data = json.loads(raw) if request.is_json else None
+    except (ValueError, UnicodeDecodeError):
+        data = None
+    if not isinstance(data, dict):
+        return jsonify(error='Expected an asset demand object'), 400
+    tab = data.get('tab_id')
+    revision = data.get('revision')
+    ids = data.get('ids')
+    hovered = data.get('hovered_id')
+    interaction = data.get('interaction', True)
+    if (not isinstance(interaction, bool)
+            or not isinstance(tab, str) or not 1 <= len(tab) <= 128
+            or not isinstance(revision, int) or isinstance(revision, bool)
+            or not 0 <= revision <= 9007199254740991
+            or not isinstance(ids, list) or len(ids) > 200
+            or any(not isinstance(value, str) or not 1 <= len(value) <= 128
+                   for value in ids)
+            or len(set(ids)) != len(ids)
+            or (hovered is not None
+                and (not isinstance(hovered, str) or hovered not in ids))):
+        return jsonify(error='Invalid asset demand'), 400
+    entries = []
+    for download_id in ids:
+        entry = _visible_download(download_id)
+        if entry is not None and _asset_eligible(entry):
+            entries.append(entry)
+    accepted_ids = [entry['id'] for entry in entries]
+    assets = _get_asset_queue()
+    accepted = assets.replace_demand(
+        _asset_demand_owner(), tab, revision, accepted_ids,
+        hovered if hovered in accepted_ids else None, renew=interaction,
+    )
+    readiness = {entry['id']: assets.register(entry) for entry in entries}
+    return jsonify(assets=readiness, accepted=accepted)
+
+
+def _stream_cached_asset(download_id, kind):
+    # Open the cached file before removal may unlink its owned artifacts.
+    with _get_asset_queue().publication_lock:
+        return _stream_cached_asset_locked(download_id, kind)
+
+
+def _stream_cached_asset_locked(download_id, kind):
+    entry = _visible_download(download_id)
+    if entry is None or entry.get('status') != 'finished':
+        abort(404)
+    media_path = entry.get('filename')
+    if not media_path or not os.path.isfile(media_path):
+        abort(404)
+    if not _is_allowed_download_path(media_path):
+        abort(403)
+    path = _asset_path(entry, kind)
+    if not path or not _is_allowed_download_path(path):
+        abort(403)
+    if not _asset_eligible(entry):
+        abort(404)
+    readiness = _get_asset_queue().register(entry)
+    if kind not in readiness:
+        abort(404)
+    if readiness[kind] != 'ready':
+        return Response(status=404 if readiness[kind] == 'failed' else 202,
+                        headers={'Cache-Control': 'no-store'})
+    return send_file(path, mimetype='image/jpeg' if kind == 'thumbnail' else 'video/mp4',
+                     conditional=True, max_age=0)
 
 
 @app.route('/api/thumbnail/<download_id>', methods=['GET'])
 def stream_thumbnail(download_id):
-    """Serve a cached local preview, generating one for older video rows."""
-    entry = _visible_download(download_id)
-    if entry is None or entry.get('status') != 'finished':
-        abort(404)
-    media_path = entry.get('filename')
-    if not media_path or not os.path.isfile(media_path):
-        abort(404)
-    if not _is_allowed_download_path(media_path):
-        abort(403)
-
-    fallback_dir = db_get_preferences().get('download_dir', '.')
-    thumbnail_path = _thumbnail_path(entry, fallback_dir)
-    if not thumbnail_path or not _is_allowed_download_path(thumbnail_path):
-        abort(403)
-    retry = _ensure_video_thumbnail(media_path, thumbnail_path)
-    if retry is not None:
-        status, delay = retry
-        return Response(status=status, headers={
-            'Retry-After': str(delay), 'Cache-Control': 'no-store',
-        })
-    return send_file(
-        thumbnail_path,
-        mimetype='image/jpeg',
-        conditional=True,
-        max_age=86400,
-    )
+    """Deliver a cached frame; all missing work belongs to the shared queue."""
+    return _stream_cached_asset(download_id, 'thumbnail')
 
 
 @app.route('/api/preview/<download_id>', methods=['GET'])
 def stream_preview(download_id):
-    """Serve a cached hover montage, generating it on first use."""
-    entry = _visible_download(download_id)
-    if entry is None or entry.get('status') != 'finished':
-        abort(404)
-    media_path = entry.get('filename')
-    if not media_path or not os.path.isfile(media_path):
-        abort(404)
-    if not _is_allowed_download_path(media_path):
-        abort(403)
+    """Deliver a cached montage with ordinary conditional/range semantics."""
+    return _stream_cached_asset(download_id, 'montage')
 
-    fallback_dir = db_get_preferences().get('download_dir', '.')
-    preview_path = _preview_path(entry, fallback_dir)
-    if not preview_path or not _is_allowed_download_path(preview_path):
-        abort(403)
-    if not os.path.isfile(preview_path):
-        with _preview_generation_lock:
-            # Another request may have filled the cache while this one waited.
-            if (not os.path.isfile(preview_path)
-                    and not generate_video_preview(media_path, preview_path)):
-                abort(404)
-    return send_file(
-        preview_path,
-        mimetype='video/mp4',
-        conditional=True,
-        max_age=86400,
-    )
+
+def start_asset_generation():
+    return _get_asset_queue().start()
+
+
+def stop_asset_generation():
+    if _asset_queue is not None:
+        _asset_queue.stop()
 
 
 @app.route('/api/preferences', methods=['GET', 'POST'])
@@ -7339,6 +7435,8 @@ def main(argv=None):
     ingest_thread = start_ingest_import() if owns_background_work else None
     metadata_thread = start_metadata_backfill() if owns_background_work else None
     duplicate_thread = start_duplicate_backfill() if owns_background_work else None
+    if owns_background_work:
+        start_asset_generation()
     print(
         f'VDL startup: UI v{APP_VERSION} | API v{APP_VERSION}',
         flush=True,
@@ -7346,6 +7444,8 @@ def main(argv=None):
     try:
         app.run(host=host, port=args.port, debug=debug, threaded=True)
     finally:
+        if owns_background_work:
+            stop_asset_generation()
         if ingest_thread is not None:
             stop_ingest_import()
         if metadata_thread is not None:

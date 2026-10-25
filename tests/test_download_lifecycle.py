@@ -9,6 +9,24 @@ from tests.support.fake_ytdlp import FakeYoutubeDL
 
 
 class DownloadLifecycleTest(AppCase):
+    def test_url_publication_queues_both_assets_without_extraction(self):
+        FakeYoutubeDL.reset()
+        download_id = self.insert('queued-url')
+        with mock.patch.object(vdl.yt_dlp, 'YoutubeDL', FakeYoutubeDL), \
+                mock.patch.object(vdl, 'ffprobe_resolution', return_value='360p'), \
+                mock.patch.object(vdl, 'generate_video_thumbnail') as thumbnail, \
+                mock.patch.object(vdl, 'generate_video_preview') as montage:
+            vdl.background_download('https://fixture.invalid/video', download_id)
+        thumbnail.assert_not_called()
+        montage.assert_not_called()
+        self.assertEqual(vdl.db_get_download(download_id)['status'], 'finished')
+        self.assertEqual(vdl._active_worker_count, 0)
+        with vdl.db() as conn:
+            rows = conn.execute('SELECT kind,state FROM generated_assets WHERE download_id=? '
+                                'ORDER BY sequence', (download_id,)).fetchall()
+        self.assertEqual([(row['kind'], row['state']) for row in rows],
+                         [('thumbnail', 'queued'), ('montage', 'queued')])
+
     def test_unknown_size_progress_exposes_live_metadata_and_indeterminate_state(self):
         download_id = self.insert("unknown1")
 

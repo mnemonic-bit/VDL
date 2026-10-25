@@ -719,7 +719,9 @@ button.history-preview:focus-visible {
     object-fit: cover;
     transition: opacity 0.15s ease;
 }
-.history-preview.thumbnail-unavailable img { display: none; }
+.history-preview.thumbnail-unavailable img,
+.history-preview.thumbnail-pending img { display: none; }
+img[data-asset-state]:not([src]) { visibility: hidden; }
 .history-preview-video {
     position: absolute;
     inset: 0;

@@ -7,6 +7,15 @@ organising entries with tags, and playing completed media.
 Live progress arrives over Server-Sent Events without browser polling.
 The UI and media APIs require a signed-in user.
 
+Completed videos automatically queue a thumbnail and hover montage, including
+uploads, mounted-file imports, and existing Library items found at startup.
+One background worker prepares both kinds of preview across all users, even
+with no browser connected. Opening a Library page promotes its thumbnails;
+intentional hover promotes that video's montage. The Library shows
+**Preparing preview** until a thumbnail is ready and updates it in place.
+Preview failures leave normal video playback available. Queue progress and
+bounded retries survive application restarts.
+
 [![Latest release](https://img.shields.io/github/v/release/mnemonic-bit/VDL?display_name=tag&sort=semver)](https://github.com/mnemonic-bit/VDL/releases/latest)
 [![Main pipeline](https://github.com/mnemonic-bit/VDL/actions/workflows/main.yml/badge.svg?branch=main&event=push)](https://github.com/mnemonic-bit/VDL/actions/workflows/main.yml?query=branch%3Amain+event%3Apush)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)

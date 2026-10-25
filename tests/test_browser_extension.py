@@ -21,6 +21,14 @@ class BrowserExtensionTest(AppCase):
         'X-VDL-Companion-Version': '1.0.0',
     }
 
+    def test_json_reader_retains_companion_limits_above_asset_demand_limit(self):
+        payload = {'cookies': 'x' * 40000}
+        with vdl.app.test_request_context('/api/extension/downloads', json=payload):
+            parsed, error = vdl._read_json_body(65536)
+            self.assertIsNone(error)
+            self.assertEqual(parsed, payload)
+            self.assertEqual(vdl.request.get_json(), payload)
+
     def pair(self, label='Firefox test'):
         code_response = self.client.post('/api/extension/pairing-codes')
         self.assertEqual(code_response.status_code, 201)

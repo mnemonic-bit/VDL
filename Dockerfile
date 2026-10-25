@@ -35,7 +35,7 @@ COPY requirements-container.in requirements-container.constraints requirements-c
 RUN python -m pip install --no-cache-dir --require-hashes -r requirements-container.txt
 
 # Runtime source is deliberately allow-listed instead of copying the repository.
-COPY vdl.py download_bandwidth.py download_history.py docker-entrypoint.sh VERSION ./
+COPY vdl.py asset_generation.py download_bandwidth.py download_history.py docker-entrypoint.sh VERSION ./
 COPY templates/ templates/
 COPY static/ static/
 COPY browser-extension/dist/vdl-companion-firefox.xpi browser-extension/dist/vdl-companion-firefox.xpi.sha256 ./browser-extension/dist/

@@ -48,7 +48,7 @@ test('attempts stay in full width rows and only finished available media request
         thumbnails.push(route.request().url());
         return route.fulfill({ status: 404 });
     });
-    await seed(page, { id: 'good', status: 'finished', title: 'Good', file: true });
+    await seed(page, { id: 'good', status: 'finished', title: 'Good', file: true, thumbnail: true });
     await seed(page, { id: 'bad', status: 'error', title: 'Bad', progress: 'Diagnostic '.repeat(200) });
     await seed(page, { id: 'partial', status: 'downloading', title: 'Partial', file: true });
     await openHistory(page);

@@ -141,6 +141,11 @@ class HoverPreviewTest(AppCase):
             return True
 
         with mock.patch.object(vdl, "generate_video_preview", side_effect=generate) as generator:
+            self.assertEqual(self.client.get("/api/preview/test0001").status_code, 202)
+            generator.assert_not_called()
+            with mock.patch.object(vdl, 'generate_video_thumbnail', return_value=False):
+                self.assertTrue(vdl._get_asset_queue().step())
+                self.assertTrue(vdl._get_asset_queue().step())
             first = self.client.get("/api/preview/test0001")
             second = self.client.get(
                 "/api/preview/test0001", headers={"Range": "bytes=2-5"}
@@ -160,8 +165,9 @@ class HoverPreviewTest(AppCase):
         self.assertEqual(self.client.get("/api/preview/active01").status_code, 404)
 
         self.finished_file()
-        with mock.patch.object(vdl, "generate_video_preview", return_value=False):
-            self.assertEqual(self.client.get("/api/preview/test0001").status_code, 404)
+        with mock.patch.object(vdl, "generate_video_preview") as generator:
+            self.assertEqual(self.client.get("/api/preview/test0001").status_code, 202)
+            generator.assert_not_called()
 
         external_dir = os.path.join(self.temp_dir.name, "external")
         os.mkdir(external_dir)

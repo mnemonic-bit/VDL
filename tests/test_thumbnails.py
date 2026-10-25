@@ -126,27 +126,27 @@ class ThumbnailTest(AppCase):
 
     def test_finished_video_generates_and_caches_a_local_thumbnail(self):
         media_path = self.finished_file()
-        entry = vdl.db_get_download("test0001")
-        thumbnail_path = vdl._thumbnail_path(entry, self.download_dir)
+        thumbnail_path = vdl._thumbnail_path(vdl.db_get_download("test0001"))
 
         def generate(source, destination):
             self.assertEqual(source, media_path)
-            self.assertEqual(destination, thumbnail_path)
+            self.assertNotEqual(destination, thumbnail_path)
             with open(destination, "wb") as image:
                 image.write(b"\xff\xd8preview\xff\xd9")
             return True
 
-        with mock.patch.object(
-            vdl, "generate_video_thumbnail", side_effect=generate
-        ) as generator:
+        with mock.patch.object(vdl, "generate_video_thumbnail", side_effect=generate) as generator:
+            pending = self.client.get("/api/thumbnail/test0001")
+            self.assertEqual(pending.status_code, 202)
+            generator.assert_not_called()
+            self.assertTrue(vdl._get_asset_queue().step())
             first = self.client.get("/api/thumbnail/test0001")
             second = self.client.get("/api/thumbnail/test0001")
-
         self.assertEqual(first.status_code, 200)
         self.assertEqual(first.mimetype, "image/jpeg")
         self.assertEqual(first.data, b"\xff\xd8preview\xff\xd9")
         self.assertEqual(second.status_code, 200)
-        generator.assert_called_once_with(media_path, thumbnail_path)
+        generator.assert_called_once()
         first.close()
         second.close()
 
@@ -155,48 +155,37 @@ class ThumbnailTest(AppCase):
         item = vdl._playlist_item(vdl.db_get_download("test0001"), 0)
         self.assertEqual(item["thumbnail_url"], "/api/thumbnail/test0001?v=2")
 
-    def test_missing_or_non_video_thumbnail_uses_a_404_fallback(self):
+    def test_pending_thumbnail_returns_202_and_non_video_uses_404(self):
         self.finished_file()
-        with mock.patch.object(
-            vdl, "generate_video_thumbnail", return_value=False
-        ):
-            self.assertEqual(
-                self.client.get("/api/thumbnail/test0001").status_code,
-                404,
-            )
-
+        with mock.patch.object(vdl, "generate_video_thumbnail") as generator:
+            self.assertEqual(self.client.get("/api/thumbnail/test0001").status_code, 202)
+            generator.assert_not_called()
         self.insert("active01")
-        self.assertEqual(
-            self.client.get("/api/thumbnail/active01").status_code,
-            404,
-        )
+        self.assertEqual(self.client.get("/api/thumbnail/active01").status_code, 404)
+        self.finished_file("audio001", "audio.mp3")
+        self.assertEqual(self.client.get("/api/thumbnail/audio001").status_code, 404)
 
-    def test_old_sidecar_is_replaced_lazily_and_never_served_as_the_new_image(self):
-        media_path = self.finished_file()
+    def test_old_sidecar_is_queued_and_never_served_as_the_new_image(self):
+        self.finished_file()
         entry = vdl.db_get_download("test0001")
         old_path = vdl._thumbnail_path(entry, version=1)
-        new_path = vdl._thumbnail_path(entry)
         with open(old_path, "wb") as image:
             image.write(b"old-frame")
-
-        with mock.patch.object(vdl, "generate_video_thumbnail", return_value=False) as generator:
-            self.assertEqual(self.client.get("/api/thumbnail/test0001?v=2").status_code, 404)
-        generator.assert_called_once_with(media_path, new_path)
 
         def generate(_source, destination):
             with open(destination, "wb") as image:
                 image.write(b"new-frame")
             return True
 
-        # A failed source gets a quiet interval before another decode attempt.
-        retry_at = vdl.time.monotonic() + vdl._THUMBNAIL_FAILURE_COOLDOWN + 1
-        with mock.patch.object(vdl.time, "monotonic", return_value=retry_at), \
-                mock.patch.object(vdl, "generate_video_thumbnail", side_effect=generate) as generator:
+        with mock.patch.object(vdl, "generate_video_thumbnail", side_effect=generate) as generator:
+            self.assertEqual(self.client.get("/api/thumbnail/test0001?v=2").status_code, 202)
+            generator.assert_not_called()
+            vdl._get_asset_queue().step()
             first = self.client.get("/api/thumbnail/test0001?v=2")
             second = self.client.get("/api/thumbnail/test0001?v=2")
         self.assertEqual(first.data, b"new-frame")
         self.assertEqual(second.data, b"new-frame")
-        generator.assert_called_once_with(media_path, new_path)
+        generator.assert_called_once()
         with open(old_path, "rb") as image:
             self.assertEqual(image.read(), b"old-frame")
         first.close()

@@ -101,81 +101,71 @@ class LiveRefreshBackendTest(AppCase):
 
         def generate(source, destination):
             calls.append(source)
-            if len(calls) > 1:
-                return False
             entered.set()
             release.wait(3)
             with open(destination, 'wb') as image:
                 image.write(b'jpeg')
             return True
 
+        assets = vdl._get_asset_queue()
         with mock.patch.object(vdl, 'generate_video_thumbnail', side_effect=generate), \
                 concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            first = pool.submit(self.client.get, '/api/thumbnail/thumbnail')
+            work = pool.submit(assets.step)
             try:
                 self.assertTrue(entered.wait(2))
-                second = other_client.get('/api/thumbnail/thumbnail')
-                self.assertEqual(second.status_code, 503)
-                self.assertEqual(second.headers['Retry-After'], '1')
+                for method in (other_client.get, other_client.head):
+                    second = method('/api/thumbnail/thumbnail')
+                    self.assertEqual(second.status_code, 202)
+                    self.assertEqual(second.headers['Cache-Control'], 'no-store')
+                self.assertFalse(assets.step())
                 self.assertEqual(calls, [media])
             finally:
                 release.set()
-            response = first.result(2)
+            self.assertTrue(work.result(2))
+        response = self.client.get('/api/thumbnail/thumbnail')
         self.assertEqual(response.status_code, 200)
         response.close()
 
-    def test_failed_thumbnail_generation_has_a_retry_cooldown(self):
+    def test_failed_thumbnail_generation_has_persistent_bounded_backoff(self):
         self.finished_file('thumbnail')
+        assets = vdl._get_asset_queue()
+        clock = mock.Mock(return_value=100)
+        assets.clock = clock
         with mock.patch.object(vdl, 'generate_video_thumbnail', return_value=False) as generate, \
-                mock.patch.object(vdl.time, 'monotonic', return_value=100) as clock:
-            self.assertEqual(self.client.get('/api/thumbnail/thumbnail').status_code, 404)
+                mock.patch.object(vdl, 'generate_video_preview', return_value=False):
+            self.assertTrue(assets.step())
+            self.assertEqual(self.client.get('/api/thumbnail/thumbnail').status_code, 202)
             clock.return_value = 110
-            cooling = self.client.get('/api/thumbnail/thumbnail')
-            self.assertEqual(cooling.status_code, 404)
-            self.assertIn('Retry-After', cooling.headers)
+            self.assertTrue(assets.step())  # Independent montage attempt.
+            self.assertFalse(assets.step())
             self.assertEqual(generate.call_count, 1)
-            clock.return_value = 131
+            for instant in (140, 440):
+                clock.return_value = instant
+                self.assertTrue(assets.step())
+                self.assertTrue(assets.step())
+            self.assertEqual(generate.call_count, 3)
             self.assertEqual(self.client.get('/api/thumbnail/thumbnail').status_code, 404)
-            self.assertEqual(generate.call_count, 2)
+            clock.return_value = 100000
+            self.assertFalse(assets.step())
+            self.assertEqual(generate.call_count, 3)
 
-    def test_thumbnail_generation_capacity_and_failure_bookkeeping_are_bounded(self):
-        import concurrent.futures
-        import threading
-
-        self.finished_file('first', 'first.mp4')
-        self.finished_file('second', 'second.mp4')
-        self.finished_file('third', 'third.mp4')
-        clients = [self.authenticated_client() for _ in range(3)]
-        entered = threading.Barrier(3)
-        release = threading.Event()
-
-        def generate(_source, _destination):
-            entered.wait(3)
-            release.wait(3)
-            return False
-
-        with mock.patch.object(vdl, 'generate_video_thumbnail', side_effect=generate) as generator, \
-                concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            pending = [pool.submit(client.get, '/api/thumbnail/' + identifier)
-                       for client, identifier in zip(clients, ('first', 'second'))]
-            try:
-                entered.wait(3)
-                response = clients[2].get('/api/thumbnail/third')
-                self.assertEqual(response.status_code, 503)
-                self.assertEqual(generator.call_count, 2)
-            finally:
-                release.set()
-            self.assertEqual([request.result(2).status_code for request in pending], [404, 404])
-
-        with mock.patch.object(vdl, '_THUMBNAIL_FAILURE_LIMIT', 2), \
-                mock.patch.object(vdl, '_thumbnail_generation_failures', {}), \
-                mock.patch.object(vdl, 'generate_video_thumbnail', return_value=False) as generator:
-            for identifier in ('first', 'second', 'third'):
-                self.assertEqual(self.client.get('/api/thumbnail/' + identifier).status_code, 404)
-            self.assertEqual(len(vdl._thumbnail_generation_failures), 2)
-            # The oldest failure is evicted, so a fresh request can retry it.
-            self.client.get('/api/thumbnail/first')
-            self.assertEqual(generator.call_count, 4)
+    def test_thumbnail_and_montage_requests_deduplicate_persistent_tasks(self):
+        for identifier in ('first', 'second', 'third'):
+            self.finished_file(identifier, identifier + '.mp4')
+        with mock.patch.object(vdl, 'generate_video_thumbnail') as thumbnail, \
+                mock.patch.object(vdl, 'generate_video_preview') as montage:
+            for _ in range(3):
+                for identifier in ('first', 'second', 'third'):
+                    for kind in ('thumbnail', 'preview'):
+                        response = self.client.get('/api/' + kind + '/' + identifier)
+                        self.assertEqual(response.status_code, 202)
+            thumbnail.assert_not_called()
+            montage.assert_not_called()
+        with vdl.db() as conn:
+            rows = conn.execute('SELECT kind, state, attempts FROM generated_assets').fetchall()
+        self.assertEqual(len(rows), 6)
+        self.assertEqual({row['state'] for row in rows}, {'queued'})
+        self.assertEqual({row['attempts'] for row in rows}, {0})
 
     def test_backfill_batch_constructs_the_allowlist_once(self):
         for index in range(5):

@@ -17,7 +17,7 @@ test('Library reload requests the current thumbnail cache version', async ({ pag
     });
     const oldResponse = await page.goto('/api/thumbnail/thumb-version');
     expect(oldResponse.status()).toBe(200);
-    expect(oldResponse.headers()['cache-control']).toContain('max-age=86400');
+    expect(oldResponse.headers()['cache-control']).toContain('max-age=0');
 
     const requests = [];
     page.on('request', request => {
@@ -539,12 +539,12 @@ test('hover previews wait before loading and only play one montage at a time', a
         body: '<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><rect width="4" height="4" fill="green"/></svg>',
     }));
     await seed(page, {
-        id: 'hover01', status: 'finished', file: true,
+        id: 'hover01', status: 'finished', file: true, thumbnail: true, montage: true,
         name: 'hover-one.mp4', title: 'Hover one', resolution: '720p',
         duration_seconds: 125,
     });
     await seed(page, {
-        id: 'hover02', status: 'finished', file: true,
+        id: 'hover02', status: 'finished', file: true, thumbnail: true, montage: true,
         name: 'hover-two.mp4', title: 'Hover two',
     });
     await refresh(page);
@@ -612,8 +612,7 @@ test('reduced motion keeps history previews static', async ({ page }) => {
 
     const preview = page.locator('[data-row-id="hover-reduced"] .history-preview');
     const video = preview.locator('.history-preview-video');
-    await expect(preview).toHaveClass(/thumbnail-unavailable/);
-    await preview.evaluate(element => element.classList.remove('thumbnail-unavailable'));
+    await expect(preview).toHaveClass(/thumbnail-pending/);
     await page.evaluate(() => {
         window.__reducedMotionPreviewPlays = 0;
         HTMLMediaElement.prototype.load = function () {};
