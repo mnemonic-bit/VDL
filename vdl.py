@@ -2054,14 +2054,26 @@ def _shuffle_choice(candidates):
     return candidates[secrets.randbelow(len(candidates))]
 
 
-def _playback_item(entry):
+def _playback_item(entry, *, include_source_revision=False):
     filename = entry.get('filename') or ''
     title = entry.get('title') or Path(filename).stem or 'Untitled download'
-    return {
+    item = {
         'id': str(entry['id']),
         'title': title,
         'extension': Path(filename).suffix.lstrip('.').lower(),
     }
+    if include_source_revision:
+        # A row can keep its ID while its file changes. Keep paths private while
+        # letting the browser reject a standby buffer from the previous source.
+        try:
+            canonical_path = os.path.realpath(filename)
+            signature = _source_signature(canonical_path)
+        except IngestSourceChanged:
+            item['source_revision'] = None
+        else:
+            identity = json.dumps((canonical_path, *signature)).encode('utf-8')
+            item['source_revision'] = hashlib.sha256(identity).hexdigest()
+    return item
 
 
 def _prune_playback_sessions_locked(now):
@@ -2092,7 +2104,9 @@ def _playback_session_response(state, entry):
         'sequence': state['sequence'],
         'page': state.get('page'),
         'position': state.get('position'),
-        'item': _playback_item(entry),
+        'item': _playback_item(
+            entry, include_source_revision=state['mode'] == 'shuffle_clips',
+        ),
     }
     if state['mode'] == 'playlist':
         response.update({
@@ -6205,7 +6219,7 @@ def create_playback_session():
     if not isinstance(payload, dict):
         return jsonify({'error': 'A JSON object is required'}), 400
     mode = payload.get('mode', 'sequential')
-    if mode not in ('sequential', 'shuffle', 'playlist'):
+    if mode not in ('sequential', 'shuffle', 'shuffle_clips', 'playlist'):
         return jsonify({'error': 'Unknown playback mode'}), 400
     user_id = g.current_user['id']
     is_admin = 'admin' in g.current_user['roles']
@@ -6262,7 +6276,7 @@ def create_playback_session():
                 )
             except PlaylistRevisionConflict:
                 return jsonify({'error': 'Playlist progress changed'}), 409
-    elif mode == 'shuffle':
+    elif mode in ('shuffle', 'shuffle_clips'):
         try:
             minimum_height, minimum_duration = _shuffle_preferences(
                 db_get_preferences()
@@ -6270,7 +6284,9 @@ def create_playback_session():
         except ValueError as exc:
             return jsonify({'error': str(exc)}), 400
         selection, metadata_pending = resolve_shuffle_pool(
-            user_id, is_admin, minimum_height, minimum_duration
+            user_id, is_admin, minimum_height,
+            max(7.5, minimum_duration) if mode == 'shuffle_clips'
+            else minimum_duration,
         )
         if not selection:
             if metadata_pending:
@@ -6281,6 +6297,11 @@ def create_playback_session():
             return jsonify({
                 'code': 'no_shuffle_candidates',
                 'error': (
+                    'No videos can supply a valid 5–20 second clip while '
+                    'matching your Shuffle preferences. Videos must be at '
+                    'least 7.5 seconds long. Change the minimum quality or '
+                    'length in Playback settings.'
+                    if mode == 'shuffle_clips' else
                     'No videos match your Shuffle preferences. Change the '
                     'minimum quality or length in Playback settings.'
                 ),
@@ -6382,6 +6403,12 @@ def _library_session_step(session_id, expected_download_id, sequence, prepare):
     """Resolve files outside the lease lock, then atomically reserve or commit."""
     user_id = g.current_user['id']
     is_admin = 'admin' in g.current_user['roles']
+    failed_ids = request.get_json().get('failed_download_ids', [])
+    if (not isinstance(failed_ids, list) or len(failed_ids) > 10000
+            or any(not isinstance(value, str) or not value or len(value) > 128
+                   for value in failed_ids)):
+        return jsonify({'error': 'failed_download_ids is invalid'}), 400
+    failed_ids = set(failed_ids)
 
     def check_state():
         _prune_playback_sessions_locked(time.monotonic())
@@ -6397,7 +6424,9 @@ def _library_session_step(session_id, expected_download_id, sequence, prepare):
         if (sequence != state['sequence'] + 1
                 or expected_download_id != state['current_download_id']):
             return None, (jsonify({'error': 'Playback position changed'}), 409)
-        if prepare and state.get('prepared'):
+        if (prepare and state.get('prepared')
+                and (state['mode'] != 'shuffle_clips'
+                     or state['prepared']['item']['id'] not in failed_ids)):
             state['last_activity'] = time.monotonic()
             return None, jsonify(state['prepared'])
         return state, None
@@ -6409,11 +6438,16 @@ def _library_session_step(session_id, expected_download_id, sequence, prepare):
         original_state = state
         snapshot = dict(state)
 
-    if snapshot['mode'] == 'shuffle':
+    if snapshot['mode'] in ('shuffle', 'shuffle_clips'):
         selection, metadata_pending = resolve_shuffle_pool(
             user_id, is_admin, snapshot['minimum_height'],
-            snapshot['minimum_duration_seconds'],
+            max(7.5, snapshot['minimum_duration_seconds'])
+            if snapshot['mode'] == 'shuffle_clips'
+            else snapshot['minimum_duration_seconds'],
         )
+        if snapshot['mode'] == 'shuffle_clips':
+            selection = [entry for entry in selection
+                         if str(entry['id']) not in failed_ids]
         if len(selection) > 1:
             selection = [entry for entry in selection
                          if str(entry['id']) != expected_download_id]
@@ -6442,6 +6476,15 @@ def _library_session_step(session_id, expected_download_id, sequence, prepare):
                     'code': 'shuffle_metadata_pending',
                     'error': 'Older videos are still being prepared for Shuffle.',
                 }), 409
+            if state['mode'] == 'shuffle_clips':
+                state.pop('prepared', None)
+                return jsonify({
+                    'code': 'no_shuffle_clip_candidates',
+                    'error': (
+                        'No remaining videos can supply a valid 5–20 second '
+                        'clip. Retry or change your Shuffle preferences.'
+                    ),
+                }), 409
             _playback_sessions.pop(session_id, None)
             return '', 204
         if next_index is not None:
@@ -6455,7 +6498,9 @@ def _library_session_step(session_id, expected_download_id, sequence, prepare):
         if prepare:
             response = {
                 'session_id': session_id, 'sequence': sequence,
-                'prepared': True, 'item': _playback_item(entry),
+                'prepared': True, 'item': _playback_item(
+                    entry, include_source_revision=state['mode'] == 'shuffle_clips',
+                ),
             }
             state['prepared'] = response
             return jsonify(response)

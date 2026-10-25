@@ -458,3 +458,48 @@ test('a moving current clock remains eligible with current data, while waiting d
     await clock(page, 27);
     await expect.poll(() => page.evaluate(() => Boolean(playerPreparation?.fade))).toBe(true);
 });
+
+test('Shuffle Clips uses excerpt time for a half-length fade and retains volume, rate, and pause controls', async ({ page }) => {
+    await page.evaluate(() => { Math.random = () => 0; });
+    await start(page, 'shuffle_clips');
+    await expect(page.locator('#playerStandby source')).toHaveCount(1);
+    await clock(page, 12.5);
+    await expect.poll(() => page.evaluate(() => Boolean(playerPreparation?.fade))).toBe(true);
+    expect(await page.evaluate(() => playerPreparation.fadeDuration)).toBe(2.5);
+    await clock(page, 13.75, 11.25);
+    await page.locator('#playerVideo').evaluate(video => {
+        video.volume = 0.6;
+        video.playbackRate = 2;
+        video.muted = true;
+    });
+    await expect.poll(() => page.evaluate(() => playerPreparation.baseVolume)).toBeCloseTo(0.6);
+    const controls = await page.evaluate(() => ({
+        rates: [playerPreparation.outgoing.playbackRate, playerPreparation.incoming.playbackRate],
+        mute: [playerPreparation.outgoing.muted, playerPreparation.incoming.muted],
+        bounds: [playerBoundaries.get(playerPreparation.incoming).start, playerBoundaries.get(playerPreparation.incoming).end],
+    }));
+    expect(controls.rates).toEqual([2, 2]);
+    expect(controls.mute).toEqual([true, true]);
+    expect(controls.bounds).toEqual([10, 15]);
+    await page.evaluate(() => togglePlayerPlayback());
+    expect(await page.evaluate(() => [playerPreparation.outgoing.paused, playerPreparation.incoming.paused])).toEqual([true, true]);
+    const opacity = await page.locator('#playerVideo').evaluate(video => video.style.opacity);
+    await page.waitForTimeout(100);
+    expect(await page.locator('#playerVideo').evaluate(video => video.style.opacity)).toBe(opacity);
+    await page.evaluate(() => togglePlayerPlayback());
+    expect(await page.evaluate(() => [playerPreparation.outgoing.paused, playerPreparation.incoming.paused])).toEqual([false, false]);
+    await page.evaluate(() => {
+        // Native pause events are queued, so buffering may resolve before they arrive.
+        HTMLMediaElement.prototype.pause = function pause() {
+            const state = window.__media(this);
+            if (state.paused) return;
+            state.paused = true;
+            setTimeout(() => this.dispatchEvent(new Event('pause')), 0);
+        };
+        document.getElementById('playerVideo').dispatchEvent(new Event('waiting'));
+    });
+    expect(await page.evaluate(() => [playerPreparation.outgoing.paused, playerPreparation.incoming.paused])).toEqual([true, true]);
+    await page.locator('#playerVideo').dispatchEvent('canplay');
+    await page.waitForTimeout(50);
+    await expect.poll(() => page.evaluate(() => [playerPreparation.outgoing.paused, playerPreparation.incoming.paused])).toEqual([false, false]);
+});

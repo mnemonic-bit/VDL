@@ -89,9 +89,9 @@ class PlaybackSessionTest(AppCase):
             self.assertEqual(advanced, self.session_step(state, 'advance').get_json())
             self.assertEqual(draw.call_count, 2)
 
-    def test_prepared_one_item_pool_repeats_in_both_modes(self):
+    def test_prepared_one_item_pool_repeats_in_all_library_modes(self):
         self.shuffle_video('only')
-        for mode in ('sequential', 'shuffle'):
+        for mode in ('sequential', 'shuffle', 'shuffle_clips'):
             with self.subTest(mode=mode):
                 state = self.create_session(mode=mode).get_json()
                 prepared = self.session_step(state, 'prepare').get_json()
@@ -100,7 +100,7 @@ class PlaybackSessionTest(AppCase):
                 self.assertEqual(advanced['item'], prepared['item'])
 
     def test_prepared_missing_or_ineligible_item_uses_live_selection(self):
-        for mode in ('sequential', 'shuffle'):
+        for mode in ('sequential', 'shuffle', 'shuffle_clips'):
             for download_id in ('one', 'two', 'three'):
                 self.shuffle_video(download_id)
             with self.subTest(mode=mode):
@@ -127,7 +127,7 @@ class PlaybackSessionTest(AppCase):
         self.shuffle_video('two')
         vdl.db_create_user('bob', 'password-2', 'normal')
         self.client = self.authenticated_client('bob', 'password-2')
-        for mode in ('sequential', 'shuffle'):
+        for mode in ('sequential', 'shuffle', 'shuffle_clips'):
             vdl.db_set_download_visibility('one', 'public')
             vdl.db_set_download_visibility('two', 'public')
             state = self.create_session(mode=mode).get_json()
@@ -390,12 +390,161 @@ class PlaybackSessionTest(AppCase):
             400,
         )
         vdl.db_set_preferences({'shuffle_min_height': '999'})
-        self.assertEqual(
-            self.client.post(
-                '/api/playback-sessions', json={'mode': 'shuffle'}
-            ).status_code,
-            400,
+        for mode in ('shuffle', 'shuffle_clips'):
+            self.assertEqual(self.create_session(mode=mode).status_code, 400)
+
+    def test_clips_requires_finite_duration_at_least_seven_and_a_half_seconds(self):
+        for download_id, duration in (
+                ('short', 7.49), ('unknown', None), ('infinite', float('inf')),
+                ('zero', 0), ('negative', -1), ('boundary', 7.5)):
+            self.shuffle_video(download_id, duration=duration)
+        created = self.create_session(mode='shuffle_clips')
+        self.assertEqual(created.status_code, 201)
+        state = created.get_json()
+        self.assertEqual(state['mode'], 'shuffle_clips')
+        self.assertEqual(state['item']['id'], 'boundary')
+        self.assertIsNone(state['page'])
+        self.assertIsNone(state['position'])
+        prepared = self.session_step(state, 'prepare').get_json()
+        self.assertEqual(prepared['item']['id'], 'boundary')
+        advanced = self.session_step(state, 'advance').get_json()
+        self.assertEqual(advanced['item'], prepared['item'])
+        self.assertEqual(advanced['sequence'], 1)
+        self.assertEqual(advanced, self.session_step(state, 'advance').get_json())
+
+    def test_clips_preserves_pending_metadata_and_explains_no_valid_duration(self):
+        self.shuffle_video('legacy', duration=None, probed=False)
+        pending = self.create_session(mode='shuffle_clips')
+        self.assertEqual(pending.status_code, 409)
+        self.assertEqual(pending.get_json()['code'], 'shuffle_metadata_pending')
+        vdl.db_update_download('legacy', media_metadata_probed=True)
+        empty = self.create_session(mode='shuffle_clips')
+        self.assertEqual(empty.status_code, 409)
+        self.assertEqual(empty.get_json()['code'], 'no_shuffle_candidates')
+        self.assertIn('7.5 seconds', empty.get_json()['error'])
+        self.assertEqual(self.create_session(mode='shuffle').status_code, 201)
+
+    def test_clips_snapshots_full_video_thresholds_and_rechecks_prepared_duration(self):
+        self.shuffle_video('long', height=1080, duration=120)
+        self.shuffle_video('short', height=1080, duration=59)
+        self.shuffle_video('low', height=360, duration=180)
+        vdl.db_set_preferences({
+            'shuffle_min_height': '720', 'shuffle_min_duration_minutes': '1',
+        })
+        state = self.create_session(mode='shuffle_clips').get_json()
+        self.assertEqual(state['item']['id'], 'long')
+        vdl.db_set_preferences({
+            'shuffle_min_height': '0', 'shuffle_min_duration_minutes': '0',
+        })
+        self.shuffle_video('added', height=720, duration=60)
+        prepared = self.session_step(state, 'prepare').get_json()
+        self.assertEqual(prepared['item']['id'], 'added')
+        vdl.db_update_download('added', duration_seconds=7.49)
+        advanced = self.session_step(state, 'advance').get_json()
+        self.assertEqual(advanced['item']['id'], 'long')
+        stored = vdl._playback_sessions[state['session_id']]
+        self.assertEqual(stored['minimum_duration_seconds'], 60)
+        self.assertEqual(stored['minimum_height'], 720)
+
+    def test_clips_recovery_excludes_failed_reservations_and_retries_each_candidate_once(self):
+        for download_id in ('one', 'two', 'three'):
+            self.shuffle_video(download_id)
+        with mock.patch.object(vdl.secrets, 'randbelow', return_value=0):
+            state = self.create_session(mode='shuffle_clips').get_json()
+            first_id = state['item']['id']
+            prepared = self.session_step(state, 'prepare').get_json()
+            failed = [first_id, prepared['item']['id']]
+            replaced = self.session_step(
+                state, 'prepare', failed_download_ids=failed,
+            ).get_json()
+            self.assertNotIn(replaced['item']['id'], failed)
+            self.assertEqual(replaced, self.session_step(
+                state, 'prepare', failed_download_ids=failed,
+            ).get_json())
+            advanced = self.session_step(
+                state, 'advance', failed_download_ids=failed,
+            ).get_json()
+            self.assertEqual(advanced['item'], replaced['item'])
+            self.assertEqual(advanced, self.session_step(
+                state, 'advance', failed_download_ids=failed,
+            ).get_json())
+            failed.append(advanced['item']['id'])
+            self.assertEqual(self.session_step(
+                advanced, 'prepare', failed_download_ids=failed,
+            ).status_code, 204)
+            exhausted = self.session_step(
+                advanced, 'advance', failed_download_ids=failed,
+            )
+            self.assertEqual(exhausted.status_code, 409)
+            self.assertEqual(exhausted.get_json()['code'], 'no_shuffle_clip_candidates')
+            self.assertIn(state['session_id'], vdl._playback_sessions)
+            self.assertTrue(all(row['view_count'] == 0 for row in vdl.db_list_downloads()))
+            self.assertEqual(self.session_step(advanced, 'advance').status_code, 200)
+
+    def test_clips_advance_revalidates_failed_prepared_item(self):
+        for download_id in ('one', 'two', 'three'):
+            self.shuffle_video(download_id)
+        state = self.create_session(mode='shuffle_clips').get_json()
+        failed_id = self.session_step(state, 'prepare').get_json()['item']['id']
+        advanced = self.session_step(
+            state, 'advance', failed_download_ids=[failed_id],
         )
+        self.assertEqual(advanced.status_code, 200)
+        self.assertNotEqual(advanced.get_json()['item']['id'], failed_id)
+
+    def test_clips_recovery_payload_is_bounded_and_validated(self):
+        self.shuffle_video('only')
+        state = self.create_session(mode='shuffle_clips').get_json()
+        for action in ('prepare', 'advance'):
+            for invalid in (None, 'only', {}, [None], [1], [''], ['x' * 129],
+                            ['only'] * 10001):
+                with self.subTest(action=action, invalid=repr(invalid)[:30]):
+                    self.assertEqual(self.session_step(
+                        state, action, failed_download_ids=invalid,
+                    ).status_code, 400)
+
+    def test_clips_source_revision_detects_replaced_files_with_the_same_id(self):
+        for change in ('replace', 'rewrite', 'rename'):
+            with self.subTest(change=change):
+                self.shuffle_video('only')
+                state = self.create_session(mode='shuffle_clips').get_json()
+                prepared = self.session_step(state, 'prepare').get_json()
+                revision = prepared['item']['source_revision']
+                self.assertRegex(revision, r'^[0-9a-f]{64}$')
+                self.assertEqual(revision, state['item']['source_revision'])
+                self.assertNotIn('filename', prepared['item'])
+                self.assertEqual(prepared, self.session_step(state, 'prepare').get_json())
+                path = vdl.db_get_download('only')['filename']
+                metadata = os.stat(path)
+                if change == 'replace':
+                    replacement = path + '.replacement'
+                    with open(replacement, 'wb') as output:
+                        output.write(b'replaced source')
+                    os.replace(replacement, path)
+                elif change == 'rewrite':
+                    with open(path, 'r+b') as output:
+                        output.write(b'changed')
+                    os.utime(path, ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1))
+                else:
+                    replacement = os.path.join(self.download_dir, 'renamed.mp4')
+                    os.replace(path, replacement)
+                    vdl.db_update_download('only', filename=replacement)
+                advanced = self.session_step(state, 'advance').get_json()
+                self.assertEqual(advanced['item']['id'], prepared['item']['id'])
+                self.assertEqual(advanced['item']['extension'], prepared['item']['extension'])
+                self.assertNotEqual(advanced['item']['source_revision'], revision)
+                self.assertEqual(advanced, self.session_step(state, 'advance').get_json())
+
+    def test_source_revision_is_clips_only_and_disappearing_source_fails_closed(self):
+        self.shuffle_video('only')
+        for mode in ('sequential', 'shuffle'):
+            state = self.create_session(mode=mode).get_json()
+            self.assertNotIn('source_revision', state['item'])
+            self.assertNotIn('source_revision', self.session_step(state, 'prepare').get_json()['item'])
+        entry = vdl.db_get_download('only')
+        os.remove(entry['filename'])
+        item = vdl._playback_item(entry, include_source_revision=True)
+        self.assertIsNone(item['source_revision'])
 
     def test_filter_contract_and_tie_breaking_match_history(self):
         admin = vdl.db_get_user_by_username("admin")

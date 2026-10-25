@@ -28,15 +28,23 @@ in SQLite, writes media to a configurable directory, supports light and dark
 themes, and ships as a hardened non-root container for `linux/amd64` and
 `linux/arm64`.
 
-Built-in **Play All** and **Shuffle** prepare the next stored video around ten
-seconds before the current one ends and blend picture and sound over the final
-three seconds when the browser is ready. Pausing freezes the overlap; volume,
+Built-in **Play All**, **Shuffle**, and **Shuffle Clips** prepare the next stored
+video around ten seconds before the current video or excerpt ends and blend
+picture and sound over the final three seconds when the browser is ready.
+Short excerpts use shorter fades. Pausing freezes the overlap; volume,
 mute, and playback speed apply to both videos. Use **Fullscreen** or **F** to
 keep both pictures inside one fullscreen stage. Reduced motion switches the
 picture immediately while retaining the audio fade. When buffering or browser
 playback restrictions prevent an overlap, the current video finishes before
 the usual handoff and recovery controls appear. Playlists, direct playback,
 and native WebKit video fullscreen retain their existing handoff.
+
+Choose **Shuffle Clips** in the Library playback menu for random 5–20 second
+excerpts. Each starts between one-third and seven-eighths through the original
+video, with enough time left for the excerpt. Videos shorter than 7.5 seconds
+are excluded; Shuffle's quality and minimum full-video length settings still
+apply. This mode remembers your choice per account in this browser and uses
+its own boundaries regardless of the **Skip video intro and outro** setting.
 
 ## Download limits
 

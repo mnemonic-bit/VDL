@@ -93,7 +93,7 @@ async function direct(page) {
 
 async function start(page, mode = 'sequential') {
     await page.evaluate(mode => startEndlessPlayback(
-        mode === 'shuffle' ? null : 'edge-current', 'Current', 'mp4', mode,
+        mode === 'sequential' ? 'edge-current' : null, 'Current', 'mp4', mode,
     ), mode);
     await expect.poll(() => page.evaluate(() => endlessPlayback.sessionId)).not.toBeNull();
     await expect.poll(() => page.evaluate(() => endlessPlayback.phase)).toBe('playing');
@@ -434,4 +434,18 @@ test('stopping after a failed fade retains the restored item boundary', async ({
     await tick(page, 50);
     await expect(page.locator('#playerVideo')).toHaveJSProperty('paused', true);
     await time(page, 50);
+});
+
+test('Shuffle Clips owns its bounds without additionally trimming the saved skip-edges preference', async ({ page }) => {
+    await page.evaluate(() => { Math.random = () => 0; });
+    await start(page, 'shuffle_clips');
+    await time(page, 20);
+    expect(await page.locator('#playerVideo').evaluate(video => {
+        const boundary = playerBoundaries.get(video);
+        return [boundary.start, boundary.end];
+    })).toEqual([20, 25]);
+    expect((await (await page.request.get('/api/preferences')).json()).skip_video_edges).toBe('true');
+    await page.evaluate(() => closePlayer());
+    await direct(page);
+    await time(page, 10);
 });

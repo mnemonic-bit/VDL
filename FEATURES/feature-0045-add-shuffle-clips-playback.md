@@ -1,7 +1,8 @@
 # Add Shuffle Clips playback with random starts and durations
 
 **Source:** User-requested feature\
-**Status:** Refined; not implemented\
+**Status:** Implemented\
+**Implemented:** 2026-10-26 · Version `0.48.0`\
 **Last refined:** 2026-10-25\
 **Extends:** [Feature 0030, Shuffle playback](feature-0030-add-shuffle-playback.md),
 [Feature 0035, Remember the last Play All mode](feature-0035-remember-play-all-mode.md),

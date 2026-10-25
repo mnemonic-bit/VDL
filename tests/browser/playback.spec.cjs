@@ -53,12 +53,12 @@ async function expectMainPlaybackMode(page, name, icon) {
     await expect(button).toHaveAttribute('aria-label', name);
     await expect(button).toContainText(name);
     await expect(button.locator('use')).toHaveAttribute('href', `#i-${icon}`);
-    await expect(button).toHaveAttribute('title', new RegExp(name === 'Shuffle' ? 'Shuffle' : 'Library'));
+    await expect(button).toHaveAttribute('title', new RegExp(name.startsWith('Shuffle') ? 'Shuffle' : 'Library'));
 }
 
 async function choosePlaybackMode(page, name) {
     await page.getByRole('button', { name: 'Choose playback mode' }).click();
-    await page.locator('#playbackModeMenu').getByRole('menuitem', { name }).click();
+    await page.locator('#playbackModeMenu').getByRole('menuitem', { name, exact: true }).click();
 }
 
 test('overlay playback assigns MIME, supports Range, and Escape closes it', async ({ page }) => {
@@ -251,10 +251,11 @@ test('Play All split button keeps its direct action and exposes an accessible me
     await toggle.click();
     await expect(toggle).toHaveAttribute('aria-expanded', 'true');
     const menu = page.locator('#playbackModeMenu');
-    await expect(menu.getByRole('menuitem')).toHaveCount(2);
+    await expect(menu.getByRole('menuitem')).toHaveCount(3);
+    await expect(menu.getByRole('menuitem')).toHaveText(['Play All', 'Shuffle', 'Shuffle Clips']);
     await page.keyboard.press('ArrowDown');
     await page.keyboard.press('End');
-    await expect(menu.getByRole('menuitem', { name: 'Shuffle' })).toBeFocused();
+    await expect(menu.getByRole('menuitem', { name: 'Shuffle Clips', exact: true })).toBeFocused();
     await page.keyboard.press('Escape');
     await expect(toggle).toBeFocused();
     await expect(toggle).toHaveAttribute('aria-expanded', 'false');
@@ -444,7 +445,7 @@ test('Shuffle ignores History search and hands off randomly in the same player',
     });
     await page.getByRole('button', { name: 'Choose playback mode' }).click();
     await page.locator('#playbackModeMenu')
-        .getByRole('menuitem', { name: 'Shuffle' }).click();
+        .getByRole('menuitem', { name: 'Shuffle', exact: true }).click();
     await expect.poll(() => page.evaluate(() => endlessPlayback.sessionId)).not.toBeNull();
     expect(createBody).toEqual({ mode: 'shuffle' });
     expect(await page.evaluate(() => endlessPlayback.mode)).toBe('shuffle');
@@ -542,4 +543,65 @@ test('three-dot menu downloads the stored video to the browser', async ({ page }
 
     expect(download.suggestedFilename()).toBe('saved video.mp4');
     expect(await download.failure()).toBeNull();
+});
+
+test('Shuffle Clips remembers explicit invocation even on failure and remains account scoped', async ({ page }) => {
+    await seed(page, { id: 'clip-choice', status: 'finished', file: true });
+    await refresh(page);
+    const requests = [];
+    await page.route('**/api/playback-sessions', async route => {
+        if (route.request().method() !== 'POST') return route.continue();
+        requests.push(route.request().postDataJSON());
+        return route.fulfill({
+            status: 400, contentType: 'application/json',
+            body: JSON.stringify({ error: 'No video can supply a valid clip.', code: 'no_shuffle_candidates' }),
+        });
+    });
+    await choosePlaybackMode(page, 'Shuffle Clips');
+    await expectMainPlaybackMode(page, 'Shuffle Clips', 'shuffle');
+    await expect(page.locator('#endlessPlaybackButton')).toHaveAttribute(
+        'title', 'Shuffle random 5–20 second clips from your library.',
+    );
+    expect(requests).toEqual([{ mode: 'shuffle_clips' }]);
+    await page.reload();
+    await expectMainPlaybackMode(page, 'Shuffle Clips', 'shuffle');
+    await page.locator('#endlessPlaybackButton').click();
+    await expect.poll(() => requests.length).toBe(2);
+    expect(requests[1]).toEqual({ mode: 'shuffle_clips' });
+    await page.keyboard.press('Escape');
+    await page.setViewportSize({ width: 420, height: 720 });
+    await expect(page.locator('#endlessPlaybackButton span')).toBeHidden();
+    await expect(page.locator('#endlessPlaybackButton')).toHaveAttribute('aria-label', 'Shuffle Clips');
+
+    const username = `clip-account-${Date.now()}`;
+    const password = 'browser-clips-password';
+    const created = await page.request.post('/api/users', { data: { username, password, role: 'normal' } });
+    expect(created.status()).toBe(201);
+    await page.request.post('/logout');
+    await page.request.post('/login', { form: { username, password } });
+    await page.goto('/');
+    await expectMainPlaybackMode(page, 'Play All', 'play');
+    await page.request.post('/logout');
+    await page.request.post('/login', { form: { username: 'admin', password: 'browser-test-password' } });
+    await page.goto('/');
+    await expectMainPlaybackMode(page, 'Shuffle Clips', 'shuffle');
+    await page.request.delete(`/api/users/${(await created.json()).id}`);
+});
+
+test('Shuffle Clips stays available outside the visible filter and survives blocked storage in-page', async ({ page }) => {
+    await seed(page, { id: 'clip-available', status: 'finished', file: true });
+    await refresh(page);
+    await page.evaluate(() => {
+        Storage.prototype.setItem = () => { throw new Error('Storage blocked'); };
+    });
+    await page.locator('#historySearchToggle').click();
+    await page.locator('#historySearchInput').fill('no matching videos');
+    await expect(page.locator('#historyList [data-row-id]')).toHaveCount(0);
+    await expect(page.locator('#endlessPlaybackButton')).toBeDisabled();
+    await page.getByRole('button', { name: 'Choose playback mode' }).click();
+    await expect(page.locator('#playbackMenuShuffleClips')).toBeEnabled();
+    await page.locator('#playbackMenuShuffleClips').click();
+    await expectMainPlaybackMode(page, 'Shuffle Clips', 'shuffle');
+    await expect(page.locator('#endlessPlaybackButton')).toBeEnabled();
+    expect(await page.evaluate(() => rememberedPlaybackMode)).toBe('shuffle_clips');
 });

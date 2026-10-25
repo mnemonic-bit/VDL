@@ -280,3 +280,19 @@ test('queued URLs show a waiting message and Stop cancels before admission', asy
         await page.request.post('/__test__/release-downloads');
     }
 });
+
+test('saving other playback preferences preserves the remembered Shuffle Clips choice', async ({ page }) => {
+    await page.evaluate(() => {
+        const id = document.getElementById('playbackModeControl').dataset.userId;
+        localStorage.setItem(`playback-mode-user-${id}`, 'shuffle_clips');
+    });
+    await page.reload();
+    await expect(page.locator('#endlessPlaybackButton')).toHaveAttribute('aria-label', 'Shuffle Clips');
+    await openSettings(page);
+    await page.locator('#prefSkipVideoEdges').check();
+    await page.locator('#saveBtn').click();
+    await expect(page.locator('#saveBtn')).toContainText('Saved');
+    await page.reload();
+    await expect(page.locator('#endlessPlaybackButton')).toHaveAttribute('aria-label', 'Shuffle Clips');
+    expect(await page.evaluate(() => rememberedPlaybackMode)).toBe('shuffle_clips');
+});

@@ -74,3 +74,68 @@ for (const reducedMotion of ['no-preference', 'reduce']) {
         await expect.poll(() => page.evaluate(() => document.fullscreenElement)).toBeNull();
     });
 }
+
+test('real Shuffle Clips preloads the random position and continues through consecutive five-second overlaps', async ({ page }) => {
+    test.setTimeout(25_000);
+    await reset(page);
+    await page.evaluate(() => { Math.random = () => 0; });
+    for (const id of ['real-clip-one', 'real-clip-two']) {
+        await seed(page, {
+            id, name: `${id}.webm`, status: 'finished', file: true,
+            media_fixture: 'crossfade', resolution: '90p', duration_seconds: 14,
+            media_metadata_probed: true,
+        });
+    }
+    await refresh(page);
+    await page.getByRole('button', { name: 'Choose playback mode' }).click();
+    await page.getByRole('menuitem', { name: 'Shuffle Clips', exact: true }).click();
+    await expect.poll(() => page.evaluate(() => endlessPlayback.phase)).toBe('playing');
+    await expect(page.locator('#playerStandby source')).toHaveCount(1);
+    await expect.poll(() => page.locator('#playerStandby').evaluate(video => playerBoundaries.get(video)?.ready)).toBe(true);
+    const initial = await page.locator('#playerVideo').evaluate(video => {
+        const bounds = playerBoundaries.get(video);
+        return { start: bounds.start, end: bounds.end, time: video.currentTime };
+    });
+    expect(initial.end - initial.start).toBeCloseTo(5);
+    expect(initial.time).toBeGreaterThanOrEqual(initial.start);
+    const prepared = await page.locator('#playerStandby').evaluate(video => {
+        const bounds = playerBoundaries.get(video);
+        return { start: bounds.start, end: bounds.end, time: video.currentTime };
+    });
+    expect(prepared.time).toBeCloseTo(prepared.start, 1);
+    expect(await page.evaluate(() => endlessPlayback.sequence)).toBe(0);
+    await expect.poll(() => page.evaluate(() => Boolean(playerPreparation?.fade)), {
+        timeout: 5000, intervals: [50],
+    }).toBe(true);
+    const committedBounds = await page.locator('#playerVideo').evaluate(video => {
+        const bounds = playerBoundaries.get(video);
+        return { start: bounds.start, end: bounds.end };
+    });
+    expect(committedBounds).toEqual({ start: prepared.start, end: prepared.end });
+    await expect.poll(() => page.locator('#playerVideo').evaluate(video =>
+        video.currentTime - playerBoundaries.get(video).start)).toBeGreaterThan(0.5);
+    const overlap = await page.evaluate(() => ({
+        opacity: Number(document.getElementById('playerVideo').style.opacity),
+        gains: [playerPreparation.outgoing.volume, playerPreparation.incoming.volume],
+        playing: !playerPreparation.outgoing.paused && !playerPreparation.incoming.paused,
+    }));
+    expect(overlap.opacity).toBeGreaterThan(0);
+    expect(overlap.opacity).toBeLessThan(1);
+    expect(overlap.gains[0]).toBeGreaterThan(0);
+    expect(overlap.gains[0]).toBeLessThan(1);
+    expect(overlap.gains[1]).toBeGreaterThan(0);
+    expect(overlap.gains[1]).toBeLessThan(1);
+    expect(overlap.playing).toBe(true);
+    await expect.poll(() => page.evaluate(() => endlessPlayback.sequence), {
+        timeout: 7000, intervals: [50],
+    }).toBeGreaterThanOrEqual(2);
+    expect(await page.locator('#playerMediaStage video').count()).toBe(2);
+    const continued = await page.locator('#playerVideo').evaluate(video => ({
+        time: video.currentTime, start: playerBoundaries.get(video).start,
+        end: playerBoundaries.get(video).end,
+    }));
+    expect(continued.time).toBeGreaterThanOrEqual(continued.start);
+    expect(continued.time).toBeLessThanOrEqual(continued.end);
+    await page.evaluate(() => closePlayer());
+    await expect(page.locator('#playerMediaStage source')).toHaveCount(0);
+});

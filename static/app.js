@@ -1241,7 +1241,7 @@ const playbackModeStorageKey = 'playback-mode-user-'
 function loadRememberedPlaybackMode() {
     try {
         const stored = localStorage.getItem(playbackModeStorageKey);
-        if (stored === 'shuffle') return 'shuffle';
+        if (['shuffle', 'shuffle_clips'].includes(stored)) return stored;
     } catch (error) {
         // Browser storage can be blocked even when the page itself is usable.
     }
@@ -1251,10 +1251,13 @@ function loadRememberedPlaybackMode() {
 let rememberedPlaybackMode = loadRememberedPlaybackMode();
 
 function renderRememberedPlaybackMode() {
-    const shuffle = rememberedPlaybackMode === 'shuffle';
-    const label = shuffle ? 'Shuffle' : 'Play All';
+    const clips = rememberedPlaybackMode === 'shuffle_clips';
+    const shuffle = clips || rememberedPlaybackMode === 'shuffle';
+    const label = clips ? 'Shuffle Clips' : shuffle ? 'Shuffle' : 'Play All';
     endlessPlaybackButton.setAttribute('aria-label', label);
-    endlessPlaybackButton.title = shuffle
+    endlessPlaybackButton.title = clips
+        ? 'Shuffle random 5–20 second clips from your library.'
+        : shuffle
         ? 'Shuffle your library continuously in the built-in player'
         : 'Play the current Library selection continuously in the built-in player';
     endlessPlaybackButton.querySelector('svg use').setAttribute(
@@ -1262,7 +1265,7 @@ function renderRememberedPlaybackMode() {
     );
     endlessPlaybackButton.querySelector('span').textContent = label;
     endlessPlaybackButton.disabled = document.getElementById(
-        shuffle ? 'playbackMenuShuffle' : 'playbackMenuPlayAll',
+        clips ? 'playbackMenuShuffleClips' : shuffle ? 'playbackMenuShuffle' : 'playbackMenuPlayAll',
     ).disabled;
 }
 
@@ -1274,7 +1277,7 @@ function startChosenPlaybackMode(mode) {
     } catch (error) {
         // Keep the in-page choice and let the requested playback proceed.
     }
-    if (mode === 'shuffle') startShufflePlayback();
+    if (['shuffle', 'shuffle_clips'].includes(mode)) startShufflePlayback(mode);
     else startSequentialPlayback();
 }
 
@@ -1337,6 +1340,9 @@ document.getElementById('playbackMenuPlayAll').addEventListener(
 );
 document.getElementById('playbackMenuShuffle').addEventListener(
     'click', () => startChosenPlaybackMode('shuffle'),
+);
+document.getElementById('playbackMenuShuffleClips').addEventListener(
+    'click', () => startChosenPlaybackMode('shuffle_clips'),
 );
 accountMenuButton.addEventListener('click', event => {
     event.stopPropagation();
@@ -3701,6 +3707,7 @@ function renderDownloadCollections({ sortFavorites = false } = {}) {
     );
     document.getElementById('playbackMenuPlayAll').disabled = !sequentialAvailable;
     document.getElementById('playbackMenuShuffle').disabled = !shuffleAvailable;
+    document.getElementById('playbackMenuShuffleClips').disabled = !shuffleAvailable;
     renderRememberedPlaybackMode();
     document.getElementById('playbackModeToggle').disabled =
         !sequentialAvailable && !shuffleAvailable;
@@ -3883,6 +3890,8 @@ const endlessPlayback = {
     progressSequence: 0,
     progressTimer: null,
     lastSavedPosition: null,
+    failedClipIds: new Set(),
+    clipOccurrences: new Map(),
 };
 
 const PLAYER_PRELOAD_SECONDS = 10;
@@ -3906,7 +3915,7 @@ function updateSkipVideoEdges(enabled) {
     skipVideoEdges = enabled;
     // A preloaded item has not become current yet. Reload it with the saved
     // setting, or retain an already committed response for an ordinary handoff.
-    if (playerPreparation && !playerPreparation.fade) {
+    if (endlessPlayback.mode !== 'shuffle_clips' && playerPreparation && !playerPreparation.fade) {
         if (playerPreparation.committing || playerPreparation.response) {
             playerPreparation.disabled = true;
         } else {
@@ -3931,7 +3940,160 @@ function playPlayerVideo(video, generation = endlessPlayback.loadGeneration) {
 
 function playerEffectiveEnd(video) {
     const state = playerBoundaries.get(video);
-    return state?.valid && !state.tail ? state.end : video.duration;
+    return state?.valid && (state.clip || !state.tail) ? state.end : video.duration;
+}
+
+function sampleShuffleClip(duration, random = Math.random) {
+    if (!Number.isFinite(duration) || duration < 7.5) return null;
+    const earliest = duration / 3;
+    const latest = Math.min(7 * duration / 8, duration - 5);
+    const start = earliest + random() * (latest - earliest);
+    const maximumLength = Math.min(20, duration - start);
+    const length = 5 + random() * (maximumLength - 5);
+    return { start, length, end: start + length };
+}
+
+function shuffleClipOccurrence(item, sequence = endlessPlayback.sequence) {
+    if (!endlessPlayback.active || endlessPlayback.mode !== 'shuffle_clips') return null;
+    const key = JSON.stringify([endlessPlayback.sessionId, sequence, String(item.id),
+        item.source_revision || null]);
+    // Keep retries for this occurrence, but release completed sequence history.
+    for (const previous of endlessPlayback.clipOccurrences.keys()) {
+        if (JSON.parse(previous)[1] < endlessPlayback.sequence - 1) {
+            endlessPlayback.clipOccurrences.delete(previous);
+        }
+    }
+    if (!endlessPlayback.clipOccurrences.has(key)) {
+        endlessPlayback.clipOccurrences.set(key, { key, id: String(item.id) });
+    }
+    return endlessPlayback.clipOccurrences.get(key);
+}
+
+function createShuffleClipBoundary(video, { current, clipOccurrence, onFailure }) {
+    const state = {
+        enabled: true, clip: true, current, occurrence: clipOccurrence, onFailure,
+        metadata: false, started: false, valid: false, ready: false,
+        start: 0, end: NaN, finished: false, ownSeek: false, tail: false,
+    };
+    playerBoundaries.set(video, state);
+    video.style.visibility = 'hidden';
+    const alive = () => playerBoundaryCurrent(video, state);
+    const fail = () => {
+        if (!alive() || state.failed) return;
+        state.failed = true;
+        state.ready = false;
+        state.play = null;
+        clearTimeout(state.timer);
+        video.pause();
+        if (playerPreparation?.fade && playerPreparation.outgoing === video) {
+            finishPlayerFade();
+        } else {
+            state.onFailure?.();
+        }
+    };
+    const resume = () => {
+        if (!alive() || state.failed || state.finished || !state.valid || state.ownSeek || video.seeking
+                || video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA) return;
+        if (video.currentTime < state.start - 0.05 || video.currentTime > state.end + 0.05) return;
+        state.ready = true;
+        clearTimeout(state.timer);
+        video.style.removeProperty('visibility');
+        const play = state.play;
+        state.play = null;
+        play?.();
+    };
+    const update = event => {
+        if (!alive() || state.failed) return;
+        if (event.type === 'loadedmetadata') state.metadata = true;
+        if (!state.metadata) return;
+        const duration = video.duration;
+        if (!Number.isFinite(duration) || duration < 7.5) {
+            // A transient unknown duration may settle; an actual short file cannot.
+            if (state.valid || Number.isFinite(duration)) fail();
+            return;
+        }
+        if (!clipOccurrence.bounds) clipOccurrence.bounds = sampleShuffleClip(duration);
+        const bounds = clipOccurrence.bounds;
+        if (!bounds || bounds.start + 0.000001 < duration / 3
+                || bounds.start > 7 * duration / 8 + 0.000001
+                || bounds.end > duration + 0.000001) {
+            fail();
+            return;
+        }
+        state.valid = true;
+        state.start = bounds.start;
+        state.end = bounds.end;
+        if (!state.initialApplied) {
+            state.initialApplied = true;
+            seekPlayerBoundary(video, state, state.start);
+        }
+        resume();
+    };
+    const onSeeking = () => {
+        if (!alive() || state.failed || state.finished || !state.valid) return;
+        if (state.ownSeek && Math.abs(video.currentTime - state.target) < 0.05) return;
+        state.ownSeek = false;
+        state.ready = false;
+        if (video.currentTime < state.start) {
+            seekPlayerBoundary(video, state, state.start);
+        } else if (video.currentTime >= state.end) {
+            completePlayerItem(video);
+        }
+    };
+    const onSeeked = () => {
+        if (!alive() || state.failed || state.finished) return;
+        if (state.ownSeek && Math.abs(video.currentTime - state.target) > 0.05) {
+            fail();
+            return;
+        }
+        state.ownSeek = false;
+        if (video.currentTime < state.start - 0.05) {
+            seekPlayerBoundary(video, state, state.start);
+            return;
+        }
+        if (state.valid && video.currentTime >= state.end) completePlayerItem(video);
+        else resume();
+    };
+    const listeners = {
+        loadedmetadata: update, durationchange: update, seeking: onSeeking,
+        seeked: onSeeked, canplay: resume, loadeddata: resume,
+        play: () => {
+            if (!alive() || (state.ready && !state.finished && !state.failed)) return;
+            video.pause();
+            if (!state.failed && !state.finished && video.id === 'playerVideo') {
+                state.play = () => playPlayerVideo(video);
+            }
+        },
+        playing: () => {
+            if (!alive()) return;
+            if (state.ready && !state.finished && !state.failed) state.started = true;
+            else video.pause();
+        },
+    };
+    for (const [name, listener] of Object.entries(listeners)) video.addEventListener(name, listener);
+    state.timer = setTimeout(fail, PLAYER_HANDOFF_TIMEOUT_MS);
+    const frame = () => {
+        if (!alive() || state.failed) return;
+        checkPlayerBoundary(video);
+        if (video.id === 'playerVideo') maybePreparePlayer();
+        state.frame = requestAnimationFrame(frame);
+    };
+    state.frame = requestAnimationFrame(frame);
+    state.fail = fail;
+    state.cleanup = () => {
+        clearTimeout(state.timer);
+        cancelAnimationFrame(state.frame);
+        state.play = null;
+        for (const [name, listener] of Object.entries(listeners)) video.removeEventListener(name, listener);
+        video.style.removeProperty('visibility');
+        if (playerBoundaries.get(video) === state) playerBoundaries.delete(video);
+    };
+    state.playWhenReady = play => {
+        if (state.failed || state.finished) return;
+        if (state.ready) play();
+        else state.play = play;
+    };
+    return state;
 }
 
 function seekPlayerBoundary(video, state, position) {
@@ -3943,17 +4105,22 @@ function seekPlayerBoundary(video, state, position) {
     try {
         video.currentTime = position;
     } catch (_error) {
-        // Some media cannot seek. Play what is available without failing it.
         state.seekFailed = true;
+        if (state.clip) {
+            state.fail();
+            return;
+        }
+        // Ordinary playback can still use media that does not support seeking.
     }
     if (!video.seeking || state.seekFailed) {
         state.ownSeek = false;
-        state.ready = true;
+        state.ready = !state.clip;
     }
 }
 
-function createPlayerBoundary(video, { current, seekSeconds = null } = {}) {
+function createPlayerBoundary(video, { current, seekSeconds = null, clipOccurrence = null, onFailure = null } = {}) {
     playerBoundaries.get(video)?.cleanup();
+    if (clipOccurrence) return createShuffleClipBoundary(video, { current, clipOccurrence, onFailure });
     const state = {
         enabled: skipVideoEdges, current, metadata: false, started: false,
         valid: false, start: 0, end: NaN, tail: false, finished: false,
@@ -4056,13 +4223,16 @@ function completePlayerItem(video, natural = false) {
         return;
     }
     if (video.id !== 'playerVideo') return;
-    if (state) state.finished = true;
+    if (state) {
+        state.finished = true;
+        state.play = null;
+    }
     if (!natural) {
         if (state?.valid) seekPlayerBoundary(video, state, state.end);
         video.pause();
     }
     if (usePreparedPlayerHandoff()) return;
-    if (endlessPlayback.active && endlessPlayback.phase === 'playing') {
+    if (endlessPlayback.active && (endlessPlayback.phase === 'playing' || state?.clip)) {
         advanceEndlessPlayback(endlessPlayback.mode === 'playlist');
     }
 }
@@ -4078,7 +4248,7 @@ function checkPlayerBoundary(video) {
 
 function canPreparePlayer() {
     return endlessPlayback.active && endlessPlayback.sessionId
-        && ['sequential', 'shuffle'].includes(endlessPlayback.mode);
+        && ['sequential', 'shuffle', 'shuffle_clips'].includes(endlessPlayback.mode);
 }
 
 function currentPreparation(preparation) {
@@ -4102,7 +4272,7 @@ function setPlayerStandby(video, standby) {
     video.classList.toggle('player-standby', standby);
     video.controls = !standby;
     video.controlsList?.toggle('nofullscreen', endlessPlayback.active
-        && ['sequential', 'shuffle'].includes(endlessPlayback.mode)
+        && ['sequential', 'shuffle', 'shuffle_clips'].includes(endlessPlayback.mode)
         && Boolean(document.getElementById('playerMediaStage').requestFullscreen));
     video.autoplay = !standby;
     if (standby) {
@@ -4140,6 +4310,7 @@ function finishPlayerFade() {
     outgoing.muted = muted;
     clearPlayerPreparation();
     endlessPlayback.handoffInProgress = false;
+    if (endlessPlayback.mode === 'shuffle_clips') maybePreparePlayer();
 }
 
 function applyPlayerFade(preparation) {
@@ -4170,6 +4341,16 @@ function applyPlayerFade(preparation) {
     if (progress >= 1) finishPlayerFade();
 }
 
+function resumeBufferedClipFade(preparation) {
+    if (!currentPreparation(preparation) || !preparation.fade || !preparation.buffering
+            || !preparation.resumeAfterBuffer) return;
+    const { incoming, outgoing } = preparation;
+    if ([incoming, outgoing].some(video => playerMediaWaiting.has(video)
+            || video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA)) return;
+    preparation.buffering = false;
+    Promise.all([incoming.play(), outgoing.play()]).catch(() => failPlayerFade(preparation));
+}
+
 function playerFadeFrame(preparation) {
     if (!currentPreparation(preparation) || !preparation.fade) return;
     applyPlayerFade(preparation);
@@ -4180,6 +4361,9 @@ function playerFadeFrame(preparation) {
 
 function failPlayerFade(preparation) {
     if (!currentPreparation(preparation)) return;
+    if (endlessPlayback.mode === 'shuffle_clips' && preparation.item) {
+        endlessPlayback.failedClipIds.add(String(preparation.item.id));
+    }
     if (preparation.fade) {
         // The server has committed. Restore the outgoing picture until ended,
         // then retry that committed item without drawing another Shuffle choice.
@@ -4213,6 +4397,10 @@ function failPlayerFade(preparation) {
         preparation.disabled = true;
         unloadPlayerMedia(preparation.incoming);
         preparation.incoming.style.opacity = '0';
+        if (endlessPlayback.mode === 'shuffle_clips' && !preparation.response && !preparation.committing) {
+            clearPlayerPreparation();
+            queueMicrotask(maybePreparePlayer);
+        }
     }
 }
 
@@ -4231,12 +4419,20 @@ function usePreparedPlayerHandoff() {
     return true;
 }
 
+function playerFadeLimit(preparation) {
+    const outgoing = playerBoundaries.get(preparation.outgoing);
+    const incoming = playerBoundaries.get(preparation.incoming);
+    if (!outgoing?.clip || !incoming?.clip) return PLAYER_FADE_SECONDS;
+    return Math.min(PLAYER_FADE_SECONDS, (outgoing.end - outgoing.start) / 2,
+        (incoming.end - incoming.start) / 2);
+}
+
 function beginPlayerFade(preparation) {
     if (!currentPreparation(preparation) || preparation.disabled) return;
     const { outgoing, incoming } = preparation;
     const remaining = playerEffectiveEnd(outgoing) - outgoing.currentTime;
     if (outgoing.paused || outgoing.ended || !Number.isFinite(remaining)
-            || remaining < 1 || remaining > PLAYER_FADE_SECONDS
+            || remaining < 1 || remaining > playerFadeLimit(preparation)
             || endlessPlayback.presentation === 'webkit-fullscreen'
             || document.fullscreenElement === outgoing) {
         failPlayerFade(preparation);
@@ -4248,7 +4444,7 @@ function beginPlayerFade(preparation) {
     incoming.muted = outgoing.muted;
     incoming.playbackRate = outgoing.playbackRate;
     preparation.startTime = outgoing.currentTime;
-    preparation.fadeDuration = Math.min(PLAYER_FADE_SECONDS, remaining);
+    preparation.fadeDuration = Math.min(playerFadeLimit(preparation), remaining);
     preparation.reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
     preparation.fade = true;
     preparation.progress = 0;
@@ -4281,6 +4477,8 @@ async function commitPlayerFade(preparation) {
                 body: JSON.stringify({
                     expected_download_id: preparation.expectedId,
                     sequence: preparation.sequence,
+                    ...(endlessPlayback.mode === 'shuffle_clips'
+                        ? { failed_download_ids: Array.from(endlessPlayback.failedClipIds) } : {}),
                 }),
                 signal: preparation.controller.signal,
             },
@@ -4303,6 +4501,9 @@ async function commitPlayerFade(preparation) {
         }
         if (!preparation.data || String(preparation.data.item.id) !== String(preparation.item.id)
                 || preparation.data.item.extension !== preparation.item.extension
+                || (endlessPlayback.mode === 'shuffle_clips'
+                    && (!preparation.data.item.source_revision
+                        || preparation.data.item.source_revision !== preparation.item.source_revision))
                 || preparation.disabled || playerEffectiveEnd(preparation.outgoing) - preparation.outgoing.currentTime < 1) {
             failPlayerFade(preparation);
             return;
@@ -4341,12 +4542,12 @@ function maybeCommitPlayerFade(preparation) {
     const boundary = playerBoundaries.get(incoming);
     const remaining = playerEffectiveEnd(outgoing) - outgoing.currentTime;
     if (outgoing.paused || outgoing.ended || playerMediaWaiting.has(outgoing)
-            || remaining > PLAYER_FADE_SECONDS || remaining < 1
+            || remaining > playerFadeLimit(preparation) || remaining < 1
             || endlessPlayback.presentation === 'webkit-fullscreen'
             || document.fullscreenElement === outgoing
             || incoming.readyState < HTMLMediaElement.HAVE_FUTURE_DATA
             || !Number.isFinite(incoming.duration)
-            || playerEffectiveEnd(incoming) - (boundary?.start || 0) <= PLAYER_FADE_SECONDS
+            || (!boundary?.clip && playerEffectiveEnd(incoming) - (boundary?.start || 0) <= PLAYER_FADE_SECONDS)
             || (boundary?.valid && boundary.seekFailed)
             || !boundary?.ready || incoming.seeking) return;
     commitPlayerFade(preparation);
@@ -4390,7 +4591,7 @@ function maybePreparePlayer() {
     incoming.addEventListener('playing', onPlaying);
     incoming.addEventListener('error', onFailure);
     const onWaiting = () => {
-        if (preparation.fade) failPlayerFade(preparation);
+        if (preparation.fade && endlessPlayback.mode !== 'shuffle_clips') failPlayerFade(preparation);
     };
     incoming.addEventListener('waiting', onWaiting);
     preparation.cleanup = () => {
@@ -4404,7 +4605,10 @@ function maybePreparePlayer() {
     };
     apiFetch('/api/playback-sessions/' + encodeURIComponent(endlessPlayback.sessionId) + '/prepare', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ expected_download_id: preparation.expectedId, sequence: preparation.sequence }),
+        body: JSON.stringify({ expected_download_id: preparation.expectedId, sequence: preparation.sequence,
+            ...(endlessPlayback.mode === 'shuffle_clips'
+                ? { failed_download_ids: Array.from(endlessPlayback.failedClipIds) } : {}),
+        }),
         signal: preparation.controller.signal,
     }).then(async response => {
         if (!response.ok || response.status === 204) throw new Error('No prepared item');
@@ -4417,12 +4621,17 @@ function maybePreparePlayer() {
         }
         preparation.item = data.item;
         incoming.preload = 'auto';
+        incoming.autoplay = false;
         incoming.style.opacity = '0';
         const source = document.createElement('source');
         source.src = '/api/file/' + encodeURIComponent(data.item.id);
         if (_VIDEO_MIME[data.item.extension]) source.type = _VIDEO_MIME[data.item.extension];
         incoming.replaceChildren(source);
-        createPlayerBoundary(incoming, { current: () => currentPreparation(preparation) });
+        createPlayerBoundary(incoming, {
+            current: () => currentPreparation(preparation),
+            clipOccurrence: shuffleClipOccurrence(data.item, preparation.sequence),
+            onFailure: () => failPlayerFade(preparation),
+        });
         incoming.load();
         maybeCommitPlayerFade(preparation);
     }).catch(() => {
@@ -4512,6 +4721,15 @@ function clearPlayerMediaCallbacks() {
 
 function markPlaybackStarted(generation) {
     if (generation !== endlessPlayback.loadGeneration) return;
+    const boundary = playerBoundaries.get(document.getElementById('playerVideo'));
+    if (endlessPlayback.mode === 'shuffle_clips') {
+        if (!boundary?.clip || !boundary.ready || boundary.failed || boundary.finished) return;
+        endlessPlayback.failedClipIds.clear();
+        if (endlessPlayback.sequence === 0 && !boundary.occurrence.viewRecorded) {
+            boundary.occurrence.viewRecorded = true;
+            recordView(endlessPlayback.currentDownloadId);
+        }
+    }
     clearPlaybackWatchdog();
     endlessPlayback.phase = 'playing';
     endlessPlayback.handoffInProgress = Boolean(playerPreparation?.fade
@@ -4532,6 +4750,14 @@ function handlePlaybackFailure(generation, message) {
             || generation !== endlessPlayback.loadGeneration
             || endlessPlayback.failedGeneration === generation) return;
     clearPlaybackWatchdog();
+    if (endlessPlayback.mode === 'shuffle_clips') {
+        const video = document.getElementById('playerVideo');
+        video.pause();
+        if (endlessPlayback.currentDownloadId) {
+            endlessPlayback.failedClipIds.add(String(endlessPlayback.currentDownloadId));
+        }
+        clearPlayerPreparation();
+    }
     endlessPlayback.failedGeneration = generation;
     endlessPlayback.phase = 'failed';
     endlessPlayback.handoffInProgress = false;
@@ -4540,7 +4766,7 @@ function handlePlaybackFailure(generation, message) {
         ? endlessPlayback.playlistQueue.length
         : historyTotal;
     const currentLimit = Math.max(1, Math.min(MAX_AUTOMATIC_SKIPS, selectionSize || 1));
-    if (endlessPlayback.failureCount >= currentLimit) {
+    if (endlessPlayback.mode !== 'shuffle_clips' && endlessPlayback.failureCount >= currentLimit) {
         showPlayerTransition(
             message,
             ['retry', 'skip', 'stop', 'close'],
@@ -4549,7 +4775,12 @@ function handlePlaybackFailure(generation, message) {
         return;
     }
     showPlayerTransition(`${message} Skipping to the next video.`, []);
-    setTimeout(() => advanceEndlessPlayback(), 0);
+    const epoch = endlessPlayback.epoch;
+    setTimeout(() => {
+        if (epoch === endlessPlayback.epoch && generation === endlessPlayback.loadGeneration) {
+            advanceEndlessPlayback();
+        }
+    }, 0);
 }
 
 function observePlaybackPromise(playback, generation) {
@@ -4586,11 +4817,18 @@ function loadPlaybackItem(item, { automatic = false, seekSeconds = null, adopt =
     const epoch = endlessPlayback.epoch;
     const boundary = adopt ? playerBoundaries.get(video)
         : createPlayerBoundary(video, {
-            seekSeconds, current: () => epoch === endlessPlayback.epoch
+            seekSeconds, clipOccurrence: shuffleClipOccurrence(item),
+            onFailure: () => handlePlaybackFailure(generation, 'This video cannot supply a valid clip.'),
+            current: () => epoch === endlessPlayback.epoch
                 && generation === endlessPlayback.loadGeneration,
         });
-    if (adopt && boundary) boundary.current = () => epoch === endlessPlayback.epoch
-        && generation === endlessPlayback.loadGeneration;
+    if (adopt && boundary) {
+        boundary.current = () => epoch === endlessPlayback.epoch
+            && generation === endlessPlayback.loadGeneration;
+        if (boundary.clip) boundary.onFailure = () => handlePlaybackFailure(
+            generation, 'This video cannot supply a valid clip.',
+        );
+    }
     endlessPlayback.phase = 'loading';
     endlessPlayback.failedGeneration = null;
     endlessPlayback.currentItem = item;
@@ -4612,10 +4850,10 @@ function loadPlaybackItem(item, { automatic = false, seekSeconds = null, adopt =
                 : requested;
         }
         applyOriginalPlayerSize(generation);
-        armPlaybackWatchdog(generation);
+        if (!boundary?.clip) armPlaybackWatchdog(generation);
     });
     const onResize = current(() => applyOriginalPlayerSize(generation));
-    const onCanPlay = current(() => armPlaybackWatchdog(generation));
+    const onCanPlay = current(() => { if (!boundary?.clip) armPlaybackWatchdog(generation); });
     const onPlaying = current(() => markPlaybackStarted(generation));
     const onError = current(() => {
         if (playerPreparation?.fade) failPlayerFade(playerPreparation);
@@ -4668,7 +4906,7 @@ function loadPlaybackItem(item, { automatic = false, seekSeconds = null, adopt =
 function requestPlayerFullscreen({ launch = false } = {}) {
     const video = document.getElementById('playerVideo');
     try {
-        const target = endlessPlayback.active && ['sequential', 'shuffle'].includes(endlessPlayback.mode)
+        const target = endlessPlayback.active && ['sequential', 'shuffle', 'shuffle_clips'].includes(endlessPlayback.mode)
             ? document.getElementById('playerMediaStage') : video;
         if (target.requestFullscreen) {
             if (launch) playerStartedFullscreen = true;
@@ -4713,7 +4951,7 @@ function openBuiltInPlayer({ fullscreen = false, requestFullscreen = true } = {}
     hidePlayerControls();
     backdrop.classList.add('open');
     document.getElementById('playerMediaStage').classList.toggle('player-continuous',
-        endlessPlayback.active && ['sequential', 'shuffle'].includes(endlessPlayback.mode));
+        endlessPlayback.active && ['sequential', 'shuffle', 'shuffle_clips'].includes(endlessPlayback.mode));
     endlessPlayback.launchProvenance = fullscreen ? 'fullscreen' : 'original';
     endlessPlayback.presentation = 'original';
     playerStartedFullscreen = false;
@@ -4729,8 +4967,17 @@ function releasePlaybackLease(sessionId) {
 }
 
 function deactivateEndlessPlayback({ release = true } = {}) {
+    const clips = endlessPlayback.mode === 'shuffle_clips';
+    // Playback promises can settle while the replacement session is opening.
+    if (clips) endlessPlayback.loadGeneration += 1;
+    endlessPlayback.active = false;
     finishPlayerFade();
     clearPlayerPreparation();
+    if (clips) {
+        clearPlayerMediaCallbacks();
+        unloadPlayerMedia(document.getElementById('playerVideo'));
+        unloadPlayerMedia(document.getElementById('playerStandby'));
+    }
     const sessionId = endlessPlayback.sessionId;
     clearInterval(endlessPlayback.keepaliveTimer);
     endlessPlayback.keepaliveTimer = null;
@@ -4744,6 +4991,8 @@ function deactivateEndlessPlayback({ release = true } = {}) {
     endlessPlayback.advancePending = false;
     endlessPlayback.handoffInProgress = false;
     endlessPlayback.returnFullscreenNeeded = false;
+    endlessPlayback.clipOccurrences.clear();
+    endlessPlayback.failedClipIds.clear();
     if (release) releasePlaybackLease(sessionId);
 }
 
@@ -4866,9 +5115,9 @@ function startSequentialPlayback() {
     startEndlessPlaybackFromView();
 }
 
-function startShufflePlayback() {
+function startShufflePlayback(mode = 'shuffle') {
     closePlaybackModeMenu();
-    startEndlessPlayback(null, '', '', 'shuffle');
+    startEndlessPlayback(null, '', '', mode);
 }
 
 function renderPlaylistQueue() {
@@ -5052,11 +5301,19 @@ function startEndlessPlayback(id = null, label = '', extension = '', mode = 'seq
     if (mode === 'sequential' && !id && historyTotal === 0) return;
     endlessPlayback.epoch += 1;
     const epoch = endlessPlayback.epoch;
+    const replaceClips = mode === 'shuffle_clips' && endlessPlayback.mode !== 'shuffle_clips';
     deactivateEndlessPlayback();
+    if (replaceClips) {
+        clearPlayerMediaCallbacks();
+        unloadPlayerMedia(document.getElementById('playerVideo'));
+        unloadPlayerMedia(document.getElementById('playerStandby'));
+    }
     endlessPlayback.active = true;
     endlessPlayback.mode = mode;
     endlessPlayback.phase = 'opening';
     endlessPlayback.failureCount = 0;
+    endlessPlayback.failedClipIds.clear();
+    endlessPlayback.clipOccurrences.clear();
     endlessPlayback.returnFullscreenNeeded = false;
     document.getElementById('playlistQueue').hidden = true;
     document.querySelector('.player-box').classList.remove('playlist-player');
@@ -5070,7 +5327,7 @@ function startEndlessPlayback(id = null, label = '', extension = '', mode = 'seq
         recordView(id);
     } else {
         showPlayerTransition(
-            mode === 'shuffle' ? 'Starting shuffle…' : 'Starting endless playback…',
+            mode === 'shuffle_clips' ? 'Starting Shuffle Clips…' : mode === 'shuffle' ? 'Starting shuffle…' : 'Starting endless playback…',
             [],
         );
     }
@@ -5080,7 +5337,7 @@ function startEndlessPlayback(id = null, label = '', extension = '', mode = 'seq
     const playbackPageSize = endlessHistoryEnabled()
         ? ENDLESS_PLAYBACK_PAGE_SIZE
         : historyPageSize;
-    const body = mode === 'shuffle' ? { mode: 'shuffle' } : {
+    const body = ['shuffle', 'shuffle_clips'].includes(mode) ? { mode } : {
         mode: 'sequential',
         filter: historySearchInput.value,
         ordering: historyOrdering,
@@ -5107,16 +5364,19 @@ function startEndlessPlayback(id = null, label = '', extension = '', mode = 'seq
         if (!response.ok) {
             if (epoch !== endlessPlayback.epoch || !endlessPlayback.active) return;
             const error = await playbackResponseError(response);
-            if (error.code === 'no_shuffle_candidates') {
+            if (error.code === 'no_shuffle_candidates' || error.code === 'no_shuffle_clip_candidates') {
                 endlessPlayback.phase = 'create-failed';
-                showPlayerTransition(error.message, ['settings', 'close'], 'settings');
+                showPlayerTransition(error.message,
+                    mode === 'shuffle_clips' ? ['retry', 'settings', 'stop', 'close'] : ['settings', 'close'],
+                    mode === 'shuffle_clips' ? 'retry' : 'settings');
                 return;
             }
             if (error.code === 'shuffle_metadata_pending') {
                 endlessPlayback.phase = 'create-failed';
                 showPlayerTransition(
-                    'Older videos are still being prepared for Shuffle.',
-                    ['retry', 'close'],
+                    mode === 'shuffle_clips' ? 'Older videos are still being prepared for Shuffle Clips.'
+                        : 'Older videos are still being prepared for Shuffle.',
+                    mode === 'shuffle_clips' ? ['retry', 'stop', 'close'] : ['retry', 'close'],
                     'retry',
                 );
                 return;
@@ -5135,7 +5395,7 @@ function startEndlessPlayback(id = null, label = '', extension = '', mode = 'seq
         startPlaybackKeepalive(epoch);
         if (!id || String(id) !== String(data.item.id)) {
             loadPlaybackItem(data.item, { automatic: true });
-            recordView(data.item.id);
+            if (mode !== 'shuffle_clips') recordView(data.item.id);
         } else {
             endlessPlayback.currentItem = data.item;
             if (endlessPlayback.phase === 'failed') advanceEndlessPlayback();
@@ -5179,6 +5439,8 @@ function advanceEndlessPlayback(completed = false, preparedResponse = null, reco
                 expected_download_id: expectedId,
                 sequence: nextSequence,
                 completed: endlessPlayback.mode === 'playlist' && completed,
+                ...(endlessPlayback.mode === 'shuffle_clips'
+                    ? { failed_download_ids: Array.from(endlessPlayback.failedClipIds) } : {}),
             }),
         },
     )).then(async response => {
@@ -5249,8 +5511,8 @@ function continueEndlessPlayback() {
 }
 
 function restartEndlessPlayback() {
-    if (endlessPlayback.mode === 'shuffle') {
-        startShufflePlayback();
+    if (['shuffle', 'shuffle_clips'].includes(endlessPlayback.mode)) {
+        startShufflePlayback(endlessPlayback.mode);
         return;
     }
     if (endlessPlayback.mode === 'playlist' && endlessPlayback.playlistId) {
@@ -5265,15 +5527,21 @@ function restartEndlessPlayback() {
 function retryEndlessPlayback() {
     if (!endlessPlayback.active) return;
     if (endlessPlayback.phase === 'create-failed'
-            && endlessPlayback.mode === 'shuffle') {
-        startShufflePlayback();
+            && ['shuffle', 'shuffle_clips'].includes(endlessPlayback.mode)) {
+        startShufflePlayback(endlessPlayback.mode);
         return;
     }
     if (endlessPlayback.phase === 'failed' && endlessPlayback.handoffInProgress) {
+        if (endlessPlayback.mode === 'shuffle_clips') endlessPlayback.failedClipIds.clear();
         advanceEndlessPlayback();
         return;
     }
     const generation = endlessPlayback.loadGeneration;
+    if (endlessPlayback.mode === 'shuffle_clips' && playerBoundaries.get(document.getElementById('playerVideo'))?.failed) {
+        endlessPlayback.failedClipIds.clear();
+        loadPlaybackItem(endlessPlayback.currentItem, { automatic: true });
+        return;
+    }
     endlessPlayback.failedGeneration = null;
     endlessPlayback.phase = 'loading';
     showPlayerTransition('Resuming playback…', []);
@@ -5289,6 +5557,11 @@ function skipEndlessPlayback() {
 
 function stopEndlessPlayback() {
     if (!endlessPlayback.active) return;
+    const clips = endlessPlayback.mode === 'shuffle_clips';
+    if (clips) {
+        endlessPlayback.epoch += 1;
+        endlessPlayback.loadGeneration += 1;
+    }
     deactivateEndlessPlayback();
     endlessPlayback.phase = 'playing';
     showPlayerTransition('Endless playback stopped.', ['close']);
@@ -5363,11 +5636,31 @@ for (const video of document.querySelectorAll('#playerMediaStage video')) {
     video.addEventListener('waiting', () => {
         playerMediaWaiting.add(video);
         playerMediaTimes.set(video, video.currentTime);
+        const preparation = playerPreparation;
+        if (preparation?.fade && endlessPlayback.mode === 'shuffle_clips') {
+            if (!preparation.buffering) preparation.resumeAfterBuffer = !preparation.incoming.paused;
+            preparation.buffering = true;
+            preparation.bufferPauseVideos ||= new WeakSet();
+            for (const media of [preparation.incoming, preparation.outgoing]) {
+                if (!media.paused) preparation.bufferPauseVideos.add(media);
+                media.pause();
+            }
+        }
+    });
+    video.addEventListener('canplay', () => {
+        playerMediaWaiting.delete(video);
+        if (playerPreparation?.buffering) resumeBufferedClipFade(playerPreparation);
     });
     video.addEventListener('ended', () => completePlayerItem(video, true));
     video.addEventListener('pause', () => {
+        const bufferingPause = playerPreparation?.bufferPauseVideos?.delete(video);
         if (video.id !== 'playerVideo') return;
-        if (playerPreparation?.fade) playerPreparation.outgoing.pause();
+        if (playerPreparation?.buffering && !bufferingPause) {
+            playerPreparation.resumeAfterBuffer = false;
+        }
+        if (playerPreparation?.fade && !bufferingPause && video.paused) {
+            playerPreparation.outgoing.pause();
+        }
         if (endlessPlayback.active && endlessPlayback.mode === 'playlist' && !video.ended
                 && !playerBoundaries.get(video)?.finished) {
             savePlaylistProgress({ force: true });
