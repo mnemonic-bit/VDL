@@ -2226,14 +2226,26 @@ function copyToClipboard(text, btn) {
 }
 
 function fallback(text, done) {
+    const previousFocus = document.activeElement;
     const ta = document.createElement('textarea');
     ta.value = text;
     ta.style.position = 'fixed';
     ta.style.opacity = '0';
-    document.body.appendChild(ta);
-    ta.select();
-    try { document.execCommand('copy'); done(); } catch (e) {}
-    document.body.removeChild(ta);
+    // A modal makes the rest of the page inert, including a textarea in body.
+    (document.querySelector('dialog:modal') || document.body).appendChild(ta);
+    let copied = false;
+    try {
+        ta.focus();
+        ta.select();
+        copied = document.execCommand('copy');
+    } catch (e) {
+        // Browsers can either return false or throw when copying is blocked.
+    } finally {
+        ta.remove();
+        if (previousFocus) previousFocus.focus({ preventScroll: true });
+    }
+    if (copied) done();
+    else showActionError('Could not copy the URL. Please try again.');
 }
 
 const PLAYLIST_VIDEO_EXTENSIONS = new Set([

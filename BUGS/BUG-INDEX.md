@@ -216,6 +216,12 @@ second batch before scrolling. Version `0.46.7` waits for animations to finish
 and checks the sentinel's current visibility and position. Deterministic
 regressions cover both the observer and scroll-event fallback; confirmation on
 the hosted runner remains outstanding.
+Issue 58 was reported and reproduced on 2026-10-25. Copy URL in Current
+Downloads showed a success tick while leaving the clipboard empty whenever
+the Clipboard API was unavailable or rejected the write. The fallback's text
+field was outside the modal drawer and therefore inert, and its copy result
+was ignored. Version `0.46.8` puts the field inside the active modal, restores
+focus, and reports failed copies instead of showing success.
 
 ## Bug reports
 
@@ -276,6 +282,7 @@ the hosted runner remains outstanding.
 - [Bug 0055 — Hidden card animations trigger endless scrolling on return from Settings](bug-0055-hidden-card-animations-trigger-endless-scroll.md)
 - [Bug 0056 — Debounce browser test clock kept advancing between explicit time steps](bug-0056-debounce-browser-test-clock-kept-advancing.md)
 - [Bug 0057 — Visible card animations trigger endless scrolling before user scrolling](bug-0057-visible-card-animations-trigger-endless-scroll.md)
+- [Bug 0058 — Current Downloads confirms copying without filling the clipboard](bug-0058-current-downloads-copy-leaves-clipboard-empty.md)
 
 ## Accepted UI decisions
 
