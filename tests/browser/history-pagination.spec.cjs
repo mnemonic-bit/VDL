@@ -89,8 +89,11 @@ test('endless scrolling reveals the next batch at the end of the library', async
 
     await sentinel.scrollIntoViewIfNeeded();
     await expect.poll(async () => cards.count()).toBeGreaterThanOrEqual(20);
+    // DOM insertion precedes the new cards' expanded layout. Scroll to the
+    // settled end so their entrance animations cannot move it away afterward.
+    await expect(page.locator('#historyList .item-fade-in')).toHaveCount(0);
     if (await sentinel.isVisible()) {
-        await sentinel.evaluate(element => element.scrollIntoView());
+        await sentinel.scrollIntoViewIfNeeded();
     }
     await expect(cards).toHaveCount(21);
     await expect(sentinel).toBeHidden();
@@ -121,6 +124,134 @@ test('endless scrolling keeps its first batch when cards arrive while Settings i
 });
 
 for (const trigger of ['observer', 'scroll fallback']) {
+    test(`endless scrolling waits for the second batch's expanded layout (${trigger})`, async ({ page }) => {
+        await page.setViewportSize({ width: 800, height: 400 });
+        await page.addInitScript(useFallback => {
+            window.__testIntersectionObserver = window.IntersectionObserver;
+            if (useFallback) delete window.IntersectionObserver;
+        }, trigger === 'scroll fallback');
+        for (let index = 1; index <= 21; index += 1) {
+            await seed(page, {
+                id: `layout${String(index).padStart(4, '0')}`,
+                status: 'finished',
+            });
+        }
+        await page.request.post('/__test__/preferences', {
+            data: { history_page_size: 'endless' },
+        });
+        await page.route('**/static/styles.css*', async route => {
+            const response = await route.fetch();
+            await route.fulfill({
+                response,
+                body: `${await response.text()}\n#historyList .item-fade-in:nth-child(n+11):nth-child(-n+20) { animation-play-state: paused; }`,
+            });
+        });
+        await page.reload();
+        const cards = page.locator('#historyList [data-row-id]');
+        const sentinel = page.locator('#historyEndlessSentinel');
+        await expect(page.locator('#historyList .item-fade-in')).toHaveCount(0);
+        await expect(cards).toHaveCount(10);
+        await sentinel.scrollIntoViewIfNeeded();
+        await expect(cards).toHaveCount(20);
+        // Reproduce the original test's scroll into the collapsed second batch.
+        await sentinel.evaluate(element => new Promise(resolve => {
+            const observer = new window.__testIntersectionObserver(entries => {
+                if (!entries.some(entry => entry.isIntersecting)) return;
+                observer.disconnect();
+                resolve();
+            });
+            observer.observe(element);
+            element.scrollIntoView();
+        }));
+        await page.evaluate(() => window.dispatchEvent(new Event('scroll')));
+        await page.evaluate(async () => {
+            document.getElementById('historyList').getAnimations({ subtree: true })
+                .forEach(animation => animation.finish());
+            await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        });
+        await expect(page.locator('#historyList .item-fade-in')).toHaveCount(0);
+        await expect(cards).toHaveCount(20);
+        expect(await sentinel.evaluate(element =>
+            element.getBoundingClientRect().top > window.innerHeight + HISTORY_ENDLESS_PREFETCH_MARGIN)).toBe(true);
+        await sentinel.scrollIntoViewIfNeeded();
+        await expect(cards).toHaveCount(21);
+        await expect(sentinel).toBeHidden();
+    });
+
+    test(`endless scrolling retains a final-batch trigger during a pending refresh (${trigger})`, async ({ page }) => {
+        await page.setViewportSize({ width: 800, height: 400 });
+        await page.addInitScript(useFallback => {
+            if (useFallback) {
+                delete window.IntersectionObserver;
+            } else {
+                const NativeObserver = window.IntersectionObserver;
+                window.__sentinelIntersections = 0;
+                window.IntersectionObserver = class extends NativeObserver {
+                    constructor(callback, options) {
+                        super((entries, observer) => {
+                            callback(entries, observer);
+                            window.__sentinelIntersections += entries.filter(entry =>
+                                entry.target.id === 'historyEndlessSentinel' && entry.isIntersecting).length;
+                        }, options);
+                    }
+                };
+            }
+        }, trigger === 'scroll fallback');
+        for (let index = 1; index <= 21; index += 1) {
+            await seed(page, {
+                id: `pending${String(index).padStart(4, '0')}`,
+                status: 'finished',
+            });
+        }
+        await page.request.post('/__test__/preferences', {
+            data: { history_page_size: 'endless' },
+        });
+        await page.reload();
+        await page.evaluate(() => fetchHistory());
+        await page.evaluate(async () => {
+            await Promise.all(document.getElementById('historyList').getAnimations({ subtree: true })
+                .map(animation => animation.finished));
+        });
+        const cards = page.locator('#historyList [data-row-id]');
+        const sentinel = page.locator('#historyEndlessSentinel');
+        await expect(cards).toHaveCount(10);
+
+        // Library renders independently of Current Downloads. Keep the latter
+        // pending while the user reaches the end of the newly rendered batch.
+        let releaseCurrent;
+        const currentGate = new Promise(resolve => { releaseCurrent = resolve; });
+        await page.route('**/api/current-downloads', async route => {
+            await currentGate;
+            await route.continue();
+        });
+        try {
+            await sentinel.scrollIntoViewIfNeeded();
+            await expect(cards).toHaveCount(20);
+            await page.evaluate(async () => {
+                await Promise.all(document.getElementById('historyList').getAnimations({ subtree: true })
+                    .map(animation => animation.finished));
+            });
+            await expect(sentinel).not.toBeInViewport();
+            const intersections = await page.evaluate(() => window.__sentinelIntersections);
+            await sentinel.evaluate(element => element.scrollIntoView());
+            if (trigger === 'observer') {
+                await expect.poll(() => page.evaluate(() => window.__sentinelIntersections))
+                    .toBeGreaterThan(intersections);
+            } else {
+                await page.evaluate(() => window.dispatchEvent(new Event('scroll')));
+            }
+            expect(await page.evaluate(() => historyEndlessLoadPending)).toBe(true);
+            await expect(cards).toHaveCount(20);
+        } finally {
+            releaseCurrent();
+        }
+        await expect(cards).toHaveCount(21);
+        await expect(sentinel).toBeHidden();
+        const ids = await cards.evaluateAll(elements => elements.map(element => element.dataset.rowId));
+        expect(ids).toEqual(Array.from({ length: 21 }, (_, index) =>
+            `pending${String(21 - index).padStart(4, '0')}`));
+    });
+
     test(`endless scrolling rechecks the sentinel after visible card animations finish (${trigger})`, async ({ page }) => {
         await page.setViewportSize({ width: 800, height: 400 });
         await page.addInitScript(useFallback => {

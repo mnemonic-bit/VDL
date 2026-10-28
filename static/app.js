@@ -3690,28 +3690,33 @@ async function loadNextEndlessHistoryBatch() {
             || historyEndlessVisibleCount >= historyTotal) return;
     historyEndlessLoadPending = true;
     try {
-        // Entrance animations temporarily collapse the library. Wait for its
-        // layout to settle, including any cards added by a concurrent refresh.
-        while (true) {
-            const animations = document.getElementById('historyList')
-                .getAnimations({ subtree: true })
-                .filter(animation => animation.animationName === 'item-fade-in'
-                    && animation.playState !== 'finished');
-            if (!animations.length) break;
-            await Promise.all(animations.map(animation => animation.finished.catch(() => {})));
+        // A scroll/observer trigger can arrive after Library renders but before
+        // Current Downloads finishes refreshing. Recheck after each batch so
+        // that trigger is not lost behind the pending-load guard.
+        while (endlessHistoryEnabled() && historyEndlessVisibleCount < historyTotal) {
+            // Entrance animations temporarily collapse the library. Wait for its
+            // layout to settle, including any cards added by a concurrent refresh.
+            while (true) {
+                const animations = document.getElementById('historyList')
+                    .getAnimations({ subtree: true })
+                    .filter(animation => animation.animationName === 'item-fade-in'
+                        && animation.playState !== 'finished');
+                if (!animations.length) break;
+                await Promise.all(animations.map(animation => animation.finished.catch(() => {})));
+            }
+            // Observer entries describe an earlier frame; navigation and animation
+            // completion can both move the sentinel before this callback resumes.
+            if (!endlessHistoryEnabled() || historyEndlessVisibleCount >= historyTotal
+                    || !historyEndlessSentinel.getClientRects().length) return;
+            const bounds = historyEndlessSentinel.getBoundingClientRect();
+            if (bounds.top > window.innerHeight + HISTORY_ENDLESS_PREFETCH_MARGIN
+                    || bounds.bottom < 0) return;
+            historyEndlessVisibleCount = Math.min(
+                historyTotal,
+                historyEndlessVisibleCount + HISTORY_ENDLESS_BATCH_SIZE,
+            );
+            await fetchHistory();
         }
-        // Observer entries describe an earlier frame; navigation and animation
-        // completion can both move the sentinel before this callback resumes.
-        if (!endlessHistoryEnabled() || historyEndlessVisibleCount >= historyTotal
-                || !historyEndlessSentinel.getClientRects().length) return;
-        const bounds = historyEndlessSentinel.getBoundingClientRect();
-        if (bounds.top > window.innerHeight + HISTORY_ENDLESS_PREFETCH_MARGIN
-                || bounds.bottom < 0) return;
-        historyEndlessVisibleCount = Math.min(
-            historyTotal,
-            historyEndlessVisibleCount + HISTORY_ENDLESS_BATCH_SIZE,
-        );
-        await fetchHistory();
     } finally {
         historyEndlessLoadPending = false;
     }

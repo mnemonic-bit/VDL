@@ -278,8 +278,15 @@ Feature 0045's timing contract now permits this continuity fallback.
 Issue 65 was reported from GitHub Actions on 2026-10-28. The endless-scroll
 browser test loads its initial and second batches but times out with 20 cards
 instead of the expected 21 after scrolling for the final batch. The run ended
-with one failed and 278 passed tests. The report records the reproduction
-sequence and artifact paths; the cause and production impact remain unverified.
+with one failed and 278 passed tests. Local traces and controlled reproductions
+show two cases: the test scrolls before newly inserted cards finish expanding,
+and valid scrolls during a pending refresh are discarded. Version `0.49.7`
+synchronizes the test's final scroll with the settled layout and rechecks the
+sentinel after every loaded batch. All pagination checks pass repeatedly and
+within the full Chromium suite; Python 3.12 coverage is 91.6%. The full browser
+gate has a separate live-refresh request-count failure that also reproduces
+with unchanged baseline JavaScript. Original CI artifacts and production impact
+remain unverified.
 
 ## Bug reports
 
