@@ -259,11 +259,12 @@ transfer, validation, and delayed collection reads. Deterministic browser
 regressions cover the reproduced blocking cases and lifecycle races. Large real
 video confirmation in the affected deployment remains outstanding.
 
-Issue 63 was reported on 2026-10-28. Fullscreen playback of a 4:3 video on a
-16:9 display crops the top and/or bottom instead of fitting the complete
-picture with dark side bars. The report records the expected proportional
-fit and regression criteria; the implementation cause and affected browser
-remain unverified.
+Issue 63 was reported, reproduced in Chromium, and fixed locally in version
+`0.49.5` on 2026-10-28. Continuous fullscreen playback let intrinsic video
+dimensions expand its grid beyond the screen and crop the picture. Explicit
+grid tracks now constrain the image to both viewport dimensions. Browser
+regressions check rendered edge markers and black bars across four aspect
+ratios, both fullscreen entry paths, resizing, exit, and re-entry.
 
 Issue 64 was reported on 2026-10-28. Shuffle Clips can show an empty player
 when a short excerpt expires before the next video is ready. The requested

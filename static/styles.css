@@ -1954,6 +1954,8 @@ details[open] > .history-summary::before { transform: rotate(90deg); }
 .player-media-stage:fullscreen .player-stage-fullscreen { display: none; }
 .player-media-stage:fullscreen {
     display: grid; place-items: center; width: 100vw; height: 100vh; background: black;
+    /* Intrinsic video dimensions must not expand the grid beyond the screen. */
+    grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr);
 }
 .player-media-stage:fullscreen video {
     width: 100% !important; height: 100% !important; max-width: none; max-height: none;
