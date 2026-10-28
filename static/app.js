@@ -1122,8 +1122,66 @@ function searchPlaylistValues(terms = searchTerms) {
         .map(term => term.replace(/^playlists?:/, '').trim());
 }
 
+function parseDurationTime(value) {
+    const text = value.toLowerCase();
+    let seconds;
+    if (/^[0-9]+(?:\.[0-9]+)?$/.test(text)) {
+        seconds = Number(text);
+    } else if (/^[0-9]+:[0-5][0-9](?::[0-5][0-9])?$/.test(text)) {
+        seconds = text.split(':').reduce((total, field) => total * 60 + Number(field), 0);
+    } else {
+        const components = Array.from(text.matchAll(/([0-9]+(?:\.[0-9]+)?)([hms])/g));
+        if (!components.length || components.map(component => component[0]).join('') !== text) return null;
+        const factors = { h: 3600, m: 60, s: 1 };
+        let previousFactor = Infinity;
+        seconds = 0;
+        for (const [index, component] of components.entries()) {
+            const factor = factors[component[2]];
+            if (factor >= previousFactor
+                    || (index < components.length - 1 && component[1].includes('.'))) return null;
+            seconds += Number(component[1]) * factor;
+            previousFactor = factor;
+        }
+    }
+    return Number.isFinite(seconds) ? seconds : null;
+}
+
+const durationSearchCache = new WeakMap();
+
+function durationSearchConditions(terms = searchTerms) {
+    if (durationSearchCache.has(terms)) return durationSearchCache.get(terms);
+    const conditions = [];
+    let valid = true;
+    for (const term of terms) {
+        if (!/^duration:/i.test(term)) continue;
+        const comparison = term.slice('duration:'.length).match(/^(>=|<=|>|<)(.+)$/);
+        const seconds = comparison ? parseDurationTime(comparison[2]) : null;
+        if (seconds === null) {
+            valid = false;
+            break;
+        }
+        conditions.push({ operator: comparison[1], seconds });
+    }
+    const result = { valid, conditions };
+    durationSearchCache.set(terms, result);
+    return result;
+}
+
+function matchesDurationConditions(duration, conditions) {
+    if (!Number.isFinite(duration) || duration <= 0) return false;
+    return conditions.every(({ operator, seconds }) => {
+        if (operator === '>') return duration > seconds;
+        if (operator === '>=') return duration >= seconds;
+        if (operator === '<') return duration < seconds;
+        return duration <= seconds;
+    });
+}
+
 function matchesSearchFilter(info, terms = searchTerms) {
     if (terms.length === 0) return true;
+    const durationFilter = durationSearchConditions(terms);
+    if (!durationFilter.valid || (durationFilter.conditions.length
+            && !matchesDurationConditions(info.duration_seconds, durationFilter.conditions))) return false;
     const title = tagSearchKey(info.title);
     const filename = tagSearchKey(displayFilename(info));
     const tags = new Set((Array.isArray(info.tags) ? info.tags : []).map(tagSearchKey));
@@ -1134,6 +1192,7 @@ function matchesSearchFilter(info, terms = searchTerms) {
     const playlistTerms = [];
     const contentTerms = [];
     terms.forEach(term => {
+        if (/^duration:/i.test(term)) return;
         const key = tagSearchKey(term);
         if (key.startsWith('user:')) userTerms.push(key.slice('user:'.length).trim());
         else if (key.startsWith('quality:')) {
@@ -1195,13 +1254,26 @@ function setHistorySearchExpanded(expanded) {
     toggle.setAttribute('aria-expanded', String(expanded));
 }
 
+function updateDurationSearchFeedback() {
+    const invalid = !durationSearchConditions().valid;
+    const input = document.getElementById('historySearchInput');
+    input.setAttribute('aria-invalid', String(invalid));
+    input.setAttribute('aria-describedby', invalid
+        ? 'historySearchHint historySearchError' : 'historySearchHint');
+    document.getElementById('historySearchError').hidden = !invalid;
+    document.getElementById('historySearch').classList.toggle('invalid', invalid);
+}
+
 function applyHistorySearch() {
+    closeAllMenus();
     const input = document.getElementById('historySearchInput');
     document.getElementById('historySearchClear').hidden = !input.value;
     searchTerms = parseSearchTerms(input.value);
+    updateDurationSearchFeedback();
     historyPage = 0;
     historyEndlessVisibleCount = HISTORY_ENDLESS_BATCH_SIZE;
-    renderPlaylists();
+    // Apply the query to retained data immediately while a live refresh runs.
+    renderDownloadCollections({ sortFavorites: true });
     fetchHistory({ sortFavorites: true });
 }
 
@@ -3655,6 +3727,7 @@ function fetchDownloadCollection(key) {
 }
 
 function renderDownloadCollections({ sortFavorites = false } = {}) {
+    updateDurationSearchFeedback();
     const data = collectionSnapshots.library.concat(collectionSnapshots.current);
     const itemCount = document.getElementById('itemCount');
     itemCount.textContent = `${data.length} ${data.length === 1 ? 'item' : 'items'}`;
@@ -5298,6 +5371,7 @@ async function selectPlaylistQueueItem(downloadId) {
 }
 
 function startEndlessPlayback(id = null, label = '', extension = '', mode = 'sequential') {
+    if (mode === 'sequential' && !durationSearchConditions().valid) return;
     if (mode === 'sequential' && !id && historyTotal === 0) return;
     endlessPlayback.epoch += 1;
     const epoch = endlessPlayback.epoch;

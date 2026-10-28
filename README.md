@@ -161,6 +161,14 @@ the account menu for a separate list of acquisition attempts, or select its
 **Duplicates** tab to review identical media. The Library has no view tabs.
 The Current downloads drawer remains available from both pages.
 
+Library search accepts duration comparisons such as `duration:>5m3s` for
+videos longer than five minutes and three seconds. Combine bounds with
+`duration:>5m3s duration:<10m` to select only videos inside that range; use
+`>=` or `<=` to include an endpoint. Times accept seconds, minutes, hours,
+combined units, or clock notation such as `1:30:00`. Unknown durations do not
+match. Play All follows the filtered selection, while Shuffle and Shuffle
+Clips keep their separate Settings filters.
+
 History records accepted URL downloads, Firefox companion work, uploads, and
 mounted imports, including failures after acceptance. Pause/unpause belongs to
 one attempt; Resume and Retry create another attempt on the same download

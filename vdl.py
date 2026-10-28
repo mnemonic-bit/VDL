@@ -1845,6 +1845,45 @@ def _history_search_key(value):
     return str(value or '').lower()
 
 
+def _parse_duration_filter(terms):
+    """Keep duration comparisons separate from text and repeated OR groups."""
+    conditions = []
+    error = 'Use duration:>10m or duration:>=1:30:00'
+    number_pattern = r'[0-9]+(?:\.[0-9]+)?'
+    for term in terms:
+        key = _history_search_key(term)
+        if not key.startswith('duration:'):
+            continue
+        comparison = re.fullmatch(r'duration:(>=|<=|>|<)(.+)', key)
+        if comparison is None:
+            raise ValueError(error)
+        operator, value = comparison.groups()
+        if re.fullmatch(number_pattern, value):
+            seconds = float(value)
+        elif re.fullmatch(r'[0-9]+:[0-5][0-9](?::[0-5][0-9])?', value):
+            seconds = 0.0
+            for part in value.split(':'):
+                seconds = seconds * 60 + float(part)
+        else:
+            parts = list(re.finditer(f'({number_pattern})([hms])', value))
+            if not parts or ''.join(part.group() for part in parts) != value:
+                raise ValueError(error)
+            previous = 3601
+            seconds = 0.0
+            for index, part in enumerate(parts):
+                amount, unit = part.groups()
+                factor = {'h': 3600, 'm': 60, 's': 1}[unit]
+                if (factor >= previous
+                        or ('.' in amount and index != len(parts) - 1)):
+                    raise ValueError(error)
+                seconds += float(amount) * factor
+                previous = factor
+        if not math.isfinite(seconds):
+            raise ValueError(error)
+        conditions.append((operator, seconds))
+    return conditions
+
+
 def _history_quality_height(value):
     key = _history_search_key(value)
     aliases = {
@@ -1861,10 +1900,28 @@ def _history_quality_height(value):
     return height if height > 0 else None
 
 
-def _matches_history_filter(entry, normalized_filter):
+def _matches_history_filter(entry, normalized_filter, duration_conditions=None):
     terms = _parse_history_filter(normalized_filter)
     if not terms:
         return True
+
+    if duration_conditions is None:
+        try:
+            duration_conditions = _parse_duration_filter(terms)
+        except ValueError:
+            return False
+    if duration_conditions:
+        duration = entry.get('duration_seconds')
+        if (isinstance(duration, bool)
+                or not isinstance(duration, (int, float))
+                or not math.isfinite(duration) or duration <= 0):
+            return False
+        for operator, seconds in duration_conditions:
+            if not {
+                    '>': duration > seconds, '>=': duration >= seconds,
+                    '<': duration < seconds, '<=': duration <= seconds,
+            }[operator]:
+                return False
 
     title = _history_search_key(entry.get('title'))
     display_filename = _history_search_key(
@@ -1882,7 +1939,9 @@ def _matches_history_filter(entry, normalized_filter):
     content_terms = []
     for term in terms:
         key = _history_search_key(term)
-        if key.startswith('user:'):
+        if key.startswith('duration:'):
+            continue
+        elif key.startswith('user:'):
             user_terms.append(key[len('user:'):].strip())
         elif key.startswith('quality:'):
             quality_terms.append(
@@ -1955,13 +2014,16 @@ def _playable_library_entry(entry, allowed_bases=None):
 
 def resolve_library_selection(user_id, is_admin, normalized_filter, ordering):
     """Return the current canonical, visible, browser-playable selection."""
+    duration_conditions = _parse_duration_filter(
+        _parse_history_filter(normalized_filter)
+    )
     allowed_bases = _trusted_download_directories()
     entries = [
         entry for entry in db_list_downloads(
             user_id, is_admin=is_admin, statuses=('finished',),
         )
         if _playable_library_entry(entry, allowed_bases)
-        and _matches_history_filter(entry, normalized_filter)
+        and _matches_history_filter(entry, normalized_filter, duration_conditions)
     ]
     if ordering == 'favorites_first':
         entries.sort(
@@ -6321,6 +6383,7 @@ def create_playback_session():
             normalized_filter = _normalize_history_filter(
                 payload.get('filter', '')
             )
+            _parse_duration_filter(_parse_history_filter(normalized_filter))
             ordering = payload.get('ordering', 'newest')
             if ordering not in PLAYBACK_SESSION_ORDERINGS:
                 raise ValueError('Unknown playback ordering')

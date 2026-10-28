@@ -31,3 +31,10 @@ search the history, filter by parts of the title, or the web site, and quality
   It is represented by a magnifier until selected, then expands into the input.
 - Search applies only to Download History; Current downloads remain visible in
   their drawer.
+
+## Duration filtering extension
+
+[Feature 0046](feature-0046-filter-library-by-video-duration.md), implemented
+in `0.49.0`, extends Library search with duration comparisons and AND ranges
+such as `duration:>5m3s duration:<10m`. The separate download-attempt History
+search keeps its existing behavior.

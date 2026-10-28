@@ -222,6 +222,17 @@ the Clipboard API was unavailable or rejected the write. The fallback's text
 field was outside the modal drawer and therefore inert, and its copy result
 was ignored. Version `0.46.8` puts the field inside the active modal, restores
 focus, and reports failed copies instead of showing success.
+Issue 59 was reported on 2026-10-28. Pasting a URL into the Download dialog
+and pressing Download starts the job and increases the active-download count,
+but leaves the dialog open. Successful submission should close the dialog
+automatically. The behavior has not yet been independently reproduced, and
+the cause remains unconfirmed.
+Issue 60 was reported and investigated on 2026-10-28. Since bandwidth controls
+were added, downloads sometimes do not start or progress slowly at 50 Mbps,
+10 Mbps, and 0 (Unlimited). Local tests confirm excessive synchronous progress
+work from small capped reads and changed HLS downloader selection even at 0.
+The capped-mode slowdown is reproducible, but the complete reported failure,
+particularly unchanged behavior in Unlimited mode, remains unexplained.
 
 ## Bug reports
 
@@ -283,6 +294,8 @@ focus, and reports failed copies instead of showing success.
 - [Bug 0056 — Debounce browser test clock kept advancing between explicit time steps](bug-0056-debounce-browser-test-clock-kept-advancing.md)
 - [Bug 0057 — Visible card animations trigger endless scrolling before user scrolling](bug-0057-visible-card-animations-trigger-endless-scroll.md)
 - [Bug 0058 — Current Downloads confirms copying without filling the clipboard](bug-0058-current-downloads-copy-leaves-clipboard-empty.md)
+- [Bug 0059 — Download dialog remains open after a successful submission](bug-0059-download-dialog-remains-open-after-submission.md)
+- [Bug 0060 — Downloads stall or slow down after bandwidth controls were added](bug-0060-downloads-stall-or-slow-after-bandwidth-controls.md)
 
 ## Accepted UI decisions
 
