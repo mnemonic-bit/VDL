@@ -787,6 +787,7 @@ function startDownload(event) {
     const url = urlInput.value.trim();
     if (downloadSubmitting || probeState !== 'ready' || url !== probedUrl) return;
     const generation = probeGeneration;
+    const dialogSession = newDownloadSession;
     downloadSubmitting = true;
     renderProbeState();
     const selectedQuality = document.getElementById('optionsQualitySelect').value;
@@ -818,8 +819,9 @@ function startDownload(event) {
             filename: customFilename || undefined
         })
     }).then(() => {
-        // A completed submission must not discard a newer URL draft.
-        if (generation !== probeGeneration) {
+        // A completed submission must not discard a newer URL draft or close
+        // a dialog that the user reopened while acceptance was pending.
+        if (generation !== probeGeneration || dialogSession !== newDownloadSession) {
             fetchHistory();
             return;
         }
@@ -973,7 +975,11 @@ if (optionsDetails) {
 
 urlInput.addEventListener('input', () => {
     updateUrlClear();
-    scheduleProbe(urlInput.value.trim());
+    const url = urlInput.value.trim();
+    // Equivalent input must not invalidate a pending submission's success
+    // callback: whitespace and repeated pastes still refer to the same URL.
+    if (url === probedUrl) return;
+    scheduleProbe(url);
 });
 
 // Native paste fires input after updating the field, including clipboard
@@ -5868,6 +5874,7 @@ function focusNewDownload() {
 }
 
 let newDownloadReturnFocus = null;
+let newDownloadSession = 0;
 
 function openNewDownload() {
     const dialog = document.getElementById('newDownloadDialog');
@@ -5883,6 +5890,7 @@ function openNewDownload() {
         closeAllMenus();
         hideActionError();
         dialog.showModal();
+        newDownloadSession += 1;
         document.getElementById('newDownloadButton').setAttribute('aria-expanded', 'true');
     }
     if (optionsDetails.open) setOptionsOpen(true);

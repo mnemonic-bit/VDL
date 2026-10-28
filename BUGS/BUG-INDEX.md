@@ -222,11 +222,14 @@ the Clipboard API was unavailable or rejected the write. The fallback's text
 field was outside the modal drawer and therefore inert, and its copy result
 was ignored. Version `0.46.8` puts the field inside the active modal, restores
 focus, and reports failed copies instead of showing success.
-Issue 59 was reported on 2026-10-28. Pasting a URL into the Download dialog
-and pressing Download starts the job and increases the active-download count,
-but leaves the dialog open. Successful submission should close the dialog
-automatically. The behavior has not yet been independently reproduced, and
-the cause remains unconfirmed.
+Issue 59 was reported and fixed locally in version `0.49.1` on 2026-10-28.
+Equivalent URL input while acceptance was pending could invalidate the probe
+generation and skip the successful submission's dialog close. Input with an
+unchanged trimmed URL now preserves the generation, while a dialog-session
+guard protects reopened drafts. Browser regressions cover pasted submissions,
+immediate/delayed/queued acceptance, failures, and newer drafts. This race is
+independently reproduced; the original reporter's exact trigger and deployed
+confirmation remain outstanding.
 Issue 60 was reported and investigated on 2026-10-28. Since bandwidth controls
 were added, downloads sometimes do not start or progress slowly at 50 Mbps,
 10 Mbps, and 0 (Unlimited). Local tests confirm excessive synchronous progress
