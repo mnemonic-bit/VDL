@@ -1,5 +1,5 @@
 const { test, expect } = require('@playwright/test');
-const { reset, seed, refresh } = require('./support.cjs');
+const { reset, seed, refresh, switchAccount } = require('./support.cjs');
 
 test.beforeEach(async ({ page }) => reset(page));
 
@@ -410,16 +410,12 @@ test('playback mode is scoped to account and survives sign-out on this browser',
 
     await choosePlaybackMode(page, 'Shuffle');
     await expectMainPlaybackMode(page, 'Shuffle', 'shuffle');
-    await page.request.post('/logout');
-    await page.request.post('/login', { form: { username, password } });
-    await page.goto('/');
+    await page.keyboard.press('Escape');
+    await expect(page.locator('#playerBackdrop')).not.toHaveClass(/open/);
+    await switchAccount(page, username, password);
     await expectMainPlaybackMode(page, 'Play All', 'play');
 
-    await page.request.post('/logout');
-    await page.request.post('/login', {
-        form: { username: 'admin', password: 'browser-test-password' },
-    });
-    await page.goto('/');
+    await switchAccount(page, 'admin', 'browser-test-password');
     await expectMainPlaybackMode(page, 'Shuffle', 'shuffle');
     await page.request.delete(`/api/users/${(await created.json()).id}`);
 });
@@ -577,13 +573,9 @@ test('Shuffle Clips remembers explicit invocation even on failure and remains ac
     const password = 'browser-clips-password';
     const created = await page.request.post('/api/users', { data: { username, password, role: 'normal' } });
     expect(created.status()).toBe(201);
-    await page.request.post('/logout');
-    await page.request.post('/login', { form: { username, password } });
-    await page.goto('/');
+    await switchAccount(page, username, password);
     await expectMainPlaybackMode(page, 'Play All', 'play');
-    await page.request.post('/logout');
-    await page.request.post('/login', { form: { username: 'admin', password: 'browser-test-password' } });
-    await page.goto('/');
+    await switchAccount(page, 'admin', 'browser-test-password');
     await expectMainPlaybackMode(page, 'Shuffle Clips', 'shuffle');
     await page.request.delete(`/api/users/${(await created.json()).id}`);
 });

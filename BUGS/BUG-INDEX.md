@@ -240,6 +240,16 @@ Real HTTP regressions cover costly progress callbacks, concurrent workers, and
 The original source-specific startup failure and deployment confirmation remain
 outstanding.
 
+Issue 61 was reported from GitHub Actions on 2026-10-28 after pushing Feature
+0045 (Shuffle Clips). A controlled local reproduction established that API-only
+account switching leaves the old Library alive: a delayed 401 can redirect it
+to `/login` and expire the new session cookie. Version `0.49.3` changes both
+playback tests to use the browser's Sign out and Sign in flow, verifying the
+authenticated Library and active account before checking the saved mode.
+Both affected tests passed ten consecutive runs each and within the complete
+browser run; that run has a separate upload-stop timeout. The original
+hosted-runner artifacts were unavailable, and production impact is unconfirmed.
+
 ## Bug reports
 
 - [Bug 0001 — Merged downloads kept the deleted temporary audio filename](bug-0001-merged-downloads-kept-deleted-temporary-audio-filename.md)
@@ -302,6 +312,7 @@ outstanding.
 - [Bug 0058 — Current Downloads confirms copying without filling the clipboard](bug-0058-current-downloads-copy-leaves-clipboard-empty.md)
 - [Bug 0059 — Download dialog remains open after a successful submission](bug-0059-download-dialog-remains-open-after-submission.md)
 - [Bug 0060 — Downloads stall or slow down after bandwidth controls were added](bug-0060-downloads-stall-or-slow-after-bandwidth-controls.md)
+- [Bug 0061 — Playback account-switch tests fail in GitHub Actions after Shuffle Clips](bug-0061-playback-account-switch-tests-fail-after-shuffle-clips.md)
 
 ## Accepted UI decisions
 
