@@ -230,12 +230,15 @@ guard protects reopened drafts. Browser regressions cover pasted submissions,
 immediate/delayed/queued acceptance, failures, and newer drafts. This race is
 independently reproduced; the original reporter's exact trigger and deployed
 confirmation remain outstanding.
-Issue 60 was reported and investigated on 2026-10-28. Since bandwidth controls
-were added, downloads sometimes do not start or progress slowly at 50 Mbps,
-10 Mbps, and 0 (Unlimited). Local tests confirm excessive synchronous progress
-work from small capped reads and changed HLS downloader selection even at 0.
-The capped-mode slowdown is reproducible, but the complete reported failure,
-particularly unchanged behavior in Unlimited mode, remains unexplained.
+Issue 60 was reported, investigated, and fixed locally in version `0.49.2` on
+2026-10-28. Small capped reads amplified synchronous progress work, while
+Unlimited also changed HLS downloader selection. Response reads now combine
+accounted allowances with bounded latency, and transport selection preserves
+the original options at 0, including live changes before subsequent transfers.
+Real HTTP regressions cover costly progress callbacks, concurrent workers, and
+50/10/0 Mbps; shared accounting, Stop/Pause, and external guards remain covered.
+The original source-specific startup failure and deployment confirmation remain
+outstanding.
 
 ## Bug reports
 

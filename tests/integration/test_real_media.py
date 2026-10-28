@@ -5,7 +5,10 @@ import time
 import unittest
 from unittest import mock
 
+import yt_dlp
+
 import vdl
+from download_bandwidth import govern_download
 from tests.support.app_case import AppCase
 from tests.support.fixture_server import FixtureHandler, fixture_server
 from tests.support.media_factory import generate_media, require_media_tools, run, streams
@@ -24,6 +27,37 @@ class RealMediaIntegrationTest(AppCase):
         row = vdl.db_get_download(download_id)
         self.assertEqual(row["status"], "finished", row["progress"])
         return row
+
+    def test_hls_unlimited_external_and_capped_native_downloads_keep_playable_media(self):
+        manifest = os.path.join(self.temp_dir.name, 'fixture.m3u8')
+        run([
+            'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
+            '-i', self.media['combined'], '-c', 'copy',
+            '-hls_time', '1', '-hls_list_size', '0', '-f', 'hls', manifest,
+        ])
+        with fixture_server(self.temp_dir.name) as server:
+            for rate in ('0', '10', '50'):
+                with self.subTest(rate=rate):
+                    download_id = 'hls-rate-' + rate
+                    vdl.db_set_preferences({'max_total_download_mbps': rate})
+                    url = server.base_url + '/fixture.m3u8'
+                    self.insert(download_id, url)
+                    destination = os.path.join(self.download_dir, download_id + '.mp4')
+                    with yt_dlp.YoutubeDL({
+                        'quiet': True, 'noprogress': True,
+                        'progress_hooks': [lambda data: vdl.progress_hook(data, download_id)],
+                    }) as ydl:
+                        govern_download(ydl, vdl._bandwidth, download_id)
+                        success, _ = ydl.dl(destination, {
+                            'url': url, 'protocol': 'm3u8', 'ext': 'mp4',
+                            'is_live': False, 'id': download_id, 'title': 'fixture',
+                        })
+                    self.assertTrue(success)
+                    actual = streams(destination)
+                    self.assertTrue(any(stream['codec_type'] == 'video' for stream in actual))
+                    self.assertTrue(any(stream['codec_type'] == 'audio' for stream in actual))
+                    run(['ffmpeg', '-hide_banner', '-loglevel', 'error',
+                         '-i', destination, '-f', 'null', '-'])
 
     def test_dash_merge_stored_path_playback_rename_and_removal(self):
         with fixture_server(self.temp_dir.name) as server:

@@ -143,17 +143,23 @@ class _MediaResponse:
                 if not part:
                     return b''.join(parts)
                 parts.append(part)
-        allowance, generation = self.controller.take(self.download_id, size)
-        try:
-            # Reads may return short buffers or EOF. Refund only unused credit;
-            # retries and discarded fragments already consumed real bytes.
+        parts = []
+        remaining = size
+        deadline = self.controller.clock() + 0.1
+        while remaining:
+            allowance, generation = self.controller.take(self.download_id, remaining)
+            # If a network read raises, retain its reservation: partial bytes
+            # may have arrived before the error and must still count.
             data = self.response.read(allowance)
-        except BaseException:
-            # Partial network reads may have consumed bytes before raising.
-            # Keeping the reservation is conservative and cannot exceed the cap.
-            raise
-        self.controller.refund(allowance - len(data), generation)
-        return data
+            self.controller.refund(allowance - len(data), generation)
+            parts.append(data)
+            remaining -= len(data)
+            # Keep FIFO turns and Stop/Pause checks at each small allowance,
+            # without making yt-dlp publish progress for every 16 KiB. Bound
+            # aggregation time so slow transfers still report live progress.
+            if len(data) < allowance or self.controller.clock() >= deadline:
+                break
+        return b''.join(parts)
 
 
 def _guarded_popen(base, controller, download_id):
@@ -308,7 +314,31 @@ def govern_download(ydl, controller, download_id):
         return response
 
     ydl.urlopen = urlopen
-    # Native fragment readers share the same response boundary, including
-    # audio/video fragments, retries, redirect responses, and format fallback.
-    ydl.params['hls_prefer_native'] = True
-    ydl.params['external_downloader'] = {'default': 'native'}
+    missing = object()
+    original_options = {key: ydl.params.get(key, missing)
+                        for key in ('hls_prefer_native', 'external_downloader')}
+
+    def select_transport():
+        # Unlimited must preserve yt-dlp's original compatibility choices.
+        # Re-evaluate at both selection boundaries so live changes during
+        # extraction or between audio/video transfers also restore defaults.
+        if controller.rate:
+            ydl.params['hls_prefer_native'] = True
+            ydl.params['external_downloader'] = {'default': 'native'}
+        else:
+            for key, value in original_options.items():
+                if value is missing:
+                    ydl.params.pop(key, None)
+                else:
+                    ydl.params[key] = value
+
+    def with_transport_selection(method):
+        @functools.wraps(method)
+        def transfer(*args, **kwargs):
+            select_transport()
+            return method(*args, **kwargs)
+        return transfer
+
+    select_transport()
+    ydl.process_info = with_transport_selection(ydl.process_info)
+    ydl.dl = with_transport_selection(ydl.dl)

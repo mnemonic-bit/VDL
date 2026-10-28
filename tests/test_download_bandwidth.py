@@ -9,6 +9,7 @@ from unittest import mock
 
 import yt_dlp
 from yt_dlp.downloader.external import FFmpegFD
+from yt_dlp.downloader import get_suitable_downloader
 from yt_dlp.downloader.hls import HlsFD
 from yt_dlp.networking import Response
 from yt_dlp.utils import DownloadError, Popen
@@ -147,6 +148,54 @@ class SharedBandwidthTest(unittest.TestCase):
             self.assertIs(ydl.urlopen('http://fixture.invalid'), raw)
             raw.close()
 
+    def test_aggregated_read_keeps_each_allowance_interruptible(self):
+        cancelled = threading.Event()
+        paused = threading.Event()
+        controller = SharedBandwidth(cancelled=lambda _: cancelled.is_set(),
+                                     paused=lambda _: paused.is_set(),
+                                     pause=lambda _: paused.clear())
+        controller.configure('128')
+
+        class Source(io.BytesIO):
+            def read(self, size):
+                data = super().read(size)
+                cancelled.set()
+                return data
+
+        source = Source(b'x' * 65536)
+        with self.assertRaises(InterruptedError):
+            _MediaResponse(source, controller, 'one').read(65536)
+        self.assertEqual(source.tell(), 16384)
+        cancelled.clear()
+
+        class LiveSource(io.BytesIO):
+            def read(self, size):
+                data = super().read(size)
+                if self.tell() == 16384:
+                    paused.set()
+                    controller.configure('0')
+                return data
+
+        source = LiveSource(b'x' * 65536)
+        with mock.patch.object(controller, 'pause', wraps=controller.pause) as pause:
+            self.assertEqual(len(_MediaResponse(source, controller, 'one').read(65536)), 65536)
+            pause.assert_called_once_with('one')
+        self.assertFalse(paused.is_set())
+
+    def test_aggregation_yields_for_progress_even_when_caller_requests_a_large_buffer(self):
+        now = [0.0]
+        controller = SharedBandwidth(clock=lambda: now[0])
+        controller.configure('128')
+
+        class Source(io.BytesIO):
+            def read(self, size):
+                now[0] += 0.1
+                return super().read(size)
+
+        source = Source(b'x' * 65536)
+        self.assertEqual(len(_MediaResponse(source, controller, 'one').read(65536)), 16384)
+        self.assertEqual(source.tell(), 16384)
+
     def test_external_process_rejected_under_cap_and_stopped_on_live_enable(self):
         controller = SharedBandwidth()
         guarded = _guarded_popen(Popen, controller, 'one')
@@ -202,6 +251,129 @@ class SharedBandwidthTest(unittest.TestCase):
 
 
 class NativeMediaBandwidthTest(AppCase):
+    def test_reported_rates_transfer_with_slow_application_progress(self):
+        payload = b'x' * (8 * 1024 * 1024)
+        with open(os.path.join(self.temp_dir.name, 'rates.mp4'), 'wb') as output:
+            output.write(payload)
+        with fixture_server(self.temp_dir.name) as server:
+            for rate in ('50', '10', '0'):
+                with self.subTest(rate=rate):
+                    download_id = 'rate-' + rate
+                    vdl.db_set_preferences({'max_total_download_mbps': rate})
+                    vdl.db_insert_download(download_id, server.base_url + '/rates.mp4')
+
+                    def progress(data):
+                        time.sleep(0.005)
+                        vdl.progress_hook(data, download_id)
+
+                    destination = os.path.join(self.download_dir, download_id + '.mp4')
+                    started = time.monotonic()
+                    with yt_dlp.YoutubeDL({'quiet': True, 'noprogress': True,
+                                          'progress_hooks': [progress]}) as ydl:
+                        govern_download(ydl, vdl._bandwidth, download_id)
+                        success, _ = ydl.dl(destination, {
+                            'url': server.base_url + '/rates.mp4', 'protocol': 'http',
+                            'ext': 'mp4', 'id': download_id, 'title': 'fixture',
+                        })
+                    elapsed = time.monotonic() - started
+                    self.assertTrue(success)
+                    self.assertEqual(vdl.db_get_download(download_id)['downloaded_bytes'], len(payload))
+                    self.assertEqual(os.path.getsize(destination), len(payload))
+                    if rate != '0':
+                        bytes_per_second = float(rate) * 125000
+                        # One second of initial credit is allowed. Check both
+                        # the cap and useful throughput, with room for tracing.
+                        minimum = max(0, len(payload) / bytes_per_second - 1)
+                        self.assertGreaterEqual(elapsed + 0.02, minimum)
+                        self.assertLess(elapsed, max(1, minimum) * 1.5 + 0.5)
+                    else:
+                        self.assertLess(elapsed, 2)
+
+    def test_capped_concurrent_http_keeps_useful_throughput_with_slow_progress(self):
+        payload = b'x' * (8 * 1024 * 1024)
+        with open(os.path.join(self.temp_dir.name, 'large.mp4'), 'wb') as output:
+            output.write(payload)
+        measurements = []
+        with fixture_server(self.temp_dir.name) as server:
+            for rate in ('0', '256'):
+                vdl.db_set_preferences({'max_total_download_mbps': rate})
+                calls = [0, 0]
+                errors = []
+
+                def download(index):
+                    download_id = f'large-{rate}-{index}'
+                    vdl.db_insert_download(download_id, server.base_url + '/large.mp4')
+
+                    def progress(data):
+                        # Model the same storage/UI publication cost in both modes.
+                        time.sleep(0.005)
+                        vdl.progress_hook(data, download_id)
+                        calls[index] += 1
+
+                    try:
+                        destination = os.path.join(self.download_dir, download_id + '.mp4')
+                        with yt_dlp.YoutubeDL({'quiet': True, 'noprogress': True,
+                                              'progress_hooks': [progress]}) as ydl:
+                            govern_download(ydl, vdl._bandwidth, download_id)
+                            success, _ = ydl.dl(destination, {
+                                'url': server.base_url + '/large.mp4', 'protocol': 'http',
+                                'ext': 'mp4', 'id': download_id, 'title': 'fixture',
+                            })
+                        self.assertTrue(success)
+                        self.assertEqual(vdl.db_get_download(download_id)['downloaded_bytes'], len(payload))
+                        with open(destination, 'rb') as source:
+                            self.assertEqual(source.read(), payload)
+                    except BaseException as exc:
+                        errors.append(exc)
+
+                with mock.patch.object(vdl._bandwidth.condition, 'wait',
+                                       wraps=vdl._bandwidth.condition.wait) as waits:
+                    started = time.monotonic()
+                    workers = [threading.Thread(target=download, args=(index,)) for index in range(2)]
+                    for worker in workers:
+                        worker.start()
+                    for worker in workers:
+                        worker.join(15)
+                    self.assertTrue(all(not worker.is_alive() for worker in workers))
+                    measurements.append((time.monotonic() - started, sum(calls)))
+                    # Both payloads fit in the shared initial burst allowance.
+                    self.assertEqual(waits.call_count, 0)
+                self.assertEqual(errors, [])
+        self.assertLess(measurements[1][1], 128, 'Tiny allowances must not each publish progress')
+        self.assertLess(measurements[1][0], 3 * measurements[0][0] + 0.5)
+
+    def test_unlimited_preserves_downloader_selection_and_options(self):
+        controller = SharedBandwidth()
+        info = {'url': 'https://fixture.invalid/video.m3u8', 'protocol': 'm3u8',
+                'ext': 'mp4', 'is_live': False}
+        for options in ({}, {'hls_prefer_native': False,
+                             'external_downloader': {'default': 'ffmpeg'}}):
+            with self.subTest(options=options), yt_dlp.YoutubeDL({'quiet': True, **options}) as ydl:
+                original = dict(ydl.params)
+                expected = get_suitable_downloader(dict(info), ydl.params)
+                govern_download(ydl, controller, 'unlimited')
+                self.assertEqual(ydl.params, original)
+                self.assertIs(get_suitable_downloader(dict(info), ydl.params), expected)
+
+    def test_live_rate_changes_restore_transport_options_before_each_transfer(self):
+        controller = SharedBandwidth()
+        info = {'url': 'https://fixture.invalid/video.m3u8', 'protocol': 'm3u8',
+                'ext': 'mp4', 'is_live': False, 'id': 'live-options', 'title': 'fixture'}
+        for initial in ('0', '1'):
+            with self.subTest(initial=initial), yt_dlp.YoutubeDL({'quiet': True}) as ydl:
+                controller.configure(initial)
+                selected = []
+                govern_download(ydl, controller, 'live-options')
+                with mock.patch.object(FFmpegFD, 'real_download',
+                                       side_effect=lambda *_: selected.append('external') or True), \
+                        mock.patch.object(HlsFD, 'real_download',
+                                          side_effect=lambda *_: selected.append('native') or True):
+                    for rate in ('0', '1', '0'):
+                        controller.configure(rate)
+                        success, _ = ydl.dl(os.path.join(self.download_dir, 'selection.mp4'), dict(info))
+                        self.assertTrue(success)
+                self.assertEqual(selected, ['external', 'native', 'external'])
+
     def test_simultaneous_http_hls_and_dash_payload_share_one_real_budget(self):
         payload = b'x' * 90000
         for name in ('one.mp4', 'two.ts', 'three.ts'):

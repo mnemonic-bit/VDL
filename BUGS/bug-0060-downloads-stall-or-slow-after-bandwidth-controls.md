@@ -1,11 +1,11 @@
-## 60. [Open] Downloads stall or slow down after bandwidth controls were added
+## 60. [Resolved] Downloads stall or slow down after bandwidth controls were added
 
 **Severity:** High
 
-**Status:** Open; reported and investigated on 2026-10-28. A related capped-mode
-performance defect is reproduced locally. The full reported regression,
-including failure to start and unchanged behavior in Unlimited mode, remains
-unconfirmed locally and unexplained.
+**Status:** The reproduced progress-overhead and Unlimited transport-selection
+regressions are fixed locally in version `0.49.2` on 2026-10-28. The reporter's
+exact source-specific startup failure has not been reproduced; confirmation
+in the affected deployment remains outstanding.
 
 Since the download-speed setting was introduced, URL downloads sometimes do
 not start and otherwise progress much more slowly than before. The reporter
@@ -19,6 +19,47 @@ The total-bandwidth feature (Feature 0039) and per-server concurrency controls
 reporter's deployed version, example source URLs, transfer protocols, saved
 concurrency limits, and exact waiting/error messages have not been captured.
 The timing of the report alone does not establish which change caused it.
+
+### Repair and local verification
+
+`_MediaResponse.read(size)` now combines small, individually accounted
+allowances before returning a buffer to yt-dlp. Each allowance still obtains
+its FIFO turn, checks Stop/Pause, observes live bandwidth changes, and refunds
+unused bytes. Aggregation stops at the requested size, a short underlying
+read/EOF, or 100 ms of elapsed time so low-rate downloads retain live progress.
+This removes the database transaction and SSE callback per 16 KiB without
+changing the shared token bucket or bypassing accounting.
+
+Native transport overrides now apply only under a positive cap. The governor
+preserves the original yt-dlp options and rechecks the current setting before
+`process_info()` and `dl()` select a downloader. Fresh Unlimited jobs retain
+their previous downloader choices, and switching a capped job to Unlimited
+restores those choices for subsequent transfers. An already-selected native
+transfer stops throttling immediately without restarting. Existing external
+transfer guards still reject an unsupported transfer under a cap and stop an
+external child if a cap is enabled while it runs.
+
+The controlled 8 MiB reproduction below failed before the fix with 517 capped
+progress callbacks and passed afterward with 15. With the same 5 ms callback
+delay, the measured capped transfer changed from 3.95 s to 0.17 s; Unlimited
+measured 0.21 s before and 0.20 s afterward. Neither run waited for tokens.
+These are local fixture measurements, not production throughput claims.
+
+Six new regressions cover concurrent real HTTP transfers with costly
+application progress, useful throughput and upper bounds at 50/10/0 Mbps,
+unchanged Unlimited options and selection, live selection changes, Stop/Pause
+inside an aggregated read, and bounded aggregation latency. All 52 focused
+bandwidth, concurrency, and download-lifecycle tests pass on Python 3.12.
+An additional real-media HLS regression verifies decodable audio/video at
+0/10/50 Mbps, exercising the restored external path and the capped native path.
+All six media integration tests pass, including DASH merging, audio extraction,
+and HTTP Stop/Continue with range requests. The required
+`./tests/run-all.sh --unit` gate passes on Python 3.12.14: 380 tests, five
+optional skips, and `vdl.py` coverage of 91.6% (90% required).
+
+The historical findings below explain the verified defects. They do not
+establish the original deployment's exact stall trigger. An affected URL and
+deployed version are still needed to confirm that symptom after the fix.
 
 ### Reproduction to confirm in the affected environment
 
@@ -46,7 +87,7 @@ to the selected rate without substantial additional overhead. At 0,
 Unlimited restores the previous unrestricted behavior. Legitimately queued
 jobs remain distinguishable from extraction or transfer failures.
 
-### Confirmed finding: capped reads amplify synchronous progress work
+### Before the fix: capped reads amplified synchronous progress work
 
 The local reproduction uses the installed Python **3.11.2** and yt-dlp
 **2026.08.19**, an isolated temporary SQLite database, a local HTTP fixture,
@@ -92,7 +133,7 @@ Unlimited HTTP case did not reproduce the slowdown. It cannot explain the
 reporter's unchanged behavior at 0 by itself, and no local transfer failed
 to start.
 
-### Confirmed finding: Unlimited still changes transport selection
+### Before the fix: Unlimited changed transport selection
 
 `govern_download()` runs for new and resumed URL workers, including at 0.
 It wraps media responses and unconditionally sets:
@@ -127,14 +168,16 @@ with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
 PY
 ```
 
-Observed output: `FFmpegFD`, then `HlsFD`.
+Observed before the fix: `FFmpegFD`, then `HlsFD`. After the fix both selections
+are `FFmpegFD` while the setting is Unlimited.
 
 ### Controlled HTTP slowdown reproduction
 
 This command creates its own database and payload, exercises real yt-dlp HTTP
 reads and application progress persistence, and adds the same 5 ms callback
 cost to both settings. It leaves the application's runtime database alone.
-The final assertion is expected to fail on the investigated implementation.
+The final assertion fails on the original implementation and passes after the
+fix.
 
 ```bash
 .venv/bin/python - <<'PY'
@@ -180,7 +223,7 @@ with tempfile.TemporaryDirectory() as root:
 PY
 ```
 
-### Existing coverage and remaining investigation
+### Historical coverage and remaining deployment confirmation
 
 - All **14 bandwidth tests** passed, including native HTTP/HLS/DASH,
   cancellation, pause, live updates, retries, and external-transfer guards.
@@ -196,7 +239,7 @@ PY
   at 50, 10, and 0. Compare a fresh job at 0 with the pre-feature transport
   options before attributing the Unlimited failure to the capped-mode defect.
 - No production network trace or affected-environment reproduction was
-  available. The complete cause remains open; remote-source throttling,
+  available. The source-specific startup cause remains unconfirmed; remote-source throttling,
   extractor delay, scheduler occupancy, and database contention have not
   been established as causes.
 
@@ -219,6 +262,3 @@ PY
   controlled update latency and concurrent workers, plus a reproduction of
   the Unlimited startup failure once its trigger is known. Check both upper
   rate limits and useful throughput, rather than only the maximum allowed.
-
-This investigation changes documentation only. No fix is applied and
-`VERSION` is unchanged.
