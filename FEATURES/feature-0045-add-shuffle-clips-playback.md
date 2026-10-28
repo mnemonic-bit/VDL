@@ -121,7 +121,9 @@ new occurrence gets new draws; randomness may legitimately repeat values.
   other eligible candidates without repeatedly drawing the failed one. Bound
   recovery to one attempt per candidate until playback succeeds or show the
   existing recoverable player error when candidates are exhausted. Never
-  silently play a full video or an out-of-range excerpt.
+  bypass a valid selected start or play a full video when excerpt selection
+  fails. Playback may extend past the selected end while waiting for a
+  successor under the timing contract below.
 - If duration changes before playback, revalidate the chosen bounds; retain
   them if still valid. If they become invalid, discard that occurrence through
   the same recovery path rather than silently shortening or redrawing it.
@@ -132,7 +134,7 @@ new occurrence gets new draws; randomness may legitimately repeat values.
 - Reuse Feature 0040's prepare/reserve/advance flow and two-element player.
   Preloading reserves one next video without advancing the session or recording
   a view. Retain its chosen excerpt through commit; a different committed item
-  requires its own valid bounds and the ordinary handoff path.
+  requires its own valid bounds and readiness check before revealing it.
 - Measure remaining time as `E - currentTime`. Prepare the next item when ten
   seconds remain, or immediately after playback begins if the excerpt is
   already shorter than that. Preload the chosen random position with normal
@@ -146,10 +148,10 @@ new occurrence gets new draws; randomness may legitimately repeat values.
   is ready. For example, a five-second excerpt permits at most a 2.5-second
   fade at either end.
 - The incoming video starts at its own `S`. Its fade-in consumes part of its
-  chosen `L`; afterward it continues from that reached position and finishes
-  at its own `E`. Never restart at `S`, reset to 0:00, or add the fade duration
-  to the clip. Thus 5–20 seconds describes source playback per excerpt,
-  including overlaps; time between logical video changes can be shorter.
+  chosen `L`; afterward it continues from that reached position toward its
+  intended end `E`. Never restart at `S` or reset to 0:00. The intended
+  5–20 seconds includes overlaps; a late successor may extend playback as
+  described below. Time between logical video changes can be shorter.
 - Release the outgoing element when its fade finishes. If the now-current
   excerpt already has ten seconds or less remaining, prepare its successor
   immediately once standby becomes free. This must work for consecutive
@@ -158,12 +160,20 @@ new occurrence gets new draws; randomness may legitimately repeat values.
   fullscreen container, reduced-motion behavior, and autoplay handling.
   Pause or buffering freezes advancement and fade progress with media time.
   Playback-rate changes alter wall-clock pacing, not the chosen source bounds.
-- If incoming readiness or commit is late, shorten the fade to the remaining
-  outgoing time, subject to the excerpt half-length caps and Feature 0040's
-  one-second minimum fade. Otherwise use an ordinary handoff at `E`. Do not
-  pause the outgoing video to manufacture an overlap. If preloading fails,
-  keep playing only until `E`, then use existing recovery. Never continue to
-  the file's natural end just to wait for the next clip.
+- Treat `E` as the intended transition endpoint. If incoming readiness or
+  server confirmation is late, keep the outgoing video visible and playing
+  beyond `E` while source footage remains. As soon as the successor can play
+  at its selected start (including seek completion) and the handoff is
+  authorized, fade once using the same half-length caps. Shorten only for
+  the outgoing file's natural end; use a ready-media handoff when less than
+  one second remains or the presentation cannot blend two elements.
+- Failed preloads try each eligible candidate at most once per recovery
+  attempt without clearing the outgoing picture. Exhaustion offers Retry,
+  Stop, and Close. At natural EOF retain the last picture while waiting;
+  moving playback cannot continue without source footage. Pending network
+  and media preparation have bounded timeouts. Retry permits a new attempt.
+  Pause holds the transition until playback resumes, and cancellation
+  invalidates pending readiness and authorization callbacks.
 - Finish each occurrence exactly once. Late `ended`, time updates, seek events,
   or repeated advance responses cannot cause duplicate handoffs. Close, Stop,
   mode replacement, and logout cancel pending work and unload both elements
@@ -173,7 +183,7 @@ new occurrence gets new draws; randomness may legitimately repeat values.
 Seamless transitions are the normal ready-media path. As with Feature 0040,
 browser buffering, autoplay restrictions, or slow storage can require a
 recoverable ordinary handoff; the mode cannot guarantee gapless playback on
-every device. Fullscreen fallbacks still honor the excerpt end.
+every device. Fullscreen fallbacks also wait for a playable successor.
 
 ## Controls and interaction with other playback settings
 
@@ -229,8 +239,10 @@ Acceptance coverage must include:
    respect media time and the chosen boundaries.
 6. Stop/Close/restart and stale callbacks, fullscreen/reduced motion/autoplay
    fallbacks, missing candidates, skip-edges interaction, and existing playback
-   modes retain their defined behavior. Failed preloads never extend a clip
-   beyond its chosen end.
+   modes retain their defined behavior. Delayed responses, initial seeks,
+   and authorization keep the outgoing picture and moving clock past `E`,
+   then transition once. Exhausted recovery and natural EOF preserve useful
+   feedback and the last available picture.
 
 Extend the existing playback-session unit tests and playback, preferences,
 crossfade, crossfade-media, and skip-video-edges browser suites. Before marking

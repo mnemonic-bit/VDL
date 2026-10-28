@@ -232,15 +232,15 @@ for (const failure of ['duration', 'seek']) {
     });
 }
 
-test('failed preloads and fullscreen fallback stop at the excerpt end exactly once', async ({ page }) => {
+test('failed preloads retry and fullscreen fallback promotes ready media exactly once', async ({ page }) => {
     await installClipMedia(page);
     await startClips(page);
     await expect(page.locator('#playerStandby source')).toHaveCount(1);
     await page.evaluate(() => { endlessPlayback.presentation = 'webkit-fullscreen'; });
     await page.locator('#playerStandby').dispatchEvent('error');
-    await clipTick(page, 24.9);
+    await clipTick(page, 22.4);
     expect(await page.evaluate(() => endlessPlayback.sequence)).toBe(0);
-    await clipTick(page, 25);
+    await clipTick(page, 22.5);
     await expect.poll(() => page.evaluate(() => endlessPlayback.sequence)).toBe(1);
     expect((await clipBounds(page)).time).toBe(20);
     await page.locator('#playerVideo').dispatchEvent('ended');
@@ -267,6 +267,96 @@ test('unusable metadata times out once per candidate and remains recoverable', a
     await page.evaluate(() => closePlayer());
 });
 
+test('exhausted preloads keep the outgoing clip through its endpoint and EOF with useful recovery', async ({ page }) => {
+    await installClipMedia(page);
+    await startClips(page);
+    await expect(page.locator('#playerStandby source')).toHaveCount(1);
+    const first = await page.evaluate(() => {
+        window.__clipOutgoing = document.getElementById('playerVideo');
+        return playerPreparation.item.id;
+    });
+    await page.locator('#playerStandby').dispatchEvent('error');
+    await expect.poll(() => page.evaluate(() => playerPreparation?.item?.id)).not.toBe(first);
+    await expect(page.locator('#playerStandby source')).toHaveCount(1);
+    await page.locator('#playerStandby').dispatchEvent('error');
+    await expect(page.locator('#playerRetry')).toBeVisible();
+    await clipTick(page, 26);
+    expect(await page.evaluate(() => document.getElementById('playerVideo') === window.__clipOutgoing)).toBe(true);
+    expect(await page.evaluate(() => window.__clipOutgoing.paused)).toBe(false);
+    expect(await page.evaluate(() => endlessPlayback.sequence)).toBe(0);
+    const attempts = await page.evaluate(() => window.__clipLoads.slice(1));
+    expect(attempts).toHaveLength(2);
+    expect(new Set(attempts).size).toBe(2);
+    await page.locator('#playerVideo').evaluate(video => {
+        window.__clipState(video).currentTime = 60;
+        video.ended = true;
+        video.dispatchEvent(new Event('ended'));
+        video.dispatchEvent(new Event('ended'));
+    });
+    expect(await page.locator('#playerVideo source').count()).toBe(1);
+    expect(await page.evaluate(() => endlessPlayback.sequence)).toBe(0);
+    await expect(page.locator('#playerStatus')).toContainText('Retry or stop');
+    await page.evaluate(() => closePlayer());
+});
+
+test('a timed-out preparation retains outgoing playback and Retry permits a fresh bounded attempt', async ({ page }) => {
+    await page.clock.install();
+    await installClipMedia(page);
+    let release;
+    const gate = new Promise(resolve => { release = resolve; });
+    let requested = false;
+    await page.route('**/api/playback-sessions/*/prepare', async route => {
+        const response = await route.fetch();
+        requested = true;
+        await gate;
+        await route.fulfill({ response });
+    });
+    try {
+        await startClips(page);
+        await expect.poll(() => requested).toBe(true);
+        await page.clock.fastForward(20_100);
+        await expect(page.locator('#playerRetry')).toBeVisible();
+        await clipTick(page, 26);
+        expect(await page.locator('#playerVideo').evaluate(video => video.paused)).toBe(false);
+        expect(await page.evaluate(() => endlessPlayback.sequence)).toBe(0);
+        release();
+        await page.locator('#playerRetry').press('Enter');
+        await expect.poll(() => page.evaluate(() => endlessPlayback.sequence)).toBe(1);
+        expect(await page.evaluate(() => Boolean(playerPreparation?.fade))).toBe(true);
+    } finally {
+        release();
+        await page.evaluate(() => closePlayer());
+    }
+});
+
+test('pause after incoming play resolves defers a late playing event until resume', async ({ page }) => {
+    await installClipMedia(page);
+    await page.evaluate(() => {
+        const play = HTMLMediaElement.prototype.play;
+        HTMLMediaElement.prototype.play = function () {
+            if (this.id !== 'playerStandby') return play.call(this);
+            window.__clipState(this).paused = false;
+            this.dispatchEvent(new Event('play'));
+            window.__clipLatePlaying = () => this.dispatchEvent(new Event('playing'));
+            return Promise.resolve();
+        };
+    });
+    await startClips(page);
+    await expect(page.locator('#playerStandby source')).toHaveCount(1);
+    await clipTick(page, 22.5);
+    await expect.poll(() => page.evaluate(() => playerPreparation?.playResolved)).toBe(true);
+    await page.locator('#playerVideo').evaluate(video => video.pause());
+    await page.evaluate(() => window.__clipLatePlaying());
+    expect(await page.evaluate(() => endlessPlayback.sequence)).toBe(0);
+    expect(await page.locator('#playerStandby').evaluate(video => video.paused)).toBe(true);
+    await page.locator('#playerVideo').evaluate(video => video.play());
+    await expect.poll(() => page.evaluate(() => playerPreparation?.playResolved)).toBe(true);
+    await page.evaluate(() => window.__clipLatePlaying());
+    await expect.poll(() => page.evaluate(() => endlessPlayback.sequence)).toBe(1);
+    expect(await page.evaluate(() => Boolean(playerPreparation?.fade))).toBe(true);
+    await page.evaluate(() => closePlayer());
+});
+
 test('duration changes before initial seek completion discard bounds without redrawing or playing', async ({ page }) => {
     await installClipMedia(page);
     await page.evaluate(() => { window.__clipHoldSeek = true; });
@@ -288,7 +378,7 @@ test('duration changes before initial seek completion discard bounds without red
     await page.evaluate(() => closePlayer());
 });
 
-test('a committed replacement discards stale prepared bounds and samples its own ordinary handoff', async ({ page }) => {
+test('a committed replacement discards stale prepared bounds and seeks its own excerpt before fading', async ({ page }) => {
     await installClipMedia(page);
     await page.evaluate(() => { window.__clipDraws = [0, 0, 0.5, 0.5, 0.75, 0.25]; });
     await startClips(page, { count: 3 });
@@ -299,14 +389,14 @@ test('a committed replacement discards stale prepared bounds and samples its own
     await page.request.post('/__test__/row', { data: { id: reserved, status: 'error' } });
     await clipTick(page, 22.5);
     await expect.poll(() => page.evaluate(() => Boolean(playerPreparation?.response))).toBe(true);
-    expect(await page.evaluate(() => Boolean(playerPreparation?.fade))).toBe(false);
-    await clipTick(page, 25);
+    await expect.poll(() => page.evaluate(() => Boolean(playerPreparation?.fade))).toBe(true);
     await expect.poll(() => page.evaluate(() => endlessPlayback.sequence)).toBe(1);
     expect(await page.evaluate(() => endlessPlayback.currentDownloadId)).not.toBe(reserved);
     const committed = await clipBounds(page);
     expect(committed.start).toBe(44.375);
     expect(committed.start).not.toBe(staleBounds.start);
     expect(committed.time).toBe(committed.start);
+    await clipTick(page, 25, committed.start + 2.5);
 });
 
 test('a failed fade retries the committed occurrence with its original excerpt bounds', async ({ page }) => {
@@ -319,6 +409,12 @@ test('a failed fade retries the committed occurrence with its original excerpt b
     await expect.poll(() => page.evaluate(() => Boolean(playerPreparation?.fade))).toBe(true);
     await page.locator('#playerVideo').dispatchEvent('error');
     await clipTick(page, 25);
+    expect(await page.evaluate(() => playerPreparation.outgoing.paused)).toBe(false);
+    await clipTick(page, 60);
+    await page.locator('#playerVideo').evaluate(video => {
+        video.ended = true;
+        video.dispatchEvent(new Event('ended'));
+    });
     await expect(page.locator('#playerRetry')).toBeVisible();
     expect((await clipBounds(page)).start).toBe(prepared.start);
     expect((await clipBounds(page)).end).toBe(prepared.end);
@@ -388,12 +484,11 @@ test('same-ID source replacement discards stale standby and draws bounds for the
     expect(preparedBounds.start).toBe(36.25);
     await clipTick(page, 22.5);
     await expect.poll(() => page.evaluate(() => Boolean(playerPreparation?.response))).toBe(true);
-    expect(await page.evaluate(() => Boolean(playerPreparation?.fade))).toBe(false);
-    expect(await page.evaluate(() => document.getElementById('playerVideo') === window.__clipOriginalActive)).toBe(true);
-    await clipTick(page, 25);
+    await expect.poll(() => page.evaluate(() => Boolean(playerPreparation?.fade))).toBe(true);
+    expect(await page.evaluate(() => playerPreparation.outgoing === window.__clipOriginalActive)).toBe(true);
     await expect.poll(() => page.evaluate(() => endlessPlayback.sequence)).toBe(1);
     expect(await page.evaluate(() => endlessPlayback.currentDownloadId)).toBe(reserved);
-    expect(await page.evaluate(() => document.getElementById('playerVideo') === window.__clipOriginalActive)).toBe(true);
+    expect(await page.evaluate(() => document.getElementById('playerVideo') === window.__clipOriginalActive)).toBe(false);
     const committed = await clipBounds(page);
     expect(committed.start).toBe(44.375);
     expect(committed.time).toBe(committed.start);

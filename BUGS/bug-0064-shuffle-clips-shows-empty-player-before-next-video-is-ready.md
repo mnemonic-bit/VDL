@@ -2,9 +2,8 @@
 
 **Severity:** Medium — automatic clip transitions interrupt visible playback.
 
-**Status:** Open. Reported on 2026-10-28. Recorded from the user's
-observation; not independently reproduced. The affected browser, application
-version, clip lengths, and loading timings have not been supplied.
+**Status:** Fixed locally in version `0.49.6` on 2026-10-28. Reproduced in
+Chromium with a held incoming media response and distinct visible videos.
 
 **Related:** [Feature 0045 — Shuffle Clips](../FEATURES/feature-0045-add-shuffle-clips-playback.md)
 and [Feature 0040 — Preloading and crossfades](../FEATURES/feature-0040-preload-and-crossfade-play-all-and-shuffle.md).
@@ -47,7 +46,7 @@ when readiness is late and explicitly prohibits extending playback while
 waiting. This user request revises that fallback: continuity takes precedence
 over the randomly selected endpoint when the successor is not ready. Update
 the feature's timing contract and related tests with the eventual repair.
-The implementation cause of the empty player has not been established.
+The repair below implements this revised timing contract.
 
 ### Acceptance criteria and regression coverage
 
@@ -79,5 +78,39 @@ The implementation cause of the empty player has not been established.
   occurs after readiness. Include an already-ready control and consecutive
   short clips; timer or request assertions alone do not prove continuity.
 
-This report changes documentation only; no application fix or version bump
-is included.
+### Cause and repair
+
+Automatic excerpt completion paused the outgoing element at `E` and loaded
+the successor into it before that successor could display. The fade guards
+also rejected late readiness once less than one excerpt second remained.
+
+Excerpt endpoints now schedule the transition without stopping playback.
+Preparation and authorization preserve the outgoing source; promotion waits
+for playable data at the selected start, seek completion, and actual incoming
+playback. Late transitions use the normal capped fade against remaining
+source footage. The incoming element is adopted with its clock intact.
+Revalidated replacement candidates load and seek in standby before promotion.
+
+Network/media preparation is bounded, failed candidates are excluded from
+automatic recovery, and exhausted recovery exposes Retry/Stop/Close while
+preserving the current picture. Natural EOF retains the last available frame
+until a successor can play. Pause defers promotion; session cancellation
+invalidates late callbacks. Explicit user seeks still retain their existing
+completion behavior.
+
+### Regression coverage
+
+`tests/browser/shuffle-clips-continuity.spec.cjs` uses real red/blue media,
+held responses, held seek completion, and delayed advance confirmation. It
+checks rendered picture colors, actual media-clock progress past `E`, overlap,
+continued incoming playback, consecutive short excerpts, pause, cancellation,
+and natural EOF. `shuffle-clips.spec.cjs` covers bounded preload exhaustion,
+replacement revisions, occurrence bounds, and recovery from a failed fade.
+Feature 0045's timing contract is updated with the repair.
+
+Validated with `./tests/run-all.sh --unit` under Python 3.12: 384 tests,
+6 skipped, and **91.6% `vdl.py` line coverage** (90% required). Browser
+validation covers 92 distinct regressions across the Shuffle Clips,
+continuity, crossfade, real-media crossfade, skip-edges, and real-media
+skip-edges suites. The final 17-test Shuffle Clips rerun passes, including
+preparation timeout/Retry and pause during a pending incoming `playing` event.

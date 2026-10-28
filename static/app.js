@@ -4173,7 +4173,8 @@ function createShuffleClipBoundary(video, { current, clipOccurrence, onFailure }
     const resume = () => {
         if (!alive() || state.failed || state.finished || !state.valid || state.ownSeek || video.seeking
                 || video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA) return;
-        if (video.currentTime < state.start - 0.05 || video.currentTime > state.end + 0.05) return;
+        if (video.currentTime < state.start - 0.05
+                || (!state.started && video.currentTime > state.end + 0.05)) return;
         state.ready = true;
         clearTimeout(state.timer);
         video.style.removeProperty('visibility');
@@ -4402,6 +4403,15 @@ function completePlayerItem(video, natural = false) {
         return;
     }
     if (video.id !== 'playerVideo') return;
+    if (natural && state?.clip && playerPreparation && !playerPreparation.disabled) {
+        // At EOF there is no more moving footage; retain the last picture while
+        // the reserved successor finishes loading instead of replacing its source.
+        playerPreparation.ended = true;
+        maybeCommitPlayerFade(playerPreparation);
+        return;
+    }
+    if (natural && state?.clip && playerPreparation?.disabled
+            && !playerPreparation.response) return;
     if (state) {
         state.finished = true;
         state.play = null;
@@ -4422,6 +4432,9 @@ function checkPlayerBoundary(video) {
             || state.tail || state.ownSeek || video.paused || video.seeking
             || playerMediaWaiting.has(video)
             || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
+    // A clip endpoint schedules a transition, not a hard stop. The fade owns
+    // completion once its successor is playable, even if loading ran past E.
+    if (state.clip) return;
     if (video.currentTime >= state.end) completePlayerItem(video);
 }
 
@@ -4468,6 +4481,7 @@ function clearPlayerPreparation() {
     playerPreparation = null;
     if (!preparation) return;
     preparation.controller.abort();
+    clearTimeout(preparation.timer);
     cancelAnimationFrame(preparation.frame);
     preparation.cleanup?.();
     const standby = document.getElementById('playerStandby');
@@ -4540,6 +4554,7 @@ function playerFadeFrame(preparation) {
 
 function failPlayerFade(preparation) {
     if (!currentPreparation(preparation)) return;
+    clearTimeout(preparation.timer);
     if (endlessPlayback.mode === 'shuffle_clips' && preparation.item) {
         endlessPlayback.failedClipIds.add(String(preparation.item.id));
     }
@@ -4579,6 +4594,9 @@ function failPlayerFade(preparation) {
         if (endlessPlayback.mode === 'shuffle_clips' && !preparation.response && !preparation.committing) {
             clearPlayerPreparation();
             queueMicrotask(maybePreparePlayer);
+        } else if (endlessPlayback.mode === 'shuffle_clips') {
+            showPlayerTransition('The next clip could not be played. Retry or stop playback.',
+                ['retry', 'stop', 'close']);
         }
     }
 }
@@ -4609,11 +4627,22 @@ function playerFadeLimit(preparation) {
 function beginPlayerFade(preparation) {
     if (!currentPreparation(preparation) || preparation.disabled) return;
     const { outgoing, incoming } = preparation;
-    const remaining = playerEffectiveEnd(outgoing) - outgoing.currentTime;
-    if (outgoing.paused || outgoing.ended || !Number.isFinite(remaining)
+    const clip = endlessPlayback.mode === 'shuffle_clips';
+    if (clip && ((outgoing.paused && !outgoing.ended) || incoming.seeking
+            || !playerBoundaries.get(incoming)?.ready
+            || incoming.readyState < HTMLMediaElement.HAVE_FUTURE_DATA)) {
+        clearTimeout(preparation.timer);
+        incoming.pause();
+        preparation.starting = false;
+        preparation.playing = preparation.playResolved = false;
+        return;
+    }
+    clearTimeout(preparation.timer);
+    const remaining = (clip ? outgoing.duration : playerEffectiveEnd(outgoing)) - outgoing.currentTime;
+    if (!clip && (outgoing.paused || outgoing.ended || !Number.isFinite(remaining)
             || remaining < 1 || remaining > playerFadeLimit(preparation)
             || endlessPlayback.presentation === 'webkit-fullscreen'
-            || document.fullscreenElement === outgoing) {
+            || document.fullscreenElement === outgoing)) {
         failPlayerFade(preparation);
         if (outgoing.ended || preparation.ended) usePreparedPlayerHandoff();
         return;
@@ -4624,6 +4653,9 @@ function beginPlayerFade(preparation) {
     incoming.playbackRate = outgoing.playbackRate;
     preparation.startTime = outgoing.currentTime;
     preparation.fadeDuration = Math.min(playerFadeLimit(preparation), remaining);
+    const immediate = clip && (outgoing.ended || remaining < 1
+        || endlessPlayback.presentation === 'webkit-fullscreen'
+        || document.fullscreenElement === outgoing);
     preparation.reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
     preparation.fade = true;
     preparation.progress = 0;
@@ -4642,12 +4674,72 @@ function beginPlayerFade(preparation) {
     endlessPlayback.sequence = preparation.data.sequence;
     markPlaybackStarted(preparation.generation);
     endlessPlayback.handoffInProgress = true;
-    playerFadeFrame(preparation);
+    if (immediate) finishPlayerFade();
+    else playerFadeFrame(preparation);
+}
+
+function startPreparedClip(preparation) {
+    if (!currentPreparation(preparation) || preparation.disabled || preparation.fade
+            || preparation.starting || !preparation.data) return;
+    const { incoming, outgoing } = preparation;
+    const boundary = playerBoundaries.get(incoming);
+    if ((outgoing.paused && !outgoing.ended) || outgoing.seeking
+            || (playerMediaWaiting.has(outgoing) && !outgoing.ended)
+            || !boundary?.ready || boundary.failed || incoming.seeking
+            || incoming.readyState < HTMLMediaElement.HAVE_FUTURE_DATA) return;
+    preparation.baseVolume = outgoing.volume;
+    preparation.muted = outgoing.muted;
+    incoming.volume = 0;
+    if (incoming.volume !== 0) {
+        failPlayerFade(preparation);
+        return;
+    }
+    incoming.muted = outgoing.muted;
+    incoming.playbackRate = outgoing.playbackRate;
+    preparation.starting = true;
+    preparation.playResolved = preparation.playing = false;
+    preparation.timer = setTimeout(() => failPlayerFade(preparation), PLAYER_HANDOFF_TIMEOUT_MS);
+    Promise.resolve().then(() => {
+        if (!currentPreparation(preparation)) return;
+        return incoming.play();
+    }).then(() => {
+        if (!currentPreparation(preparation)) return;
+        // Pause may have happened while play() or authorization was pending.
+        if (outgoing.paused && !outgoing.ended) {
+            clearTimeout(preparation.timer);
+            incoming.pause();
+            preparation.starting = false;
+            preparation.playing = false;
+            return;
+        }
+        preparation.playResolved = true;
+        if (preparation.playing) beginPlayerFade(preparation);
+    }).catch(() => failPlayerFade(preparation));
+}
+
+function loadPreparedPlayer(preparation, item) {
+    const { incoming } = preparation;
+    playerBoundaries.get(incoming)?.cleanup();
+    preparation.item = item;
+    incoming.preload = 'auto';
+    incoming.autoplay = false;
+    incoming.style.opacity = '0';
+    const source = document.createElement('source');
+    source.src = '/api/file/' + encodeURIComponent(item.id);
+    if (_VIDEO_MIME[item.extension]) source.type = _VIDEO_MIME[item.extension];
+    incoming.replaceChildren(source);
+    createPlayerBoundary(incoming, {
+        current: () => currentPreparation(preparation),
+        clipOccurrence: shuffleClipOccurrence(item, preparation.sequence),
+        onFailure: () => failPlayerFade(preparation),
+    });
+    incoming.load();
 }
 
 async function commitPlayerFade(preparation) {
     preparation.committing = true;
     endlessPlayback.handoffInProgress = true;
+    preparation.timer = setTimeout(() => preparation.controller.abort(), PLAYER_HANDOFF_TIMEOUT_MS);
     try {
         const response = await apiFetch(
             '/api/playback-sessions/' + encodeURIComponent(endlessPlayback.sessionId) + '/advance',
@@ -4674,16 +4766,24 @@ async function commitPlayerFade(preparation) {
             ? JSON.parse(body) : null;
         if (!currentPreparation(preparation)) return;
         preparation.committing = false;
-        if (preparation.ended || preparation.outgoing.ended) {
+        clearTimeout(preparation.timer);
+        const clip = endlessPlayback.mode === 'shuffle_clips';
+        if (!clip && (preparation.ended || preparation.outgoing.ended)) {
             usePreparedPlayerHandoff();
             return;
         }
-        if (!preparation.data || String(preparation.data.item.id) !== String(preparation.item.id)
+        const changed = preparation.data && (String(preparation.data.item.id) !== String(preparation.item.id)
                 || preparation.data.item.extension !== preparation.item.extension
-                || (endlessPlayback.mode === 'shuffle_clips'
+                || (clip
                     && (!preparation.data.item.source_revision
-                        || preparation.data.item.source_revision !== preparation.item.source_revision))
-                || preparation.disabled || playerEffectiveEnd(preparation.outgoing) - preparation.outgoing.currentTime < 1) {
+                        || preparation.data.item.source_revision !== preparation.item.source_revision)));
+        if (clip && preparation.data && !preparation.disabled) {
+            if (changed) loadPreparedPlayer(preparation, preparation.data.item);
+            startPreparedClip(preparation);
+            return;
+        }
+        if (!preparation.data || changed || preparation.disabled
+                || playerEffectiveEnd(preparation.outgoing) - preparation.outgoing.currentTime < 1) {
             failPlayerFade(preparation);
             return;
         }
@@ -4705,6 +4805,7 @@ async function commitPlayerFade(preparation) {
         if (preparation.playing) beginPlayerFade(preparation);
     } catch (error) {
         if (!currentPreparation(preparation)) return;
+        clearTimeout(preparation.timer);
         preparation.committing = false;
         failPlayerFade(preparation);
         if (preparation.ended || preparation.outgoing.ended) {
@@ -4714,16 +4815,23 @@ async function commitPlayerFade(preparation) {
 }
 
 function maybeCommitPlayerFade(preparation) {
-    if (!currentPreparation(preparation) || preparation.disabled || preparation.committing
+    if (!currentPreparation(preparation)) return;
+    if (endlessPlayback.mode === 'shuffle_clips' && preparation.response) {
+        startPreparedClip(preparation);
+        return;
+    }
+    if (preparation.disabled || preparation.committing
             || preparation.response || !preparation.item || preparation.fade) return;
     const { incoming, outgoing } = preparation;
     if (playerBoundaries.get(outgoing)?.tail) return;
     const boundary = playerBoundaries.get(incoming);
     const remaining = playerEffectiveEnd(outgoing) - outgoing.currentTime;
-    if (outgoing.paused || outgoing.ended || playerMediaWaiting.has(outgoing)
-            || remaining > playerFadeLimit(preparation) || remaining < 1
-            || endlessPlayback.presentation === 'webkit-fullscreen'
-            || document.fullscreenElement === outgoing
+    const clip = endlessPlayback.mode === 'shuffle_clips';
+    if ((outgoing.paused && !(clip && outgoing.ended)) || (!clip && outgoing.ended)
+            || (playerMediaWaiting.has(outgoing) && !outgoing.ended)
+            || remaining > playerFadeLimit(preparation) || (!clip && remaining < 1)
+            || (!clip && (endlessPlayback.presentation === 'webkit-fullscreen'
+                || document.fullscreenElement === outgoing))
             || incoming.readyState < HTMLMediaElement.HAVE_FUTURE_DATA
             || !Number.isFinite(incoming.duration)
             || (!boundary?.clip && playerEffectiveEnd(incoming) - (boundary?.start || 0) <= PLAYER_FADE_SECONDS)
@@ -4737,9 +4845,11 @@ function maybePreparePlayer() {
     const outgoing = document.getElementById('playerVideo');
     if (playerBoundaries.get(outgoing)?.tail) return;
     const remaining = playerEffectiveEnd(outgoing) - outgoing.currentTime;
-    if (outgoing.paused || outgoing.ended || outgoing.seeking || outgoing.playbackRate <= 0
+    const clip = endlessPlayback.mode === 'shuffle_clips';
+    if ((outgoing.paused && !(clip && outgoing.ended)) || (!clip && outgoing.ended)
+            || outgoing.seeking || outgoing.playbackRate <= 0
             || playerMediaWaiting.has(outgoing)
-            || !Number.isFinite(remaining) || remaining <= 0 || remaining > PLAYER_PRELOAD_SECONDS) return;
+            || !Number.isFinite(remaining) || (!clip && remaining <= 0) || remaining > PLAYER_PRELOAD_SECONDS) return;
     if (playerPreparation) {
         maybeCommitPlayerFade(playerPreparation);
         return;
@@ -4753,6 +4863,7 @@ function maybePreparePlayer() {
     };
     if (!preparation.expectedId || endlessPlayback.advancePending) return;
     playerPreparation = preparation;
+    preparation.timer = setTimeout(() => preparation.controller.abort(), PLAYER_HANDOFF_TIMEOUT_MS);
     const { incoming } = preparation;
     const onReady = () => {
         // Boundary metadata handlers run before this readiness check.
@@ -4798,23 +4909,18 @@ function maybePreparePlayer() {
             preparation.disabled = true;
             return;
         }
-        preparation.item = data.item;
-        incoming.preload = 'auto';
-        incoming.autoplay = false;
-        incoming.style.opacity = '0';
-        const source = document.createElement('source');
-        source.src = '/api/file/' + encodeURIComponent(data.item.id);
-        if (_VIDEO_MIME[data.item.extension]) source.type = _VIDEO_MIME[data.item.extension];
-        incoming.replaceChildren(source);
-        createPlayerBoundary(incoming, {
-            current: () => currentPreparation(preparation),
-            clipOccurrence: shuffleClipOccurrence(data.item, preparation.sequence),
-            onFailure: () => failPlayerFade(preparation),
-        });
-        incoming.load();
+        clearTimeout(preparation.timer);
+        loadPreparedPlayer(preparation, data.item);
         maybeCommitPlayerFade(preparation);
     }).catch(() => {
-        if (currentPreparation(preparation)) preparation.disabled = true;
+        if (currentPreparation(preparation)) {
+            clearTimeout(preparation.timer);
+            preparation.disabled = true;
+            if (endlessPlayback.mode === 'shuffle_clips') {
+                showPlayerTransition('No next clip could be loaded. Retry or stop playback.',
+                    ['retry', 'stop', 'close']);
+            }
+        }
     });
 }
 
@@ -5706,6 +5812,22 @@ function restartEndlessPlayback() {
 
 function retryEndlessPlayback() {
     if (!endlessPlayback.active) return;
+    if (endlessPlayback.mode === 'shuffle_clips' && playerPreparation?.disabled
+            && !playerPreparation.fade) {
+        endlessPlayback.failedClipIds.clear();
+        const preparation = playerPreparation;
+        if (preparation.data && !preparation.failedDuringFade) {
+            preparation.disabled = false;
+            loadPreparedPlayer(preparation, preparation.data.item);
+        } else if (preparation.failedDuringFade) {
+            usePreparedPlayerHandoff();
+        } else {
+            clearPlayerPreparation();
+            maybePreparePlayer();
+        }
+        showPlayerTransition('', []);
+        return;
+    }
     if (endlessPlayback.phase === 'create-failed'
             && ['shuffle', 'shuffle_clips'].includes(endlessPlayback.mode)) {
         startShufflePlayback(endlessPlayback.mode);

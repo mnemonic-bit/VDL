@@ -266,11 +266,14 @@ grid tracks now constrain the image to both viewport dimensions. Browser
 regressions check rendered edge markers and black bars across four aspect
 ratios, both fullscreen entry paths, resizing, exit, and re-entry.
 
-Issue 64 was reported on 2026-10-28. Shuffle Clips can show an empty player
-when a short excerpt expires before the next video is ready. The requested
-behavior keeps the outgoing video playing until the incoming clip can play,
-then cross-fades. This revises Feature 0045's strict excerpt-end fallback;
-the implementation cause remains unverified.
+Issue 64 was reproduced in Chromium and fixed locally in version `0.49.6`
+on 2026-10-28. Shuffle Clips replaced the outgoing source at its excerpt end
+before the successor was playable. It now keeps that video visible and
+playing until readiness and authorization permit a fade, preserving the
+incoming clock through promotion. Real-media regressions cover held loads,
+seeks and confirmation, consecutive short clips, pause/cancellation, and EOF;
+bounded recovery preserves the outgoing picture and exposes useful feedback.
+Feature 0045's timing contract now permits this continuity fallback.
 
 Issue 65 was reported from GitHub Actions on 2026-10-28. The endless-scroll
 browser test loads its initial and second batches but times out with 20 cards

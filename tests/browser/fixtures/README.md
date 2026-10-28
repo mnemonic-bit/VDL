@@ -14,6 +14,10 @@ intro/outro start seeks, early finishing, and crossfade using a real browser
 media timeline. Regenerate it with the command above using `-t 30` and output
 `edges.webm` instead.
 
+`clips-red.webm` uses the `crossfade.webm` command with `color=c=red` and
+`frequency=660`. The distinct picture and tone let Shuffle Clips regressions
+detect the outgoing picture, overlap, and completed handoff with delayed media.
+
 The `fit-*.webm` fixtures are silent, 60-second blue pictures with a 40-pixel
 white border on every edge. Browser tests sample screenshots at the expected
 border and bar positions to detect fullscreen cropping, stretching, or an
