@@ -9,6 +9,32 @@ from tests.support.app_case import AppCase
 
 
 class UploadTest(AppCase):
+    def test_client_upload_id_is_preserved_and_cannot_replace_an_existing_row(self):
+        upload_id = '0123456789abcdef0123456789abcdef'
+        payload = {'id': upload_id, 'filename': 'first.mp4', 'filesize': 4}
+        response = self.client.post('/api/upload', json=payload)
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.get_json()['id'], upload_id)
+        duplicate = self.client.post('/api/upload', json={**payload, 'filename': 'other.mp4'})
+        self.assertEqual(duplicate.status_code, 409)
+        self.assertEqual(vdl.db_get_download(upload_id)['title'], 'first')
+
+    def test_client_upload_id_rejects_unsafe_or_invalid_values(self):
+        for upload_id in ('../file', '<script>', '', 123, None, 'A' * 32):
+            with self.subTest(upload_id=upload_id):
+                response = self.client.post('/api/upload', json={
+                    'id': upload_id, 'filename': 'video.mp4', 'filesize': 4,
+                })
+                self.assertEqual(response.status_code, 400)
+        self.assertEqual(vdl.db_list_downloads(), [])
+
+    def test_stop_before_transfer_marks_upload_cancelled_and_allows_removal(self):
+        upload_id = self.start_upload().get_json()['id']
+        self.assertEqual(self.client.post(f'/api/stop/{upload_id}').status_code, 200)
+        self.assertEqual(vdl.db_get_download(upload_id)['status'], 'cancelled')
+        self.assertEqual(self.client.put(f'/api/upload/{upload_id}', data=b'video').status_code, 409)
+        self.assertEqual(self.client.post(f'/api/remove/{upload_id}').status_code, 200)
+
     def start_upload(self, payload=b"video bytes", filename="desktop-video.mp4"):
         return self.client.post(
             "/api/upload",

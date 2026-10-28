@@ -527,21 +527,19 @@ const uploadDropOverlay = document.getElementById('uploadDropOverlay');
 const uploadDropTitle = document.getElementById('uploadDropTitle');
 const uploadDropDetail = document.getElementById('uploadDropDetail');
 let uploadDragDepth = 0;
-let uploadInProgress = false;
-let uploadOverlayTimer = null;
+const droppedUploads = new Map();
 const activeUploadRequests = new Map();
+let uploadProgressRenderTimer = null;
 
 function isFileDrag(event) {
     return event.dataTransfer
         && Array.from(event.dataTransfer.types || []).includes('Files');
 }
 
-function showUploadOverlay(title, detail, uploading = false) {
-    clearTimeout(uploadOverlayTimer);
+function showUploadOverlay(title, detail) {
     uploadDropTitle.textContent = title;
     uploadDropDetail.textContent = detail;
     uploadDropOverlay.classList.add('active');
-    uploadDropOverlay.classList.toggle('uploading', uploading);
     uploadDropOverlay.setAttribute('aria-hidden', 'false');
     if (!uploadDropOverlay.open) uploadDropOverlay.showModal();
 }
@@ -559,6 +557,16 @@ function transferDroppedVideo(id, file) {
         request.open('PUT', '/api/upload/' + encodeURIComponent(id));
         request.setRequestHeader(
             'Content-Type', file.type || 'application/octet-stream');
+        request.upload.onprogress = event => {
+            const upload = droppedUploads.get(String(id));
+            if (!upload || upload.cancelled) return;
+            upload.info.downloaded_bytes = event.loaded;
+            upload.info.upload_detail = event.loaded >= file.size
+                ? 'Validating video…' : 'Uploading…';
+            if (uploadProgressRenderTimer === null) {
+                uploadProgressRenderTimer = setTimeout(renderDroppedUploads, 150);
+            }
+        };
         request.onload = () => {
             const data = (() => {
                 try { return JSON.parse(request.responseText || '{}'); }
@@ -582,68 +590,132 @@ function transferDroppedVideo(id, file) {
     });
 }
 
-async function registerDroppedVideo(file) {
+function renderDroppedUploads() {
+    clearTimeout(uploadProgressRenderTimer);
+    uploadProgressRenderTimer = null;
+    renderDownloadCollections();
+}
+
+async function registerDroppedVideo(upload, file) {
     const response = await apiFetch('/api/upload', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ filename: file.name, filesize: file.size }),
+        body: JSON.stringify({ id: upload.info.id, filename: file.name, filesize: file.size }),
     });
     if (!response.ok) {
         const data = await response.json().catch(() => ({}));
         throw new Error(data.error || response.statusText || 'Upload failed');
     }
     const data = await response.json();
-    return {
-        file,
-        id: data.id,
-        completion: transferDroppedVideo(data.id, file),
-    };
+    if (data.id !== upload.info.id) throw new Error('Upload registration returned a different id');
+    upload.registered = true;
+    // Do not abort registration: the server may already have created the row.
+    // A Stop during preparation is applied as soon as registration acknowledges it.
+    if (upload.cancelled) {
+        await stopDroppedUpload(upload);
+        return;
+    }
+    upload.info.status = 'downloading';
+    upload.info.upload_detail = 'Uploading…';
+    renderDroppedUploads();
+    fetchHistory().catch(() => {});
+    const result = await transferDroppedVideo(data.id, file);
+    if (result.cancelled || result.error === 'Upload cancelled') {
+        upload.cancelled = true;
+        upload.info.status = 'cancelled';
+        upload.info.upload_detail = 'Upload stopped';
+    }
+    if (!upload.cancelled && !result.cancelled && !result.error) {
+        upload.info.status = 'finished';
+        upload.info.upload_detail = '';
+    }
 }
 
-async function uploadDroppedVideos(files) {
-    if (uploadInProgress || !files.length) return;
-    uploadInProgress = true;
+function uploadDroppedVideos(files) {
+    hideUploadOverlay();
+    if (!files.length) return;
+    closeAllMenus();
     hideActionError();
-    const failures = [];
-    const transfers = [];
-
-    for (let index = 0; index < files.length; index += 1) {
-        const file = files[index];
-        const prefix = files.length > 1 ? `${index + 1} of ${files.length}: ` : '';
-        showUploadOverlay('Preparing upload…', prefix + file.name, true);
-        try {
-            transfers.push(await registerDroppedVideo(file));
-        } catch (error) {
-            failures.push(`${file.name}: ${error.message || 'Upload failed'}`);
-        }
-    }
-
-    uploadInProgress = false;
-    await fetchHistory().catch(() => {});
-    if (transfers.length > 0) {
-        const noun = transfers.length === 1 ? 'Upload' : `${transfers.length} uploads`;
-        showUploadOverlay(
-            `${noun} started`,
-            'Track progress or stop it from Current downloads.',
-        );
-        uploadOverlayTimer = setTimeout(hideUploadOverlay, 900);
-    } else {
-        hideUploadOverlay();
-    }
-
-    const results = await Promise.allSettled(
-        transfers.map(transfer => transfer.completion));
-    results.forEach((result, index) => {
-        if (result.status === 'rejected') {
-            failures.push(
-                `${transfers[index].file.name}: ${result.reason.message || 'Upload failed'}`);
-        }
+    const uploads = files.map(file => {
+        // getRandomValues also works on HTTP LAN deployments where randomUUID
+        // is unavailable. Only hex IDs enter row selectors and action handlers.
+        const id = Array.from(crypto.getRandomValues(new Uint8Array(16)),
+            byte => byte.toString(16).padStart(2, '0')).join('');
+        const upload = {
+            registered: false, cancelled: false, dismissed: false, settled: false,
+            info: {
+                id, title: file.name, requested_filename: file.name,
+                source_type: 'upload', url: '', status: 'starting',
+                progress: '0%', downloaded_bytes: 0, total_bytes: file.size,
+                filesize: file.size, created_at: Date.now() / 1000,
+                upload_detail: 'Preparing upload…',
+            },
+        };
+        droppedUploads.set(id, upload);
+        return upload;
     });
-    if (failures.length) showActionError(failures.join(' '));
+    renderDroppedUploads();
+    // Start all registrations independently, and attach a rejection handler
+    // immediately so one failed file cannot hide or delay its siblings.
+    uploads.forEach((upload, index) => {
+        registerDroppedVideo(upload, files[index]).catch(error => {
+            if (upload.cancelled) return;
+            upload.info.status = 'interrupted';
+            upload.info.upload_detail = error.message || 'Upload failed';
+            showActionError(`${files[index].name}: ${upload.info.upload_detail}`);
+        }).finally(() => {
+            upload.settled = true;
+            if (upload.dismissed && !upload.registered) droppedUploads.delete(upload.info.id);
+            renderDroppedUploads();
+            fetchHistory({ sortFavorites: true }).catch(() => {});
+        });
+    });
+}
+
+async function stopDroppedUpload(upload) {
+    if (!upload.registered) return;
+    const id = upload.info.id;
+    await apiAction('/api/stop/' + encodeURIComponent(id), { method: 'POST' });
+    activeUploadRequests.get(id)?.abort();
+    if (upload.dismissed) {
+        await apiAction('/api/remove/' + encodeURIComponent(id), { method: 'POST' });
+        droppedUploads.delete(id);
+        collectionSnapshots.current = collectionSnapshots.current.filter(info => String(info.id) !== id);
+        renderDroppedUploads();
+    }
+    fetchHistory().catch(() => {});
+}
+
+function uploadCollectionData() {
+    if (!droppedUploads.size) {
+        return collectionSnapshots.library.concat(collectionSnapshots.current);
+    }
+    const byId = new Map(collectionSnapshots.current.concat(collectionSnapshots.library)
+        .map(info => [String(info.id), info]));
+    for (const [id, upload] of droppedUploads) {
+        const server = byId.get(id);
+        if (!upload.dismissed && upload.settled && server && (
+            server.status === 'finished' || (upload.cancelled && server.status === 'cancelled'))) {
+            droppedUploads.delete(id);
+            continue;
+        }
+        if (upload.dismissed) {
+            byId.delete(id);
+        } else if (server?.status === 'finished') {
+            // Only the server can publish validated media into the Library.
+            byId.set(id, server);
+        } else {
+            byId.set(id, {
+                ...server, ...upload.info,
+                downloaded_bytes: Math.max(server?.downloaded_bytes || 0, upload.info.downloaded_bytes),
+            });
+        }
+    }
+    return [...byId.values()];
 }
 
 document.addEventListener('dragenter', event => {
-    if (!isFileDrag(event) || uploadInProgress) return;
+    if (!isFileDrag(event)) return;
     event.preventDefault();
     uploadDragDepth += 1;
     showUploadOverlay(
@@ -655,11 +727,10 @@ document.addEventListener('dragenter', event => {
 document.addEventListener('dragover', event => {
     if (!isFileDrag(event)) return;
     event.preventDefault();
-    event.dataTransfer.dropEffect = uploadInProgress ? 'none' : 'copy';
+    event.dataTransfer.dropEffect = 'copy';
 });
 
 document.addEventListener('dragleave', event => {
-    if (uploadInProgress) return;
     // A final page exit may follow several descendant enters, so it is authoritative
     // even when the browser no longer exposes the external drag's data types.
     if (event.relatedTarget === null && uploadDragDepth > 0) {
@@ -676,14 +747,14 @@ document.addEventListener('drop', event => {
     if (!isFileDrag(event)) return;
     event.preventDefault();
     uploadDragDepth = 0;
-    if (uploadInProgress) return;
     const files = Array.from(event.dataTransfer.files || []);
     uploadDroppedVideos(files);
 });
 
 uploadDropOverlay.addEventListener('cancel', event => {
     event.preventDefault();
-    if (!uploadInProgress) hideUploadOverlay();
+    uploadDragDepth = 0;
+    hideUploadOverlay();
 });
 
 function updateApiVersion(version, unavailable) {
@@ -1656,6 +1727,15 @@ function bindTagEditors() {
 
 function stopDownload(id) {
     closeAllMenus();
+    const upload = droppedUploads.get(String(id));
+    if (upload) {
+        upload.cancelled = true;
+        upload.info.status = 'cancelled';
+        upload.info.upload_detail = 'Upload stopped';
+        renderDroppedUploads();
+        stopDroppedUpload(upload).catch(() => {});
+        return;
+    }
     const uploadRequest = activeUploadRequests.get(String(id));
     apiAction('/api/stop/' + encodeURIComponent(id), { method: 'POST' })
         .then(() => {
@@ -1810,14 +1890,32 @@ function continueDownload(id, url) {
 function deleteDownload(id) {
     closeHistoryInfo();
     closeAllMenus();
+    const upload = droppedUploads.get(String(id));
+    if (upload) {
+        upload.dismissed = true;
+        if (!upload.registered) {
+            if (upload.settled) droppedUploads.delete(String(id));
+            renderDroppedUploads();
+            return;
+        }
+    }
     const row = document.querySelector(`[data-row-id="${id}"]`);
     if (row) {
         row.classList.add('item-fade-out');
         row.addEventListener('animationend', () => row.remove(), { once: true });
     }
     apiAction('/api/remove/' + encodeURIComponent(id), { method: 'POST' })
-        .then(() => fetchHistory())
-        .catch(() => fetchHistory());
+        .then(() => {
+            droppedUploads.delete(String(id));
+            collectionSnapshots.current = collectionSnapshots.current.filter(info => String(info.id) !== String(id));
+            renderDroppedUploads();
+            return fetchHistory();
+        })
+        .catch(() => {
+            if (upload) upload.dismissed = false;
+            renderDroppedUploads();
+            return fetchHistory();
+        });
 }
 
 function toggleFavorite(button) {
@@ -3057,7 +3155,7 @@ function renderItem(info, inHistoryView = false) {
     }
 
     if (isTerminal) {
-        if (!isFinished && !isCancelled && info.status !== 'interrupted') {
+        if (!isUpload && !isFinished && !isCancelled && info.status !== 'interrupted') {
             menuItems.push(`<button data-url-action="reload" data-download-id="${id}" ${urlData}><svg class="menu-icon"><use href="#i-sync"/></svg>Reload</button>`);
         }
         if (!isUpload) {
@@ -3097,7 +3195,9 @@ function renderItem(info, inHistoryView = false) {
         downloadSummaryParts.push('Waiting for a download slot');
     }
     const summarySize = formatBytes(info.filesize);
+    if (isUpload && info.upload_detail) downloadSummaryParts.push(escapeHtml(info.upload_detail));
     if (summarySize) downloadSummaryParts.push(`<strong>Total size:</strong> ${summarySize}`);
+    if (isUpload) downloadSummaryParts.push(`<strong>Bytes uploaded:</strong> ${formatBytes(info.downloaded_bytes) || '0 B'}`);
     if (info.resolution) downloadSummaryParts.push(`<strong>Quality:</strong> ${info.resolution}`);
     downloadSummaryParts.push(`<strong>${isUpload ? 'Uploaded' : 'Downloaded'}:</strong> ${downloadedPercent === null ? '&mdash;' : `${downloadedPercent}%`}`);
     const downloadSummaryRow = isCurrentRow
@@ -3734,7 +3834,7 @@ function fetchDownloadCollection(key) {
 
 function renderDownloadCollections({ sortFavorites = false } = {}) {
     updateDurationSearchFeedback();
-    const data = collectionSnapshots.library.concat(collectionSnapshots.current);
+    const data = uploadCollectionData();
     const itemCount = document.getElementById('itemCount');
     itemCount.textContent = `${data.length} ${data.length === 1 ? 'item' : 'items'}`;
     if (historyRefreshBlocked()) {

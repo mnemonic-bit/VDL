@@ -5588,13 +5588,18 @@ def start_video_upload():
         if (isinstance(filesize, bool) or not isinstance(filesize, int)
                 or filesize <= 0):
             raise ValueError('Uploaded video size must be a positive integer')
+        # A browser can render preparation before registration returns. Keeping
+        # its ID avoids duplicate rows when SSE beats the registration response.
+        download_id = data.get('id', str(uuid.uuid4())[:8])
+        if 'id' in data and (not isinstance(download_id, str)
+                            or not re.fullmatch(r'[0-9a-f]{32}', download_id)):
+            raise ValueError('Invalid upload id')
         output_dir = _prepare_download_directory(
             db_get_preferences().get('download_dir', '.')
         )
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 
-    download_id = str(uuid.uuid4())[:8]
     output_dir = os.path.abspath(output_dir)
     title = os.path.splitext(original_name)[0] or original_name
     try:
@@ -5607,6 +5612,8 @@ def start_video_upload():
             g.current_user['id'],
             g.current_user['username'],
         )
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "Upload id already exists"}), 409
     except sqlite3.Error:
         return jsonify({"error": "Unable to start the video upload"}), 500
     return jsonify({
@@ -5892,7 +5899,15 @@ def stop_download(download_id):
     # pause flag so the worker wakes up and aborts cleanly.
     if entry['status'] not in ('starting', 'downloading', 'paused'):
         return jsonify({"message": "Download is not active", "status": entry['status']}), 200
-    request_cancel(download_id)
+    with _worker_condition:
+        request_cancel(download_id)
+        # Preparation can be stopped before a PUT starts. With no receiver
+        # alive, no worker will publish the terminal status on our behalf.
+        if (entry.get('source_type') == 'upload'
+                and download_id not in _live_worker_ids):
+            current = db_get_download(download_id)
+            if current and current['status'] in ('starting', 'downloading', 'paused'):
+                db_update_download(download_id, status='cancelled', finished_at=time.time())
     return jsonify({"message": "Stop requested", "id": download_id})
 
 

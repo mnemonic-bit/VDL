@@ -250,6 +250,33 @@ Both affected tests passed ten consecutive runs each and within the complete
 browser run; that run has a separate upload-stop timeout. The original
 hosted-runner artifacts were unavailable, and production impact is unconfirmed.
 
+Issue 62 was reported and investigated on 2026-10-28, and fixed locally in
+version `0.49.4`. Dropping files now closes the modal immediately and creates
+individual preparation entries in Current downloads. Independent registrations,
+stable client/server IDs, progress, per-file failure feedback, and deferred
+Stop/Delete keep the page and sibling uploads usable through registration,
+transfer, validation, and delayed collection reads. Deterministic browser
+regressions cover the reproduced blocking cases and lifecycle races. Large real
+video confirmation in the affected deployment remains outstanding.
+
+Issue 63 was reported on 2026-10-28. Fullscreen playback of a 4:3 video on a
+16:9 display crops the top and/or bottom instead of fitting the complete
+picture with dark side bars. The report records the expected proportional
+fit and regression criteria; the implementation cause and affected browser
+remain unverified.
+
+Issue 64 was reported on 2026-10-28. Shuffle Clips can show an empty player
+when a short excerpt expires before the next video is ready. The requested
+behavior keeps the outgoing video playing until the incoming clip can play,
+then cross-fades. This revises Feature 0045's strict excerpt-end fallback;
+the implementation cause remains unverified.
+
+Issue 65 was reported from GitHub Actions on 2026-10-28. The endless-scroll
+browser test loads its initial and second batches but times out with 20 cards
+instead of the expected 21 after scrolling for the final batch. The run ended
+with one failed and 278 passed tests. The report records the reproduction
+sequence and artifact paths; the cause and production impact remain unverified.
+
 ## Bug reports
 
 - [Bug 0001 — Merged downloads kept the deleted temporary audio filename](bug-0001-merged-downloads-kept-deleted-temporary-audio-filename.md)
@@ -313,6 +340,10 @@ hosted-runner artifacts were unavailable, and production impact is unconfirmed.
 - [Bug 0059 — Download dialog remains open after a successful submission](bug-0059-download-dialog-remains-open-after-submission.md)
 - [Bug 0060 — Downloads stall or slow down after bandwidth controls were added](bug-0060-downloads-stall-or-slow-after-bandwidth-controls.md)
 - [Bug 0061 — Playback account-switch tests fail in GitHub Actions after Shuffle Clips](bug-0061-playback-account-switch-tests-fail-after-shuffle-clips.md)
+- [Bug 0062 — Drag-and-drop uploads block access to the main screen](bug-0062-drag-and-drop-uploads-block-main-screen.md)
+- [Bug 0063 — Fullscreen playback crops non-widescreen videos](bug-0063-fullscreen-playback-crops-non-widescreen-videos.md)
+- [Bug 0064 — Shuffle Clips shows an empty player before the next video is ready](bug-0064-shuffle-clips-shows-empty-player-before-next-video-is-ready.md)
+- [Bug 0065 — Endless scrolling stalls before the final batch in GitHub Actions](bug-0065-endless-scroll-stalls-before-final-batch-in-github-actions.md)
 
 ## Accepted UI decisions
 
