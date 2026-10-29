@@ -167,6 +167,31 @@
                     <rect x="9.4" y="3.5" width="2.6" height="9" rx="0.5"/>
                 </g>
             </symbol>
+            <symbol id="i-volume" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M2 6h3l3-3v10l-3-3H2z"/>
+                    <path d="M11 5a4 4 0 0 1 0 6M13 2.5a7.5 7.5 0 0 1 0 11"/>
+                </g>
+            </symbol>
+            <symbol id="i-muted" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M2 6h3l3-3v10l-3-3H2zM11 6l4 4M15 6l-4 4"/>
+                </g>
+            </symbol>
+            <symbol id="i-next" viewBox="0 0 16 16">
+                <path d="M3 3.5v9L10 8z" fill="currentColor"/>
+                <path d="M12 3.5v9" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            </symbol>
+            <symbol id="i-previous" viewBox="0 0 16 16">
+                <path d="M13 3.5v9L6 8z" fill="currentColor"/>
+                <path d="M4 3.5v9" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            </symbol>
+            <symbol id="i-fullscreen" viewBox="0 0 16 16">
+                <path d="M2 6V2h4M10 2h4v4M14 10v4h-4M6 14H2v-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+            </symbol>
+            <symbol id="i-exit-fullscreen" viewBox="0 0 16 16">
+                <path d="M6 2v4H2M14 6h-4V2M10 14v-4h4M2 10h4v4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+            </symbol>
             <symbol id="i-pencil" viewBox="0 0 16 16">
                 <g fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round">
                     <path d="M11.5 2.5l2 2-7.5 7.5-2.5.5.5-2.5z"/>
@@ -819,15 +844,20 @@
     </dialog>
 
     <div id="playerBackdrop" class="player-backdrop" onclick="closePlayer(event)">
-        <div class="player-box player-original-size" onclick="event.stopPropagation()">
-            <button class="player-close" type="button" onclick="closePlayer()" aria-label="Close player"><svg aria-hidden="true"><use href="#i-x"/></svg></button>
+        <div id="playerContainer" class="player-box player-original-size" role="dialog" aria-modal="true" aria-label="Video player" tabindex="-1" onclick="event.stopPropagation()">
+            <div class="player-chrome">
+                <div class="player-heading">
+                    <strong id="playerTitle"></strong>
+                    <span id="playerModeLabel" hidden></span>
+                </div>
+                <button class="player-native-fullscreen" type="button" onclick="requestPlayerFullscreen()">Fullscreen</button>
+                <button class="player-close" type="button" onclick="closePlayer()" aria-label="Close player"><svg aria-hidden="true"><use href="#i-x"/></svg></button>
+            </div>
             <div class="player-layout">
                 <div class="player-media-column">
                     <div id="playerMediaStage" class="player-media-stage">
                         <video id="playerVideo" controls autoplay></video>
                         <video id="playerStandby" class="player-standby" preload="none" aria-hidden="true" tabindex="-1"></video>
-                        <button class="player-stage-fullscreen" type="button" onclick="requestPlayerFullscreen()">Fullscreen</button>
-                        <button class="player-stage-close" type="button" onclick="closePlayer()" aria-label="Close fullscreen player"><svg aria-hidden="true"><use href="#i-x"/></svg></button>
                         <div id="playerTransition" class="player-transition" hidden>
                             <span id="playerStatus" role="status" aria-live="polite"></span>
                             <div class="player-transition-actions">
@@ -847,6 +877,35 @@
                     <h2 id="playlistQueueTitle">Playlist queue</h2>
                     <div id="playlistQueueItems" class="playlist-queue-items"></div>
                 </aside>
+            </div>
+            <div id="playerControls" class="player-controls" role="group" aria-label="Playback controls" hidden>
+                <label class="visually-hidden" for="playerSeek">Seek</label>
+                <input id="playerSeek" class="player-seek" type="range" min="0" max="0" value="0" step="0.1" disabled aria-valuetext="Time unavailable">
+                <div class="player-control-buttons">
+                    <button id="playerPrevious" class="player-control-button" type="button" aria-label="Previous video" hidden><svg aria-hidden="true"><use href="#i-previous"/></svg></button>
+                    <button id="playerPlayPause" class="player-control-button" type="button" aria-label="Play"><svg aria-hidden="true"><use href="#i-play"/></svg></button>
+                    <button id="playerNext" class="player-control-button" type="button" aria-label="Next video" hidden><svg aria-hidden="true"><use href="#i-next"/></svg></button>
+                    <span id="playerTime" class="player-time">--:-- / --:--</span>
+                    <div class="player-volume-control">
+                        <button id="playerMute" class="player-control-button" type="button" aria-label="Mute" aria-pressed="false"><svg aria-hidden="true"><use href="#i-volume"/></svg></button>
+                        <label class="visually-hidden" for="playerVolume">Volume</label>
+                        <input id="playerVolume" type="range" min="0" max="100" value="100" step="1" aria-describedby="playerVolumeHint" aria-valuetext="100%">
+                    </div>
+                    <label class="player-speed-control" for="playerSpeed">Speed
+                        <select id="playerSpeed">
+                            <option value="0.5">0.5×</option>
+                            <option value="0.75">0.75×</option>
+                            <option value="1" selected>1×</option>
+                            <option value="1.25">1.25×</option>
+                            <option value="1.5">1.5×</option>
+                            <option value="2">2×</option>
+                        </select>
+                    </label>
+                    <button id="playerQueueToggle" class="player-control-button player-queue-toggle" type="button" aria-label="Hide playlist queue" aria-expanded="true" aria-controls="playlistQueue" hidden><svg aria-hidden="true"><use href="#i-playlist"/></svg><span>Queue</span></button>
+                    <button id="playerFullscreen" class="player-control-button" type="button" aria-label="Enter fullscreen" aria-describedby="playerFullscreenHint"><svg aria-hidden="true"><use href="#i-fullscreen"/></svg></button>
+                </div>
+                <span id="playerVolumeHint" class="player-volume-hint" hidden>Use your device controls to adjust volume.</span>
+                <span id="playerFullscreenHint" class="player-capability-hint" hidden>Fullscreen is unavailable in this browser.</span>
             </div>
         </div>
     </div>

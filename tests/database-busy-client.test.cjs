@@ -11,6 +11,7 @@ function harness(replies, { onDelay = () => {} } = {}) {
     const delays = [];
     const requests = [];
     const redirects = [];
+    const listeningResets = [];
     const elements = new Map();
     const context = vm.createContext({
         document: {
@@ -31,10 +32,11 @@ function harness(replies, { onDelay = () => {} } = {}) {
             return reply;
         },
         setTimeout: (callback, delay) => { delays.push(delay); onDelay(); callback(); },
+        resetPlayerListening: () => listeningResets.push(true),
         Date,
     });
     vm.runInContext(source, context);
-    return { apiFetch: context.apiFetch, delays, requests, redirects, elements };
+    return { apiFetch: context.apiFetch, delays, requests, redirects, elements, listeningResets };
 }
 
 function busy(retryAfter = '1') {
@@ -92,6 +94,7 @@ test('expired sessions still redirect to login without retrying authentication f
     const client = harness([busy('0'), new Response('{}', { status: 401 })]);
     await assert.rejects(client.apiFetch('/api/current-downloads'), /session has ended/);
     assert.deepEqual(client.redirects, ['/login']);
+    assert.equal(client.listeningResets.length, 1);
     assert.equal(client.requests.length, 2);
 });
 

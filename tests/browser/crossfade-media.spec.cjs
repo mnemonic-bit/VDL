@@ -28,8 +28,8 @@ for (const reducedMotion of ['no-preference', 'reduce']) {
         expect(await page.evaluate(() => endlessPlayback.sequence)).toBe(0);
         // Request fullscreen from a real click, so both pictures share one surface.
         await page.mouse.move(500, 350);
-        await page.getByRole('button', { name: 'Fullscreen', exact: true }).click({ force: true });
-        await expect.poll(() => page.evaluate(() => document.fullscreenElement?.id)).toBe('playerMediaStage');
+        await page.getByRole('button', { name: 'Enter fullscreen', exact: true }).click({ force: true });
+        await expect.poll(() => page.evaluate(() => document.fullscreenElement?.id)).toBe('playerContainer');
         await page.evaluate(() => { window.__outgoingVideo.currentTime = 10.8; });
         await expect.poll(() => page.evaluate(() => Boolean(playerPreparation?.fade))).toBe(true).catch(async error => {
             console.log('Media handoff state:', await page.evaluate(() => ({
@@ -67,8 +67,8 @@ for (const reducedMotion of ['no-preference', 'reduce']) {
         expect(elapsed).toBeLessThan(4.5);
         await expect(page.locator('#playerStandby source')).toHaveCount(0);
         expect(await page.locator('#playerVideo').evaluate(video => video.volume)).toBeCloseTo(0.7);
-        expect(await page.evaluate(() => document.fullscreenElement?.id)).toBe('playerMediaStage');
-        await page.getByRole('button', { name: 'Close fullscreen player' }).click();
+        expect(await page.evaluate(() => document.fullscreenElement?.id)).toBe('playerContainer');
+        await page.getByRole('button', { name: 'Close player', exact: true }).click();
         await expect(page.locator('#playerBackdrop')).not.toHaveClass(/open/);
         await expect(page.locator('#playerMediaStage source')).toHaveCount(0);
         await expect.poll(() => page.evaluate(() => document.fullscreenElement)).toBeNull();

@@ -1,7 +1,8 @@
 # Add custom controls to the built-in player
 
 **Source:** User-requested feature\
-**Status:** Proposed\
+**Status:** Implemented\
+**Implemented:** 2026-10-29 · Version `0.50.0`\
 **Last refined:** 2026-10-28\
 **Extends:** [Feature 0028, Player keyboard shortcuts](feature-0028-add-player-keyboard-shortcuts.md)\
 **Interacts with:** [Feature 0027, Endless Library playback](feature-0027-endless-library-playback.md),
@@ -283,5 +284,32 @@ Before marking implementation complete, run `./tests/run-all.sh --unit` and
 verify the enforced **90% minimum `vdl.py` line coverage**, using Python 3.12
 when close to the threshold, then run the relevant browser suites. Record
 any platform validation still pending. Implementation requires its own MINOR
-version bump under `AGENTS.md`; this documentation-only proposal leaves
-`VERSION` unchanged.
+version bump under `AGENTS.md`.
+
+## Implementation verification
+
+Implemented in version `0.50.0`. The shared player container includes both
+media elements, controls, recovery actions, and the collapsible playlist queue.
+Listening choices belong to the page session; fade gains and delayed media
+callbacks cannot replace those choices. Native controls remain usable if custom
+initialization fails, and native video fullscreen uses the platform's controls
+when container fullscreen is unavailable.
+
+Verification on 2026-10-29:
+
+- `./tests/run-all.sh --unit` passed under Python 3.12: 384 tests, six optional
+  real-media integration skips, and **91.6% `vdl.py` line coverage**.
+- `node --test tests/*.test.cjs`: **20 passed**.
+- Final affected browser set: **69 passed in each of Chromium, Firefox, and
+  WebKit**. Focus restoration with a hidden launcher also passed in all three.
+- The browser runs cover playback, playlists, preferences, intro/outro seeking,
+  Shuffle Clips continuity, fullscreen fitting, and 23 focused custom-control
+  regressions. Generated marked-frame media checks all four aspect ratios,
+  queue expansion/collapse, and real overlaps. Screenshot capture preserves
+  Chromium's emulated resize and Firefox's actual fullscreen viewport.
+
+Physical supported-device validation remains pending: macOS/iOS Safari native
+video fullscreen, fullscreen exit provenance on those devices, hardware volume
+limitations, and touch reveal/drag/cancellation on a real touchscreen. The
+native-only fullscreen and fixed-volume automated cases simulate capabilities;
+they do not establish those device behaviors.

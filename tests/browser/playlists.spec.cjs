@@ -114,15 +114,16 @@ test('resumes in the built-in player, selects queue entries, and stops at the en
     await expect(page.locator('.playlist-queue-row').first()).toHaveAttribute('aria-current', 'true');
     await expect.poll(() => page.locator('#playerVideo').evaluate(video => video.currentTime)).toBe(24);
     const geometry = await page.locator('.player-layout').evaluate(layout => {
-        const overlay = document.getElementById('playerBackdrop').getBoundingClientRect();
+        const player = document.getElementById('playerContainer').getBoundingClientRect();
         const media = layout.querySelector('.player-media-column').getBoundingClientRect();
         const video = layout.querySelector('#playerVideo').getBoundingClientRect();
         const queue = layout.querySelector('.playlist-queue').getBoundingClientRect();
+        const controls = document.getElementById('playerControls').getBoundingClientRect();
         return {
-            queueTopInset: Math.round(queue.top - overlay.top),
-            queueBottomInset: Math.round(overlay.bottom - queue.bottom),
-            mediaTopInset: Math.round(media.top - overlay.top),
-            mediaBottomInset: Math.round(overlay.bottom - media.bottom),
+            queueContained: queue.left >= player.left && queue.right <= player.right
+                && queue.top >= player.top && queue.bottom <= controls.top + 1,
+            mediaContained: media.left >= player.left && media.right <= player.right
+                && media.top >= player.top && media.bottom <= controls.top + 1,
             videoCenterXOffset: Math.round(
                 (video.left + video.right - media.left - media.right) / 2,
             ),
@@ -132,10 +133,8 @@ test('resumes in the built-in player, selects queue entries, and stops at the en
         };
     });
     expect(geometry).toEqual({
-        queueTopInset: 0,
-        queueBottomInset: 0,
-        mediaTopInset: 0,
-        mediaBottomInset: 0,
+        queueContained: true,
+        mediaContained: true,
         videoCenterXOffset: 0,
         videoCenterYOffset: 0,
     });

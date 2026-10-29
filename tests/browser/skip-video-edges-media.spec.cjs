@@ -44,20 +44,32 @@ test('real fullscreen crossfade prebuffers at the incoming start and retains its
     await expect.poll(() => page.locator('#playerStandby').evaluate(video => video.seeking)).toBe(false);
     expect(await page.locator('#playerStandby').evaluate(video => video.currentTime)).toBeCloseTo(10, 1);
     await page.mouse.move(500, 350);
-    await page.getByRole('button', { name: 'Fullscreen', exact: true }).click({ force: true });
-    await expect.poll(() => page.evaluate(() => document.fullscreenElement?.id)).toBe('playerMediaStage');
+    await page.getByRole('button', { name: 'Enter fullscreen', exact: true }).click({ force: true });
+    await expect.poll(() => page.evaluate(() => document.fullscreenElement?.id)).toBe('playerContainer');
     await page.evaluate(() => {
         window.__edgeOutgoing = document.getElementById('playerVideo');
         window.__edgeOutgoing.currentTime = 16.8;
     });
     await expect.poll(() => page.evaluate(() => Boolean(playerPreparation?.fade))).toBe(true);
+    await page.evaluate(() => {
+        window.__edgeFade = playerPreparation;
+        window.__edgeOutgoingEmptied = false;
+        window.__edgeOutgoing.addEventListener('emptied', () => {
+            window.__edgeOutgoingEmptied = true;
+        }, { once: true });
+    });
     await expect.poll(() => page.locator('#playerVideo').evaluate(video => video.currentTime)).toBeGreaterThan(10);
-    await expect.poll(() => page.evaluate(() => playerPreparation === null), {
+    // A trimmed successor can immediately prepare another item. Track this
+    // overlap's completion instead of requiring a gap between preparations.
+    await expect.poll(() => page.evaluate(() => !window.__edgeFade.fade
+        && playerPreparation !== window.__edgeFade), {
         timeout: 4500, intervals: [100],
     }).toBe(true);
     const time = await page.locator('#playerVideo').evaluate(video => video.currentTime);
     expect(time).toBeGreaterThan(12.5);
     expect(time).toBeLessThan(14.5);
-    await expect(page.locator('#playerStandby source')).toHaveCount(0);
-    expect(await page.evaluate(() => document.fullscreenElement?.id)).toBe('playerMediaStage');
+    await expect.poll(() => page.evaluate(() => window.__edgeOutgoingEmptied)).toBe(true);
+    expect(await page.evaluate(() => window.__edgeOutgoing.paused)).toBe(true);
+    await expect(page.locator('#playerStandby')).toHaveAttribute('aria-hidden', 'true');
+    expect(await page.evaluate(() => document.fullscreenElement?.id)).toBe('playerContainer');
 });

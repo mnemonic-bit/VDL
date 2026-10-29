@@ -121,7 +121,7 @@ for (const mode of ['sequential', 'shuffle']) {
         expect(overlap.volumes[0]).toBeCloseTo(0.8 * Math.SQRT1_2);
         expect(overlap.volumes[1]).toBeCloseTo(0.8 * Math.SQRT1_2);
         expect(overlap.moving).toBe(true);
-        expect(overlap.controls).toEqual([false, true]);
+        expect(overlap.controls).toEqual([false, false]);
         await clock(page, 30, 3);
         await expect.poll(() => page.evaluate(() => playerPreparation)).toBeNull();
         expect(await page.locator('#playerVideo').evaluate(video => video.currentTime)).toBe(3);
@@ -313,10 +313,10 @@ test('Stop during overlap completes the switch and releases standby while preser
 test('standard fullscreen uses the stable media stage across the swap', async ({ page }) => {
     await start(page);
     await page.evaluate(() => requestPlayerFullscreen());
-    await expect.poll(() => page.evaluate(() => document.fullscreenElement?.id)).toBe('playerMediaStage');
+    await expect.poll(() => page.evaluate(() => document.fullscreenElement?.id)).toBe('playerContainer');
     await fade(page);
-    await expect(page.getByRole('button', { name: 'Close fullscreen player' })).toBeVisible();
-    expect(await page.evaluate(() => document.fullscreenElement?.id)).toBe('playerMediaStage');
+    await expect(page.getByRole('button', { name: 'Close player', exact: true })).toBeVisible();
+    expect(await page.evaluate(() => document.fullscreenElement?.id)).toBe('playerContainer');
     await page.evaluate(() => document.exitFullscreen());
     await expect(page.locator('#playerReturnFullscreen')).toBeVisible();
     expect(await page.evaluate(() => endlessPlayback.active)).toBe(true);

@@ -451,6 +451,7 @@ async function apiFetch(url, options) {
             options?.signal?.throwIfAborted();
             const res = await fetch(url, options);
             if (res.status === 401) {
+                resetPlayerListening();
                 window.location.assign('/login');
                 throw Object.assign(new Error('Your session has ended. Sign in again.'), { retryable: false });
             }
@@ -4040,7 +4041,7 @@ const _VIDEO_MIME = {
     flac: 'audio/flac', wav: 'audio/wav',
 };
 
-const PLAYER_CONTROLS_IDLE_MS = 2000;
+const PLAYER_CONTROLS_IDLE_MS = 3000;
 const PLAYER_HANDOFF_TIMEOUT_MS = 20_000;
 const PLAYBACK_KEEPALIVE_MS = 5 * 60 * 1000;
 const PLAYLIST_PROGRESS_SAVE_MS = 10 * 1000;
@@ -4083,10 +4084,349 @@ const PLAYER_FADE_SECONDS = 3;
 let playerPreparation = null;
 const playerMediaWaiting = new WeakSet();
 const playerMediaTimes = new WeakMap();
+const playerMediaProgressing = new WeakSet();
 
 // Each media load owns its preference snapshot and original-timeline bounds.
 // Keeping this on the element also preserves the incoming clock across a fade.
 const playerBoundaries = new WeakMap();
+
+// Listening choices belong to the page session, independently of fade gains.
+const playerListening = { volume: 1, muted: false, rate: 1 };
+let playerControlsReady = false;
+let playerSeekDrag = null;
+let playerSliderInteraction = false;
+let playerReturnFocus = null;
+let playerVolumeSupported = true;
+let playerFullscreenRequest = 0;
+
+function playerControl(id) { return document.getElementById(id); }
+function playerIsOpen() { return playerControl('playerBackdrop').classList.contains('open'); }
+function playerInFullscreen() {
+    return Boolean(document.fullscreenElement && [playerControl('playerContainer'), playerControl('playerMediaStage'), playerControl('playerVideo')]
+        .includes(document.fullscreenElement)) || endlessPlayback.presentation === 'webkit-fullscreen';
+}
+function playerClock(seconds) {
+    if (!Number.isFinite(seconds) || seconds < 0) return '--:--';
+    const whole = Math.floor(seconds);
+    const second = String(whole % 60).padStart(2, '0');
+    const minutes = Math.floor(whole / 60);
+    return minutes >= 60 ? `${Math.floor(minutes / 60)}:${String(minutes % 60).padStart(2, '0')}:${second}`
+        : `${minutes}:${second}`;
+}
+function playerSpokenTime(seconds) {
+    if (!Number.isFinite(seconds) || seconds < 0) return 'unavailable';
+    const whole = Math.floor(seconds);
+    const hours = Math.floor(whole / 3600);
+    const minutes = Math.floor(whole % 3600 / 60);
+    const remaining = whole % 60;
+    return [hours && `${hours} ${hours === 1 ? 'hour' : 'hours'}`,
+        minutes && `${minutes} ${minutes === 1 ? 'minute' : 'minutes'}`,
+        (!hours && !minutes || remaining) && `${remaining} ${remaining === 1 ? 'second' : 'seconds'}`]
+        .filter(Boolean).join(' ');
+}
+function playerNavigationBusy() {
+    return endlessPlayback.advancePending || Boolean(playerPreparation?.committing
+        || playerPreparation?.starting || (playerPreparation?.response && !playerPreparation.fade));
+}
+function playerRecoveryActive() {
+    return !playerControl('playerTransition').hidden
+        && ['playerContinue', 'playerRetry', 'playerRestart', 'playerSkip', 'playerStopEndless',
+            'playerPlaybackSettings'].some(id => !playerControl(id).hidden);
+}
+function adjacentPlaylistItem(direction) {
+    if (endlessPlayback.playlistPosition === null) return null;
+    for (let index = endlessPlayback.playlistPosition + direction;
+        index >= 0 && index < endlessPlayback.playlistQueue.length; index += direction) {
+        const item = endlessPlayback.playlistQueue[index];
+        if (item.id && !item.unavailable) return item;
+    }
+    return null;
+}
+function playerCanSeek(video) {
+    return Number.isFinite(video.duration) && video.duration > 0
+        && video.readyState >= HTMLMediaElement.HAVE_METADATA && video.seekable.length > 0;
+}
+function syncPlayerControls() {
+    if (!playerControlsReady || !playerIsOpen()) return;
+    const video = playerControl('playerVideo');
+    const paused = video.paused || video.ended;
+    const play = playerControl('playerPlayPause');
+    play.setAttribute('aria-label', paused ? 'Play' : 'Pause');
+    play.title = paused ? 'Play' : 'Pause';
+    play.querySelector('use')?.setAttribute('href', paused ? '#i-play' : '#i-pause');
+    play.disabled = playerRecoveryActive() || (endlessPlayback.active
+        && ['opening', 'advancing', 'create-failed'].includes(endlessPlayback.phase));
+    playerControl('playerTitle').textContent = endlessPlayback.currentItem?.title || 'Video playback';
+    const mode = playerControl('playerModeLabel');
+    mode.textContent = endlessPlayback.active ? ({ sequential: 'Play All', shuffle: 'Shuffle',
+        shuffle_clips: 'Shuffle Clips', playlist: 'Playlist' })[endlessPlayback.mode] || '' : '';
+    mode.hidden = !mode.textContent;
+    const seek = playerControl('playerSeek');
+    if (playerSeekDrag && (playerSeekDrag.video !== video
+            || playerSeekDrag.generation !== endlessPlayback.loadGeneration)) playerSeekDrag = null;
+    const position = playerSeekDrag ? Number(seek.value) : video.currentTime;
+    seek.disabled = !playerCanSeek(video) || playerRecoveryActive();
+    seek.max = Number.isFinite(video.duration) && video.duration > 0 ? String(video.duration) : '0';
+    if (!playerSeekDrag) seek.value = Number.isFinite(position) ? String(position) : '0';
+    seek.setAttribute('aria-valuetext', `${playerSpokenTime(position)} of ${playerSpokenTime(video.duration)}`);
+    playerControl('playerTime').textContent = `${playerClock(position)} / ${playerClock(video.duration)}`;
+    playerControl('playerVolume').value = String(Math.round(playerListening.volume * 100));
+    playerControl('playerVolume').setAttribute('aria-valuetext', `${Math.round(playerListening.volume * 100)}%`);
+    playerControl('playerVolume').disabled = !playerVolumeSupported;
+    playerControl('playerVolumeHint').hidden = playerVolumeSupported;
+    const mute = playerControl('playerMute');
+    // Fade gain callbacks can briefly report a backend's implicit startup mute.
+    // Its control represents the listening choice that the envelope restores.
+    const muted = playerPreparation?.fade ? playerListening.muted : video.muted;
+    mute.setAttribute('aria-pressed', String(muted));
+    mute.setAttribute('aria-label', muted ? 'Unmute' : 'Mute');
+    mute.title = muted ? 'Unmute' : 'Mute';
+    mute.querySelector('use')?.setAttribute('href', muted ? '#i-muted' : '#i-volume');
+    const speed = playerControl('playerSpeed');
+    if (![...speed.options].some(option => option.value === String(video.playbackRate))) {
+        for (const option of speed.querySelectorAll('[data-actual-rate]')) option.remove();
+        const option = new Option(`${video.playbackRate}×`, String(video.playbackRate));
+        option.dataset.actualRate = 'true';
+        speed.add(option);
+    }
+    speed.value = String(video.playbackRate);
+    const previous = playerControl('playerPrevious');
+    const next = playerControl('playerNext');
+    previous.hidden = !endlessPlayback.active || endlessPlayback.mode !== 'playlist';
+    next.hidden = !endlessPlayback.active;
+    const busy = playerNavigationBusy() || playerRecoveryActive() || !endlessPlayback.sessionId;
+    previous.disabled = busy || !adjacentPlaylistItem(-1);
+    next.disabled = busy || (endlessPlayback.mode === 'playlist' && !adjacentPlaylistItem(1));
+    for (const button of playerControl('playlistQueueItems').querySelectorAll('button')) button.disabled = busy;
+    const queueToggle = playerControl('playerQueueToggle');
+    queueToggle.hidden = !endlessPlayback.active || endlessPlayback.mode !== 'playlist';
+    queueToggle.setAttribute('aria-expanded', String(!playerControl('playlistQueue').hidden));
+    queueToggle.setAttribute('aria-label', playerControl('playlistQueue').hidden ? 'Show playlist queue' : 'Hide playlist queue');
+    const fullscreen = playerControl('playerFullscreen');
+    const supported = Boolean((document.fullscreenEnabled !== false
+        && (playerControl('playerContainer').requestFullscreen || video.requestFullscreen))
+        || video.webkitEnterFullscreen);
+    fullscreen.disabled = !supported;
+    const fullscreenHint = playerControl('playerFullscreenHint');
+    if (fullscreenHint) fullscreenHint.hidden = supported;
+    fullscreen.setAttribute('aria-label', playerInFullscreen() ? 'Exit fullscreen' : 'Enter fullscreen');
+    fullscreen.title = supported ? fullscreen.getAttribute('aria-label') : 'Fullscreen is unavailable in this browser';
+    fullscreen.querySelector('use')?.setAttribute('href', playerInFullscreen() ? '#i-exit-fullscreen' : '#i-fullscreen');
+}
+function applyPlayerListening(video) {
+    try { video.volume = playerListening.volume; } catch (_error) { playerVolumeSupported = false; }
+    // WebKit restores the default mute state when a new source starts playing.
+    video.defaultMuted = playerListening.muted;
+    video.muted = playerListening.muted;
+    try { video.defaultPlaybackRate = playerListening.rate; video.playbackRate = playerListening.rate; } catch (_error) { /* Retain the engine's accepted rate. */ }
+}
+function updatePlayerListening({ volume, muted, rate } = {}) {
+    const active = playerControl('playerVideo');
+    if (volume !== undefined) playerListening.volume = Math.max(0, Math.min(1, volume));
+    if (muted !== undefined) playerListening.muted = muted;
+    if (rate !== undefined) {
+        try { active.playbackRate = rate; } catch (_error) { /* Read back the accepted value below. */ }
+        playerListening.rate = active.playbackRate;
+    }
+    const preparation = playerPreparation;
+    if (preparation?.fade) {
+        preparation.baseVolume = playerListening.volume;
+        preparation.muted = playerListening.muted;
+        // The next envelope write must not interpret its old gain as user input.
+        preparation.newVolume = NaN;
+        preparation.incoming.defaultMuted = preparation.outgoing.defaultMuted = playerListening.muted;
+        preparation.incoming.muted = preparation.outgoing.muted = playerListening.muted;
+        preparation.incoming.defaultPlaybackRate = preparation.outgoing.defaultPlaybackRate = playerListening.rate;
+        preparation.incoming.playbackRate = preparation.outgoing.playbackRate = playerListening.rate;
+        applyPlayerFade(preparation);
+    } else {
+        for (const video of playerControl('playerMediaStage').querySelectorAll('video')) applyPlayerListening(video);
+        if (Math.abs(active.volume - playerListening.volume) > 0.01) playerVolumeSupported = false;
+        playerListening.volume = active.volume;
+    }
+    syncPlayerControls();
+    showPlayerControls();
+}
+function commitPlayerSeek(value, drag = null) {
+    const video = playerControl('playerVideo');
+    if (drag && (drag.video !== video || drag.generation !== endlessPlayback.loadGeneration)) return;
+    if (!playerCanSeek(video)) { syncPlayerControls(); return; }
+    let target = Math.max(0, Math.min(video.duration, Number(value)));
+    if (!Number.isFinite(target)) { syncPlayerControls(); return; }
+    let nearest = null;
+    let distance = Infinity;
+    for (let index = 0; index < video.seekable.length; index++) {
+        const start = Math.max(0, video.seekable.start(index));
+        const end = Math.min(video.duration, video.seekable.end(index));
+        const candidate = Math.max(start, Math.min(end, target));
+        if (Math.abs(candidate - target) < distance) {
+            nearest = candidate;
+            distance = Math.abs(candidate - target);
+        }
+    }
+    if (nearest === null) { syncPlayerControls(); return; }
+    if (playerPreparation?.fade) finishPlayerFade();
+    try { video.currentTime = nearest; } catch (_error) { /* Keep the actual media clock on failure. */ }
+    syncPlayerControls();
+}
+function navigatePlayer(direction) {
+    if (!endlessPlayback.active || playerNavigationBusy() || playerRecoveryActive()) return;
+    if (playerPreparation?.fade) finishPlayerFade();
+    if (endlessPlayback.mode === 'playlist') {
+        const item = adjacentPlaylistItem(direction);
+        if (item) selectPlaylistQueueItem(item.id);
+    } else if (direction === 1) advanceEndlessPlayback();
+    syncPlayerControls();
+}
+function togglePlayerFullscreen() {
+    if (!playerInFullscreen()) { requestPlayerFullscreen(); return; }
+    if (document.fullscreenElement) {
+        try { Promise.resolve(document.exitFullscreen()).catch(() => {}); } catch (_error) { /* Browser owns exit. */ }
+    } else playerControl('playerVideo').webkitExitFullscreen?.();
+}
+function resetPlayerListening() {
+    closePlayer();
+    Object.assign(playerListening, { volume: 1, muted: false, rate: 1 });
+    for (const video of playerControl('playerMediaStage').querySelectorAll('video')) applyPlayerListening(video);
+}
+function initializePlayerControls() {
+    const container = playerControl('playerContainer');
+    const controls = playerControl('playerControls');
+    const ids = ['playerTitle', 'playerModeLabel', 'playerPlayPause', 'playerMute', 'playerPrevious',
+        'playerNext', 'playerFullscreen', 'playerQueueToggle', 'playerSeek', 'playerVolume',
+        'playerSpeed', 'playerTime', 'playerVolumeHint'];
+    if (!container || !controls || ids.some(id => !playerControl(id))) return;
+    const abort = new AbortController();
+    const listen = (node, type, callback, options = {}) => node.addEventListener(type, callback,
+        { ...options, signal: abort.signal });
+    try {
+        listen(playerControl('playerPlayPause'), 'click', () => togglePlayerPlayback());
+        listen(playerControl('playerMute'), 'click', () => updatePlayerListening({
+            muted: playerPreparation?.fade ? !playerListening.muted : !playerControl('playerVideo').muted,
+        }));
+        listen(playerControl('playerVolume'), 'input', event => updatePlayerListening({ volume: Number(event.target.value) / 100 }));
+        listen(playerControl('playerSpeed'), 'change', event => updatePlayerListening({ rate: Number(event.target.value) }));
+        listen(playerControl('playerPrevious'), 'click', () => navigatePlayer(-1));
+        listen(playerControl('playerNext'), 'click', () => navigatePlayer(1));
+        listen(playerControl('playerFullscreen'), 'click', togglePlayerFullscreen);
+        listen(playerControl('playerQueueToggle'), 'click', () => {
+            const queue = playerControl('playlistQueue');
+            queue.hidden = !queue.hidden;
+            container.classList.toggle('playlist-queue-collapsed', queue.hidden);
+            syncPlayerControls();
+            showPlayerControls();
+        });
+        const seek = playerControl('playerSeek');
+        let pointerSeekCommitted = false;
+        listen(seek, 'keydown', () => { pointerSeekCommitted = false; });
+        listen(seek, 'pointerdown', event => {
+            if (seek.disabled) return;
+            pointerSeekCommitted = true;
+            playerSeekDrag = { video: playerControl('playerVideo'), generation: endlessPlayback.loadGeneration,
+                pointerId: event.pointerId };
+            showPlayerControls();
+        });
+        listen(seek, 'input', () => {
+            if (playerSeekDrag) syncPlayerControls();
+        });
+        listen(seek, 'change', () => {
+            if (!playerSeekDrag && !pointerSeekCommitted) commitPlayerSeek(seek.value);
+        });
+        // Native ranges own thumb capture. Explicit capture prevents WebKit's
+        // thumb from moving; observing the document still handles outside release.
+        listen(document, 'pointerup', event => {
+            if (!playerSeekDrag || event.pointerId !== playerSeekDrag.pointerId) return;
+            const drag = playerSeekDrag;
+            const target = seek.value;
+            playerSeekDrag = null;
+            pointerSeekCommitted = true;
+            commitPlayerSeek(target, drag);
+        });
+        for (const [target, name] of [[document, 'pointercancel'], [seek, 'lostpointercapture']]) {
+            listen(target, name, event => {
+                if (!playerSeekDrag || event.pointerId !== playerSeekDrag.pointerId) return;
+                playerSeekDrag = null;
+                pointerSeekCommitted = true;
+                syncPlayerControls();
+            });
+        }
+        for (const range of controls.querySelectorAll('input[type="range"]')) {
+            listen(range, 'pointerdown', () => { playerSliderInteraction = true; showPlayerControls(); });
+            for (const name of ['pointerup', 'pointercancel', 'lostpointercapture']) {
+                listen(range, name, () => { playerSliderInteraction = false; showPlayerControls(); });
+            }
+        }
+        for (const name of ['pointerup', 'pointercancel']) {
+            listen(document, name, () => {
+                if (!playerSliderInteraction) return;
+                playerSliderInteraction = false;
+                showPlayerControls();
+            });
+        }
+        listen(container, 'pointermove', showPlayerControls);
+        listen(container, 'pointerdown', showPlayerControls);
+        listen(container, 'keydown', event => {
+            showPlayerControls();
+            if (event.key !== 'Tab') return;
+            const focusable = [...container.querySelectorAll('button, input, select, [tabindex="0"]')]
+                .filter(node => !node.disabled && !node.closest('[hidden], [inert]') && node.getClientRects().length);
+            const first = focusable[0];
+            const last = focusable[focusable.length - 1];
+            if (!first) { event.preventDefault(); container.focus(); }
+            else if (event.shiftKey && (document.activeElement === first || document.activeElement === container)) {
+                event.preventDefault(); last.focus();
+            } else if (!event.shiftKey && (document.activeElement === last || document.activeElement === container)) {
+                event.preventDefault(); first.focus();
+            }
+        });
+        listen(container, 'focusin', showPlayerControls);
+        listen(container, 'focusout', () => { setTimeout(() => { if (playerIsOpen()) showPlayerControls(); }, 0); });
+        listen(controls, 'pointerleave', showPlayerControls);
+        listen(document, 'focusin', event => {
+            if (playerIsOpen() && !container.contains(event.target)) {
+                showPlayerControls(); container.focus({ preventScroll: true });
+            }
+        });
+        for (const video of playerControl('playerMediaStage').querySelectorAll('video')) {
+            for (const name of ['loadedmetadata', 'loadeddata', 'durationchange', 'progress', 'timeupdate',
+                'play', 'playing', 'pause', 'ended', 'waiting', 'stalled', 'canplay', 'seeking', 'seeked', 'emptied', 'error']) {
+                listen(video, name, () => {
+                    if (video.id !== 'playerVideo') return;
+                    if (playerIsOpen() && !endlessPlayback.active) {
+                        if (name === 'waiting'
+                                || (name === 'stalled' && !playerMediaProgressing.has(video))) {
+                            showPlayerTransition('Buffering…', []);
+                        }
+                        else if (name === 'canplay' && playerControl('playerStatus').textContent === 'Buffering…') {
+                            showPlayerTransition('', []);
+                        }
+                    }
+                    syncPlayerControls();
+                    if (['play', 'playing', 'pause', 'ended', 'waiting', 'error'].includes(name)
+                            || (name === 'stalled' && !playerMediaProgressing.has(video))) showPlayerControls();
+                });
+            }
+        }
+        listen(document, 'fullscreenchange', () => { syncPlayerControls(); showPlayerControls(); });
+        const logout = document.querySelector('form.logout-form');
+        if (logout) listen(logout, 'submit', resetPlayerListening);
+        playerControlsReady = true;
+        controls.hidden = false;
+        container.classList.add('custom-controls-ready');
+        for (const video of playerControl('playerMediaStage').querySelectorAll('video')) video.controls = false;
+        // Some mobile engines expose volume but ignore writes. A reversible
+        // capability probe keeps the initial listening level at 100 percent.
+        const video = playerControl('playerVideo');
+        try { video.volume = 0.5; playerVolumeSupported = video.volume === 0.5; video.volume = 1; }
+        catch (_error) { playerVolumeSupported = false; }
+    } catch (_error) {
+        abort.abort();
+        playerControlsReady = false;
+        controls.hidden = true;
+        container.classList.remove('custom-controls-ready');
+        playerControl('playerVideo').controls = true;
+    }
+}
 
 function playerBoundaryCurrent(video, state) {
     return playerBoundaries.get(video) === state
@@ -4456,6 +4796,9 @@ function currentPreparation(preparation) {
 }
 
 function unloadPlayerMedia(video) {
+    playerMediaProgressing.delete(video);
+    playerMediaTimes.delete(video);
+    playerMediaWaiting.delete(video);
     playerBoundaries.get(video)?.cleanup();
     video.pause();
     video.removeAttribute('src');
@@ -4467,7 +4810,7 @@ function unloadPlayerMedia(video) {
 
 function setPlayerStandby(video, standby) {
     video.classList.toggle('player-standby', standby);
-    video.controls = !standby;
+    video.controls = !standby && !playerControlsReady;
     video.controlsList?.toggle('nofullscreen', endlessPlayback.active
         && ['sequential', 'shuffle', 'shuffle_clips'].includes(endlessPlayback.mode)
         && Boolean(document.getElementById('playerMediaStage').requestFullscreen));
@@ -4477,7 +4820,8 @@ function setPlayerStandby(video, standby) {
         video.setAttribute('tabindex', '-1');
     } else {
         video.removeAttribute('aria-hidden');
-        video.removeAttribute('tabindex');
+        if (playerControlsReady) video.setAttribute('tabindex', '-1');
+        else video.removeAttribute('tabindex');
     }
 }
 
@@ -4488,6 +4832,7 @@ function clearPlayerPreparation() {
     preparation.controller.abort();
     clearTimeout(preparation.timer);
     cancelAnimationFrame(preparation.frame);
+    clearTimeout(preparation.resumeTimer);
     preparation.cleanup?.();
     const standby = document.getElementById('playerStandby');
     unloadPlayerMedia(standby);
@@ -4508,35 +4853,76 @@ function finishPlayerFade() {
     outgoing.muted = muted;
     clearPlayerPreparation();
     endlessPlayback.handoffInProgress = false;
+    syncPlayerControls();
     if (endlessPlayback.mode === 'shuffle_clips') maybePreparePlayer();
+}
+
+function playerFadeVolumeIsGain(preparation, volume) {
+    return preparation.volumeGains?.some(gain => Math.abs(gain - volume) <= 0.0001) || false;
 }
 
 function applyPlayerFade(preparation) {
     if (!currentPreparation(preparation) || !preparation.fade) return;
+    let frozen = Boolean(preparation.controlPaused);
+    if (preparation.resumePending) {
+        const { outgoing, incoming } = preparation;
+        const progressing = ![outgoing, incoming].some(video => video.paused || video.seeking
+                || playerMediaWaiting.has(video) || !playerMediaProgressing.has(video))
+            && outgoing.currentTime >= preparation.resumeOutgoingTime + 0.05
+            && incoming.currentTime >= preparation.resumeIncomingTime + 0.05;
+        if (progressing) {
+            preparation.resumePending = false;
+            clearTimeout(preparation.resumeTimer);
+            // A resume can briefly rebuffer in WebKit. Retain the frozen envelope
+            // until both clocks move, then continue it from the same media-time gain.
+            if (preparation.resumeBuffered) {
+                preparation.startTime = outgoing.currentTime - preparation.progress * preparation.fadeDuration;
+            }
+        } else if (preparation.resumeBuffered) frozen = true;
+    }
     const { outgoing, incoming, startTime, fadeDuration } = preparation;
-    const progress = outgoing.ended ? 1 : Math.max(0, Math.min(1,
+    const progress = frozen ? preparation.progress : outgoing.ended ? 1 : Math.max(0, Math.min(1,
         (outgoing.currentTime - startTime) / fadeDuration,
     ));
     if (Number.isFinite(preparation.newVolume)
-            && Math.abs(incoming.volume - preparation.newVolume) > 0.0001) {
+            && Math.abs(incoming.volume - preparation.newVolume) > 0.0001
+            && !playerFadeVolumeIsGain(preparation, incoming.volume)) {
         preparation.baseVolume = incoming.volume;
+        playerListening.volume = incoming.volume;
+        playerListening.muted = incoming.muted;
     }
-    preparation.muted = incoming.muted;
+    // Native volume callbacks may carry an earlier gain and its old mute. The
+    // envelope must retain the listening choices supplied through the controls.
+    preparation.muted = playerListening.muted;
     preparation.progress = progress;
     incoming.style.opacity = preparation.reducedMotion ? '1' : String(progress);
     const oldVolume = preparation.baseVolume * Math.cos(Math.PI * progress / 2);
     const newVolume = preparation.baseVolume * Math.sin(Math.PI * progress / 2);
     preparation.oldVolume = oldVolume;
     preparation.newVolume = newVolume;
-    outgoing.volume = oldVolume;
-    incoming.volume = newVolume;
-    outgoing.muted = incoming.muted = preparation.muted;
+    preparation.volumeGains ||= [];
+    const previousGain = preparation.volumeGains[preparation.volumeGains.length - 1];
+    if (!Number.isFinite(previousGain) || Math.abs(previousGain - newVolume) > 0.0001) {
+        preparation.volumeGains.push(newVolume);
+        if (preparation.volumeGains.length > 512) preparation.volumeGains.shift();
+    }
+    // Media backends may round gains to float precision. Avoid rewriting an
+    // unchanged gain from its own volumechange callback and queueing it again.
+    if (Math.abs(outgoing.volume - oldVolume) > 0.000001) outgoing.volume = oldVolume;
+    if (Math.abs(incoming.volume - newVolume) > 0.000001) incoming.volume = newVolume;
+    if (outgoing.muted !== preparation.muted) outgoing.muted = preparation.muted;
+    if (incoming.muted !== preparation.muted) incoming.muted = preparation.muted;
     if (Math.abs(outgoing.volume - oldVolume) > 0.01
             || Math.abs(incoming.volume - newVolume) > 0.01) {
         failPlayerFade(preparation);
         return;
     }
     if (progress >= 1) finishPlayerFade();
+}
+
+function playerPauseAborted(error, preparation = playerPreparation) {
+    return error?.name === 'AbortError' && preparation?.fade && currentPreparation(preparation)
+        && preparation.controlPaused && preparation.incoming.paused && preparation.outgoing.paused;
 }
 
 function resumeBufferedClipFade(preparation) {
@@ -4546,7 +4932,9 @@ function resumeBufferedClipFade(preparation) {
     if ([incoming, outgoing].some(video => playerMediaWaiting.has(video)
             || video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA)) return;
     preparation.buffering = false;
-    Promise.all([incoming.play(), outgoing.play()]).catch(() => failPlayerFade(preparation));
+    Promise.all([incoming.play(), outgoing.play()]).catch(error => {
+        if (!playerPauseAborted(error, preparation)) failPlayerFade(preparation);
+    });
 }
 
 function playerFadeFrame(preparation) {
@@ -4560,6 +4948,8 @@ function playerFadeFrame(preparation) {
 function failPlayerFade(preparation) {
     if (!currentPreparation(preparation)) return;
     clearTimeout(preparation.timer);
+    clearTimeout(preparation.resumeTimer);
+    preparation.resumePending = false;
     if (endlessPlayback.mode === 'shuffle_clips' && preparation.item) {
         endlessPlayback.failedClipIds.add(String(preparation.item.id));
     }
@@ -4724,8 +5114,12 @@ function startPreparedClip(preparation) {
 
 function loadPreparedPlayer(preparation, item) {
     const { incoming } = preparation;
+    playerMediaProgressing.delete(incoming);
+    playerMediaTimes.delete(incoming);
+    playerMediaWaiting.delete(incoming);
     playerBoundaries.get(incoming)?.cleanup();
     preparation.item = item;
+    applyPlayerListening(incoming);
     incoming.preload = 'auto';
     incoming.autoplay = false;
     incoming.style.opacity = '0';
@@ -4744,6 +5138,7 @@ function loadPreparedPlayer(preparation, item) {
 async function commitPlayerFade(preparation) {
     preparation.committing = true;
     endlessPlayback.handoffInProgress = true;
+    syncPlayerControls();
     preparation.timer = setTimeout(() => preparation.controller.abort(), PLAYER_HANDOFF_TIMEOUT_MS);
     try {
         const response = await apiFetch(
@@ -4771,6 +5166,7 @@ async function commitPlayerFade(preparation) {
             ? JSON.parse(body) : null;
         if (!currentPreparation(preparation)) return;
         preparation.committing = false;
+        syncPlayerControls();
         clearTimeout(preparation.timer);
         const clip = endlessPlayback.mode === 'shuffle_clips';
         if (!clip && (preparation.ended || preparation.outgoing.ended)) {
@@ -4886,7 +5282,9 @@ function maybePreparePlayer() {
     incoming.addEventListener('playing', onPlaying);
     incoming.addEventListener('error', onFailure);
     const onWaiting = () => {
-        if (preparation.fade && endlessPlayback.mode !== 'shuffle_clips') failPlayerFade(preparation);
+        if (preparation.resumePending) preparation.resumeBuffered = true;
+        if (preparation.fade && endlessPlayback.mode !== 'shuffle_clips'
+                && !preparation.resumePending && !preparation.controlPaused) failPlayerFade(preparation);
     };
     incoming.addEventListener('waiting', onWaiting);
     preparation.cleanup = () => {
@@ -4930,26 +5328,56 @@ function maybePreparePlayer() {
 }
 
 function playerVolumeChanged(video) {
+    if (!playerIsOpen() || video.id !== 'playerVideo') return;
     const preparation = playerPreparation;
-    if (!preparation?.fade || video !== preparation.incoming) return;
-    if (Math.abs(video.volume - preparation.newVolume) > 0.0001) {
-        preparation.baseVolume = video.volume;
+    if (preparation?.fade) {
+        if (Math.abs(video.volume - preparation.newVolume) > 0.0001
+                && !playerFadeVolumeIsGain(preparation, video.volume)) {
+            playerListening.volume = video.volume;
+            preparation.baseVolume = playerListening.volume;
+            playerListening.muted = video.muted;
+        }
+        preparation.muted = playerListening.muted;
+        applyPlayerFade(preparation);
+    } else {
+        playerListening.volume = video.volume;
+        playerListening.muted = video.muted;
     }
-    preparation.muted = video.muted;
-    applyPlayerFade(preparation);
+    video.defaultMuted = playerListening.muted;
+    syncPlayerControls();
 }
 
-function hidePlayerControls() {
+function hidePlayerControls({ force = false } = {}) {
     clearTimeout(playerControlsTimer);
     playerControlsTimer = null;
-    document.querySelector('.player-box').classList.remove('player-controls-visible');
+    const video = playerControl('playerVideo');
+    const container = playerControl('playerContainer') || document.querySelector('.player-box');
+    const controls = playerControl('playerControls');
+    if (!force && playerIsOpen() && (video.paused || video.ended || video.seeking
+            || (video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA
+                && !(video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && playerMediaProgressing.has(video)))
+            || playerMediaWaiting.has(video)
+            || !playerControl('playerTransition').hidden || playerSeekDrag || playerSliderInteraction
+            || container.querySelector('.player-chrome :focus, #playerControls :focus, #playlistQueue :focus')
+            || controls?.matches(':hover') || container.querySelector('.player-chrome:hover')
+            || (!playerControl('playlistQueue').hidden && playerControl('playlistQueue').matches(':hover')))) return;
+    container.classList.remove('player-controls-visible');
+    if (playerControlsReady) {
+        controls.inert = true;
+        const chrome = container.querySelector('.player-chrome');
+        if (chrome) chrome.inert = true;
+    }
 }
 
 function showPlayerControls() {
-    const backdrop = document.getElementById('playerBackdrop');
-    if (!backdrop.classList.contains('open')) return;
-    const player = backdrop.querySelector('.player-box');
-    player.classList.add('player-controls-visible');
+    if (!playerIsOpen()) return;
+    const container = playerControl('playerContainer') || document.querySelector('.player-box');
+    container.classList.add('player-controls-visible');
+    if (playerControlsReady) {
+        playerControl('playerControls').inert = false;
+        const chrome = container.querySelector('.player-chrome');
+        if (chrome) chrome.inert = false;
+    }
     clearTimeout(playerControlsTimer);
     playerControlsTimer = setTimeout(hidePlayerControls, PLAYER_CONTROLS_IDLE_MS);
 }
@@ -4972,8 +5400,14 @@ function showPlayerTransition(message, actions = [], focusAction = null) {
         document.getElementById(id).hidden = !actions.includes(name);
     });
     transition.hidden = !message && actions.length === 0;
+    syncPlayerControls();
+    if (!transition.hidden) showPlayerControls();
     if (focusAction && actionIds[focusAction]) {
+        const epoch = endlessPlayback.epoch;
+        const generation = endlessPlayback.loadGeneration;
         setTimeout(() => {
+            if (!playerIsOpen() || epoch !== endlessPlayback.epoch
+                    || generation !== endlessPlayback.loadGeneration) return;
             const button = document.getElementById(actionIds[focusAction]);
             if (!transition.hidden && !button.hidden) button.focus();
         }, 0);
@@ -5036,9 +5470,12 @@ function markPlaybackStarted(generation) {
 }
 
 function handlePlaybackFailure(generation, message) {
-    if (!endlessPlayback.active
-            || generation !== endlessPlayback.loadGeneration
+    if (generation !== endlessPlayback.loadGeneration
             || endlessPlayback.failedGeneration === generation) return;
+    if (!endlessPlayback.active) {
+        if (playerIsOpen()) showPlayerTransition(message, ['close']);
+        return;
+    }
     clearPlaybackWatchdog();
     if (endlessPlayback.mode === 'shuffle_clips') {
         const video = document.getElementById('playerVideo');
@@ -5078,8 +5515,14 @@ function observePlaybackPromise(playback, generation) {
     playback.then(
         () => markPlaybackStarted(generation),
         error => {
-            if (generation !== endlessPlayback.loadGeneration
-                    || !endlessPlayback.active) return;
+            if (generation !== endlessPlayback.loadGeneration || playerPauseAborted(error)) return;
+            if (!endlessPlayback.active) {
+                if (playerIsOpen()) showPlayerTransition(
+                    error?.name === 'NotAllowedError' ? 'Your browser paused playback. Press Play to continue.'
+                        : 'Playback could not start. Press Play to try again.', [],
+                );
+                return;
+            }
             if (error && error.name === 'NotAllowedError') {
                 clearPlaybackWatchdog();
                 endlessPlayback.phase = 'awaiting-user';
@@ -5102,7 +5545,14 @@ function observePlaybackPromise(playback, generation) {
 function loadPlaybackItem(item, { automatic = false, seekSeconds = null, adopt = false, waitForRetry = false } = {}) {
     if (!adopt) clearPlayerPreparation();
     const video = document.getElementById('playerVideo');
+    if (!adopt) {
+        playerMediaProgressing.delete(video);
+        playerMediaTimes.delete(video);
+        playerMediaWaiting.delete(video);
+    }
     clearPlayerMediaCallbacks();
+    playerSeekDrag = null;
+    playerSliderInteraction = false;
     const generation = ++endlessPlayback.loadGeneration;
     const epoch = endlessPlayback.epoch;
     const boundary = adopt ? playerBoundaries.get(video)
@@ -5124,6 +5574,9 @@ function loadPlaybackItem(item, { automatic = false, seekSeconds = null, adopt =
     endlessPlayback.currentItem = item;
     endlessPlayback.currentDownloadId = String(item.id);
     setPlayerStandby(video, false);
+    if (!adopt) applyPlayerListening(video);
+    syncPlayerControls();
+    showPlayerControls();
     video.style.removeProperty('width');
     video.style.removeProperty('height');
 
@@ -5144,7 +5597,16 @@ function loadPlaybackItem(item, { automatic = false, seekSeconds = null, adopt =
     });
     const onResize = current(() => applyOriginalPlayerSize(generation));
     const onCanPlay = current(() => { if (!boundary?.clip) armPlaybackWatchdog(generation); });
-    const onPlaying = current(() => markPlaybackStarted(generation));
+    let listeningPending = !adopt;
+    const onPlaying = current(() => {
+        // WebKit can restore its prior output mute on source startup, after
+        // metadata. Reconcile once, then let ordinary mute events stay authoritative.
+        if (listeningPending) {
+            listeningPending = false;
+            if (playerListening.muted && !video.muted) video.muted = true;
+        }
+        markPlaybackStarted(generation);
+    });
     const onError = current(() => {
         if (playerPreparation?.fade) failPlayerFade(playerPreparation);
         else handlePlaybackFailure(
@@ -5194,14 +5656,23 @@ function loadPlaybackItem(item, { automatic = false, seekSeconds = null, adopt =
 }
 
 function requestPlayerFullscreen({ launch = false } = {}) {
+    const epoch = endlessPlayback.epoch;
+    const requestId = ++playerFullscreenRequest;
+    const current = () => playerIsOpen() && epoch === endlessPlayback.epoch
+        && requestId === playerFullscreenRequest;
     const video = document.getElementById('playerVideo');
     try {
-        const target = endlessPlayback.active && ['sequential', 'shuffle', 'shuffle_clips'].includes(endlessPlayback.mode)
-            ? document.getElementById('playerMediaStage') : video;
-        if (target.requestFullscreen) {
+        if (playerInFullscreen()) return;
+        const container = playerControl('playerContainer');
+        const target = document.fullscreenEnabled === false ? null
+            : container?.requestFullscreen ? container : video;
+        if (target?.requestFullscreen) {
+            if (target === video) video.controls = true;
             if (launch) playerStartedFullscreen = true;
             const request = target.requestFullscreen();
             if (request) request.catch(() => {
+                if (!current()) return;
+                video.controls = !playerControlsReady;
                 if (launch) {
                     playerStartedFullscreen = false;
                     endlessPlayback.launchProvenance = 'original';
@@ -5217,10 +5688,13 @@ function requestPlayerFullscreen({ launch = false } = {}) {
             return;
         }
         if (video.webkitEnterFullscreen) {
+            video.controls = true;
             if (launch) playerStartedFullscreen = true;
             video.webkitEnterFullscreen();
         }
     } catch (error) {
+        if (!current()) return;
+        video.controls = !playerControlsReady;
         if (launch) {
             playerStartedFullscreen = false;
             endlessPlayback.launchProvenance = 'original';
@@ -5238,8 +5712,12 @@ function requestPlayerFullscreen({ launch = false } = {}) {
 
 function openBuiltInPlayer({ fullscreen = false, requestFullscreen = true } = {}) {
     const backdrop = document.getElementById('playerBackdrop');
-    hidePlayerControls();
+    if (!backdrop.classList.contains('open')) playerReturnFocus = document.activeElement;
     backdrop.classList.add('open');
+    backdrop.querySelector('.player-box').classList.remove('playlist-queue-collapsed');
+    showPlayerControls();
+    syncPlayerControls();
+    if (playerControlsReady) playerControl('playerContainer').focus({ preventScroll: true });
     document.getElementById('playerMediaStage').classList.toggle('player-continuous',
         endlessPlayback.active && ['sequential', 'shuffle', 'shuffle_clips'].includes(endlessPlayback.mode));
     endlessPlayback.launchProvenance = fullscreen ? 'fullscreen' : 'original';
@@ -5317,11 +5795,17 @@ function closePlayer() {
     const backdrop = document.getElementById('playerBackdrop');
     const video = document.getElementById('playerVideo');
     const closeButton = backdrop.querySelector('.player-close');
+    if (video.webkitDisplayingFullscreen || endlessPlayback.presentation === 'webkit-fullscreen') {
+        playerStartedFullscreen = false;
+        endlessPlayback.presentation = 'original';
+        try { video.webkitExitFullscreen?.(); } catch (_error) { /* Cleanup still closes the overlay. */ }
+    }
     if (endlessPlayback.active && endlessPlayback.mode === 'playlist') {
         savePlaylistProgress({ force: true, keepalive: true });
     }
     endlessPlayback.epoch += 1;
     endlessPlayback.loadGeneration += 1;
+    playerFullscreenRequest += 1;
     deactivateEndlessPlayback();
     clearPlayerMediaCallbacks();
     endlessPlayback.phase = 'idle';
@@ -5336,7 +5820,9 @@ function closePlayer() {
     clearInterval(endlessPlayback.progressTimer);
     endlessPlayback.progressTimer = null;
     playerStartedFullscreen = false;
-    hidePlayerControls();
+    playerSeekDrag = null;
+    playerSliderInteraction = false;
+    hidePlayerControls({ force: true });
     showPlayerTransition('', []);
     if (document.activeElement === closeButton) closeButton.blur();
     playerBoundaries.get(video)?.cleanup();
@@ -5347,9 +5833,17 @@ function closePlayer() {
     video.innerHTML = '';
     video.load();
     backdrop.classList.remove('open');
+    clearTimeout(playerControlsTimer);
+    playerControlsTimer = null;
+    const restoreFocus = [playerReturnFocus, document.getElementById('historySearchToggle'),
+        document.getElementById('endlessPlaybackButton')].find(target => target?.isConnected
+            && target !== document.body && !target.disabled
+            && !target.closest('[hidden], [inert]') && target.getClientRects().length);
+    playerReturnFocus = null;
+    restoreFocus?.focus({ preventScroll: true });
     backdrop.querySelector('.player-box').classList.remove('playlist-player');
     document.getElementById('playlistQueue').hidden = true;
-    if (document.fullscreenElement === document.getElementById('playerMediaStage')) {
+    if (document.fullscreenElement && [playerControl('playerContainer'), playerControl('playerMediaStage'), video].includes(document.fullscreenElement)) {
         document.exitFullscreen()?.catch(() => {});
     }
 }
@@ -5542,11 +6036,17 @@ function startPlaylistPlayback(playlistId, restart = false) {
 
 async function selectPlaylistQueueItem(downloadId) {
     if (endlessPlayback.mode !== 'playlist' || !endlessPlayback.sessionId
-            || endlessPlayback.advancePending
+            || playerNavigationBusy()
             || String(downloadId) === endlessPlayback.currentDownloadId) return;
-    const saved = await savePlaylistProgress({ force: true });
-    if (!saved) return;
     const epoch = endlessPlayback.epoch;
+    endlessPlayback.advancePending = true;
+    syncPlayerControls();
+    const saved = await savePlaylistProgress({ force: true });
+    if (!saved || epoch !== endlessPlayback.epoch || !endlessPlayback.active) {
+        if (epoch === endlessPlayback.epoch) endlessPlayback.advancePending = false;
+        syncPlayerControls();
+        return;
+    }
     const sequence = endlessPlayback.sequence + 1;
     const expectedId = endlessPlayback.currentDownloadId;
     endlessPlayback.advancePending = true;
@@ -5584,6 +6084,7 @@ async function selectPlaylistQueueItem(downloadId) {
         );
     } finally {
         if (epoch === endlessPlayback.epoch) endlessPlayback.advancePending = false;
+        syncPlayerControls();
     }
 }
 
@@ -5684,6 +6185,7 @@ function startEndlessPlayback(id = null, label = '', extension = '', mode = 'seq
         endlessPlayback.sequence = data.sequence;
         endlessPlayback.currentDownloadId = String(data.item.id);
         startPlaybackKeepalive(epoch);
+        syncPlayerControls();
         if (!id || String(id) !== String(data.item.id)) {
             loadPlaybackItem(data.item, { automatic: true });
             if (mode !== 'shuffle_clips') recordView(data.item.id);
@@ -5794,6 +6296,7 @@ function advanceEndlessPlayback(completed = false, preparedResponse = null, reco
         );
     }).finally(() => {
         if (epoch === endlessPlayback.epoch) endlessPlayback.advancePending = false;
+        syncPlayerControls();
     });
 }
 
@@ -5894,6 +6397,8 @@ function returnEndlessFullscreen() {
 }
 
 function handleFullscreenExit() {
+    const video = playerControl('playerVideo');
+    video.controls = !playerControlsReady;
     const backdrop = document.getElementById('playerBackdrop');
     if (!backdrop.classList.contains('open')) return;
     endlessPlayback.presentation = 'original';
@@ -5911,8 +6416,7 @@ function handleFullscreenExit() {
 }
 
 document.addEventListener('fullscreenchange', () => {
-    if (document.fullscreenElement === document.getElementById('playerVideo')
-            || document.fullscreenElement === document.getElementById('playerMediaStage')) {
+    if (document.fullscreenElement && [playerControl('playerContainer'), playerControl('playerMediaStage'), playerControl('playerVideo')].includes(document.fullscreenElement)) {
         endlessPlayback.presentation = 'standard-fullscreen';
         return;
     }
@@ -5920,16 +6424,38 @@ document.addEventListener('fullscreenchange', () => {
 });
 
 for (const video of document.querySelectorAll('#playerMediaStage video')) {
+    let nativeFullscreenEpoch = null;
     video.addEventListener('webkitbeginfullscreen', () => {
+        nativeFullscreenEpoch = endlessPlayback.epoch;
+        video.controls = true;
         endlessPlayback.presentation = 'webkit-fullscreen';
+        syncPlayerControls();
     });
-    video.addEventListener('webkitendfullscreen', handleFullscreenExit);
+    video.addEventListener('webkitendfullscreen', () => {
+        video.controls = !playerControlsReady;
+        if (nativeFullscreenEpoch !== endlessPlayback.epoch) {
+            nativeFullscreenEpoch = null;
+            return;
+        }
+        nativeFullscreenEpoch = null;
+        handleFullscreenExit();
+        syncPlayerControls();
+        showPlayerControls();
+    });
     video.addEventListener('timeupdate', () => {
         const previousTime = playerMediaTimes.get(video);
         // WebKit can keep HAVE_CURRENT_DATA after a seek even as its clock
         // advances. Actual forward progress also proves that waiting ended.
         if (video.currentTime > previousTime && !video.seeking && !video.paused) {
+            const resumed = !playerMediaProgressing.has(video);
+            playerMediaProgressing.add(video);
             playerMediaWaiting.delete(video);
+            if (video.id === 'playerVideo' && playerIsOpen()) {
+                if (!endlessPlayback.active && playerControl('playerStatus').textContent === 'Buffering…') {
+                    showPlayerTransition('', []);
+                }
+                if (resumed) showPlayerControls();
+            }
         }
         playerMediaTimes.set(video, video.currentTime);
         checkPlayerBoundary(video);
@@ -5941,6 +6467,7 @@ for (const video of document.querySelectorAll('#playerMediaStage video')) {
         if (video.id === 'playerVideo') maybePreparePlayer();
     });
     video.addEventListener('waiting', () => {
+        playerMediaProgressing.delete(video);
         playerMediaWaiting.add(video);
         playerMediaTimes.set(video, video.currentTime);
         const preparation = playerPreparation;
@@ -5960,6 +6487,7 @@ for (const video of document.querySelectorAll('#playerMediaStage video')) {
     });
     video.addEventListener('ended', () => completePlayerItem(video, true));
     video.addEventListener('pause', () => {
+        playerMediaProgressing.delete(video);
         const bufferingPause = playerPreparation?.bufferPauseVideos?.delete(video);
         if (video.id !== 'playerVideo') return;
         if (playerPreparation?.buffering && !bufferingPause) {
@@ -5977,10 +6505,15 @@ for (const video of document.querySelectorAll('#playerMediaStage video')) {
         if (video.id !== 'playerVideo' || !playerPreparation?.fade) return;
         const preparation = playerPreparation;
         try {
-            Promise.resolve(preparation.outgoing.play()).catch(() => failPlayerFade(preparation));
-        } catch (error) { failPlayerFade(preparation); }
+            Promise.resolve(preparation.outgoing.play()).catch(error => {
+                if (!playerPauseAborted(error, preparation)) failPlayerFade(preparation);
+            });
+        } catch (error) {
+            if (!playerPauseAborted(error, preparation)) failPlayerFade(preparation);
+        }
     });
     video.addEventListener('seeking', () => {
+        playerMediaProgressing.delete(video);
         playerMediaTimes.delete(video);
         if (video.id !== 'playerVideo' || playerBoundaries.get(video)?.ownSeek) return;
         if (playerPreparation?.fade) finishPlayerFade();
@@ -5993,9 +6526,11 @@ for (const video of document.querySelectorAll('#playerMediaStage video')) {
         if (video.id === 'playerVideo') maybePreparePlayer();
     });
     video.addEventListener('ratechange', () => {
-        if (video.id === 'playerVideo' && playerPreparation?.fade) {
-            playerPreparation.outgoing.playbackRate = video.playbackRate;
-        }
+        if (!playerIsOpen() || video.id !== 'playerVideo') return;
+        playerListening.rate = video.playbackRate;
+        video.defaultPlaybackRate = playerListening.rate;
+        if (playerPreparation?.fade) playerPreparation.outgoing.playbackRate = video.playbackRate;
+        syncPlayerControls();
     });
     video.addEventListener('volumechange', () => playerVolumeChanged(video));
 }
@@ -6013,15 +6548,38 @@ document.addEventListener('visibilitychange', () => {
     }
 });
 
+initializePlayerControls();
+
 document.getElementById('playerBackdrop').addEventListener(
     'mousemove', showPlayerControls,
 );
 
 function togglePlayerPlayback() {
+    if (playerRecoveryActive()) return;
     const video = document.getElementById('playerVideo');
+    const preparation = playerPreparation;
     if (!video.paused && !video.ended) {
+        if (preparation?.fade) {
+            preparation.controlPaused = true;
+            preparation.resumePending = false;
+            clearTimeout(preparation.resumeTimer);
+        }
         video.pause();
         return;
+    }
+    if (preparation?.fade) {
+        preparation.controlPaused = false;
+        preparation.resumePending = true;
+        preparation.resumeBuffered = false;
+        preparation.startTime = preparation.outgoing.currentTime - preparation.progress * preparation.fadeDuration;
+        preparation.resumeOutgoingTime = preparation.outgoing.currentTime;
+        preparation.resumeIncomingTime = preparation.incoming.currentTime;
+        for (const media of [preparation.outgoing, preparation.incoming]) {
+            playerMediaProgressing.delete(media);
+            playerMediaTimes.set(media, media.currentTime);
+        }
+        clearTimeout(preparation.resumeTimer);
+        preparation.resumeTimer = setTimeout(() => failPlayerFade(preparation), PLAYER_HANDOFF_TIMEOUT_MS);
     }
     playPlayerVideo(video);
 }
@@ -6037,9 +6595,9 @@ function handlePlayerShortcut(ev) {
     if (!fullscreenShortcut && !playbackShortcut) return false;
 
     // Space must retain its native activation when a visible player action has focus.
-    if (playbackShortcut && ev.target instanceof Element
-            && backdrop.contains(ev.target)
-            && ev.target.closest('button, input, textarea, select, [contenteditable="true"]')) {
+    if (ev.target instanceof Element
+            && (ev.target.isContentEditable
+                || ev.target.closest('button, input, textarea, select, [role="slider"]'))) {
         return false;
     }
 

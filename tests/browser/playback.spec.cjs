@@ -87,7 +87,7 @@ test('Escape closes playback that started in full screen', async ({ page }) => {
         .getByRole('button', { name: 'Play', exact: true }).click();
 
     await expect.poll(() => page.evaluate(() => document.fullscreenElement?.id || null))
-        .toBe('playerVideo');
+        .toBe('playerContainer');
     await page.evaluate(() => window.__browserEscapeFullscreen());
 
     await expect.poll(() => page.evaluate(() => document.fullscreenElement)).toBeNull();
@@ -104,7 +104,7 @@ test('Escape returns manually entered full screen to overlay playback', async ({
     await page.reload();
     await page.locator('[data-row-id="play-overlay"]')
         .getByRole('button', { name: 'Play', exact: true }).click();
-    await page.locator('#playerVideo').evaluate(video => video.requestFullscreen());
+    await page.locator('#playerContainer').evaluate(player => player.requestFullscreen());
     await page.evaluate(() => window.__browserEscapeFullscreen());
 
     await expect(page.locator('#playerBackdrop')).toHaveClass(/open/);
@@ -126,11 +126,13 @@ test('player keyboard shortcuts toggle playback and enter full screen', async ({
             get() { return window.__shortcutPaused; },
         });
         HTMLMediaElement.prototype.play = function play() {
+            if (this.id !== 'playerVideo') return Promise.resolve();
             window.__shortcutPaused = false;
             window.__shortcutPlayCalls += 1;
             return Promise.resolve();
         };
         HTMLMediaElement.prototype.pause = function pause() {
+            if (this.id !== 'playerVideo') return;
             window.__shortcutPaused = true;
             window.__shortcutPauseCalls += 1;
         };
@@ -153,7 +155,7 @@ test('player keyboard shortcuts toggle playback and enter full screen', async ({
 
     await page.keyboard.press('f');
     await expect.poll(() => page.evaluate(() => document.fullscreenElement?.id || null))
-        .toBe('playerVideo');
+        .toBe('playerContainer');
     expect(await page.evaluate(() => window.__fullscreenRequests)).toBe(1);
 
     await page.keyboard.press('Space');
@@ -164,38 +166,21 @@ test('player keyboard shortcuts toggle playback and enter full screen', async ({
     expect(await page.evaluate(() => window.__fullscreenRequests)).toBe(1);
 });
 
-test('overlay omits the title and reveals its inner close button on mouse activity', async ({ page }) => {
-    test.setTimeout(15_000);
-    await seed(page, { id: 'player-ui', status: 'finished', file: true, name: 'fixture.mp4' });
+test('overlay shows its title and keeps controls reachable while media is unavailable', async ({ page }) => {
+    await seed(page, { id: 'player-ui', status: 'finished', file: true,
+        name: 'fixture.mp4', title: 'Player interface' });
     await refresh(page);
     await page.locator('[data-row-id="player-ui"]').getByRole('button', { name: 'Play', exact: true }).click();
 
-    const player = page.locator('.player-box');
-    const video = page.locator('#playerVideo');
-    const close = page.getByRole('button', { name: 'Close player' });
-    await expect(page.locator('#playerTitle')).toHaveCount(0);
-    await expect(close).toHaveCSS('opacity', '0');
-
-    const videoBounds = await video.boundingBox();
-    const closeBounds = await close.boundingBox();
-    expect(closeBounds.x).toBeGreaterThanOrEqual(videoBounds.x);
-    expect(closeBounds.y).toBeGreaterThanOrEqual(videoBounds.y);
-    expect(closeBounds.x + closeBounds.width).toBeLessThanOrEqual(videoBounds.x + videoBounds.width);
-    expect(closeBounds.y + closeBounds.height).toBeLessThanOrEqual(videoBounds.y + videoBounds.height);
-
-    await page.mouse.move(
-        videoBounds.x + videoBounds.width / 2,
-        videoBounds.y + videoBounds.height / 2,
-    );
-    await expect(player).toHaveClass(/player-controls-visible/);
+    await expect(page.locator('#playerTitle')).toHaveText('fixture.mp4');
+    await expect(page.locator('#playerControls')).toBeVisible();
+    const close = page.getByRole('button', { name: 'Close player', exact: true });
+    await expect(close).toBeVisible();
     await expect(close).toHaveCSS('opacity', '1');
-    await page.waitForTimeout(2_100);
-    expect(await player.evaluate(element =>
-        element.classList.contains('player-controls-visible'))).toBe(false);
-    await expect(close).toHaveCSS('opacity', '0');
-
     await close.focus();
-    await expect(close).toHaveCSS('opacity', '1');
+    await expect(close).toBeFocused();
+    await close.click();
+    await expect(page.locator('#playerBackdrop')).not.toHaveClass(/open/);
 });
 
 test('new-tab player mode opens the stored file endpoint', async ({ page }) => {
@@ -468,7 +453,7 @@ test('endless handoff retains standard fullscreen without requesting it again', 
 
     await page.locator('#playerVideo').evaluate(video => video.dispatchEvent(new Event('ended')));
     await expect(page.locator('#playerVideo source')).toHaveAttribute('src', '/api/file/full-old');
-    expect(await page.evaluate(() => document.fullscreenElement?.id)).toBe('playerMediaStage');
+    expect(await page.evaluate(() => document.fullscreenElement?.id)).toBe('playerContainer');
     expect(await page.evaluate(() => window.__fullscreenRequests)).toBe(1);
 });
 
@@ -489,7 +474,7 @@ test('autoplay denial offers one-action continuation', async ({ page }) => {
     expect(await page.evaluate(() => window.__playerPlayAttempts)).toBe(2);
 });
 
-test('original-size policy is recalculated from each handoff item', async ({ page }) => {
+test('each handoff fits its own intrinsic image within the available media stage', async ({ page }) => {
     await page.evaluate(() => {
         HTMLMediaElement.prototype.pause = function pause() {};
         HTMLMediaElement.prototype.load = function load() {
@@ -516,13 +501,21 @@ test('original-size policy is recalculated from each handoff item', async ({ pag
     await seed(page, { id: 'size-first', status: 'finished', file: true, name: 'first.mp4' });
     await refresh(page);
     await startEndlessFromCard(page, 'size-first');
-    await expect(page.locator('#playerVideo')).toHaveCSS('width', '320px');
-    await expect(page.locator('#playerVideo')).toHaveCSS('height', '180px');
+    const expectFitted = async (width, height) => {
+        await expect.poll(() => page.locator('#playerVideo').evaluate(video => [video.videoWidth, video.videoHeight])).toEqual([width, height]);
+        await expect(page.locator('#playerVideo')).toHaveCSS('object-fit', 'contain');
+        const media = await page.locator('#playerMediaStage').boundingBox();
+        const video = await page.locator('#playerVideo').boundingBox();
+        expect(video.x).toBeCloseTo(media.x);
+        expect(video.y).toBeCloseTo(media.y);
+        expect(video.width).toBeCloseTo(media.width);
+        expect(video.height).toBeCloseTo(media.height);
+    };
+    await expectFitted(320, 180);
 
     await page.locator('#playerVideo').evaluate(video => video.dispatchEvent(new Event('ended')));
     await expect(page.locator('#playerVideo source')).toHaveAttribute('src', '/api/file/size-second');
-    await expect(page.locator('#playerVideo')).toHaveCSS('width', '640px');
-    await expect(page.locator('#playerVideo')).toHaveCSS('height', '360px');
+    await expectFitted(640, 360);
 });
 
 test('three-dot menu downloads the stored video to the browser', async ({ page }) => {

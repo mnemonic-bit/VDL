@@ -205,7 +205,7 @@ test('Clear History is grouped in the Danger Zone section', async ({ page }) => 
 
 test('saved full-screen playback preference requests full screen for the overlay', async ({ page }) => {
     await page.addInitScript(() => {
-        HTMLVideoElement.prototype.requestFullscreen = function requestFullscreen() {
+        Element.prototype.requestFullscreen = function requestFullscreen() {
             window.__fullscreenRequestCount = (window.__fullscreenRequestCount || 0) + 1;
             return Promise.resolve();
         };
