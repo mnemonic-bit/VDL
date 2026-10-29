@@ -288,6 +288,17 @@ gate has a separate live-refresh request-count failure that also reproduces
 with unchanged baseline JavaScript. Original CI artifacts and production impact
 remain unverified.
 
+Issue 66 was reported from GitHub Actions on 2026-10-29. A controlled
+Chromium reproduction confirms that the paused `0.03502`-second clock rounds
+to zero in the seek range. Home then emits no change or media-clock write,
+so the test's reset assumption fails. Version `0.50.1` makes the setup
+deterministic by pressing ArrowRight before Home and checks zero seek writes
+through pointer preview/cancellation and one per completed drag. The fix is
+verified locally: the focused regression passes 20 repetitions, all 352
+Chromium browser tests pass, and Firefox/WebKit each pass six focused checks.
+The Python 3.12 unit gate passes with 91.6% coverage. The original CI artifacts
+remain uninspected.
+
 ## Bug reports
 
 - [Bug 0001 — Merged downloads kept the deleted temporary audio filename](bug-0001-merged-downloads-kept-deleted-temporary-audio-filename.md)
@@ -355,6 +366,7 @@ remain unverified.
 - [Bug 0063 — Fullscreen playback crops non-widescreen videos](bug-0063-fullscreen-playback-crops-non-widescreen-videos.md)
 - [Bug 0064 — Shuffle Clips shows an empty player before the next video is ready](bug-0064-shuffle-clips-shows-empty-player-before-next-video-is-ready.md)
 - [Bug 0065 — Endless scrolling stalls before the final batch in GitHub Actions](bug-0065-endless-scroll-stalls-before-final-batch-in-github-actions.md)
+- [Bug 0066 — Custom-controls Home seek does not reach zero in GitHub Actions](bug-0066-custom-controls-home-seek-does-not-reach-zero-in-github-actions.md)
 
 ## Accepted UI decisions
 

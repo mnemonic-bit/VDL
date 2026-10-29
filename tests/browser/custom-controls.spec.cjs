@@ -80,6 +80,19 @@ test('pointer dragging previews once and pointer cancellation leaves the real cl
     await realVideo(page);
     await openDirect(page);
     await pause(page);
+    // Reproduce the CI clock that rounds to the range's zero-valued step.
+    await page.locator('#playerVideo').evaluate(async video => {
+        const seeked = new Promise(resolve => video.addEventListener('seeked', resolve, { once: true }));
+        video.currentTime = 0.03502;
+        await seeked;
+        const descriptor = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'currentTime');
+        window.__controlSeekWrites = 0;
+        Object.defineProperty(video, 'currentTime', {
+            configurable: true,
+            get: () => descriptor.get.call(video),
+            set: value => { window.__controlSeekWrites += 1; descriptor.set.call(video, value); },
+        });
+    });
     const range = page.locator('#playerSeek');
     const before = await page.locator('#playerVideo').evaluate(video => video.currentTime);
     await range.dispatchEvent('pointerdown', { pointerId: 17, pointerType: 'touch', isPrimary: true });
@@ -91,17 +104,17 @@ test('pointer dragging previews once and pointer cancellation leaves the real cl
     await expect(page.locator('#playerTime')).toContainText('0:08');
     await range.dispatchEvent('pointercancel', { pointerId: 17, pointerType: 'touch' });
     expect(await page.locator('#playerVideo').evaluate(video => video.currentTime)).toBeCloseTo(before, 1);
+    expect(await page.evaluate(() => window.__controlSeekWrites)).toBe(0);
+    await expect(range).toHaveValue('0');
+    // Home emits no change when the rounded range is already at its minimum.
+    // Move one native step first so Home reliably commits the drag's baseline.
+    await range.press('ArrowRight');
+    await expect(range).toHaveValue('0.1');
     await range.press('Home');
     await expect.poll(() => page.locator('#playerVideo').evaluate(video => video.currentTime)).toBeCloseTo(0);
-    await page.locator('#playerVideo').evaluate(video => {
-        const descriptor = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'currentTime');
-        window.__controlSeekWrites = 0;
-        Object.defineProperty(video, 'currentTime', {
-            configurable: true,
-            get: () => descriptor.get.call(video),
-            set: value => { window.__controlSeekWrites += 1; descriptor.set.call(video, value); },
-        });
-    });
+    expect(await page.evaluate(() => window.__controlSeekWrites)).toBe(2);
+    expect(await page.locator('#playerVideo').evaluate(video => video.paused)).toBe(true);
+    await page.evaluate(() => { window.__controlSeekWrites = 0; });
     const bounds = await range.boundingBox();
     // WebKit jumps on a track click, but starts a drag only on the thumb.
     await page.mouse.move(bounds.x + 8, bounds.y + bounds.height / 2);
