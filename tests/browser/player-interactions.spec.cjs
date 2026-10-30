@@ -90,17 +90,37 @@ for (const { reducedMotion, fullscreen } of idleScenarios) {
         await page.locator('#playerVideo').hover();
         await container.evaluate(container => {
             window.__idleAnimations = [];
+            window.__idleSamples = [];
             container.addEventListener('transitionrun', event => {
                 if (event.target.matches('.player-chrome, #playerControls')) {
                     window.__idleAnimations.push([event.target.id || 'header', event.propertyName]);
-                    requestAnimationFrame(() => requestAnimationFrame(() => {
-                        const style = getComputedStyle(event.target);
-                        const value = event.propertyName === 'opacity' ? Number(style.opacity)
-                            : new DOMMatrixReadOnly(style.transform).m42 / event.target.getBoundingClientRect().height;
-                        window.__idleAnimations.push([event.target.id || 'header', 'sample', value]);
-                    }));
                 }
             });
+            const observer = new MutationObserver(() => {
+                if (container.classList.contains('player-controls-visible')) return;
+                observer.disconnect();
+                for (const [selector, property] of [['.player-chrome', 'opacity'], ['#playerControls', 'transform']]) {
+                    const target = container.querySelector(selector);
+                    const animation = target.getAnimations().find(animation => animation.transitionProperty === property);
+                    if (!animation) continue;
+                    const duration = animation.effect.getTiming().duration;
+                    const currentTime = animation.currentTime;
+                    // Frame callbacks can run before the animation clock advances or
+                    // after it finishes. Seek the real CSS transition before yielding.
+                    animation.pause();
+                    try {
+                        animation.currentTime = duration / 2;
+                        const style = getComputedStyle(target);
+                        const value = property === 'opacity' ? Number(style.opacity)
+                            : new DOMMatrixReadOnly(style.transform).m42 / target.getBoundingClientRect().height;
+                        window.__idleSamples.push({ target: target.id || 'header', property, duration, value });
+                    } finally {
+                        animation.currentTime = currentTime;
+                        animation.play();
+                    }
+                }
+            });
+            observer.observe(container, { attributes: true, attributeFilter: ['class'] });
         });
         await page.waitForTimeout(2200);
         await expect(header).toBeVisible();
@@ -125,9 +145,13 @@ for (const { reducedMotion, fullscreen } of idleScenarios) {
             const transitions = await page.evaluate(() => window.__idleAnimations);
             expect(transitions).toContainEqual(['header', 'opacity']);
             expect(transitions).toContainEqual(['playerControls', 'transform']);
-            for (const target of ['header', 'playerControls']) {
-                expect(transitions.some(([name, kind, value]) => name === target && kind === 'sample'
-                    && value > 0 && value < 1)).toBe(true);
+            const samples = await page.evaluate(() => window.__idleSamples);
+            for (const [target, property] of [['header', 'opacity'], ['playerControls', 'transform']]) {
+                const sample = samples.find(sample => sample.target === target && sample.property === property);
+                expect(sample, `${target} ${property} transition: ${JSON.stringify(samples)}`).toBeDefined();
+                expect(sample.duration).toBeGreaterThan(0);
+                expect(sample.value).toBeGreaterThan(0);
+                expect(sample.value).toBeLessThan(1);
             }
         }
         // Hit testing at the old bar position must reach the media beneath it.

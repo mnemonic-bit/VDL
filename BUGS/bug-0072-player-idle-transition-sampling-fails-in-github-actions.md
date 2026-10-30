@@ -3,8 +3,11 @@
 **Severity:** Medium — blocks the browser-test CI gate; impact on visible
 player animations is not established.
 
-**Status:** Open. Reported on 2026-10-30 after pushing the committed version
-to GitHub. Source reviewed at local commit `1674bbe`, version `0.50.5`.
+**Status:** Resolved locally in version `0.50.7`, validated on 2026-10-31.
+Hosted GitHub Actions confirmation remains outstanding.
+
+Reported on 2026-10-30 after pushing the committed version to GitHub.
+Source reviewed at local commit `1674bbe`, version `0.50.5`.
 The workflow URL and failing commit SHA were not supplied, so that commit
 has not been independently confirmed as the CI revision. No local browser
 reproduction was performed for this report; failure frequency is unknown.
@@ -106,7 +109,7 @@ the trace from `tests/browser` with:
 npx playwright show-trace test-results/player-interactions-idle-c-62b99--preference-motion-overlay-/trace.zip
 ```
 
-**Cause remains unconfirmed.** The nested animation-frame sampling assumes
+**Initial hypothesis (before the local investigation below):** The nested animation-frame sampling assumes
 its callbacks run while each transition is still between endpoints. Delayed
 frame delivery on a busy runner could miss that interval; this is an
 investigation hypothesis, not a demonstrated CI timing defect. A real
@@ -135,3 +138,49 @@ defect from an observation race before choosing a repair.
 - Any eventual code fix receives its own version bump and passes
   `./tests/run-all.sh --unit` with at least **90% `vdl.py` line coverage**,
   plus the relevant browser checks, before this report is marked resolved.
+
+### Local investigation and repair
+
+The exact focused reproduction above failed locally at the reported assertion.
+An instrumented five-run repetition then produced **1 failed, 4 passed**.
+Instrumentation recorded `performance.now()`, each actual CSS transition's
+computed timing, and the styles read by the original nested frame callbacks.
+The failing run showed:
+
+| Target/property | Event time (ms) | Sample time (ms) | Animation local time (ms) | Duration (ms) | Sample |
+|---|---:|---:|---:|---:|---:|
+| Header opacity | 3882.5 | 3884.1 | 0 | 150 | 1 |
+| Bottom controls transform | 3882.3 | 3884.0 | 0 | 200 | 0 |
+
+Both transitions emitted `transitionrun` with elapsed time zero. Both nested
+frame callbacks executed before their animation clocks advanced, so neither
+sample was intermediate. This establishes a sampling race in the test without
+artificial scheduling delays; the failure need not involve a late frame.
+The original GitHub Actions artifacts remain unavailable, so their exact
+ordering is unverified. No visible playback defect was established.
+
+Version `0.50.7` observes the real idle-class removal with a `MutationObserver`.
+Before yielding to another frame, the test obtains the browser-generated CSS
+transitions, pauses each one, seeks to half its actual duration, and reads the
+computed opacity or normalized translation. It restores the original animation
+time and resumes in `finally`. Assertions identify each target/property and
+require a positive duration and a value strictly between zero and one.
+The existing transition-event, idle-delay, hidden-style, hit-testing, pointer
+reveal/reset, reduced-motion, and keyboard-access assertions remain in place.
+
+The repair was also checked against deliberate rendering regressions. Temporary
+`steps(1, end)` timing was applied separately to the header and bottom controls.
+The focused test rejected both at the intermediate-value assertions (header
+opacity remained 1; normalized slide remained 0). Those overrides and all
+diagnostic instrumentation were removed before validation.
+
+Validation:
+
+- Python 3.12: `VDL_PYTHON=/path/to/python3.12 ./tests/run-all.sh --unit`
+  passed, **397 tests**, six expected skips, **92.0% `vdl.py` line coverage**
+  (5139/5588 executable lines; minimum 90%).
+- `python3 tests/browser/run.py player-interactions.spec.cjs --grep 'idle controls fade and slide' --repeat-each=5`
+  passed **20/20** cases: five each for overlay/fullscreen with normal/reduced
+  motion. The first four-scenario run also passed **4/4**.
+- `./tests/run-all.sh --browser` passed the complete Chromium suite:
+  **409 passed**, including all four idle scenarios.

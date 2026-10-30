@@ -349,12 +349,14 @@ themes, reduced motion, narrow controls, volume interactions, and repeated
 playing/paused seeks. The Python 3.12 unit gate passes with 92.0% `vdl.py` line
 coverage.
 
-Issue 72 was reported from GitHub Actions on 2026-10-30: the browser suite
-finished with one failure and 392 passes. The overlay idle-controls test
-recorded transition events and reached the expected hidden states, but
-failed to capture an intermediate animation value for at least one bar.
-Frame-sampling timing is a hypothesis; the cause and visible playback impact
-remain unconfirmed pending trace review or a controlled reproduction.
+Issue 72 is fixed locally in version `0.50.7`. The overlay idle-controls
+failure reproduced with both nested frame callbacks sampling before the
+animation clocks advanced. The test now seeks the real CSS transitions to
+their midpoints, checks interpolated styles, then restores and resumes them.
+Deliberate jump transitions remain rejected. All 20 repeated idle scenarios
+and the complete 409-test Chromium suite pass; the Python 3.12 unit gate
+passes with 92.0% `vdl.py` line coverage. Hosted CI confirmation remains
+outstanding; no visible playback defect was established.
 
 ## Bug reports
 
