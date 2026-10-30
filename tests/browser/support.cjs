@@ -58,7 +58,10 @@ async function closeCurrent(page) {
 async function openNewDownload(page) {
     const dialog = page.locator('#newDownloadDialog');
     if (!(await dialog.isVisible())) {
-        await page.locator('#newDownloadButton').click();
+        await page.locator('.app-title').click();
+        // Exercise the shortcut without pasting over saved drafts in helpers.
+        // download-entry.spec.cjs covers native clipboard paste separately.
+        await page.locator('body').dispatchEvent('keydown', { key: 'v', ctrlKey: true });
     }
     await expect(dialog).toBeVisible();
 }

@@ -391,7 +391,7 @@ test('Header search expands from the leftmost magnifier', async ({ page }) => {
     await expect(input).toBeHidden();
     await expect(header.locator('select')).toHaveCount(0);
     expect(await search.evaluate(element => (
-        element.getBoundingClientRect().right <= document.querySelector('#newDownloadButton').getBoundingClientRect().left
+        element.getBoundingClientRect().right <= document.querySelector('#playbackModeControl').getBoundingClientRect().left
     ))).toBeTruthy();
 
     await toggle.click();

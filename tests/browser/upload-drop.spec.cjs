@@ -28,7 +28,7 @@ test('pending registration leaves the page usable and every upload visible', asy
     await expect(page.locator('#uploadDropOverlay')).toBeHidden({ timeout: 1000 });
     await expect(page.locator('#currentDownloadsDrawer')).toBeHidden();
     await expect(page.locator('#currentBadge')).toHaveText('2');
-    await page.locator('#newDownloadButton').click();
+    await openNewDownload(page);
     await page.getByRole('button', { name: 'Close new download' }).click();
     await expect(page.locator('#currentBadge')).toHaveText('2');
     await page.locator('#currentDownloadsButton').click();

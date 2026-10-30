@@ -286,19 +286,6 @@ body.settings-open { max-width: 1180px; }
 .header-search.expanded.invalid:focus-within { border-color: var(--error-border); }
 .header-search-error { display: block; margin-top: 6px; color: var(--error-text); }
 .header-search-error[hidden] { display: none; }
-.new-download-button {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    flex: none;
-    width: 40px;
-    height: 40px;
-    padding: 0;
-    color: #fff;
-    background: var(--brand);
-    border: 1px solid var(--brand);
-    border-radius: 50%;
-}
 .create-playlist-button {
     display: inline-flex;
     align-items: center;
@@ -377,9 +364,6 @@ body.settings-open { max-width: 1180px; }
 .playback-mode-menu button:focus-visible { background: var(--surface-3); outline: none; }
 .playback-mode-menu button:disabled { color: var(--muted-2); }
 .playback-mode-menu svg { width: 17px; height: 17px; flex: none; }
-.new-download-button:hover { background: var(--app-progress-track-active); }
-.new-download-button:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
-.new-download-button svg { width: 17px; height: 17px; flex: none; }
 .current-downloads-button {
     position: relative;
     display: inline-flex;
@@ -419,7 +403,6 @@ body.settings-open { max-width: 1180px; }
 .settings-back svg,
 .new-download-close svg { width: 20px; height: 20px; }
 body.settings-open .header-search,
-body.settings-open .new-download-button,
 body.settings-open .current-downloads-button,
 body.settings-open .playback-mode-control,
 body.settings-open .create-playlist-button { display: none; }
@@ -1831,7 +1814,6 @@ details[open] > .history-summary::before { transform: rotate(90deg); }
     .app-header { min-height: 56px; padding: 8px 12px; }
     .app-title { font-size: 1.1em; }
     .header-search-toggle { width: 38px; height: 38px; }
-    .new-download-button { width: 38px; height: 38px; padding: 0; }
     .endless-playback-button { width: 38px; min-height: 38px; height: 38px; padding: 0; justify-content: center; }
     .endless-playback-button span { display: none; }
     .playback-mode-toggle { width: 38px; min-height: 38px; height: 38px; }

@@ -310,6 +310,14 @@ eventual HTTP image delivery, and successful slow-commit warning fields.
 SQLite timing and contention diagnostics remain enabled. The original deployed
 image, complete logs, and storage conditions remain unconfirmed.
 
+Issue 68 was reported and fixed in version `0.50.3` on 2026-10-30. The
+redundant header New download Plus button and its styles were removed while
+preserving the existing Ctrl/Cmd+V workflow. Dialog closure restores the
+original focus target or falls back to the account menu when that target is
+unavailable. Browser regressions cover native paste, successful submission,
+editable controls, modal guards, focus restoration, and header spacing in
+both themes at desktop and mobile widths.
+
 ## Bug reports
 
 - [Bug 0001 — Merged downloads kept the deleted temporary audio filename](bug-0001-merged-downloads-kept-deleted-temporary-audio-filename.md)
@@ -379,6 +387,7 @@ image, complete logs, and storage conditions remain unconfirmed.
 - [Bug 0065 — Endless scrolling stalls before the final batch in GitHub Actions](bug-0065-endless-scroll-stalls-before-final-batch-in-github-actions.md)
 - [Bug 0066 — Custom-controls Home seek does not reach zero in GitHub Actions](bug-0066-custom-controls-home-seek-does-not-reach-zero-in-github-actions.md)
 - [Bug 0067 — Container startup delays previews and logs SQLite registration warnings](bug-0067-container-startup-delays-previews-and-logs-sqlite-warnings.md)
+- [Bug 0068 — Redundant Plus button in the download header](bug-0068-redundant-plus-button-in-download-header.md)
 
 ## Accepted UI decisions
 

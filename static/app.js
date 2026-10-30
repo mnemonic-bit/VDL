@@ -6676,7 +6676,6 @@ function openNewDownload() {
         hideActionError();
         dialog.showModal();
         newDownloadSession += 1;
-        document.getElementById('newDownloadButton').setAttribute('aria-expanded', 'true');
     }
     if (optionsDetails.open) setOptionsOpen(true);
     urlInput.focus();
@@ -6689,12 +6688,19 @@ function closeNewDownload() {
 }
 
 const newDownloadDialog = document.getElementById('newDownloadDialog');
+function restoreDownloadFocus(target) {
+    if (target && target.isConnected && target !== document.body) {
+        target.focus();
+        if (document.activeElement === target) return;
+    }
+    // Paste can start from the page itself, and completed downloads can hide
+    // the drawer's trigger while it is open. Keep keyboard navigation usable.
+    document.getElementById('accountMenuButton').focus();
+}
+
 newDownloadDialog.addEventListener('close', () => {
     hideActionError();
-    document.getElementById('newDownloadButton').setAttribute('aria-expanded', 'false');
-    if (newDownloadReturnFocus && newDownloadReturnFocus.isConnected) {
-        newDownloadReturnFocus.focus();
-    }
+    restoreDownloadFocus(newDownloadReturnFocus);
     newDownloadReturnFocus = null;
 });
 newDownloadDialog.addEventListener('click', ev => {
@@ -6727,12 +6733,7 @@ currentDownloadsDrawer.addEventListener('close', () => {
     hideActionError();
     closeAllMenus();
     document.getElementById('currentDownloadsButton').setAttribute('aria-expanded', 'false');
-    if (currentDrawerReturnFocus && currentDrawerReturnFocus.isConnected
-            && !currentDrawerReturnFocus.hidden) {
-        currentDrawerReturnFocus.focus();
-    } else {
-        document.getElementById('newDownloadButton').focus();
-    }
+    restoreDownloadFocus(currentDrawerReturnFocus);
     currentDrawerReturnFocus = null;
 });
 currentDownloadsDrawer.addEventListener('click', ev => {

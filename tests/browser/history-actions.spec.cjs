@@ -1,5 +1,5 @@
 const { test, expect } = require('@playwright/test');
-const { reset, seed, refresh, openCurrent, openSettings } = require('./support.cjs');
+const { reset, seed, refresh, openCurrent, openSettings, openNewDownload } = require('./support.cjs');
 
 async function openInfo(row) {
     await row.locator('.kebab-btn').click();
@@ -53,20 +53,11 @@ test('fixed header opens the Current drawer and full Settings page', async ({ pa
     });
     expect(headerPosition).toEqual({ position: 'fixed', top: 0, left: 0, right: 0 });
 
-    const newDownloadButton = page.locator('#newDownloadButton');
     const currentButton = page.locator('#currentDownloadsButton');
     const accountButton = page.locator('#accountMenuButton');
     const accountMenu = page.locator('#accountMenu');
     const settingsButton = page.locator('#settingsButton');
-    await expect(newDownloadButton).toHaveText('');
-    expect(await newDownloadButton.evaluate(button => {
-        const box = button.getBoundingClientRect();
-        return {
-            width: Math.round(box.width),
-            height: Math.round(box.height),
-            borderRadius: getComputedStyle(button).borderRadius,
-        };
-    })).toEqual({ width: 40, height: 40, borderRadius: '50%' });
+    await expect(page.locator('#newDownloadButton')).toHaveCount(0);
     await expect(currentButton).toContainText('Current downloads');
     await expect(currentButton).toBeVisible();
     await expect(currentButton.locator('#currentBadge')).toHaveText('1');
@@ -78,14 +69,14 @@ test('fixed header opens the Current drawer and full Settings page', async ({ pa
             >= document.querySelector(currentSelector).getBoundingClientRect().right
     ), '#currentDownloadsButton')).toBeTruthy();
 
-    await newDownloadButton.click();
+    await openNewDownload(page);
     const newDownloadDialog = page.locator('#newDownloadDialog');
     await expect(newDownloadDialog).toBeVisible();
     await expect(newDownloadDialog.getByRole('heading', { name: 'New download' })).toBeVisible();
     expect(await newDownloadDialog.evaluate(element => element.matches(':modal'))).toBe(true);
     await newDownloadDialog.getByRole('button', { name: 'Close new download' }).click();
     await expect(newDownloadDialog).toBeHidden();
-    await expect(newDownloadButton).toBeFocused();
+    await expect(accountButton).toBeFocused();
 
     await currentButton.click();
     const drawer = page.locator('#currentDownloadsDrawer');
