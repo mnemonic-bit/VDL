@@ -121,9 +121,11 @@ test('resumes in the built-in player, selects queue entries, and stops at the en
         const controls = document.getElementById('playerControls').getBoundingClientRect();
         return {
             queueContained: queue.left >= player.left && queue.right <= player.right
-                && queue.top >= player.top && queue.bottom <= controls.top + 1,
+                && queue.top >= player.top && queue.bottom <= player.bottom + 1,
             mediaContained: media.left >= player.left && media.right <= player.right
-                && media.top >= player.top && media.bottom <= controls.top + 1,
+                && media.top >= player.top && media.bottom <= player.bottom + 1,
+            controlsOverlayMedia: controls.left >= media.left && controls.right <= media.right
+                && controls.top >= media.top && Math.abs(controls.bottom - media.bottom) < 1,
             videoCenterXOffset: Math.round(
                 (video.left + video.right - media.left - media.right) / 2,
             ),
@@ -135,6 +137,7 @@ test('resumes in the built-in player, selects queue entries, and stops at the en
     expect(geometry).toEqual({
         queueContained: true,
         mediaContained: true,
+        controlsOverlayMedia: true,
         videoCenterXOffset: 0,
         videoCenterYOffset: 0,
     });

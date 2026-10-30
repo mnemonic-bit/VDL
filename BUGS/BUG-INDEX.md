@@ -328,15 +328,16 @@ SQLite-lock and local-HTTP regressions cover recovery and queued successors at
 Unlimited and 50 Mbps. The affected deployment's precise trigger and any
 connection to Bug 0067 remain unconfirmed.
 
-Issue 70 records the reported player-control visibility and interaction gaps.
-After three seconds of inactivity, the title/Close header should fade out and
-the bottom controls should slide out of sight. The video surface should toggle
-Play/Pause on click, the speed selector should show rate factors without a
-visible Speed label, and a dedicated button should repeat the current video.
-In fullscreen, the video should use its final viewport-based size immediately,
-with both bars overlaid; hiding or revealing them must not resize the video.
-The report is open and documentation-only; these behaviors have not yet been
-reproduced or repaired for this request.
+Issue 70 is fixed in version `0.50.5`. Both player bars overlay the full media
+area and hide after three seconds of inactivity: the header fades and the
+bottom toolbar slides away without resizing the video. Pointer activity reveals
+them; keyboard focus, range dragging and native rate menus remain usable.
+Video clicks toggle playback, the speed selector displays only rate factors,
+and a dedicated toggle repeats the current video without changing library or
+playlist playback modes. Repeat resets on close or video changes. Real-media
+browser checks cover fullscreen, reduced motion, playback and repeat in
+Chromium, Firefox and WebKit. The Python 3.12 unit gate passes with 92.0%
+`vdl.py` line coverage.
 
 ## Bug reports
 

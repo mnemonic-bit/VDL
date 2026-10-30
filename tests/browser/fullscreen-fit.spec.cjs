@@ -11,9 +11,20 @@ async function expectCompleteFrame(page, width, height, capture = null) {
     const rectangle = await video.boundingBox();
     // Firefox fullscreen uses the headless display's viewport; a default
     // screenshot clips it to the context's configured window dimensions.
-    const screenshot = capture ? await capture() : await page.screenshot({
-        fullPage: page.context().browser().browserType().name() === 'firefox',
+    // Inspect the fitted picture beneath the overlaid bars, including paused
+    // fades whose controls intentionally stay visible. Visibility preserves
+    // layout, so this cannot conceal a bar that reserves video height.
+    const chromeMask = await page.addStyleTag({
+        content: '.player-chrome, .player-controls { visibility: hidden !important; }',
     });
+    let screenshot;
+    try {
+        screenshot = capture ? await capture() : await page.screenshot({
+            fullPage: page.context().browser().browserType().name() === 'firefox',
+        });
+    } finally {
+        await chromeMask.evaluate(style => style.remove());
+    }
     const samples = await page.evaluate(async ({ png, width, height, rectangle }) => {
         const image = new Image();
         image.src = `data:image/png;base64,${png}`;

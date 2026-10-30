@@ -1,11 +1,11 @@
-## 70. [Open] Player controls stay visible and lack direct playback actions
+## 70. [Resolved] Player controls stay visible and lack direct playback actions
 
 **Severity:** Medium — persistent controls obstruct the video, and expected
 playback interactions are missing or unnecessarily verbose.
 
-**Status:** Reported on 2026-10-30. Repository reference: commit `462915b`,
-version `0.50.4`. This report records the user's observations and requested
-behavior; no browser reproduction or implementation diagnosis was performed.
+**Status:** Fixed and verified locally in version `0.50.5` on 2026-10-30.
+Originally reported against commit `462915b`, version `0.50.4`; the initial
+report recorded the requested behavior without a browser reproduction.
 
 **Related:** [Bug 0041 — History video previews and player overlays](bug-0041-history-video-previews-were-redundant-and-firefox-incompatible.md)
 previously specified hiding the close control after two seconds. This request
@@ -108,5 +108,59 @@ for existing seek and keyboard regression coverage.
   run the relevant browser checks plus `./tests/run-all.sh --unit`, with
   `vdl.py` line coverage meeting the required 90% minimum.
 
-This change creates the report and ledger entry only. Application code and
-`VERSION` remain unchanged; runtime tests are not claimed for this report.
+### Implementation and verification
+
+Browser regressions reproduced a stationary pointer over the title keeping the
+controls visible beyond the idle deadline, a video-surface click leaving real
+playback unchanged, and the visible `Speed` prefix. The player layout also
+reserved separate grid rows for both control bars, reducing the media area.
+Idle hiding was blocked by static hover and pointer-origin focus. Hiding a
+hovered bottom bar could also generate `pointerleave`, whose handler revealed
+the controls again. Native rate-picker cancellation reproduced this feedback
+loop without any new pointer movement.
+
+The controls now overlay the media area, with a fading header and a bottom bar
+that slides completely outside the clipped video area. Their visibility does
+not alter the video's dimensions. Pointer activity resets the shared idle
+timer; keyboard focus and active control interactions keep the controls usable.
+Reduced-motion preferences remove the transitions.
+Playback feedback is centered over the picture so an error message cannot
+intercept clicks on the overlaid Play button.
+
+Primary clicks on the active video use the same playback action as Space. The
+rate selector retains its accessible name and factor choices. A pressed-state
+Repeat button repeats only the current video without changing the library or
+playlist playback mode, and its state clears when another video opens or the
+player closes. Ordinary playback retains configured intro/outro skips. In
+Shuffle Clips, repeat continues to the current video's actual end and restarts
+it at zero; disabling repeat restores the sampled clip and normal advancement.
+
+The unit gate was run with `VDL_PYTHON` selecting Python 3.12.14:
+
+```sh
+./tests/run-all.sh --unit
+```
+
+It passed 397 tests (six skipped), with `vdl.py` line coverage of **92.0%**
+(`5139/5588` lines), exceeding the required 90% minimum.
+
+`tests/browser/player-interactions.spec.cjs` covers real media clicks and EOF,
+idle deadlines and intermediate animations, pointer and keyboard focus, native
+rate-menu cancellation, reduced motion, stable fullscreen bounds for matching,
+wide and portrait videos, and repeat isolation in direct, sequential, shuffle,
+Shuffle Clips and playlist playback. Chromium covers the native select popup;
+that platform-specific case is skipped in Firefox and WebKit. The remaining
+interaction scenarios were checked in all three engines.
+
+The existing playback, custom-controls, fullscreen-fit, playlists,
+crossfade-media, skip-video-edges-media and shuffle-clips-continuity suites were
+also exercised. Their retry regression exposed the status-panel overlap, which
+was fixed and verified by rerunning all 23 custom-controls tests successfully.
+
+Run the interaction checks with:
+
+```sh
+python3 tests/browser/run.py player-interactions.spec.cjs
+VDL_TEST_BROWSER=firefox python3 tests/browser/run.py player-interactions.spec.cjs
+VDL_TEST_BROWSER=webkit python3 tests/browser/run.py player-interactions.spec.cjs
+```

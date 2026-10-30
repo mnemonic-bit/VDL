@@ -110,6 +110,11 @@
             <symbol id="i-caret-down" viewBox="0 0 16 16">
                 <path fill="currentColor" d="M3.2 5.8h9.6L8 10.6z"/>
             </symbol>
+            <symbol id="i-repeat" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M3 5h8a2 2 0 0 1 2 2v1M10 2l3 3-3 3M13 11H5a2 2 0 0 1-2-2V8M6 14l-3-3 3-3"/>
+                </g>
+            </symbol>
             <symbol id="i-shuffle" viewBox="0 0 16 16">
                 <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M2 4h2.2c3.8 0 3.8 8 7.6 8H14"/>
@@ -840,16 +845,16 @@
 
     <div id="playerBackdrop" class="player-backdrop" onclick="closePlayer(event)">
         <div id="playerContainer" class="player-box player-original-size" role="dialog" aria-modal="true" aria-label="Video player" tabindex="-1" onclick="event.stopPropagation()">
-            <div class="player-chrome">
-                <div class="player-heading">
-                    <strong id="playerTitle"></strong>
-                    <span id="playerModeLabel" hidden></span>
-                </div>
-                <button class="player-native-fullscreen" type="button" onclick="requestPlayerFullscreen()">Fullscreen</button>
-                <button class="player-close" type="button" onclick="closePlayer()" aria-label="Close player"><svg aria-hidden="true"><use href="#i-x"/></svg></button>
-            </div>
             <div class="player-layout">
                 <div class="player-media-column">
+                    <div class="player-chrome">
+                        <div class="player-heading">
+                            <strong id="playerTitle"></strong>
+                            <span id="playerModeLabel" hidden></span>
+                        </div>
+                        <button class="player-native-fullscreen" type="button" onclick="requestPlayerFullscreen()">Fullscreen</button>
+                        <button class="player-close" type="button" onclick="closePlayer()" aria-label="Close player"><svg aria-hidden="true"><use href="#i-x"/></svg></button>
+                    </div>
                     <div id="playerMediaStage" class="player-media-stage">
                         <video id="playerVideo" controls autoplay></video>
                         <video id="playerStandby" class="player-standby" preload="none" aria-hidden="true" tabindex="-1"></video>
@@ -867,40 +872,41 @@
                             </div>
                         </div>
                     </div>
+                    <div id="playerControls" class="player-controls" role="group" aria-label="Playback controls" hidden>
+                        <label class="visually-hidden" for="playerSeek">Seek</label>
+                        <input id="playerSeek" class="player-seek" type="range" min="0" max="0" value="0" step="0.1" disabled aria-valuetext="Time unavailable">
+                        <div class="player-control-buttons">
+                            <button id="playerPrevious" class="player-control-button" type="button" aria-label="Previous video" hidden><svg aria-hidden="true"><use href="#i-previous"/></svg></button>
+                            <button id="playerPlayPause" class="player-control-button" type="button" aria-label="Play"><svg aria-hidden="true"><use href="#i-play"/></svg></button>
+                            <button id="playerNext" class="player-control-button" type="button" aria-label="Next video" hidden><svg aria-hidden="true"><use href="#i-next"/></svg></button>
+                            <span id="playerTime" class="player-time">--:-- / --:--</span>
+                            <div class="player-volume-control">
+                                <button id="playerMute" class="player-control-button" type="button" aria-label="Mute" aria-pressed="false"><svg aria-hidden="true"><use href="#i-volume"/></svg></button>
+                                <label class="visually-hidden" for="playerVolume">Volume</label>
+                                <input id="playerVolume" type="range" min="0" max="100" value="100" step="1" aria-describedby="playerVolumeHint" aria-valuetext="100%">
+                            </div>
+                            <div class="player-speed-control">
+                                <select id="playerSpeed" aria-label="Playback speed">
+                                    <option value="0.5">0.5×</option>
+                                    <option value="0.75">0.75×</option>
+                                    <option value="1" selected>1×</option>
+                                    <option value="1.25">1.25×</option>
+                                    <option value="1.5">1.5×</option>
+                                    <option value="2">2×</option>
+                                </select>
+                            </div>
+                            <button id="playerRepeat" class="player-control-button" type="button" aria-label="Repeat current video" title="Repeat current video" aria-pressed="false"><svg aria-hidden="true"><use href="#i-repeat"/></svg></button>
+                            <button id="playerQueueToggle" class="player-control-button player-queue-toggle" type="button" aria-label="Hide playlist queue" aria-expanded="true" aria-controls="playlistQueue" hidden><svg aria-hidden="true"><use href="#i-playlist"/></svg><span>Queue</span></button>
+                            <button id="playerFullscreen" class="player-control-button" type="button" aria-label="Enter fullscreen" aria-describedby="playerFullscreenHint"><svg aria-hidden="true"><use href="#i-fullscreen"/></svg></button>
+                        </div>
+                        <span id="playerVolumeHint" class="player-volume-hint" hidden>Use your device controls to adjust volume.</span>
+                        <span id="playerFullscreenHint" class="player-capability-hint" hidden>Fullscreen is unavailable in this browser.</span>
+                    </div>
                 </div>
                 <aside id="playlistQueue" class="playlist-queue" aria-labelledby="playlistQueueTitle" hidden>
                     <h2 id="playlistQueueTitle">Playlist queue</h2>
                     <div id="playlistQueueItems" class="playlist-queue-items"></div>
                 </aside>
-            </div>
-            <div id="playerControls" class="player-controls" role="group" aria-label="Playback controls" hidden>
-                <label class="visually-hidden" for="playerSeek">Seek</label>
-                <input id="playerSeek" class="player-seek" type="range" min="0" max="0" value="0" step="0.1" disabled aria-valuetext="Time unavailable">
-                <div class="player-control-buttons">
-                    <button id="playerPrevious" class="player-control-button" type="button" aria-label="Previous video" hidden><svg aria-hidden="true"><use href="#i-previous"/></svg></button>
-                    <button id="playerPlayPause" class="player-control-button" type="button" aria-label="Play"><svg aria-hidden="true"><use href="#i-play"/></svg></button>
-                    <button id="playerNext" class="player-control-button" type="button" aria-label="Next video" hidden><svg aria-hidden="true"><use href="#i-next"/></svg></button>
-                    <span id="playerTime" class="player-time">--:-- / --:--</span>
-                    <div class="player-volume-control">
-                        <button id="playerMute" class="player-control-button" type="button" aria-label="Mute" aria-pressed="false"><svg aria-hidden="true"><use href="#i-volume"/></svg></button>
-                        <label class="visually-hidden" for="playerVolume">Volume</label>
-                        <input id="playerVolume" type="range" min="0" max="100" value="100" step="1" aria-describedby="playerVolumeHint" aria-valuetext="100%">
-                    </div>
-                    <label class="player-speed-control" for="playerSpeed">Speed
-                        <select id="playerSpeed">
-                            <option value="0.5">0.5×</option>
-                            <option value="0.75">0.75×</option>
-                            <option value="1" selected>1×</option>
-                            <option value="1.25">1.25×</option>
-                            <option value="1.5">1.5×</option>
-                            <option value="2">2×</option>
-                        </select>
-                    </label>
-                    <button id="playerQueueToggle" class="player-control-button player-queue-toggle" type="button" aria-label="Hide playlist queue" aria-expanded="true" aria-controls="playlistQueue" hidden><svg aria-hidden="true"><use href="#i-playlist"/></svg><span>Queue</span></button>
-                    <button id="playerFullscreen" class="player-control-button" type="button" aria-label="Enter fullscreen" aria-describedby="playerFullscreenHint"><svg aria-hidden="true"><use href="#i-fullscreen"/></svg></button>
-                </div>
-                <span id="playerVolumeHint" class="player-volume-hint" hidden>Use your device controls to adjust volume.</span>
-                <span id="playerFullscreenHint" class="player-capability-hint" hidden>Fullscreen is unavailable in this browser.</span>
             </div>
         </div>
     </div>

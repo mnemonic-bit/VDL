@@ -1175,7 +1175,7 @@ input[type="text"].tag-entry-input {
 .player-box.playlist-player {
     position: relative; display: grid;
     grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: auto minmax(0, 1fr) auto;
+    grid-template-rows: minmax(0, 1fr);
     width: 94vw; height: 92vh; height: 92dvh;
     max-width: 1400px; max-height: 100%; min-width: 0; min-height: 0;
     overflow: hidden; border-radius: 8px; background: var(--player-bg);
@@ -1186,10 +1186,14 @@ input[type="text"].tag-entry-input {
     border-radius: 0;
 }
 .player-chrome {
+    /* Overlays share the media bounds, so revealing controls cannot reframe
+       the video or obscure a playlist queue beside or below it. */
+    position: absolute; top: 0; right: 0; left: 0; z-index: 2;
     display: flex; align-items: center; gap: 12px;
     min-width: 0;
     min-height: 52px; padding: 4px 8px 4px 16px; box-sizing: border-box;
-    background: var(--surface); transition: opacity 0.15s ease;
+    background: var(--surface);
+    transition: opacity 0.15s ease, visibility 0s;
 }
 .player-heading { display: flex; align-items: baseline; gap: 12px; flex: 1; min-width: 0; }
 .player-heading strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1230,7 +1234,9 @@ input[type="text"].tag-entry-input {
     max-width: none; max-height: none; object-fit: contain;
 }
 .player-transition {
-    position: absolute; right: 12px; bottom: 12px; left: 12px; z-index: 3;
+    /* Playback feedback must leave the bottom toolbar available for retry. */
+    position: absolute; top: 50%; right: 12px; left: 12px; z-index: 3;
+    transform: translateY(-50%);
     max-height: calc(100% - 24px); overflow-y: auto;
     padding: 12px; color: var(--fg); background: var(--surface);
     border: 1px solid var(--border); border-radius: 6px; text-align: center;
@@ -1262,8 +1268,10 @@ input[type="text"].tag-entry-input {
 .player-native-fullscreen:hover { background: var(--surface-hover); }
 .custom-controls-ready .player-native-fullscreen { display: none; }
 .player-controls {
+    position: absolute; right: 0; bottom: 0; left: 0; z-index: 2;
     padding: 0 12px 8px; box-sizing: border-box; min-width: 0;
-    background: var(--surface); transition: opacity 0.15s ease;
+    background: var(--surface);
+    transition: transform 0.2s ease, visibility 0s;
 }
 .player-controls[hidden],
 .player-controls [hidden] { display: none; }
@@ -1275,6 +1283,9 @@ input[type="text"].tag-entry-input {
     border-radius: 6px; font: inherit; cursor: pointer;
 }
 .player-control-button:hover:not(:disabled) { background: var(--surface-hover); }
+#playerRepeat[aria-pressed="true"] {
+    color: var(--on-brand); background: var(--brand); border-color: var(--brand);
+}
 .player-control-button:disabled { color: var(--muted); opacity: 0.6; cursor: default; }
 .player-control-button svg { width: 22px; height: 22px; flex: none; }
 .player-controls input[type="range"] {
@@ -1295,7 +1306,13 @@ input[type="text"].tag-entry-input {
 .player-capability-hint { display: block; color: var(--muted); font-size: 0.85em; padding: 5px 0; }
 .custom-controls-ready:not(.player-controls-visible) .player-controls,
 .custom-controls-ready:not(.player-controls-visible) .player-chrome {
-    opacity: 0; visibility: hidden; pointer-events: none;
+    visibility: hidden; pointer-events: none;
+}
+.custom-controls-ready:not(.player-controls-visible) .player-chrome {
+    opacity: 0; transition-delay: 0s, 0.15s;
+}
+.custom-controls-ready:not(.player-controls-visible) .player-controls {
+    transform: translateY(100%); transition-delay: 0s, 0.2s;
 }
 .custom-controls-ready:not(.player-controls-visible) .player-media-stage { cursor: none; }
 .playlist-queue {

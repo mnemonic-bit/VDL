@@ -4100,6 +4100,9 @@ let playerSliderInteraction = false;
 let playerReturnFocus = null;
 let playerVolumeSupported = true;
 let playerFullscreenRequest = 0;
+let playerRepeatCurrent = false;
+// Pointer activation leaves buttons focused without an ongoing interaction.
+let playerPointerFocus = false;
 
 function playerControl(id) { return document.getElementById(id); }
 function playerIsOpen() { return playerControl('playerBackdrop').classList.contains('open'); }
@@ -4158,6 +4161,10 @@ function syncPlayerControls() {
     play.querySelector('use')?.setAttribute('href', paused ? '#i-play' : '#i-pause');
     play.disabled = playerRecoveryActive() || (endlessPlayback.active
         && ['opening', 'advancing', 'create-failed'].includes(endlessPlayback.phase));
+    const repeat = playerControl('playerRepeat');
+    repeat.setAttribute('aria-pressed', String(playerRepeatCurrent));
+    repeat.disabled = play.disabled || (playerNavigationBusy() && !playerPreparation?.fade)
+        || !endlessPlayback.currentItem;
     playerControl('playerTitle').textContent = endlessPlayback.currentItem?.title || 'Video playback';
     const mode = playerControl('playerModeLabel');
     mode.textContent = endlessPlayback.active ? ({ sequential: 'Play All', shuffle: 'Shuffle',
@@ -4296,18 +4303,28 @@ function initializePlayerControls() {
     const controls = playerControl('playerControls');
     const ids = ['playerTitle', 'playerModeLabel', 'playerPlayPause', 'playerMute', 'playerPrevious',
         'playerNext', 'playerFullscreen', 'playerQueueToggle', 'playerSeek', 'playerVolume',
-        'playerSpeed', 'playerTime', 'playerVolumeHint'];
+        'playerSpeed', 'playerTime', 'playerVolumeHint', 'playerRepeat'];
     if (!container || !controls || ids.some(id => !playerControl(id))) return;
     const abort = new AbortController();
     const listen = (node, type, callback, options = {}) => node.addEventListener(type, callback,
         { ...options, signal: abort.signal });
     try {
         listen(playerControl('playerPlayPause'), 'click', () => togglePlayerPlayback());
+        listen(playerControl('playerRepeat'), 'click', togglePlayerRepeat);
+        listen(playerControl('playerMediaStage'), 'click', event => {
+            if (event.button !== 0 || event.target !== playerControl('playerVideo')) return;
+            container.focus({ preventScroll: true });
+            togglePlayerPlayback();
+        });
         listen(playerControl('playerMute'), 'click', () => updatePlayerListening({
             muted: playerPreparation?.fade ? !playerListening.muted : !playerControl('playerVideo').muted,
         }));
         listen(playerControl('playerVolume'), 'input', event => updatePlayerListening({ volume: Number(event.target.value) / 100 }));
-        listen(playerControl('playerSpeed'), 'change', event => updatePlayerListening({ rate: Number(event.target.value) }));
+        listen(playerControl('playerSpeed'), 'change', event => {
+            updatePlayerListening({ rate: Number(event.target.value) });
+            if (playerPointerFocus) container.focus({ preventScroll: true });
+        });
+        listen(playerControl('playerSpeed'), 'keyup', showPlayerControls);
         listen(playerControl('playerPrevious'), 'click', () => navigatePlayer(-1));
         listen(playerControl('playerNext'), 'click', () => navigatePlayer(1));
         listen(playerControl('playerFullscreen'), 'click', togglePlayerFullscreen);
@@ -4366,8 +4383,12 @@ function initializePlayerControls() {
             });
         }
         listen(container, 'pointermove', showPlayerControls);
-        listen(container, 'pointerdown', showPlayerControls);
+        listen(container, 'pointerdown', () => {
+            playerPointerFocus = true;
+            showPlayerControls();
+        });
         listen(container, 'keydown', event => {
+            playerPointerFocus = false;
             showPlayerControls();
             if (event.key !== 'Tab') return;
             const focusable = [...container.querySelectorAll('button, input, select, [tabindex="0"]')]
@@ -4382,8 +4403,11 @@ function initializePlayerControls() {
             }
         });
         listen(container, 'focusin', showPlayerControls);
-        listen(container, 'focusout', () => { setTimeout(() => { if (playerIsOpen()) showPlayerControls(); }, 0); });
-        listen(controls, 'pointerleave', showPlayerControls);
+        listen(container, 'focusout', () => {
+            setTimeout(() => {
+                if (playerIsOpen() && container.classList.contains('player-controls-visible')) showPlayerControls();
+            }, 0);
+        });
         listen(document, 'focusin', event => {
             if (playerIsOpen() && !container.contains(event.target)) {
                 showPlayerControls(); container.focus({ preventScroll: true });
@@ -4404,7 +4428,7 @@ function initializePlayerControls() {
                         }
                     }
                     syncPlayerControls();
-                    if (['play', 'playing', 'pause', 'ended', 'waiting', 'error'].includes(name)
+                    if (['play', 'playing', 'pause', 'ended', 'waiting', 'error', 'seeked', 'canplay'].includes(name)
                             || (name === 'stalled' && !playerMediaProgressing.has(video))) showPlayerControls();
                 });
             }
@@ -4466,7 +4490,35 @@ function playPlayerVideo(video, generation = endlessPlayback.loadGeneration) {
 
 function playerEffectiveEnd(video) {
     const state = playerBoundaries.get(video);
+    // Repeating a video takes precedence over sampled Shuffle Clips bounds.
+    if (state?.clip && repeatingPlayerVideo(video)) return video.duration;
     return state?.valid && (state.clip || !state.tail) ? state.end : video.duration;
+}
+
+function repeatingPlayerVideo(video) {
+    return playerRepeatCurrent && video.id === 'playerVideo';
+}
+
+function togglePlayerRepeat() {
+    if (playerControl('playerRepeat').disabled) return;
+    playerRepeatCurrent = !playerRepeatCurrent;
+    // A fade has already made its incoming video current. Settle onto that
+    // video before discarding the reserved successor and its async callbacks.
+    if (playerRepeatCurrent) {
+        finishPlayerFade();
+        clearPlayerPreparation();
+        const state = playerBoundaries.get(playerControl('playerVideo'));
+        if (state) state.finished = false;
+    } else {
+        const video = playerControl('playerVideo');
+        const state = playerBoundaries.get(video);
+        if (state?.clip && (video.currentTime < state.start || video.currentTime >= state.end)) {
+            seekPlayerBoundary(video, state, state.start);
+        }
+        maybePreparePlayer();
+    }
+    syncPlayerControls();
+    showPlayerControls();
 }
 
 function sampleShuffleClip(duration, random = Math.random) {
@@ -4520,8 +4572,8 @@ function createShuffleClipBoundary(video, { current, clipOccurrence, onFailure }
     const resume = () => {
         if (!alive() || state.failed || state.finished || !state.valid || state.ownSeek || video.seeking
                 || video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA) return;
-        if (video.currentTime < state.start - 0.05
-                || (!state.started && video.currentTime > state.end + 0.05)) return;
+        if (!repeatingPlayerVideo(video) && (video.currentTime < state.start - 0.05
+                || (!state.started && video.currentTime > state.end + 0.05))) return;
         state.ready = true;
         clearTimeout(state.timer);
         video.style.removeProperty('visibility');
@@ -4561,6 +4613,7 @@ function createShuffleClipBoundary(video, { current, clipOccurrence, onFailure }
         if (state.ownSeek && Math.abs(video.currentTime - state.target) < 0.05) return;
         state.ownSeek = false;
         state.ready = false;
+        if (repeatingPlayerVideo(video)) return;
         if (video.currentTime < state.start) {
             seekPlayerBoundary(video, state, state.start);
         } else if (video.currentTime >= state.end) {
@@ -4574,11 +4627,11 @@ function createShuffleClipBoundary(video, { current, clipOccurrence, onFailure }
             return;
         }
         state.ownSeek = false;
-        if (video.currentTime < state.start - 0.05) {
+        if (!repeatingPlayerVideo(video) && video.currentTime < state.start - 0.05) {
             seekPlayerBoundary(video, state, state.start);
             return;
         }
-        if (state.valid && video.currentTime >= state.end) completePlayerItem(video);
+        if (!repeatingPlayerVideo(video) && state.valid && video.currentTime >= state.end) completePlayerItem(video);
         else resume();
     };
     const listeners = {
@@ -4750,6 +4803,19 @@ function completePlayerItem(video, natural = false) {
         return;
     }
     if (video.id !== 'playerVideo') return;
+    if (repeatingPlayerVideo(video)) {
+        if (state) {
+            state.finished = false;
+            state.tail = false;
+            state.play = null;
+        }
+        video.pause();
+        const start = state?.valid && !state.clip ? state.start : 0;
+        if (state) seekPlayerBoundary(video, state, start);
+        else video.currentTime = start;
+        playPlayerVideo(video);
+        return;
+    }
     if (natural && state?.clip && playerPreparation && !playerPreparation.disabled) {
         // At EOF there is no more moving footage; retain the last picture while
         // the reserved successor finishes loading instead of replacing its source.
@@ -4786,7 +4852,7 @@ function checkPlayerBoundary(video) {
 }
 
 function canPreparePlayer() {
-    return endlessPlayback.active && endlessPlayback.sessionId
+    return !playerRepeatCurrent && endlessPlayback.active && endlessPlayback.sessionId
         && ['sequential', 'shuffle', 'shuffle_clips'].includes(endlessPlayback.mode);
 }
 
@@ -5355,14 +5421,23 @@ function hidePlayerControls({ force = false } = {}) {
     const video = playerControl('playerVideo');
     const container = playerControl('playerContainer') || document.querySelector('.player-box');
     const controls = playerControl('playerControls');
+    const speed = playerControl('playerSpeed');
+    let choosingRate = document.activeElement === speed;
+    // Closing a native picker on its current value emits no change event.
+    // Engines without :open retain the focused-selector accessibility fallback.
+    try { choosingRate = speed.matches(':open'); } catch (_error) { /* Older selector engine. */ }
     if (!force && playerIsOpen() && (video.paused || video.ended || video.seeking
             || (video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA
                 && !(video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && playerMediaProgressing.has(video)))
             || playerMediaWaiting.has(video)
             || !playerControl('playerTransition').hidden || playerSeekDrag || playerSliderInteraction
-            || container.querySelector('.player-chrome :focus, #playerControls :focus, #playlistQueue :focus')
-            || controls?.matches(':hover') || container.querySelector('.player-chrome:hover')
-            || (!playerControl('playlistQueue').hidden && playerControl('playlistQueue').matches(':hover')))) return;
+            || (!playerPointerFocus && container.querySelector(
+                '.player-chrome :focus, #playerControls :focus, #playlistQueue :focus'))
+            || choosingRate)) {
+        // Native picker cancellation can consume every closing input event.
+        if (choosingRate) playerControlsTimer = setTimeout(hidePlayerControls, PLAYER_CONTROLS_IDLE_MS);
+        return;
+    }
     container.classList.remove('player-controls-visible');
     if (playerControlsReady) {
         controls.inert = true;
@@ -5545,6 +5620,7 @@ function observePlaybackPromise(playback, generation) {
 }
 
 function loadPlaybackItem(item, { automatic = false, seekSeconds = null, adopt = false, waitForRetry = false } = {}) {
+    playerRepeatCurrent = false;
     if (!adopt) clearPlayerPreparation();
     const video = document.getElementById('playerVideo');
     if (!adopt) {
@@ -5737,6 +5813,7 @@ function releasePlaybackLease(sessionId) {
 }
 
 function deactivateEndlessPlayback({ release = true } = {}) {
+    playerRepeatCurrent = false;
     const clips = endlessPlayback.mode === 'shuffle_clips';
     // Playback promises can settle while the replacement session is opening.
     if (clips) endlessPlayback.loadGeneration += 1;
@@ -5824,6 +5901,8 @@ function closePlayer() {
     playerStartedFullscreen = false;
     playerSeekDrag = null;
     playerSliderInteraction = false;
+    playerRepeatCurrent = false;
+    playerPointerFocus = false;
     hidePlayerControls({ force: true });
     showPlayerTransition('', []);
     if (document.activeElement === closeButton) closeButton.blur();
