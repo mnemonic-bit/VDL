@@ -318,6 +318,16 @@ unavailable. Browser regressions cover native paste, successful submission,
 editable controls, modal guards, focus restoration, and header spacing in
 both themes at desktop and mobile widths.
 
+Issue 69 is fixed in version `0.50.4`. URL worker setup failures now publish
+an actionable outcome, with transient SQLite terminal-write failures retried
+until persistence recovers. Stop reconciles dead URL workers without a restart.
+Extraction and media requests have finite socket waits and retries, with Stop
+checked around requests and reads; ownership is retained through cleanup.
+Current downloads exposes preparation/stopping stages and byte counts. Real
+SQLite-lock and local-HTTP regressions cover recovery and queued successors at
+Unlimited and 50 Mbps. The affected deployment's precise trigger and any
+connection to Bug 0067 remain unconfirmed.
+
 ## Bug reports
 
 - [Bug 0001 — Merged downloads kept the deleted temporary audio filename](bug-0001-merged-downloads-kept-deleted-temporary-audio-filename.md)
@@ -388,6 +398,7 @@ both themes at desktop and mobile widths.
 - [Bug 0066 — Custom-controls Home seek does not reach zero in GitHub Actions](bug-0066-custom-controls-home-seek-does-not-reach-zero-in-github-actions.md)
 - [Bug 0067 — Container startup delays previews and logs SQLite registration warnings](bug-0067-container-startup-delays-previews-and-logs-sqlite-warnings.md)
 - [Bug 0068 — Redundant Plus button in the download header](bug-0068-redundant-plus-button-in-download-header.md)
+- [Bug 0069 — URL downloads remain at zero bytes without recovery](bug-0069-downloads-remain-at-zero-bytes-without-recovery.md)
 
 ## Accepted UI decisions
 

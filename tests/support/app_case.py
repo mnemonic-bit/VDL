@@ -123,6 +123,15 @@ class AppCase(unittest.TestCase):
         )
         return path
 
+    def wait_worker_stopped(self, download_id, timeout=5):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with vdl._worker_condition:
+                if download_id not in vdl._live_worker_ids:
+                    return
+            time.sleep(0.01)
+        self.fail('worker did not release ownership')
+
     def start_immediately(self):
         """Run route-created worker targets synchronously and deterministically."""
         return mock.patch.object(vdl.threading, "Thread", ImmediateThread)

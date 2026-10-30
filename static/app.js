@@ -3192,13 +3192,15 @@ function renderItem(info, inHistoryView = false) {
     const etaStr = isRunning ? formatEta(info.eta) : '';
     const downloadedPercent = itemProgressPercent(info);
     const downloadSummaryParts = [];
-    if (info.status === 'starting' && info.progress === 'Waiting for a download slot') {
-        downloadSummaryParts.push('Waiting for a download slot');
+    if ((info.status === 'starting' && info.progress)
+            || ((isRunning || isPaused) && String(info.progress).startsWith('Stopping download;'))) {
+        downloadSummaryParts.push(escapeHtml(info.progress));
     }
     const summarySize = formatBytes(info.filesize);
     if (isUpload && info.upload_detail) downloadSummaryParts.push(escapeHtml(info.upload_detail));
     if (summarySize) downloadSummaryParts.push(`<strong>Total size:</strong> ${summarySize}`);
     if (isUpload) downloadSummaryParts.push(`<strong>Bytes uploaded:</strong> ${formatBytes(info.downloaded_bytes) || '0 B'}`);
+    else downloadSummaryParts.push(`<strong>Bytes downloaded:</strong> ${formatBytes(info.downloaded_bytes) || '0 B'}`);
     if (info.resolution) downloadSummaryParts.push(`<strong>Quality:</strong> ${info.resolution}`);
     downloadSummaryParts.push(`<strong>${isUpload ? 'Uploaded' : 'Downloaded'}:</strong> ${downloadedPercent === null ? '&mdash;' : `${downloadedPercent}%`}`);
     const downloadSummaryRow = isCurrentRow

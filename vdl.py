@@ -1598,6 +1598,9 @@ def _public_download_entry(entry):
         public.get('display_filename') or os.path.basename(stored)
         if stored else None
     )
+    if (entry['status'] in ('starting', 'downloading', 'paused')
+            and is_cancel_requested(entry['id'])):
+        public['progress'] = 'Stopping download; waiting for the source to respond'
     return public
 
 
@@ -3749,7 +3752,6 @@ def _dispatch_worker_queue():
             continue
         _live_worker_ids.add(job['id'])
         try:
-            db_update_download(job['id'], progress='Preparing download')
             args = (job['url'], job['id'])
             if job['cookies'] is not None:
                 args += (job['cookies'],)
@@ -4079,20 +4081,115 @@ def _validated_custom_filename(value):
     return stem
 
 
+def _persist_worker_outcome(download_id, **changes):
+    # Keep ownership until the outcome is durable. A one-shot fallback write
+    # can hit the same busy database and strand an active row without a worker.
+    while True:
+        try:
+            return db_update_download(download_id, **changes)
+        except sqlite3.OperationalError as exc:
+            if not _is_database_busy(exc):
+                raise
+            time.sleep(0.25)
+
+
+DOWNLOAD_SOCKET_TIMEOUT = 15
+DOWNLOAD_NETWORK_RETRIES = 2
+
+
+@contextmanager
+def _guard_download_network(ydl, download_id):
+    if not hasattr(ydl, 'urlopen'):
+        yield
+        return
+    original_urlopen = ydl.urlopen
+    responses = set()
+
+    def check_cancel():
+        if is_cancel_requested(download_id):
+            raise DownloadCancelled()
+
+    def urlopen(*args, **kwargs):
+        check_cancel()
+        try:
+            response = original_urlopen(*args, **kwargs)
+        except Exception:
+            check_cancel()
+            raise
+        if is_cancel_requested(download_id):
+            response.close()
+            raise DownloadCancelled()
+        responses.add(response)
+        original_read = response.read
+        original_close = response.close
+
+        def close():
+            try:
+                return original_close()
+            finally:
+                # Long fragmented downloads must not retain every completed
+                # response until the entire video finishes.
+                responses.discard(response)
+
+        def read(*args, **kwargs):
+            check_cancel()
+            try:
+                data = original_read(*args, **kwargs)
+            except Exception:
+                check_cancel()
+                raise
+            check_cancel()
+            return data
+
+        # Preserve the transport response's type and other methods. Extraction
+        # and media reads both need cancellation, even with no bandwidth cap.
+        response.read = read
+        response.close = close
+        return response
+
+    ydl.urlopen = urlopen
+    try:
+        yield
+    finally:
+        # Generic extraction can return a direct media URL without consuming
+        # its response body. Close every response before releasing ownership.
+        for response in list(responses):
+            response.close()
+        ydl.urlopen = original_urlopen
+
+
 def background_download(url, download_id, cookie_bundle=None):
     with _worker_condition:
         _live_worker_ids.add(download_id)
     try:
         if not _acquire_worker_slot(download_id, url):
-            db_update_download(
+            _persist_worker_outcome(
                 download_id, status='cancelled', finished_at=time.time(),
                 output_dir=os.path.abspath(db_get_preferences().get('download_dir', '.')),
             )
             clear_cancel(download_id)
             clear_pause(download_id)
             return
+        db_update_download(download_id, progress='Preparing download')
         return _background_download(url, download_id, cookie_bundle)
+    except Exception as exc:
+        sensitive_values = tuple(
+            secret
+            for cookie in (cookie_bundle or ()) if isinstance(cookie, dict)
+            for secret in (cookie.get('name', ''), cookie.get('value', ''))
+            if secret
+        )
+        diagnostic = _redact_sensitive_text(exc, sensitive_values)
+        app.logger.error('Download worker %s failed: %s', download_id, diagnostic)
+        _persist_worker_outcome(
+            download_id, status='error', progress=diagnostic,
+            finished_at=time.time(),
+        )
     finally:
+        clear_cancel(download_id)
+        clear_pause(download_id)
+        _clear_progress_estimate(download_id)
+        _clear_eta_estimate(download_id)
         # Fragment downloaders can retain their locked destination stream in a
         # progress-hook reference cycle when cancellation skips normal cleanup.
         # Finalize those unreachable objects before Remove may unlink the file.
@@ -4117,112 +4214,99 @@ def _background_download(url, download_id, cookie_bundle=None):
         if secret
     )
     cookie_buffer = None
-    prefs = db_get_preferences()
-    output_dir = prefs.get("download_dir", ".")
     try:
+        prefs = db_get_preferences()
+        output_dir = prefs.get("download_dir", ".")
         output_dir = _prepare_download_directory(output_dir)
-    except ValueError as exc:
-        db_update_download(
-            download_id,
-            status='error',
-            progress=str(exc),
-            finished_at=time.time(),
-        )
-        clear_cancel(download_id)
-        clear_pause(download_id)
-        return
-    db_update_download(download_id, output_dir=os.path.abspath(output_dir))
+        db_update_download(download_id, output_dir=os.path.abspath(output_dir))
 
-    # Check if there's a format override from quality selection; otherwise use preference
-    entry = db_get_download(download_id)
-    fmt = (entry.get('requested_format') if entry else None) or prefs.get("format", "best")
-    requested_filename = entry.get('requested_filename') if entry else None
-    audio_only = fmt == 'bestaudio/best'
+        # Check if there's a format override from quality selection; otherwise use preference
+        entry = db_get_download(download_id)
+        fmt = (entry.get('requested_format') if entry else None) or prefs.get("format", "best")
+        requested_filename = entry.get('requested_filename') if entry else None
+        audio_only = fmt == 'bestaudio/best'
 
-    # Progress hooks report the paths of individual downloaded formats. The
-    # post-processor hook is the first authoritative source for the merged or
-    # remuxed output path, so retain its last completed path until yt-dlp has
-    # returned and the file is safe to expose through History.
-    postprocessed_paths = []
+        # Progress hooks report the paths of individual downloaded formats. The
+        # post-processor hook is the first authoritative source for the merged or
+        # remuxed output path, so retain its last completed path until yt-dlp has
+        # returned and the file is safe to expose through History.
+        postprocessed_paths = []
 
-    def capture_postprocessed_path(payload):
-        if payload.get('status') != 'finished':
-            return
-        info = payload.get('info_dict') or {}
-        path = info.get('filepath') or info.get('_filename')
-        if path:
-            postprocessed_paths.append(path)
+        def capture_postprocessed_path(payload):
+            if payload.get('status') != 'finished':
+                return
+            info = payload.get('info_dict') or {}
+            path = info.get('filepath') or info.get('_filename')
+            if path:
+                postprocessed_paths.append(path)
 
-    def build_opts(format_selector):
-        if requested_filename:
-            # Retain the random row ID until the download is complete so
-            # cancellation cleanup can identify every partial owned by it.
-            # Percent signs are literals here, not yt-dlp placeholders.
-            template_stem = requested_filename.replace('%', '%%')
-        else:
-            template_stem = '%(title)s'
-        options = {
-            'format': format_selector,
-            'outtmpl': os.path.join(
-                output_dir, f'{template_stem}_{download_id}.%(ext)s'
-            ),
-            'progress_hooks': [lambda d: progress_hook(d, download_id)],
-            'postprocessor_hooks': [capture_postprocessed_path],
-            'quiet': True,
-            'noprogress': True,
-            # continuedl is default-True in yt-dlp, but make it explicit so a
-            # resumed download picks up the existing .part file rather than
-            # restarting from byte zero.
-            'continuedl': True,
-        }
-        if audio_only:
-            # `best` may be a combined video when no separate audio format is
-            # available. Preserve the user's output intent across that yt-dlp
-            # fallback, including any later retry with a concrete format ID.
-            options['postprocessors'] = [
-                {'key': 'FFmpegExtractAudio', 'preferredcodec': 'm4a'},
-            ]
-        return with_cookie_options(options)
+        def build_opts(format_selector):
+            if requested_filename:
+                # Retain the random row ID until the download is complete so
+                # cancellation cleanup can identify every partial owned by it.
+                # Percent signs are literals here, not yt-dlp placeholders.
+                template_stem = requested_filename.replace('%', '%%')
+            else:
+                template_stem = '%(title)s'
+            options = {
+                'format': format_selector,
+                'outtmpl': os.path.join(
+                    output_dir, f'{template_stem}_{download_id}.%(ext)s'
+                ),
+                'progress_hooks': [lambda d: progress_hook(d, download_id)],
+                'postprocessor_hooks': [capture_postprocessed_path],
+                'quiet': True,
+                'noprogress': True,
+                # continuedl is default-True in yt-dlp, but make it explicit so a
+                # resumed download picks up the existing .part file rather than
+                # restarting from byte zero.
+                'continuedl': True,
+            }
+            if audio_only:
+                # `best` may be a combined video when no separate audio format is
+                # available. Preserve the user's output intent across that yt-dlp
+                # fallback, including any later retry with a concrete format ID.
+                options['postprocessors'] = [
+                    {'key': 'FFmpegExtractAudio', 'preferredcodec': 'm4a'},
+                ]
+            return with_cookie_options(options)
 
-    def with_cookie_options(options):
-        # Add the live secret only after the deployment helper's deep copy.
-        merged = yt_dlp_options(options)
-        if cookie_buffer is not None:
-            cookie_buffer.seek(0)
-            merged['cookiefile'] = cookie_buffer
-            merged['logger'] = _RedactingYtdlpLogger(sensitive_values)
-        return merged
+        def with_cookie_options(options):
+            # Add the live secret only after the deployment helper's deep copy.
+            merged = yt_dlp_options(options)
+            # Bound a silent socket wait and keep retries finite. Cancellation
+            # is checked before the next request, so Stop never starts a retry.
+            merged.update(
+                socket_timeout=DOWNLOAD_SOCKET_TIMEOUT,
+                retries=DOWNLOAD_NETWORK_RETRIES,
+                extractor_retries=DOWNLOAD_NETWORK_RETRIES,
+                fragment_retries=DOWNLOAD_NETWORK_RETRIES,
+            )
+            if cookie_buffer is not None:
+                cookie_buffer.seek(0)
+                merged['cookiefile'] = cookie_buffer
+                merged['logger'] = _RedactingYtdlpLogger(sensitive_values)
+            return merged
 
-    # Persist the yt-dlp format selector that we're about to use, so the
-    # History tab can show *what was asked for* whenever a download fails
-    # with 'Requested format is not available'. Saved up-front (not only
-    # on success) so it sticks even if the probe phase below blows up.
-    db_update_download(download_id, requested_format=fmt)
+        # Persist the yt-dlp format selector that we're about to use, so the
+        # History tab can show *what was asked for* whenever a download fails
+        # with 'Requested format is not available'. Saved up-front (not only
+        # on success) so it sticks even if the probe phase below blows up.
+        db_update_download(download_id, requested_format=fmt)
 
-    formats_summary = None  # captured during the probe phase, used as
-                            # the fallback source if the first attempt fails.
+        formats_summary = None  # captured during the probe phase, used as
+                                # the fallback source if the first attempt fails.
 
-    if cookie_bundle is not None:
-        try:
+        if cookie_bundle is not None:
             cookie_buffer = _cookies_to_netscape(cookie_bundle)
             cookie_bundle = None
-        except Exception as exc:
-            db_update_download(
-                download_id, status='error',
-                progress=_redact_sensitive_text(exc, sensitive_values),
-                finished_at=time.time(),
-            )
-            clear_cancel(download_id)
-            clear_pause(download_id)
-            return
 
-    # A Continue action starts a new worker, so its in-memory filter is gone.
-    # The last persisted ETA is a much safer baseline than yt-dlp's first
-    # throughput sample while the resumed connection is still warming up.
-    if entry:
-        _seed_eta_estimate(download_id, entry.get('eta'))
+        # A Continue action starts a new worker, so its in-memory filter is gone.
+        # The last persisted ETA is a much safer baseline than yt-dlp's first
+        # throughput sample while the resumed connection is still warming up.
+        if entry:
+            _seed_eta_estimate(download_id, entry.get('eta'))
 
-    try:
         # ---- Probe phase --------------------------------------------------
         # Run extract_info(download=False) up front so the available format
         # table is captured *before* yt-dlp tries to honour the user's
@@ -4237,6 +4321,7 @@ def _background_download(url, download_id, cookie_bundle=None):
         # in the Current tab even before the first byte arrives.
         if is_cancel_requested(download_id):
             raise DownloadCancelled()
+        db_update_download(download_id, progress='Reading source information')
         try:
             probe_opts = with_cookie_options({
                 'quiet': True,
@@ -4244,7 +4329,7 @@ def _background_download(url, download_id, cookie_bundle=None):
                 'skip_download': True,
                 'progress_hooks': [lambda d: progress_hook(d, download_id)],
             })
-            with yt_dlp.YoutubeDL(probe_opts) as probe:
+            with yt_dlp.YoutubeDL(probe_opts) as probe, _guard_download_network(probe, download_id):
                 info = probe.extract_info(url, download=False)
             formats_summary = summarize_formats(info)
             updates = {}
@@ -4264,8 +4349,11 @@ def _background_download(url, download_id, cookie_bundle=None):
 
         # ---- Download phase ----------------------------------------------
         # First attempt with the user's configured format selector.
+        if is_cancel_requested(download_id):
+            raise DownloadCancelled()
+        db_update_download(download_id, progress='Waiting for media')
         try:
-            with yt_dlp.YoutubeDL(build_opts(fmt)) as ydl:
+            with yt_dlp.YoutubeDL(build_opts(fmt)) as ydl, _guard_download_network(ydl, download_id):
                 govern_download(ydl, _bandwidth, download_id)
                 ydl.download([url])
         except yt_dlp.utils.DownloadError as e:
@@ -4281,7 +4369,7 @@ def _background_download(url, download_id, cookie_bundle=None):
                 # Nothing better to try -- surface the original error.
                 raise
             db_update_download(download_id, requested_format=best_id)
-            with yt_dlp.YoutubeDL(build_opts(best_id)) as ydl:
+            with yt_dlp.YoutubeDL(build_opts(best_id)) as ydl, _guard_download_network(ydl, download_id):
                 govern_download(ydl, _bandwidth, download_id)
                 ydl.download([url])
         # Re-stat the final file (post-processing may have changed it,
@@ -4322,7 +4410,7 @@ def _background_download(url, download_id, cookie_bundle=None):
                 # extractors. ffprobe always reflects the final container.
                 final_res = ffprobe_resolution(final_path)
                 final_duration = _consume_media_probe(final_path, final_res)
-                db_update_download(
+                _persist_worker_outcome(
                     download_id,
                     status='finished',
                     progress='100%',
@@ -4340,18 +4428,18 @@ def _background_download(url, download_id, cookie_bundle=None):
                     'Download completed but the final output file is missing'
                 )
     except DownloadCancelled:
-        db_update_download(download_id, status='cancelled', finished_at=time.time())
+        _persist_worker_outcome(download_id, status='cancelled', finished_at=time.time())
     except yt_dlp.utils.DownloadError as e:
         if is_cancel_requested(download_id):
-            db_update_download(download_id, status='cancelled', finished_at=time.time())
+            _persist_worker_outcome(download_id, status='cancelled', finished_at=time.time())
         else:
-            db_update_download(
+            _persist_worker_outcome(
                 download_id, status='error',
                 progress=_redact_sensitive_text(e, sensitive_values),
                 finished_at=time.time(),
             )
     except Exception as e:
-        db_update_download(
+        _persist_worker_outcome(
             download_id, status='error',
             progress=_redact_sensitive_text(e, sensitive_values),
             finished_at=time.time(),
@@ -4359,10 +4447,6 @@ def _background_download(url, download_id, cookie_bundle=None):
     finally:
         if cookie_buffer is not None:
             cookie_buffer.close()
-        clear_cancel(download_id)
-        clear_pause(download_id)
-        _clear_progress_estimate(download_id)
-        _clear_eta_estimate(download_id)
 
 
 def _finite_positive_number(value):
@@ -5901,13 +5985,17 @@ def stop_download(download_id):
         return jsonify({"message": "Download is not active", "status": entry['status']}), 200
     with _worker_condition:
         request_cancel(download_id)
-        # Preparation can be stopped before a PUT starts. With no receiver
-        # alive, no worker will publish the terminal status on our behalf.
-        if (entry.get('source_type') == 'upload'
-                and download_id not in _live_worker_ids):
+        # A failed URL worker from an earlier release is just as ownerless as
+        # an upload awaiting its PUT. Never infer this from row status alone.
+        if (download_id not in _live_worker_ids
+                and download_id not in _worker_hosts
+                and not any(job['id'] == download_id for job in _worker_queue)):
             current = db_get_download(download_id)
             if current and current['status'] in ('starting', 'downloading', 'paused'):
                 db_update_download(download_id, status='cancelled', finished_at=time.time())
+        # The public row derives its stopping message from the flag, so a late
+        # Stop cannot overwrite a terminal result published by the worker.
+        event_bus.publish('change', {'reason': 'stop-requested', 'id': download_id})
     return jsonify({"message": "Stop requested", "id": download_id})
 
 
