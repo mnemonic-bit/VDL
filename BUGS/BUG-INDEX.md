@@ -328,6 +328,16 @@ SQLite-lock and local-HTTP regressions cover recovery and queued successors at
 Unlimited and 50 Mbps. The affected deployment's precise trigger and any
 connection to Bug 0067 remain unconfirmed.
 
+Issue 70 records the reported player-control visibility and interaction gaps.
+After three seconds of inactivity, the title/Close header should fade out and
+the bottom controls should slide out of sight. The video surface should toggle
+Play/Pause on click, the speed selector should show rate factors without a
+visible Speed label, and a dedicated button should repeat the current video.
+In fullscreen, the video should use its final viewport-based size immediately,
+with both bars overlaid; hiding or revealing them must not resize the video.
+The report is open and documentation-only; these behaviors have not yet been
+reproduced or repaired for this request.
+
 ## Bug reports
 
 - [Bug 0001 — Merged downloads kept the deleted temporary audio filename](bug-0001-merged-downloads-kept-deleted-temporary-audio-filename.md)
@@ -399,6 +409,7 @@ connection to Bug 0067 remain unconfirmed.
 - [Bug 0067 — Container startup delays previews and logs SQLite registration warnings](bug-0067-container-startup-delays-previews-and-logs-sqlite-warnings.md)
 - [Bug 0068 — Redundant Plus button in the download header](bug-0068-redundant-plus-button-in-download-header.md)
 - [Bug 0069 — URL downloads remain at zero bytes without recovery](bug-0069-downloads-remain-at-zero-bytes-without-recovery.md)
+- [Bug 0070 — Player controls stay visible and lack direct playback actions](bug-0070-player-controls-stay-visible-and-lack-direct-playback-actions.md)
 
 ## Accepted UI decisions
 
