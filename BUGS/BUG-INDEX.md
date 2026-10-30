@@ -299,6 +299,17 @@ Chromium browser tests pass, and Firefox/WebKit each pass six focused checks.
 The Python 3.12 unit gate passes with 91.6% coverage. The original CI artifacts
 remain uninspected.
 
+Issue 67 was reported and fixed in version `0.50.2` on 2026-10-30. A
+deterministic startup reproduction showed visible thumbnails waiting through
+100 unrelated registrations (30 simulated seconds with 300 ms commits).
+Reconciliation now yields after a 50 ms time slice, bounded by the current
+operation, so that reproduction generates the thumbnail after one registration.
+Unchanged asset registrations also avoid write transactions while preserving
+caches and retry budgets. Tests cover persistent cache delivery during startup,
+eventual HTTP image delivery, and successful slow-commit warning fields.
+SQLite timing and contention diagnostics remain enabled. The original deployed
+image, complete logs, and storage conditions remain unconfirmed.
+
 ## Bug reports
 
 - [Bug 0001 — Merged downloads kept the deleted temporary audio filename](bug-0001-merged-downloads-kept-deleted-temporary-audio-filename.md)
@@ -367,6 +378,7 @@ remain uninspected.
 - [Bug 0064 — Shuffle Clips shows an empty player before the next video is ready](bug-0064-shuffle-clips-shows-empty-player-before-next-video-is-ready.md)
 - [Bug 0065 — Endless scrolling stalls before the final batch in GitHub Actions](bug-0065-endless-scroll-stalls-before-final-batch-in-github-actions.md)
 - [Bug 0066 — Custom-controls Home seek does not reach zero in GitHub Actions](bug-0066-custom-controls-home-seek-does-not-reach-zero-in-github-actions.md)
+- [Bug 0067 — Container startup delays previews and logs SQLite registration warnings](bug-0067-container-startup-delays-previews-and-logs-sqlite-warnings.md)
 
 ## Accepted UI decisions
 

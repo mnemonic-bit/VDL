@@ -15,6 +15,7 @@ from contextlib import nullcontext
 
 class AssetQueue:
     BATCH_SIZE = 100
+    RECONCILE_SECONDS = 0.05
     MAX_TABS = 256
     DEMAND_SECONDS = 60
     RETRY_DELAYS = (30, 300)
@@ -144,18 +145,20 @@ class AssetQueue:
                                 (download_id,)).fetchone():
                     return {}
                 for kind, version in self.versions.items():
-                    previous = conn.execute('SELECT source FROM generated_assets WHERE download_id=? AND kind=? LIMIT 1',
-                                            (download_id, kind)).fetchone()
+                    records = conn.execute('SELECT * FROM generated_assets WHERE download_id=? AND kind=?',
+                                           (download_id, kind)).fetchall()
+                    previous = records[0] if records else None
                     if previous is not None and previous['source'] != identity:
                         self._remove(paths[kind])
                         files[kind] = False
                     # Versions have their own retry budget; obsolete records must
                     # never become candidates after a cache-version upgrade.
-                    conn.execute('DELETE FROM generated_assets WHERE download_id=? '
-                                 'AND kind=? AND version<>?', (download_id, kind, version))
-                    row = conn.execute('SELECT * FROM generated_assets WHERE '
-                                       'download_id=? AND kind=? AND version=?',
-                                       (download_id, kind, version)).fetchone()
+                    # Even a DELETE matching no rows opens a write transaction.
+                    # Unchanged startup caches and readiness checks need only reads.
+                    if any(record['version'] != version for record in records):
+                        conn.execute('DELETE FROM generated_assets WHERE download_id=? '
+                                     'AND kind=? AND version<>?', (download_id, kind, version))
+                    row = next((record for record in records if record['version'] == version), None)
                     if row is not None and row['source'] != identity:
                         self._remove(paths[kind])
                         files[kind] = False
@@ -460,6 +463,7 @@ class AssetQueue:
         """Read a bounded collection slice; stat files outside the DB write lock."""
         if self._scan_done:
             return False
+        deadline = time.monotonic() + self.RECONCILE_SECONDS
         with self.db() as conn:
             rows = conn.execute("SELECT rowid AS asset_rowid,id FROM downloads WHERE rowid>? "
                                 "AND status='finished' ORDER BY rowid LIMIT ?",
@@ -470,10 +474,14 @@ class AssetQueue:
         for row in rows:
             if self._stop.is_set():
                 return False
-            self._scan_cursor = row['asset_rowid']
             entry = self.get_entry(row['id'])
             if entry is not None:
                 self.register(entry)
+            self._scan_cursor = row['asset_rowid']
+            # A slow commit may consume the whole slice. Give queued foreground
+            # work a turn before attempting another unrelated registration.
+            if time.monotonic() >= deadline:
+                break
         return True
 
     def _recover(self):

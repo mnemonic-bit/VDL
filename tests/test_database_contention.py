@@ -273,6 +273,58 @@ class DatabaseContentionTest(AppCase):
         self.assertNotIn('UPDATE', diagnostic)
         self.assertNotIn(private, diagnostic)
 
+    def test_successful_slow_asset_commit_retains_actionable_diagnostics(self):
+        self.finished_file()
+        queue = vdl._get_asset_queue()
+        entry = vdl.db_get_download('test0001')
+        with vdl.db() as connection:
+            connection.execute('DELETE FROM generated_assets')
+        connect = sqlite3.connect
+        elapsed = [0.0]
+        failures = []
+
+        class SlowCommitConnection:
+            def __init__(self, *args, **kwargs):
+                self.connection = connect(*args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+            @property
+            def row_factory(self):
+                return self.connection.row_factory
+
+            @row_factory.setter
+            def row_factory(self, value):
+                self.connection.row_factory = value
+
+            def commit(self):
+                writing = self.connection.in_transaction
+                self.connection.commit()
+                if writing:
+                    elapsed[0] += 0.3
+
+        def register():
+            try:
+                queue.register(entry)
+            except BaseException as error:
+                failures.append(error)
+
+        with (mock.patch.object(vdl.sqlite3, 'connect', side_effect=SlowCommitConnection),
+              mock.patch.object(vdl.time, 'perf_counter', side_effect=lambda: elapsed[0]),
+              self.assertLogs(vdl.app.logger, level='WARNING') as logs):
+            worker = threading.Thread(target=register, name='vdl-assets')
+            worker.start()
+            worker.join(3)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(len(logs.output), 1)
+        diagnostic = logs.output[0]
+        for field in ('operation=register', 'thread_name=vdl-assets', 'phase=commit',
+                      'execution_seconds=0.000', 'commit_seconds=0.300', 'result=ok code=None'):
+            self.assertIn(field, diagnostic)
+        self.assertEqual(queue.readiness(entry), {'thumbnail': 'queued', 'montage': 'queued'})
+
     def test_locked_authentication_never_calls_endpoint_or_retries_lookup(self):
         error = sqlite3.OperationalError('private diagnostic')
         error.sqlite_errorcode = sqlite3.SQLITE_LOCKED

@@ -6,6 +6,7 @@ import threading
 import time
 import unittest
 from contextlib import contextmanager
+from unittest import mock
 
 from asset_generation import AssetQueue
 
@@ -257,6 +258,115 @@ class AssetQueueTests(unittest.TestCase):
         self.assertEqual(self.queue.register(entry), {'thumbnail': 'ready', 'montage': 'ready'})
         self.assertEqual(self.drain(), 0)
 
+    def test_foreground_arriving_during_slow_startup_scan_generates_promptly(self):
+        for index in range(120):
+            self.add(f'background{index:03d}', register=False)
+        visible = self.add('visible', register=False)
+        entered, release = threading.Event(), threading.Event()
+        registered = []
+        first_generation = []
+        elapsed = [0.0]
+        original_register = self.queue.register
+
+        def slow_register(entry):
+            if threading.current_thread().name == 'vdl-assets':
+                if not registered:
+                    entered.set()
+                    if not release.wait(3):
+                        raise RuntimeError('Startup test did not release registration')
+                result = original_register(entry)
+                registered.append(entry['id'])
+                # Model a successful slow commit without wall-clock sleeps.
+                elapsed[0] += 0.3
+                return result
+            return original_register(entry)
+
+        def generate(kind, source, target):
+            first_generation.append((len(registered), elapsed[0]))
+            self.queue._stop.set()
+            return self.generate(kind, source, target)
+
+        self.queue.register = slow_register
+        self.queue.generate = generate
+        with mock.patch('asset_generation.time.monotonic', side_effect=lambda: elapsed[0]):
+            thread = self.queue.start()
+            try:
+                self.assertTrue(entered.wait(3))
+                self.queue.register(visible)
+                self.queue.replace_demand('user', 'tab', 1, ['visible'])
+            finally:
+                release.set()
+                thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(self.generated, [('visible.mp4', 'thumbnail')])
+        self.assertEqual(self.queue.readiness(visible)['thumbnail'], 'ready')
+        self.assertEqual(first_generation, [(1, 0.3)])
+
+    def test_restart_reconciliation_preserves_caches_and_retry_budgets_without_writes(self):
+        cached = self.add('cached')
+        self.drain()
+        self.add('failed')
+        self.add('retrying')
+        with self.db() as conn:
+            conn.execute("UPDATE generated_assets SET state='failed',attempts=3,failure='exhausted' "
+                         "WHERE download_id='failed'")
+            conn.execute("UPDATE generated_assets SET attempts=1,retry_at=2000,failure='retry later' "
+                         "WHERE download_id='retrying'")
+        before = self.rows()
+        transactions = []
+
+        @contextmanager
+        def observed_db():
+            with self.db() as conn:
+                yield conn
+                transactions.append(conn.in_transaction)
+
+        replacement = self.make_queue()
+        replacement.db = observed_db
+        self.assertTrue(replacement.reconcile_batch())
+        self.assertFalse(replacement.reconcile_batch())
+        self.assertEqual(self.rows(), before)
+        self.assertTrue(transactions)
+        self.assertFalse(any(transactions), 'Unchanged registrations opened write transactions')
+        self.assertFalse(replacement.step())
+        self.assertEqual(len(self.generated), 2)
+        for kind in ('thumbnail', 'montage'):
+            with open(self.path(cached, kind), 'rb') as stream:
+                self.assertEqual(stream.read(), b'generated')
+
+    def test_slow_reconciliation_resumes_after_last_successful_registration(self):
+        entries = [self.add(f'scan{index}', register=False) for index in range(3)]
+        elapsed = [0.0]
+        original_register = self.queue.register
+        registered = []
+
+        def slow_register(entry):
+            result = original_register(entry)
+            registered.append(entry['id'])
+            elapsed[0] += 0.3
+            return result
+
+        self.queue.register = slow_register
+        with mock.patch('asset_generation.time.monotonic', side_effect=lambda: elapsed[0]):
+            for entry in entries:
+                self.assertTrue(self.queue.reconcile_batch())
+                self.assertEqual(registered[-1], entry['id'])
+                self.assertTrue(self.queue.step())
+            self.assertFalse(self.queue.reconcile_batch())
+        self.assertEqual(registered, [entry['id'] for entry in entries])
+        self.drain()
+        self.assertEqual({row['state'] for row in self.rows()}, {'ready'})
+        self.assertEqual(len(self.generated), 6)
+
+    def test_failed_scan_registration_is_retried_before_advancing(self):
+        entry = self.add('retry-scan', register=False)
+        with mock.patch.object(self.queue, 'register', side_effect=sqlite3.OperationalError('locked')):
+            with self.assertRaises(sqlite3.OperationalError):
+                self.queue.reconcile_batch()
+        self.assertTrue(self.queue.reconcile_batch())
+        self.assertEqual(self.drain(), 2)
+        self.assertEqual(self.queue.readiness(entry), {'thumbnail': 'ready', 'montage': 'ready'})
+
     def test_blocked_generation_serialization_deletion_and_next_priority(self):
         first = self.add('first')
         self.add('background')
@@ -371,7 +481,8 @@ class AssetQueueTests(unittest.TestCase):
         # No browser demand, no request threads, and no image requests occur.
         entries = [self.add(f'bulk{i:04d}', register=False) for i in range(1500)]
         self.assertTrue(self.queue.reconcile_batch())
-        self.assertEqual(len(self.rows()), self.queue.BATCH_SIZE * 2)
+        self.assertGreater(len(self.rows()), 0)
+        self.assertLessEqual(len(self.rows()), self.queue.BATCH_SIZE * 2)
         active = 0
         maximum = 0
         counter_lock = threading.Lock()

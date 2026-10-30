@@ -2,6 +2,7 @@
 
 import os
 import json
+import threading
 import unittest
 from unittest import mock
 
@@ -117,6 +118,77 @@ class AssetApiTest(AppCase):
         response = self.client.get("/api/thumbnail/test0001", headers={"If-None-Match": etag})
         self.assertEqual(response.status_code, 304)
         response.close()
+
+    def test_replacement_serves_persisted_caches_while_startup_scan_is_blocked(self):
+        self.finished_file('backlog1', 'backlog.mp4')
+        self.finished_file('cached01', 'cached.mp4')
+        entry = vdl.db_get_download('cached01')
+        for path in (vdl._thumbnail_path(entry), vdl._preview_path(entry)):
+            with open(path, 'wb') as stream:
+                stream.write(b'persistent cache')
+        previous = vdl._get_asset_queue()
+        self.assertEqual(previous.register(entry), {'thumbnail': 'ready', 'montage': 'ready'})
+        previous.stop()
+        entered, release = threading.Event(), threading.Event()
+        with (mock.patch.object(vdl, '_asset_queue', None),
+              mock.patch.object(vdl, 'generate_video_thumbnail') as thumbnail,
+              mock.patch.object(vdl, 'generate_video_preview') as montage):
+            replacement = vdl._get_asset_queue()
+            original_register = replacement.register
+
+            def blocked(entry):
+                if threading.current_thread().name == 'vdl-assets':
+                    entered.set()
+                    if not release.wait(5):
+                        raise RuntimeError('Cache test did not release startup scan')
+                return original_register(entry)
+
+            replacement.register = blocked
+            replacement.start()
+            try:
+                self.assertTrue(entered.wait(3))
+                for route in ('thumbnail', 'preview'):
+                    response = self.client.get(f'/api/{route}/cached01')
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.data, b'persistent cache')
+                    response.close()
+                thumbnail.assert_not_called()
+                montage.assert_not_called()
+            finally:
+                replacement._stop.set()
+                release.set()
+                replacement.stop()
+
+    def test_startup_generation_makes_missing_thumbnail_available_over_http(self):
+        self.finished_file()
+        pending = self.client.get('/api/thumbnail/test0001')
+        self.assertEqual(pending.status_code, 202)
+        pending.close()
+        queue = vdl._get_asset_queue()
+        ready = threading.Event()
+        original_notify = queue.notify
+
+        def notify(ids):
+            original_notify(ids)
+            ready.set()
+
+        def thumbnail(_source, target):
+            with open(target, 'wb') as stream:
+                stream.write(b'new thumbnail')
+            return True
+
+        queue.notify = notify
+        with (mock.patch.object(vdl, 'generate_video_thumbnail', side_effect=thumbnail),
+              mock.patch.object(vdl, 'generate_video_preview', return_value=False)):
+            queue.start()
+            try:
+                self.assertTrue(ready.wait(3))
+                response = self.client.get('/api/thumbnail/test0001')
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.data, b'new thumbnail')
+                response.close()
+            finally:
+                queue.stop()
 
     def test_stale_revisions_do_not_replace_newer_view(self):
         self.finished_file("newpage1", "new.mp4")
