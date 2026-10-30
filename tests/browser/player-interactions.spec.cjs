@@ -189,6 +189,7 @@ test('controls keep their own actions and pointer range drags do not toggle play
     await page.locator('#playerTitle').click();
     await page.locator('#playerMute').click();
     await page.locator('#playerSpeed').selectOption('1.5');
+    await page.locator('#playerMute').hover();
     const volume = await page.locator('#playerVolume').boundingBox();
     await page.mouse.move(volume.x + volume.width - 8, volume.y + volume.height / 2);
     await page.mouse.down();

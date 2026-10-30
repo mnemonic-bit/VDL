@@ -4175,6 +4175,9 @@ function syncPlayerControls() {
             || playerSeekDrag.generation !== endlessPlayback.loadGeneration)) playerSeekDrag = null;
     const position = playerSeekDrag ? Number(seek.value) : video.currentTime;
     seek.disabled = !playerCanSeek(video) || playerRecoveryActive();
+    for (const id of ['playerRewind', 'playerForward']) {
+        playerControl(id).disabled = seek.disabled || play.disabled || playerNavigationBusy();
+    }
     seek.max = Number.isFinite(video.duration) && video.duration > 0 ? String(video.duration) : '0';
     if (!playerSeekDrag) seek.value = Number.isFinite(position) ? String(position) : '0';
     seek.setAttribute('aria-valuetext', `${playerSpokenTime(position)} of ${playerSpokenTime(video.duration)}`);
@@ -4303,7 +4306,7 @@ function initializePlayerControls() {
     const controls = playerControl('playerControls');
     const ids = ['playerTitle', 'playerModeLabel', 'playerPlayPause', 'playerMute', 'playerPrevious',
         'playerNext', 'playerFullscreen', 'playerQueueToggle', 'playerSeek', 'playerVolume',
-        'playerSpeed', 'playerTime', 'playerVolumeHint', 'playerRepeat'];
+        'playerSpeed', 'playerTime', 'playerVolumeHint', 'playerRepeat', 'playerRewind', 'playerForward'];
     if (!container || !controls || ids.some(id => !playerControl(id))) return;
     const abort = new AbortController();
     const listen = (node, type, callback, options = {}) => node.addEventListener(type, callback,
@@ -4311,6 +4314,17 @@ function initializePlayerControls() {
     try {
         listen(playerControl('playerPlayPause'), 'click', () => togglePlayerPlayback());
         listen(playerControl('playerRepeat'), 'click', togglePlayerRepeat);
+        for (const [id, offset] of [['playerRewind', -10], ['playerForward', 10]]) {
+            listen(playerControl(id), 'click', () => {
+                if (playerControl(id).disabled) return;
+                const video = playerControl('playerVideo');
+                const target = video.currentTime + offset;
+                // WebKit can emit ended on a paused seek to exact EOF, which
+                // would advance the session instead of retaining this video.
+                commitPlayerSeek(target >= video.duration ? Math.max(0, video.duration - 0.001) : target);
+                showPlayerControls();
+            });
+        }
         listen(playerControl('playerMediaStage'), 'click', event => {
             if (event.button !== 0 || event.target !== playerControl('playerVideo')) return;
             container.focus({ preventScroll: true });
@@ -4320,6 +4334,28 @@ function initializePlayerControls() {
             muted: playerPreparation?.fade ? !playerListening.muted : !playerControl('playerVideo').muted,
         }));
         listen(playerControl('playerVolume'), 'input', event => updatePlayerListening({ volume: Number(event.target.value) / 100 }));
+        const volume = playerControl('playerMute').closest('.player-volume-control');
+        listen(playerControl('playerMute'), 'pointerdown', event => {
+            if (event.pointerType === 'touch') volume.classList.add('volume-touch-open');
+        });
+        listen(document, 'pointerdown', event => {
+            volume.classList.remove('volume-keyboard-open');
+            if (!volume.contains(event.target)) volume.classList.remove('volume-touch-open');
+        });
+        listen(volume, 'focusin', () => {
+            if (!playerPointerFocus) volume.classList.add('volume-keyboard-open');
+        });
+        listen(volume, 'focusout', () => {
+            // Keep the range in the tab order while focus crosses from speaker
+            // to slider; hiding it during blur causes browsers to skip it.
+            setTimeout(() => {
+                if (!volume.contains(document.activeElement)) volume.classList.remove('volume-keyboard-open');
+            }, 0);
+        });
+        listen(playerControl('playerVolume'), 'pointerdown', () => volume.classList.add('volume-adjusting'));
+        for (const name of ['pointerup', 'pointercancel', 'lostpointercapture']) {
+            listen(document, name, () => volume.classList.remove('volume-adjusting'));
+        }
         listen(playerControl('playerSpeed'), 'change', event => {
             updatePlayerListening({ rate: Number(event.target.value) });
             if (playerPointerFocus) container.focus({ preventScroll: true });
@@ -4389,6 +4425,7 @@ function initializePlayerControls() {
         });
         listen(container, 'keydown', event => {
             playerPointerFocus = false;
+            if (volume.contains(document.activeElement)) volume.classList.add('volume-keyboard-open');
             showPlayerControls();
             if (event.key !== 'Tab') return;
             const focusable = [...container.querySelectorAll('button, input, select, [tabindex="0"]')]
@@ -4418,15 +4455,7 @@ function initializePlayerControls() {
                 'play', 'playing', 'pause', 'ended', 'waiting', 'stalled', 'canplay', 'seeking', 'seeked', 'emptied', 'error']) {
                 listen(video, name, () => {
                     if (video.id !== 'playerVideo') return;
-                    if (playerIsOpen() && !endlessPlayback.active) {
-                        if (name === 'waiting'
-                                || (name === 'stalled' && !playerMediaProgressing.has(video))) {
-                            showPlayerTransition('Buffering…', []);
-                        }
-                        else if (name === 'canplay' && playerControl('playerStatus').textContent === 'Buffering…') {
-                            showPlayerTransition('', []);
-                        }
-                    }
+                    updatePlayerBuffering(video, name);
                     syncPlayerControls();
                     if (['play', 'playing', 'pause', 'ended', 'waiting', 'error', 'seeked', 'canplay'].includes(name)
                             || (name === 'stalled' && !playerMediaProgressing.has(video))) showPlayerControls();
@@ -5459,7 +5488,30 @@ function showPlayerControls() {
     playerControlsTimer = setTimeout(hidePlayerControls, PLAYER_CONTROLS_IDLE_MS);
 }
 
-function showPlayerTransition(message, actions = [], focusAction = null) {
+function showPlayerBuffering() {
+    showPlayerTransition('Buffering', [], null, { buffering: true });
+}
+
+function updatePlayerBuffering(video, event) {
+    if (!playerIsOpen()) return;
+    const buffering = playerControl('playerTransition').classList.contains('player-buffering');
+    if (buffering && (['playing', 'canplay', 'ended', 'error'].includes(event)
+            || (event === 'pause' && !playerPreparation?.buffering)
+            || (event === 'seeked' && video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA))) {
+        showPlayerTransition('', []);
+        return;
+    }
+    // Recovery messages own the panel until their action succeeds. A stalled
+    // network request alone is not buffering while cached media still advances.
+    if (video.paused || video.ended || video.error || playerRecoveryActive()
+            || endlessPlayback.failedGeneration === endlessPlayback.loadGeneration
+            || (!buffering && !playerControl('playerTransition').hidden)) return;
+    if (event === 'waiting' || (['play', 'seeking', 'stalled'].includes(event)
+            && video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA
+            && !playerMediaProgressing.has(video))) showPlayerBuffering();
+}
+
+function showPlayerTransition(message, actions = [], focusAction = null, { buffering = false } = {}) {
     const transition = document.getElementById('playerTransition');
     const status = document.getElementById('playerStatus');
     const actionIds = {
@@ -5472,7 +5524,10 @@ function showPlayerTransition(message, actions = [], focusAction = null) {
         settings: 'playerPlaybackSettings',
         close: 'playerTransitionClose',
     };
-    status.textContent = message || '';
+    // Repeated media events must not repeat the same live-region announcement.
+    if (status.textContent !== (message || '')) status.textContent = message || '';
+    playerControl('playerBufferingSpinner').hidden = !buffering;
+    transition.classList.toggle('player-buffering', buffering);
     Object.entries(actionIds).forEach(([name, id]) => {
         document.getElementById(id).hidden = !actions.includes(name);
     });
@@ -5631,6 +5686,10 @@ function loadPlaybackItem(item, { automatic = false, seekSeconds = null, adopt =
     clearPlayerMediaCallbacks();
     playerSeekDrag = null;
     playerSliderInteraction = false;
+    const volume = playerControl('playerMute').closest('.player-volume-control');
+    volume.classList.remove('volume-adjusting', 'volume-touch-open');
+    volume.classList.toggle('volume-keyboard-open', !playerPointerFocus && volume.contains(document.activeElement));
+    showPlayerTransition('', []);
     const generation = ++endlessPlayback.loadGeneration;
     const epoch = endlessPlayback.epoch;
     const boundary = adopt ? playerBoundaries.get(video)
@@ -5717,16 +5776,17 @@ function loadPlaybackItem(item, { automatic = false, seekSeconds = null, adopt =
     video.removeAttribute('src');
     video.innerHTML = '';
     const source = document.createElement('source');
+    // With <source> children, an unsupported response can fail on the child
+    // without a video error event. It must replace buffering with recovery too.
+    source.addEventListener('error', onError, { once: true });
     source.src = '/api/file/' + encodeURIComponent(item.id);
     const mime = _VIDEO_MIME[item.extension] || null;
     if (mime) source.type = mime;
     video.appendChild(source);
     video.autoplay = !waitForRetry && !boundary.enabled;
     video.load();
-    if (endlessPlayback.active) {
-        showPlayerTransition(`Loading ${item.title || 'next video'}`, []);
-        armPlaybackWatchdog(generation);
-    }
+    if (!waitForRetry) showPlayerBuffering();
+    if (endlessPlayback.active) armPlaybackWatchdog(generation);
     if (automatic || (boundary.enabled && !waitForRetry)) {
         playPlayerVideo(video, generation);
     }
@@ -5903,6 +5963,7 @@ function closePlayer() {
     playerSliderInteraction = false;
     playerRepeatCurrent = false;
     playerPointerFocus = false;
+    playerControl('playerMute').closest('.player-volume-control').classList.remove('volume-adjusting', 'volume-touch-open', 'volume-keyboard-open');
     hidePlayerControls({ force: true });
     showPlayerTransition('', []);
     if (document.activeElement === closeButton) closeButton.blur();
@@ -6532,7 +6593,7 @@ for (const video of document.querySelectorAll('#playerMediaStage video')) {
             playerMediaProgressing.add(video);
             playerMediaWaiting.delete(video);
             if (video.id === 'playerVideo' && playerIsOpen()) {
-                if (!endlessPlayback.active && playerControl('playerStatus').textContent === 'Buffering…') {
+                if (playerControl('playerTransition').classList.contains('player-buffering')) {
                     showPlayerTransition('', []);
                 }
                 if (resumed) showPlayerControls();

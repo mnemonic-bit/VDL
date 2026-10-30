@@ -339,6 +339,23 @@ browser checks cover fullscreen, reduced motion, playback and repeat in
 Chromium, Firefox and WebKit. The Python 3.12 unit gate passes with 92.0%
 `vdl.py` line coverage.
 
+Issue 71 is fixed in version `0.50.6`. Initial loading and playback buffering
+show a centered waiting spinner with **Buffering** underneath in direct and
+session playback. The volume slider opens above the speaker on hover, keyboard
+focus, or touch and stays usable during adjustment. Rewind/Forward ten-second
+buttons beside Play/Pause use the existing seek bounds and boundary behavior.
+Browser regressions cover buffering/recovery, fullscreen, the playlist queue,
+themes, reduced motion, narrow controls, volume interactions, and repeated
+playing/paused seeks. The Python 3.12 unit gate passes with 92.0% `vdl.py` line
+coverage.
+
+Issue 72 was reported from GitHub Actions on 2026-10-30: the browser suite
+finished with one failure and 392 passes. The overlay idle-controls test
+recorded transition events and reached the expected hidden states, but
+failed to capture an intermediate animation value for at least one bar.
+Frame-sampling timing is a hypothesis; the cause and visible playback impact
+remain unconfirmed pending trace review or a controlled reproduction.
+
 ## Bug reports
 
 - [Bug 0001 — Merged downloads kept the deleted temporary audio filename](bug-0001-merged-downloads-kept-deleted-temporary-audio-filename.md)
@@ -411,6 +428,8 @@ Chromium, Firefox and WebKit. The Python 3.12 unit gate passes with 92.0%
 - [Bug 0068 — Redundant Plus button in the download header](bug-0068-redundant-plus-button-in-download-header.md)
 - [Bug 0069 — URL downloads remain at zero bytes without recovery](bug-0069-downloads-remain-at-zero-bytes-without-recovery.md)
 - [Bug 0070 — Player controls stay visible and lack direct playback actions](bug-0070-player-controls-stay-visible-and-lack-direct-playback-actions.md)
+- [Bug 0071 — Player buffering feedback, volume reveal, and 10-second seek controls](bug-0071-player-buffering-feedback-volume-and-seek-controls.md)
+- [Bug 0072 — Player idle-transition sampling fails in GitHub Actions](bug-0072-player-idle-transition-sampling-fails-in-github-actions.md)
 
 ## Accepted UI decisions
 

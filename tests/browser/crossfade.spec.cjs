@@ -1,8 +1,9 @@
 const { test, expect } = require('@playwright/test');
-const { reset, seed, refresh } = require('./support.cjs');
+const { reset, seed, refresh, holdNativeMedia } = require('./support.cjs');
 
 test.beforeEach(async ({ page }) => {
     await reset(page);
+    await holdNativeMedia(page);
     await page.evaluate(() => {
         const states = new WeakMap();
         window.__media = video => {

@@ -1,8 +1,9 @@
 const { test, expect } = require('@playwright/test');
-const { reset, seed, refresh, openSettings } = require('./support.cjs');
+const { reset, seed, refresh, openSettings, holdNativeMedia } = require('./support.cjs');
 
 test.beforeEach(async ({ page }) => {
     await reset(page);
+    await holdNativeMedia(page);
     await page.request.post('/api/preferences', { data: { skip_video_edges: true } });
     await page.evaluate(() => loadPreferences());
     await page.evaluate(() => {

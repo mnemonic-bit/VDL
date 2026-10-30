@@ -19,6 +19,12 @@ async function refresh(page) {
     await page.evaluate(() => fetchHistory());
 }
 
+async function holdNativeMedia(page) {
+    // Synthetic media harnesses own their events. Decoding the dummy fixture
+    // bytes alongside them would introduce unrelated native source errors.
+    await page.route('**/api/file/**', () => {});
+}
+
 async function switchAccount(page, username, password) {
     // API-only logout leaves the old Library running: its pending reads can
     // redirect to sign-in or clear the next session. Unload it before login.
@@ -79,6 +85,7 @@ module.exports = {
     reset,
     seed,
     refresh,
+    holdNativeMedia,
     switchAccount,
     openCurrent,
     closeCurrent,

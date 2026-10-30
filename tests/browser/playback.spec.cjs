@@ -1,5 +1,5 @@
 const { test, expect } = require('@playwright/test');
-const { reset, seed, refresh, switchAccount } = require('./support.cjs');
+const { reset, seed, refresh, switchAccount, holdNativeMedia } = require('./support.cjs');
 
 test.beforeEach(async ({ page }) => reset(page));
 
@@ -23,6 +23,7 @@ async function installFullscreenHarness(page) {
 }
 
 async function installMediaHarness(page, { denyFirstPlay = false } = {}) {
+    await holdNativeMedia(page);
     await page.evaluate(({ denyFirst }) => {
         window.__playerPlayAttempts = 0;
         HTMLMediaElement.prototype.load = function load() {};
@@ -475,6 +476,7 @@ test('autoplay denial offers one-action continuation', async ({ page }) => {
 });
 
 test('each handoff fits its own intrinsic image within the available media stage', async ({ page }) => {
+    await holdNativeMedia(page);
     await page.evaluate(() => {
         HTMLMediaElement.prototype.pause = function pause() {};
         HTMLMediaElement.prototype.load = function load() {

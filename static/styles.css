@@ -1243,6 +1243,12 @@ input[type="text"].tag-entry-input {
     box-sizing: border-box;
 }
 .player-transition[hidden] { display: none; }
+.player-transition.player-buffering {
+    left: 50%; right: auto; transform: translate(-50%, -50%);
+    display: flex; flex-direction: column; align-items: center; gap: 8px;
+    max-width: calc(100% - 24px); pointer-events: none;
+}
+.player-buffering .player-transition-actions { display: none; }
 .player-transition-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 7px; margin-top: 8px; }
 .player-transition-actions:empty { margin-top: 0; }
 .player-transition-actions button {
@@ -1295,8 +1301,15 @@ input[type="text"].tag-entry-input {
 .player-controls input[type="range"]:disabled { cursor: default; opacity: 0.6; }
 .player-seek { display: block; width: 100%; touch-action: none; }
 .player-time { padding: 0 8px; font-size: 0.9em; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.player-volume-control { display: flex; align-items: center; min-width: 0; }
-#playerVolume { width: 96px; }
+.player-volume-control { position: relative; display: flex; align-items: center; min-width: 0; }
+#playerVolume {
+    display: none; position: absolute; bottom: 100%; right: 0; width: 96px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+}
+.player-volume-control:hover #playerVolume,
+.player-volume-control.volume-keyboard-open #playerVolume,
+.player-volume-control.volume-adjusting #playerVolume,
+.player-volume-control.volume-touch-open #playerVolume { display: block; }
 .player-speed-control { display: inline-flex; align-items: center; gap: 6px; min-height: 44px; margin-left: auto; font-size: 0.9em; }
 .player-speed-control select {
     min-height: 44px; padding: 0 8px; color: var(--fg); background: var(--surface-2);

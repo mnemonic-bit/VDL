@@ -1,8 +1,9 @@
 const { test, expect } = require('@playwright/test');
-const { reset, seed, refresh } = require('./support.cjs');
+const { reset, seed, refresh, holdNativeMedia } = require('./support.cjs');
 
 // Model seek completion separately from metadata so a play at 0:00 cannot pass.
 async function installClipMedia(page, duration = 60) {
+    await holdNativeMedia(page);
     await page.evaluate(duration => {
         const states = new WeakMap();
         window.__clipState = video => {

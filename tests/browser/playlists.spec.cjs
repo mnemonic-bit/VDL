@@ -1,5 +1,5 @@
 const { test, expect } = require('@playwright/test');
-const { reset, seed, refresh } = require('./support.cjs');
+const { reset, seed, refresh, holdNativeMedia } = require('./support.cjs');
 
 test.beforeEach(async ({ page }) => reset(page));
 
@@ -12,6 +12,7 @@ async function createPlaylist(page, name, downloadIds) {
 }
 
 async function installMediaHarness(page) {
+    await holdNativeMedia(page);
     await page.evaluate(() => {
         Object.defineProperty(HTMLMediaElement.prototype, 'duration', {
             configurable: true,

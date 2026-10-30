@@ -115,6 +115,16 @@
                     <path d="M3 5h8a2 2 0 0 1 2 2v1M10 2l3 3-3 3M13 11H5a2 2 0 0 1-2-2V8M6 14l-3-3 3-3"/>
                 </g>
             </symbol>
+            <symbol id="i-rewind-10" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M3 5a5.5 5.5 0 1 1-0.5 6M3 1.5V5h3.5M5.5 8h1v4M10 8h1a.5.5 0 0 1 .5.5v3a.5.5 0 0 1-.5.5h-1a.5.5 0 0 1-.5-.5v-3A.5.5 0 0 1 10 8z"/>
+                </g>
+            </symbol>
+            <symbol id="i-forward-10" viewBox="0 0 16 16">
+                <g fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M13 5a5.5 5.5 0 1 0 0.5 6M13 1.5V5H9.5M5.5 8h1v4M10 8h1a.5.5 0 0 1 .5.5v3a.5.5 0 0 1-.5.5h-1a.5.5 0 0 1-.5-.5v-3A.5.5 0 0 1 10 8z"/>
+                </g>
+            </symbol>
             <symbol id="i-shuffle" viewBox="0 0 16 16">
                 <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M2 4h2.2c3.8 0 3.8 8 7.6 8H14"/>
@@ -859,6 +869,7 @@
                         <video id="playerVideo" controls autoplay></video>
                         <video id="playerStandby" class="player-standby" preload="none" aria-hidden="true" tabindex="-1"></video>
                         <div id="playerTransition" class="player-transition" hidden>
+                            <span id="playerBufferingSpinner" class="options-spinner" aria-hidden="true" hidden></span>
                             <span id="playerStatus" role="status" aria-live="polite"></span>
                             <div class="player-transition-actions">
                                 <button id="playerContinue" type="button" onclick="continueEndlessPlayback()" hidden>Continue playback</button>
@@ -877,7 +888,9 @@
                         <input id="playerSeek" class="player-seek" type="range" min="0" max="0" value="0" step="0.1" disabled aria-valuetext="Time unavailable">
                         <div class="player-control-buttons">
                             <button id="playerPrevious" class="player-control-button" type="button" aria-label="Previous video" hidden><svg aria-hidden="true"><use href="#i-previous"/></svg></button>
+                            <button id="playerRewind" class="player-control-button" type="button" aria-label="Rewind 10 seconds" title="Rewind 10 seconds" disabled><svg aria-hidden="true"><use href="#i-rewind-10"/></svg></button>
                             <button id="playerPlayPause" class="player-control-button" type="button" aria-label="Play"><svg aria-hidden="true"><use href="#i-play"/></svg></button>
+                            <button id="playerForward" class="player-control-button" type="button" aria-label="Forward 10 seconds" title="Forward 10 seconds" disabled><svg aria-hidden="true"><use href="#i-forward-10"/></svg></button>
                             <button id="playerNext" class="player-control-button" type="button" aria-label="Next video" hidden><svg aria-hidden="true"><use href="#i-next"/></svg></button>
                             <span id="playerTime" class="player-time">--:-- / --:--</span>
                             <div class="player-volume-control">
