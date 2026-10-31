@@ -26,18 +26,21 @@ test('one video-surface click uses the Space playback action exactly once', asyn
         window.__interactionEvents = [];
         for (const event of ['play', 'pause']) video.addEventListener(event, () => window.__interactionEvents.push(event));
     });
+    // Media state changes before queued play/pause events reach the recorder.
+    // Wait for both so slow dispatch cannot turn a single toggle into a flake.
     await page.locator('#playerVideo').click();
     await expect.poll(() => page.locator('#playerVideo').evaluate(video => video.paused)).toBe(true);
-    expect(await page.evaluate(() => window.__interactionEvents)).toEqual(['pause']);
+    await expect.poll(() => page.evaluate(() => window.__interactionEvents)).toEqual(['pause']);
     await page.locator('#playerVideo').click();
     await expect.poll(() => page.locator('#playerVideo').evaluate(video => video.paused)).toBe(false);
-    expect(await page.evaluate(() => window.__interactionEvents)).toEqual(['pause', 'play']);
+    await expect.poll(() => page.evaluate(() => window.__interactionEvents)).toEqual(['pause', 'play']);
     await page.locator('#playerContainer').focus();
     await page.keyboard.press('Space');
     await expect.poll(() => page.locator('#playerVideo').evaluate(video => video.paused)).toBe(true);
+    await expect.poll(() => page.evaluate(() => window.__interactionEvents)).toEqual(['pause', 'play', 'pause']);
     await page.keyboard.press('Space');
     await expect.poll(() => page.locator('#playerVideo').evaluate(video => video.paused)).toBe(false);
-    expect(await page.evaluate(() => window.__interactionEvents)).toEqual(['pause', 'play', 'pause', 'play']);
+    await expect.poll(() => page.evaluate(() => window.__interactionEvents)).toEqual(['pause', 'play', 'pause', 'play']);
 });
 
 test('speed presents factors only and keeps its accessible name and real rate', async ({ page }) => {

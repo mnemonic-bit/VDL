@@ -358,6 +358,25 @@ and the complete 409-test Chromium suite pass; the Python 3.12 unit gate
 passes with 92.0% `vdl.py` line coverage. Hosted CI confirmation remains
 outstanding; no visible playback defect was established.
 
+Issues 73-74 were reported from a subsequent GitHub Actions run on 2026-10-31
+that finished with two failures and 407 passes. Issue 73 has a local fix in
+version `0.50.8`: controlled real-media scheduling reproduced resumed playback
+before the final queued `play` event reached the recorder. The test now waits
+for the exact event sequence and real playback state after every click and
+Space press. The focused test passes 20 repetitions, extra-toggle mutations
+remain rejected, and the Python 3.12 unit gate passes with 92.0% `vdl.py` line
+coverage. All player-interaction cases pass in the full browser run, which
+finished with 408 passes and one separate Library retry-count failure. That
+unchanged retry test also failed in two of five isolated repetitions, so
+complete-browser acceptance remains pending.
+
+Issue 74 remains open: the fullscreen idle-controls test sampled a 95.6286 px
+slide against a minimum of 95.9 px. A transition-completion race remains a
+hypothesis pending reproduction or CI artifact inspection. This fails at a
+different assertion from Issue 72, and no user-visible playback or animation
+defect has been established by these logs. Hosted CI confirmation remains
+outstanding for both reports.
+
 ## Bug reports
 
 - [Bug 0001 — Merged downloads kept the deleted temporary audio filename](bug-0001-merged-downloads-kept-deleted-temporary-audio-filename.md)
@@ -432,6 +451,8 @@ outstanding; no visible playback defect was established.
 - [Bug 0070 — Player controls stay visible and lack direct playback actions](bug-0070-player-controls-stay-visible-and-lack-direct-playback-actions.md)
 - [Bug 0071 — Player buffering feedback, volume reveal, and 10-second seek controls](bug-0071-player-buffering-feedback-volume-and-seek-controls.md)
 - [Bug 0072 — Player idle-transition sampling fails in GitHub Actions](bug-0072-player-idle-transition-sampling-fails-in-github-actions.md)
+- [Bug 0073 — Player playback-event sequence fails in GitHub Actions](bug-0073-player-playback-event-sequence-fails-in-github-actions.md)
+- [Bug 0074 — Fullscreen player idle-slide endpoint fails in GitHub Actions](bug-0074-fullscreen-player-idle-slide-endpoint-fails-in-github-actions.md)
 
 ## Accepted UI decisions
 
