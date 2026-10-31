@@ -132,6 +132,13 @@ for (const { reducedMotion, fullscreen } of idleScenarios) {
         await expect(header).toHaveCSS('opacity', '0');
         await expect(header).toHaveCSS('pointer-events', 'none');
         await expect(controls).toHaveCSS('pointer-events', 'none');
+        // The header's shorter fade and pointer-events state do not imply
+        // that the toolbar has finished sliding out of the media area.
+        await controls.evaluate(async bar => {
+            await Promise.all(bar.getAnimations()
+                .filter(animation => animation.transitionProperty === 'transform')
+                .map(animation => animation.finished));
+        });
         const hidden = await controls.evaluate(bar => ({
             translateY: new DOMMatrixReadOnly(getComputedStyle(bar).transform).m42,
             height: bar.getBoundingClientRect().height,

@@ -368,14 +368,17 @@ remain rejected, and the Python 3.12 unit gate passes with 92.0% `vdl.py` line
 coverage. All player-interaction cases pass in the full browser run, which
 finished with 408 passes and one separate Library retry-count failure. That
 unchanged retry test also failed in two of five isolated repetitions, so
-complete-browser acceptance remains pending.
+complete-browser acceptance remained pending at that revision.
 
-Issue 74 remains open: the fullscreen idle-controls test sampled a 95.6286 px
-slide against a minimum of 95.9 px. A transition-completion race remains a
-hypothesis pending reproduction or CI artifact inspection. This fails at a
-different assertion from Issue 72, and no user-visible playback or animation
-defect has been established by these logs. Hosted CI confirmation remains
-outstanding for both reports.
+Issue 74 is resolved locally in version `0.50.9`. Holding the real fullscreen
+toolbar transition at 175 of 200 ms reproduced the endpoint failure after the
+header faded: translation was 95.133 px, then exactly 96 px when that same
+transition finished. The shared idle test now awaits the toolbar's own transform
+completion before applying the unchanged strict full-hide assertion. A slowed
+transition passed, while a deliberately incomplete 99% slide still failed.
+All four idle scenarios passed five repetitions each, and the Python 3.12 unit
+gate passed with 92.0% coverage. The full browser suite passed all 409 tests.
+Hosted CI confirmation remains outstanding for both reports.
 
 ## Bug reports
 

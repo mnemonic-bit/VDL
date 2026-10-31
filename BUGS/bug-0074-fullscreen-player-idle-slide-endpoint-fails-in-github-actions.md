@@ -3,7 +3,8 @@
 **Severity:** Medium — blocks the browser-test CI gate; incomplete hiding
 of the toolbar in normal use is not established.
 
-**Status:** Open — reported on 2026-10-31; not reproduced locally.
+**Status:** Resolved locally in version `0.50.9`, validated on 2026-10-31.
+Reported on 2026-10-31. Hosted GitHub Actions confirmation remains outstanding.
 
 Source reviewed at local commit `6777fba`, version `0.50.7`. The workflow
 URL and failing commit SHA were not supplied, so the CI revision has not
@@ -129,3 +130,42 @@ The supplied log alone does not establish the cause or implicate that observer.
 - Any eventual code fix receives its own version bump and passes
   `./tests/run-all.sh --unit` with at least **90% `vdl.py` line coverage**,
   plus relevant browser checks, before this report is marked resolved.
+
+### Local reproduction and repair — 2026-10-31
+
+The unmodified fullscreen scenario passed one local run. A controlled run then
+held the real toolbar transform at **175 ms of its 200 ms duration**, after the
+midpoint observer restored it. The existing header-opacity and pointer-events
+checks passed, but the displacement assertion failed: **95.133 px**, below the
+**95.9 px** minimum for the **96 px** toolbar. Finishing that same transition
+produced a translation of exactly **96 px**. This reproduces an intermediate
+measurement rather than a persistent transform or layout defect; the original
+hosted failure's animation state remains unavailable.
+
+The shared idle-scenario test now awaits the toolbar's own transform transition
+through its Web Animations `finished` promise before reading the endpoint. If
+the transition has already finished, or reduced motion disables it, there is
+no active transform to await. The original strict displacement assertion and
+all intermediate-sampling, idle-delay, reveal/reset, hit-testing, keyboard,
+reduced-motion, and video-bound checks remain unchanged. No sleep or larger
+pixel tolerance was added.
+
+Two temporary fault injections checked the repair:
+
+- Slowing the real toolbar transition to **0.2× playback rate** still passed
+  the entire fullscreen idle scenario with the new completion wait.
+- Changing the settled transform to `translateY(99%)` still failed the strict
+  endpoint assertion: **95.04 px**, below **95.9 px**. Waiting for completion
+  does not conceal an incomplete slide.
+
+Both injections and the diagnostic logging were removed before validation.
+
+Validation:
+
+- Python 3.12: `VDL_PYTHON=/path/to/python3.12 ./tests/run-all.sh --unit`
+  passed, **397 tests**, six expected skips, **92.0% `vdl.py` line coverage**
+  (5,139 of 5,588 executable lines; minimum 90%).
+- `python3 tests/browser/run.py player-interactions.spec.cjs
+  --grep 'idle controls fade and slide' --repeat-each=5` passed **20/20**
+  scenarios: five runs each of overlay/fullscreen and normal/reduced motion.
+- `./tests/run-all.sh --browser` passed the full suite: **409 tests** (11.1m).
