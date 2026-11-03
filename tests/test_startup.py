@@ -6,6 +6,31 @@ import vdl
 
 
 class StartupArgumentsTest(unittest.TestCase):
+    def test_sigterm_runs_shutdown_checkpoint_and_restores_handler(self):
+        installed = []
+
+        def terminate(**_kwargs):
+            installed[0][1](vdl.signal.SIGTERM, None)
+
+        with (mock.patch.dict(os.environ, {'FLASK_DEBUG': '0'}),
+              mock.patch.object(vdl.signal, 'signal', side_effect=lambda *args: installed.append(args)),
+              mock.patch.object(vdl.signal, 'getsignal', return_value='previous-handler'),
+              mock.patch.object(vdl, '_should_start_ingest_import', return_value=True),
+              mock.patch.object(vdl, 'start_ingest_import'),
+              mock.patch.object(vdl, 'start_metadata_backfill'),
+              mock.patch.object(vdl, 'start_duplicate_backfill'),
+              mock.patch.object(vdl, 'start_asset_generation'),
+              mock.patch.object(vdl, 'stop_ingest_import'),
+              mock.patch.object(vdl, 'stop_metadata_backfill'),
+              mock.patch.object(vdl, 'stop_duplicate_backfill'),
+              mock.patch.object(vdl, 'stop_asset_generation') as stop,
+              mock.patch.object(vdl.app, 'run', side_effect=terminate),
+              mock.patch('builtins.print'),
+              self.assertRaises(SystemExit)):
+            vdl.main([])
+        stop.assert_called_once_with()
+        self.assertEqual(installed[-1], (vdl.signal.SIGTERM, 'previous-handler'))
+
     def test_command_line_port_overrides_environment(self):
         with (
             mock.patch.dict(os.environ, {

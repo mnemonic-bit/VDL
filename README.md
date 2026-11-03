@@ -161,6 +161,19 @@ the account menu for a separate list of acquisition attempts, or select its
 **Duplicates** tab to review identical media. The Library has no view tabs.
 The Current downloads drawer remains available from both pages.
 
+Administrators also have a **Logs** tab in History. Its System logs show
+preview-cache maintenance progress, warnings, and restart checkpoints, with
+independent text and severity filters and pagination. Events and maintenance
+state live in `DOWNLOADS_DB`, so retaining the existing data volume preserves
+them across container replacements. Clear History does not erase these logs.
+
+An unchanged video's verified old hover preview remains playable while the
+shared asset worker prepares the current recipe. Intentional hover promotes
+that upgrade; a background pass also upgrades caches after an initial
+30-second grace period, with at least 30 seconds between upgrade attempts.
+Active hovers keep their selected sequence until they end. Legacy caches
+without recorded source provenance are retained but cannot be served safely.
+
 Library search accepts duration comparisons such as `duration:>5m3s` for
 videos longer than five minutes and three seconds. Combine bounds with
 `duration:>5m3s duration:<10m` to select only videos inside that range; use

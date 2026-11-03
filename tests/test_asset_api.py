@@ -11,6 +11,10 @@ from tests.support.app_case import AppCase
 
 
 class AssetApiTest(AppCase):
+    @staticmethod
+    def generation_states(readiness):
+        return {kind: readiness[kind] for kind in ('thumbnail', 'montage')}
+
     def demand(self, ordered_ids, *, client=None, **overrides):
         payload = {"tab_id": "library-tab", "revision": 1, "ids": ordered_ids}
         payload.update(overrides)
@@ -22,7 +26,7 @@ class AssetApiTest(AppCase):
               mock.patch.object(vdl, "generate_video_preview") as montage):
             rows = self.client.get("/api/library").get_json()
             response = self.demand(["test0001"])
-            self.assertEqual(rows[0]["assets"], {
+            self.assertEqual(self.generation_states(rows[0]["assets"]), {
                 "thumbnail": "queued", "montage": "queued",
             })
             self.assertEqual(response.get_json()["assets"], {
@@ -91,12 +95,12 @@ class AssetApiTest(AppCase):
         for output in (vdl._thumbnail_path(entry), vdl._preview_path(entry)):
             with open(output, "wb") as stream:
                 stream.write(b"cached original")
-        self.assertEqual(self.demand(["test0001"], revision=2).get_json()["assets"]["test0001"],
+        self.assertEqual(self.generation_states(self.demand(["test0001"], revision=2).get_json()["assets"]["test0001"]),
                          {"thumbnail": "ready", "montage": "ready"})
         with open(path, "ab") as stream:
             stream.write(b"different source")
         readiness = self.demand(["test0001"], revision=3).get_json()["assets"]["test0001"]
-        self.assertEqual(readiness, {"thumbnail": "queued", "montage": "queued"})
+        self.assertEqual(self.generation_states(readiness), {"thumbnail": "queued", "montage": "queued"})
         self.assertEqual(self.client.get("/api/thumbnail/test0001").status_code, 202)
         self.assertEqual(self.client.get("/api/preview/test0001").status_code, 202)
 
@@ -127,7 +131,7 @@ class AssetApiTest(AppCase):
             with open(path, 'wb') as stream:
                 stream.write(b'persistent cache')
         previous = vdl._get_asset_queue()
-        self.assertEqual(previous.register(entry), {'thumbnail': 'ready', 'montage': 'ready'})
+        self.assertEqual(self.generation_states(previous.register(entry)), {'thumbnail': 'ready', 'montage': 'ready'})
         previous.stop()
         entered, release = threading.Event(), threading.Event()
         with (mock.patch.object(vdl, '_asset_queue', None),
@@ -222,7 +226,7 @@ class AssetApiTest(AppCase):
                 self.assertFalse(scheduler.step())
             for revision in (1, 2, 3):
                 readiness = self.demand(["test0001"], revision=revision).get_json()["assets"]["test0001"]
-                self.assertEqual(readiness, {"thumbnail": "failed", "montage": "failed"})
+                self.assertEqual(self.generation_states(readiness), {"thumbnail": "failed", "montage": "failed"})
             self.assertFalse(scheduler.step())
         for kind in ("thumbnail", "preview"):
             self.assertEqual(self.client.get(f"/api/{kind}/test0001").status_code, 404)

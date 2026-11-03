@@ -166,6 +166,15 @@ function assetState(id, kind = 'thumbnail') {
     return collectionSnapshots.library.find(info => String(info.id) === String(id))?.assets?.[kind] || 'queued';
 }
 
+function montageDelivery(id) {
+    const assets = collectionSnapshots.library.find(info => String(info.id) === String(id))?.assets;
+    if (assets?.montage_delivery) return assets.montage_delivery;
+    return {
+        available: assets?.montage === 'ready', current: true,
+        url: '/api/preview/' + encodeURIComponent(id) + '?v=' + HOVER_PREVIEW_CACHE_VERSION,
+    };
+}
+
 function hasVideoAssets(info) {
     return Boolean(info && (info.assets?.thumbnail
         || PLAYLIST_VIDEO_EXTENSIONS.has((info.filename || '').split('.').pop().toLowerCase())));
@@ -286,7 +295,7 @@ function applyAssetReadiness(assets) {
     }
     if (intentionalHoverPreview && !intentionalHoverPreview.isConnected) intentionalHoverPreview = null;
     if (intentionalHoverPreview && !activeHoverPreview
-            && assetState(intentionalHoverPreview.dataset.downloadId, 'montage') === 'ready') {
+            && montageDelivery(intentionalHoverPreview.dataset.downloadId).available) {
         startHoverPreview(intentionalHoverPreview, false);
     }
 }
@@ -2244,6 +2253,10 @@ function hoverPreviewsEnabled() {
 
 function stopHoverPreview(preview = activeHoverPreview || pendingHoverPreview || intentionalHoverPreview) {
     if (!preview) return;
+    if (preview._assetLeaseTimer) {
+        clearInterval(preview._assetLeaseTimer);
+        preview._assetLeaseTimer = null;
+    }
     if (intentionalHoverPreview === preview) {
         intentionalHoverPreview = null;
         scheduleAssetDemand({ reconcile: true });
@@ -2276,12 +2289,16 @@ function startHoverPreview(preview, interaction = true) {
         stopHoverPreview(activeHoverPreview);
     }
     intentionalHoverPreview = preview;
+    const delivery = montageDelivery(preview.dataset.downloadId);
+    if (delivery.url && preview._failedMontageUrl === delivery.url) return;
     scheduleAssetDemand({ reconcile: true, interaction });
-    if (assetState(preview.dataset.downloadId, 'montage') !== 'ready') return;
+    if (!delivery.available || !delivery.url) return;
     const video = preview.querySelector('.history-preview-video');
     if (!video || activeHoverPreview === preview) return;
 
     activeHoverPreview = preview;
+    const hoverSession = {};
+    preview._hoverSession = hoverSession;
     preview.classList.add('preview-loading');
     video.muted = true;
     video.onplaying = () => {
@@ -2289,18 +2306,42 @@ function startHoverPreview(preview, interaction = true) {
         preview.classList.remove('preview-loading');
         preview.classList.add('preview-playing');
     };
-    video.onerror = () => {
-        if (activeHoverPreview === preview) stopHoverPreview(preview);
-    };
-    video.src = '/api/preview/' + encodeURIComponent(preview.dataset.downloadId)
-        + '?v=' + HOVER_PREVIEW_CACHE_VERSION;
+    video.onerror = () => recoverHoverPreview(preview, delivery.url, hoverSession);
+    // A server-issued identity stays pinned until this hover ends, including
+    // any later byte-range requests after a replacement is published.
+    video.src = delivery.url;
+    if (delivery.identity) {
+        const leaseTimer = setInterval(async () => {
+            if (activeHoverPreview !== preview || intentionalHoverPreview !== preview || preview._hoverSession !== hoverSession) return;
+            try {
+                const response = await apiFetch('/api/preview/' + encodeURIComponent(preview.dataset.downloadId) + '/lease', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ asset: delivery.identity }),
+                });
+                if (response.ok) return;
+            } catch (_error) { /* Abandoned sessions expire through the bounded reader lease. */ }
+            clearInterval(leaseTimer);
+            if (preview._assetLeaseTimer === leaseTimer) preview._assetLeaseTimer = null;
+        }, 30000);
+        preview._assetLeaseTimer = leaseTimer;
+    }
     video.load();
     const playback = video.play();
     if (playback) {
-        playback.catch(() => {
-            if (activeHoverPreview === preview) stopHoverPreview(preview);
-        });
+        playback.catch(() => recoverHoverPreview(preview, delivery.url, hoverSession));
     }
+}
+
+function recoverHoverPreview(preview, failedUrl, hoverSession) {
+    if (activeHoverPreview !== preview || preview._hoverSession !== hoverSession) return;
+    stopHoverPreview(preview);
+    const hoverRegion = preview.closest('.history-preview-wrap') || preview;
+    if (!preview.isConnected || !hoverRegion.matches(':hover') || !hoverPreviewsEnabled()) return;
+    // A card may retain an identity beyond its retirement grace. Reconcile
+    // once and retry only a replacement, preserving the intentional hover.
+    preview._failedMontageUrl = failedUrl;
+    intentionalHoverPreview = preview;
+    scheduleAssetDemand({ reconcile: true, interaction: false });
 }
 
 function scheduleHoverPreview(preview) {
@@ -2309,6 +2350,7 @@ function scheduleHoverPreview(preview) {
         stopHoverPreview(pendingHoverPreview);
     }
     if (activeHoverPreview === preview || pendingHoverPreview === preview || intentionalHoverPreview === preview) return;
+    delete preview._failedMontageUrl;
     pendingHoverPreview = preview;
     hoverPreviewTimer = setTimeout(
         () => startHoverPreview(preview),
@@ -3513,28 +3555,173 @@ document.getElementById('attemptHistoryList').addEventListener('click', async ev
 document.querySelector('#attemptHistoryPage [role="tablist"]').addEventListener('keydown', event => {
     if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
     event.preventDefault();
-    const duplicates = event.key === 'End' || (event.key !== 'Home' && libraryView !== 'duplicates');
-    setLibraryView(duplicates ? 'duplicates' : 'history');
-    document.getElementById(duplicates ? 'duplicatesViewButton' : 'historyViewButton').focus();
+    const tabs = [...event.currentTarget.querySelectorAll('[role="tab"]')];
+    const index = tabs.indexOf(document.activeElement);
+    const next = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1
+        : (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+    tabs[next].click();
+    tabs[next].focus();
 });
 
 function setLibraryView(view) {
+    if (view === 'logs' && !document.getElementById('logsViewButton')) view = 'history';
     libraryView = view;
-    const showingDuplicates = view === 'duplicates';
-    document.getElementById('attemptHistoryMain').hidden = showingDuplicates;
-    document.getElementById('duplicatesPanel').hidden = !showingDuplicates;
-    for (const [id, active] of [
-        ['historyViewButton', !showingDuplicates],
-        ['duplicatesViewButton', showingDuplicates],
+    for (const [name, buttonId, panelId] of [
+        ['history', 'historyViewButton', 'attemptHistoryMain'],
+        ['duplicates', 'duplicatesViewButton', 'duplicatesPanel'],
+        ['logs', 'logsViewButton', 'systemLogsPanel'],
     ]) {
-        const button = document.getElementById(id);
+        const button = document.getElementById(buttonId);
+        if (!button) continue;
+        const active = name === view;
+        document.getElementById(panelId).hidden = !active;
         button.classList.toggle('active', active);
         button.setAttribute('aria-selected', String(active));
         button.tabIndex = active ? 0 : -1;
     }
-    if (showingDuplicates) fetchDuplicates();
+    if (view === 'duplicates') fetchDuplicates();
+    else if (view === 'logs') fetchSystemLogs();
     else fetchAttemptHistory();
 }
+
+let systemLogPage = 1;
+let systemLogSnapshot = null;
+let systemLogRequest = 0;
+let systemLogsLoaded = false;
+
+function systemLogsVisible() {
+    return attemptHistoryOpen && libraryView === 'logs'
+        && Boolean(document.getElementById('logsViewButton'));
+}
+
+function maintenanceStatusText(data) {
+    const campaign = data.campaign || data;
+    const counts = campaign.counters || campaign;
+    const state = campaign.state || campaign.status || 'idle';
+    if (state === 'idle' || campaign.id === null) return 'No preview cache updates are pending.';
+    const labels = {
+        scanning: 'Scanning Library; total not yet known',
+        discovering: 'Scanning Library; total not yet known',
+        running: 'Updating cached preview sequences',
+        active: 'Updating cached preview sequences',
+        paused: 'Preview cache updates paused for shutdown',
+        interrupted: 'Previous preview update run was interrupted',
+        completed: 'Finished updating cached preview sequences',
+        completed_with_warnings: 'Cached preview update pass finished with warnings',
+        superseded: 'Preview cache update pass superseded',
+    };
+    const summary = [`${Number(counts.updated) || 0} updated`, `${Number(counts.left) || 0} left`];
+    if (counts.failed) summary.push(`${counts.failed} failed`);
+    if (counts.skipped) summary.push(`${counts.skipped} skipped`);
+    if (campaign.discovery_complete === false || campaign.discovery_done === false) {
+        return `Scanning Library; total not yet known. ${summary.join(', ')}.`;
+    }
+    return `${labels[state] || 'Preview cache updates'}: ${summary.join(', ')}.`;
+}
+
+function logDateTime(value) {
+    const date = typeof value === 'number' ? new Date(value * 1000) : new Date(value);
+    return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function renderSystemLogEntries(items) {
+    const list = document.getElementById('systemLogsList');
+    const previous = new Map([...list.children].map(node => [node.dataset.logId, node]));
+    items.forEach((entry, index) => {
+        const id = String(entry.id);
+        let row = previous.get(id);
+        if (!row) {
+            row = document.createElement('li');
+            row.className = 'system-log-entry';
+            row.dataset.logId = id;
+            const meta = document.createElement('div');
+            meta.className = 'system-log-meta';
+            const time = document.createElement('time');
+            const date = logDateTime(entry.created_at ?? entry.timestamp);
+            if (date) {
+                time.dateTime = date.toISOString();
+                time.textContent = date.toLocaleString();
+            } else time.textContent = 'Time unavailable';
+            const severity = document.createElement('span');
+            severity.className = 'system-log-severity';
+            const levels = { info: 'Info', warning: 'Warning', error: 'Error' };
+            severity.textContent = levels[entry.severity] || entry.severity;
+            const component = document.createElement('span');
+            component.textContent = entry.component === 'preview_cache' ? 'Preview cache' : entry.component;
+            meta.append(time, severity, component);
+            const message = document.createElement('p');
+            message.textContent = entry.message;
+            row.append(meta, message);
+        }
+        // Retain unchanged nodes so incoming hints preserve text selection.
+        if (list.children[index] !== row) list.insertBefore(row, list.children[index] || null);
+        previous.delete(id);
+    });
+    for (const row of previous.values()) row.remove();
+}
+
+function fetchSystemLogs() {
+    if (!systemLogsVisible()) return;
+    return coordinateRefresh('systemLogs', loadSystemLogs);
+}
+
+async function loadSystemLogs() {
+    if (!systemLogsVisible()) return;
+    const generation = ++systemLogRequest;
+    const page = systemLogPage;
+    const filter = document.getElementById('systemLogFilter').value;
+    const severity = document.getElementById('systemLogSeverity').value;
+    const query = new URLSearchParams({ page, page_size: 50, filter, severity });
+    // New events may appear while reading an older page. An upper event ID
+    // keeps the page's entries and their selection stable across reconciliation.
+    if (page > 1 && systemLogSnapshot !== null) query.set('snapshot_id', systemLogSnapshot);
+    const status = document.getElementById('systemLogsStatus');
+    const list = document.getElementById('systemLogsList');
+    list.setAttribute('aria-busy', 'true');
+    if (!systemLogsLoaded) status.textContent = 'Loading system logs…';
+    try {
+        const [logsResponse, maintenanceResponse] = await Promise.all([
+            apiFetch('/api/system/logs?' + query), apiFetch('/api/preview-maintenance'),
+        ]);
+        if (!logsResponse.ok || !maintenanceResponse.ok) throw new Error('Could not load system logs.');
+        const [data, maintenance] = await Promise.all([logsResponse.json(), maintenanceResponse.json()]);
+        if (generation !== systemLogRequest || !systemLogsVisible()) return;
+        systemLogPage = data.page;
+        if (data.snapshot_id !== undefined) systemLogSnapshot = data.snapshot_id;
+        renderSystemLogEntries(data.items);
+        systemLogsLoaded = true;
+        document.getElementById('previewMaintenanceStatus').textContent = maintenanceStatusText(maintenance);
+        status.textContent = data.total ? `${data.total} ${data.total === 1 ? 'entry' : 'entries'}`
+            : filter.trim() || severity ? 'No system logs match these filters.' : 'No system logs yet.';
+        document.getElementById('systemLogPageInfo').textContent = `Page ${data.page} of ${data.pages || Math.max(1, Math.ceil(data.total / data.page_size))}`;
+        document.getElementById('systemLogPrev').disabled = data.page <= 1;
+        document.getElementById('systemLogNext').disabled = data.page * data.page_size >= data.total;
+    } catch (_error) {
+        if (generation === systemLogRequest && systemLogsVisible()) {
+            status.textContent = 'Could not load system logs. Use Refresh logs to try again.';
+        }
+    } finally {
+        if (generation === systemLogRequest) list.setAttribute('aria-busy', 'false');
+    }
+}
+
+function changeSystemLogFilter() {
+    systemLogPage = 1;
+    systemLogSnapshot = null;
+    systemLogsLoaded = false;
+    ++systemLogRequest;
+    document.getElementById('systemLogsList').replaceChildren();
+    fetchSystemLogs();
+}
+
+document.getElementById('logsViewButton')?.addEventListener('click', () => setLibraryView('logs'));
+document.getElementById('systemLogFilter')?.addEventListener('input', changeSystemLogFilter);
+document.getElementById('systemLogSeverity')?.addEventListener('change', changeSystemLogFilter);
+document.getElementById('systemLogsRefresh')?.addEventListener('click', fetchSystemLogs);
+document.getElementById('systemLogPrev')?.addEventListener('click', () => { ++systemLogRequest; systemLogPage--; fetchSystemLogs(); });
+document.getElementById('systemLogNext')?.addEventListener('click', () => { ++systemLogRequest; systemLogPage++; fetchSystemLogs(); });
+window.addEventListener('focus', fetchSystemLogs);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) fetchSystemLogs(); });
 
 function duplicateSourceLabel(info) {
     if (info.mounted_import) return 'Mounted import';
@@ -7753,6 +7940,7 @@ function scheduleFetch({ sortFavorites = false, currentOnly = false } = {}) {
         }
         if (attemptHistoryOpen) {
             if (libraryView === 'duplicates') fetchDuplicates();
+            else if (libraryView === 'logs') fetchSystemLogs();
             else fetchAttemptHistory();
         }
     }, 150);
@@ -7776,6 +7964,7 @@ function connectEventStream() {
             && collectionSnapshots.current.some(info => String(info.id) === String(change.id));
         scheduleFetch({ currentOnly });
     });
+    es.addEventListener('maintenance', fetchSystemLogs);
     es.addEventListener('playlist-progress', fetchPlaylists);
     es.addEventListener('error', () => {
         showServerStatus();

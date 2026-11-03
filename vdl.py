@@ -25,6 +25,7 @@ import subprocess
 import mimetypes
 import copy
 import secrets
+import signal
 import stat
 import sys
 import tempfile
@@ -396,13 +397,15 @@ class EventBus:
             if (owner_user_id is not None
                     and subscriber_user_id != owner_user_id):
                 continue
-            if kind == 'assets':
+            if kind in ('assets', 'maintenance'):
                 # A slow client needs one bounded reconciliation hint, even
                 # when the worker finishes several cached assets in a burst.
                 with q.mutex:
                     pending = next((i for i, item in enumerate(q.queue)
-                                    if item[0] == 'assets'), None)
+                                    if item[0] == kind), None)
                     if pending is not None:
+                        if kind == 'maintenance':
+                            continue
                         previous = q.queue[pending][1] or {}
                         merged = list(dict.fromkeys(
                             previous.get('ids', []) + (payload or {}).get('ids', [])
@@ -5020,7 +5023,7 @@ _PREVIEW_CACHE_VERSION = 5
 _PREVIEW_FRAMES_PER_SECOND = 12
 
 
-def _preview_path(entry, fallback_dir=None):
+def _preview_path(entry, fallback_dir=None, *, version=_PREVIEW_CACHE_VERSION):
     """Return the stable sidecar path for one download's hover preview."""
     directory = (os.path.dirname(os.path.abspath(entry['filename']))
                  if entry.get('filename') else entry.get('output_dir'))
@@ -5030,7 +5033,7 @@ def _preview_path(entry, fallback_dir=None):
         return None
     return os.path.join(
         os.path.abspath(directory),
-        f".vdl_{entry['id']}.preview-v{_PREVIEW_CACHE_VERSION}.mp4",
+        f".vdl_{entry['id']}.preview-v{version}.mp4",
     )
 
 
@@ -5187,7 +5190,8 @@ def generate_video_preview(media_path, preview_path):
         result = subprocess.run(command, capture_output=True, timeout=180)
         if (result.returncode == 0
                 and os.path.isfile(temporary_path)
-                and os.path.getsize(temporary_path) > 0):
+                and os.path.getsize(temporary_path) > 0
+                and ffprobe_video_duration(temporary_path) is not None):
             os.replace(temporary_path, preview_path)
             return True
     except (OSError, subprocess.SubprocessError):
@@ -6142,7 +6146,7 @@ def get_library():
         g.current_user['id'], is_admin='admin' in g.current_user['roles'],
         statuses=('finished',),
     ) if _playable_library_entry(entry)]
-    readiness = _get_asset_queue().readiness_many(entries)
+    readiness = _asset_readiness_many(entries)
     return jsonify([
         {**_public_download_entry(entry), 'assets': readiness.get(entry['id'], {})}
         for entry in entries
@@ -7040,7 +7044,14 @@ def events():
                                      or entry.get('owner_user_id') == user_id
                                      or 'admin' in user['roles'])):
                             entries.append(entry)
-                    payload = {'assets': _get_asset_queue().readiness_many(entries)}
+                    payload = {'assets': _asset_readiness_many(entries)}
+                if kind == 'maintenance':
+                    user = db_get_user_by_id(user_id)
+                    if (user is None or user['suspended']
+                            or user['session_version'] != session_version):
+                        return
+                    if 'admin' not in user['roles']:
+                        continue
                 data = json.dumps(payload or {})
                 yield f"event: {kind}\ndata: {data}\n\n"
         finally:
@@ -7167,6 +7178,34 @@ def _notify_assets(ids):
     event_bus.publish('assets', {'ids': list(ids)[:200]})
 
 
+def _notify_maintenance():
+    event_bus.publish('maintenance', {})
+
+
+def _asset_delivery_metadata(assets, entry):
+    selected = assets.delivery(entry)
+    return _public_asset_delivery(entry, selected)
+
+
+def _public_asset_delivery(entry, selected):
+    result = {key: selected.get(key) for key in ('available', 'current', 'identity')}
+    result['url'] = (url_for('stream_preview', download_id=entry['id'],
+                             asset=selected['identity'])
+                     if selected.get('available') else None)
+    return result
+
+
+def _asset_readiness_many(entries):
+    entries = list(entries)
+    assets = _get_asset_queue()
+    result = assets.readiness_many(entries, include_delivery=True)
+    for entry in entries:
+        if entry['id'] in result:
+            state = result[entry['id']]
+            state['montage_delivery'] = _public_asset_delivery(entry, state['montage_delivery'])
+    return result
+
+
 def _get_asset_queue():
     global _asset_queue, _asset_queue_db
     with _asset_queue_lock:
@@ -7180,6 +7219,10 @@ def _get_asset_queue():
                 versions={'thumbnail': _THUMBNAIL_CACHE_VERSION,
                           'montage': _PREVIEW_CACHE_VERSION},
                 notify=_notify_assets, confined=_is_allowed_download_path,
+                notify_maintenance=_notify_maintenance,
+                legacy_path=lambda entry, kind, version: (
+                    (_preview_path(entry, version=version) if version >= 3 else None) if kind == 'montage'
+                    else _thumbnail_path(entry, version=version)),
             )
             _asset_queue_db = DB_PATH
         return _asset_queue
@@ -7243,7 +7286,12 @@ def asset_demand():
         _asset_demand_owner(), tab, revision, accepted_ids,
         hovered if hovered in accepted_ids else None, renew=interaction,
     )
-    readiness = {entry['id']: assets.register(entry) for entry in entries}
+    readiness = {}
+    for entry in entries:
+        state = assets.register(entry)
+        if state:
+            state['montage_delivery'] = _asset_delivery_metadata(assets, entry)
+        readiness[entry['id']] = state
     return jsonify(assets=readiness, accepted=accepted)
 
 
@@ -7267,14 +7315,32 @@ def _stream_cached_asset_locked(download_id, kind):
         abort(403)
     if not _asset_eligible(entry):
         abort(404)
-    readiness = _get_asset_queue().register(entry)
+    assets = _get_asset_queue()
+    readiness = assets.register(entry)
     if kind not in readiness:
         abort(404)
-    if readiness[kind] != 'ready':
+    identity = None
+    if kind == 'montage':
+        identity = request.args.get('asset')
+        if identity is not None and not re.fullmatch(r'[a-f0-9]{32}', identity):
+            abort(404)
+        selected = assets.delivery(entry, identity=identity, lease=True)
+        if selected.get('available'):
+            path = selected['path']
+            identity = selected['identity']
+        elif identity is not None:
+            abort(404)
+        else:
+            return Response(status=404 if readiness[kind] == 'failed' else 202,
+                            headers={'Cache-Control': 'no-store'})
+    elif readiness[kind] != 'ready':
         return Response(status=404 if readiness[kind] == 'failed' else 202,
                         headers={'Cache-Control': 'no-store'})
-    return send_file(path, mimetype='image/jpeg' if kind == 'thumbnail' else 'video/mp4',
-                     conditional=True, max_age=0)
+    response = send_file(path, mimetype='image/jpeg' if kind == 'thumbnail' else 'video/mp4',
+                         conditional=True, max_age=0,
+                         etag=identity if identity else True)
+    response.headers['Cache-Control'] = 'private, no-cache'
+    return response
 
 
 @app.route('/api/thumbnail/<download_id>', methods=['GET'])
@@ -7289,6 +7355,23 @@ def stream_preview(download_id):
     return _stream_cached_asset(download_id, 'montage')
 
 
+@app.route('/api/preview/<download_id>/lease', methods=['POST'])
+def renew_preview_lease(download_id):
+    data = request.get_json(silent=True)
+    identity = data.get('asset') if isinstance(data, dict) else None
+    if not isinstance(identity, str) or not re.fullmatch(r'[a-f0-9]{32}', identity):
+        return jsonify(error='Invalid preview identity'), 400
+    assets = _get_asset_queue()
+    with assets.publication_lock:
+        entry = _visible_download(download_id)
+        if entry is None or not _asset_eligible(entry):
+            abort(404)
+        selected = assets.delivery(entry, identity=identity, lease=True)
+        if not selected.get('available'):
+            abort(404)
+    return Response(status=204, headers={'Cache-Control': 'no-store'})
+
+
 def start_asset_generation():
     return _get_asset_queue().start()
 
@@ -7296,6 +7379,36 @@ def start_asset_generation():
 def stop_asset_generation():
     if _asset_queue is not None:
         _asset_queue.stop()
+
+
+@app.route('/api/system/logs', methods=['GET'])
+@admin_required
+def system_logs():
+    try:
+        page = int(request.args.get('page', '1'))
+        page_size = int(request.args.get('page_size', '50'))
+        snapshot_id = request.args.get('snapshot_id')
+        snapshot_id = int(snapshot_id) if snapshot_id is not None else None
+        severity = request.args.get('severity', '').lower()
+        text = request.args.get('filter', '').strip()
+        if (page < 1 or not 1 <= page_size <= 100
+                or (snapshot_id is not None and snapshot_id < 0)
+                or severity not in ('', 'info', 'warning', 'error')
+                or len(text) > 500):
+            raise ValueError('Invalid system log filter or pagination')
+    except ValueError:
+        return jsonify(error='Invalid system log filter or pagination'), 400
+    result = _get_asset_queue().system_logs(
+        page=page, page_size=page_size, text=text,
+        severity=severity, snapshot_id=snapshot_id,
+    )
+    return jsonify(result)
+
+
+@app.route('/api/preview-maintenance', methods=['GET'])
+@admin_required
+def preview_maintenance():
+    return jsonify(_get_asset_queue().maintenance_status())
 
 
 @app.route('/api/preferences', methods=['GET', 'POST'])
@@ -7655,9 +7768,16 @@ def main(argv=None):
         f'VDL startup: UI v{APP_VERSION} | API v{APP_VERSION}',
         flush=True,
     )
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+    if threading.current_thread() is threading.main_thread():
+        # tini forwards SIGTERM; converting it to a normal exit commits the
+        # maintenance checkpoint before the process relinquishes its volume.
+        signal.signal(signal.SIGTERM, lambda _signum, _frame: sys.exit(0))
     try:
         app.run(host=host, port=args.port, debug=debug, threaded=True)
     finally:
+        if threading.current_thread() is threading.main_thread():
+            signal.signal(signal.SIGTERM, previous_sigterm)
         if owns_background_work:
             stop_asset_generation()
         if ingest_thread is not None:

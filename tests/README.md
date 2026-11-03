@@ -28,6 +28,20 @@ requirements explicit:
 ./tests/run-all.sh --all        # required retirement/release gate
 ```
 
+Preview-cache upgrades have deterministic fake-clock, publication-fault, and
+reader-lease tests. Run their browser checks with native Chromium or Firefox:
+
+```bash
+python3 tests/browser/run.py system-logs.spec.cjs asset-demand.spec.cjs preview-handoff-media.spec.cjs
+VDL_TEST_BROWSER=firefox python3 tests/browser/run.py system-logs.spec.cjs asset-demand.spec.cjs preview-handoff-media.spec.cjs
+python3 tests/container/check-preview-maintenance.py --image vdl:local
+```
+
+The last command uses isolated named volumes to verify graceful and abrupt
+shutdown, container replacement, persistent logs/counters/pacing, and recovery
+after successful publication without another encode. Build the named image
+from the current sources first.
+
 Before changing or publishing the container dependency lock, verify that its
 hashed wheels cover both shipping architectures:
 

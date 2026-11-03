@@ -170,6 +170,24 @@ class HoverPreviewTest(AppCase):
             for name in os.listdir(self.download_dir)
         ))
 
+    def test_successful_encoder_with_invalid_output_keeps_previous_preview(self):
+        self.finished_file()
+        entry = vdl.db_get_download('test0001')
+        destination = vdl._preview_path(entry)
+        with open(destination, 'wb') as output:
+            output.write(b'previous valid preview')
+
+        def encode(command, **_kwargs):
+            with open(command[-1], 'wb') as output:
+                output.write(b'invalid completed output')
+            return subprocess.CompletedProcess(command, 0)
+
+        with mock.patch.object(vdl, 'ffprobe_video_duration', side_effect=[30, None]), \
+                mock.patch.object(vdl.subprocess, 'run', side_effect=encode):
+            self.assertFalse(vdl.generate_video_preview(entry['filename'], destination))
+        with open(destination, 'rb') as output:
+            self.assertEqual(output.read(), b'previous valid preview')
+
     def test_preview_endpoint_generates_once_caches_and_supports_ranges(self):
         self.finished_file()
         stale_path = os.path.join(
@@ -215,8 +233,10 @@ class HoverPreviewTest(AppCase):
             connection.execute("UPDATE generated_assets SET version=4,state='ready' "
                                "WHERE download_id='test0001' AND kind='montage'")
         queue = vdl._get_asset_queue()
-        self.assertEqual(self.client.get('/api/library').get_json()[0]['assets'],
-                         {'thumbnail': 'ready', 'montage': 'queued'})
+        readiness = self.client.get('/api/library').get_json()[0]['assets']
+        self.assertEqual((readiness['thumbnail'], readiness['montage']), ('ready', 'queued'))
+        self.assertTrue(readiness['montage_delivery']['available'])
+        self.assertFalse(readiness['montage_delivery']['current'])
 
         def generate(_source, destination):
             with open(destination, 'wb') as preview:
@@ -232,9 +252,10 @@ class HoverPreviewTest(AppCase):
             })
             self.assertEqual(pending.get_json()['assets']['test0001']['montage'], 'queued')
             self.assertTrue(queue.step())
-            publish.assert_called_with('assets', {'ids': ['test0001']})
-            self.assertEqual(self.client.get('/api/library').get_json()[0]['assets'],
-                             {'thumbnail': 'ready', 'montage': 'ready'})
+            publish.assert_any_call('assets', {'ids': ['test0001']})
+            readiness = self.client.get('/api/library').get_json()[0]['assets']
+            self.assertEqual((readiness['thumbnail'], readiness['montage']), ('ready', 'ready'))
+            self.assertTrue(readiness['montage_delivery']['current'])
             for _ in range(2):
                 response = self.client.get('/api/preview/test0001?v=5')
                 self.assertEqual(response.status_code, 200)

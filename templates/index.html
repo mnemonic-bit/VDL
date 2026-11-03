@@ -362,6 +362,9 @@
         <div class="library-view-switch" role="tablist" aria-label="History views">
             <button id="historyViewButton" type="button" role="tab" aria-selected="true" aria-controls="attemptHistoryMain" class="active">Download attempts</button>
             <button id="duplicatesViewButton" type="button" role="tab" aria-selected="false" aria-controls="duplicatesPanel" tabindex="-1">Duplicates</button>
+            {% if is_admin %}
+            <button id="logsViewButton" type="button" role="tab" aria-selected="false" aria-controls="systemLogsPanel" tabindex="-1">Logs</button>
+            {% endif %}
         </div>
         <section id="attemptHistoryMain" role="tabpanel" aria-labelledby="historyViewButton">
             <div id="attemptSearch" class="header-search" role="search">
@@ -391,6 +394,33 @@
             <div id="duplicatesList"></div>
         </section>
 
+        {% if is_admin %}
+        <section id="systemLogsPanel" role="tabpanel" aria-labelledby="logsViewButton" hidden>
+            <h2>System logs</h2>
+            <p id="previewMaintenanceStatus" class="maintenance-status" role="status" aria-live="polite"></p>
+            <div class="system-log-filters" role="search" aria-label="Filter system logs">
+                <label for="systemLogFilter">Filter logs
+                    <input id="systemLogFilter" type="search" maxlength="256" autocomplete="off" placeholder="Search messages">
+                </label>
+                <label for="systemLogSeverity">Severity
+                    <select id="systemLogSeverity">
+                        <option value="">All severities</option>
+                        <option value="info">Info</option>
+                        <option value="warning">Warning</option>
+                        <option value="error">Error</option>
+                    </select>
+                </label>
+                <button id="systemLogsRefresh" type="button">Refresh logs</button>
+            </div>
+            <p id="systemLogsStatus" role="status" aria-live="polite"></p>
+            <ol id="systemLogsList" class="system-logs-list" aria-label="System log entries"></ol>
+            <nav class="pager" aria-label="System log pages">
+                <button id="systemLogPrev" type="button" aria-label="Previous logs page">‹</button>
+                <span id="systemLogPageInfo"></span>
+                <button id="systemLogNext" type="button" aria-label="Next logs page">›</button>
+            </nav>
+        </section>
+        {% endif %}
     </section>
 
     <section id="settingsPage" class="settings-page" aria-labelledby="settingsTitle" hidden>

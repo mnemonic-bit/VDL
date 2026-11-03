@@ -4,13 +4,19 @@ The queue keeps demand separate from enqueue order. Callers publish media first,
 then register it; a bounded startup reconciliation closes a missed-register gap.
 """
 import glob
+import errno
 import json
 import os
 import sqlite3
 import threading
 import time
 import uuid
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from preview_maintenance import PreviewMaintenance
+
+
+class RegistrationBusy(Exception):
+    pass
 
 
 class AssetQueue:
@@ -21,7 +27,8 @@ class AssetQueue:
     RETRY_DELAYS = (30, 300)
 
     def __init__(self, *, db, db_lock, get_entry, eligible, asset_path,
-                 generate, versions, notify=None, clock=time.time, confined=None):
+                 generate, versions, notify=None, clock=time.time, confined=None,
+                 notify_maintenance=None, validate=None, legacy_path=None):
         self.db = db
         self.db_lock = db_lock
         self.get_entry = get_entry
@@ -32,6 +39,12 @@ class AssetQueue:
         self.notify = notify or (lambda ids: None)
         self.clock = clock
         self.confined = confined or (lambda path: True)
+        self.validate = validate or (lambda kind, path: self._nonempty(path))
+        self.legacy_path = legacy_path or self._legacy_path
+        self.notify_maintenance = notify_maintenance or (lambda: None)
+        self.maintenance = PreviewMaintenance(self)
+        self._shutdown = False
+        self._maintenance_changed = False
         # Removal uses the same order: publication guard, then database lock.
         self.publication_lock = threading.RLock()
         self._generation_lock = threading.Lock()
@@ -87,6 +100,44 @@ class AssetQueue:
             );
         """)
 
+        PreviewMaintenance.init_schema(conn)
+
+    def _legacy_path(self, entry, kind, version):
+        path = self.asset_path(entry, kind)
+        current = self.versions[kind]
+        return path.replace(f"preview-v{current}.", f"preview-v{version}.")
+
+    def delivery(self, entry, identity=None, lease=False):
+        selected = self.maintenance.delivery(entry, identity=identity, lease=lease)
+        if not selected['available'] and identity is None:
+            # First reads can precede bounded startup discovery. Adopt only
+            # provenance-backed legacy or the owned current recipe sidecar.
+            with self.db() as conn:
+                known = conn.execute("SELECT 1 FROM generated_assets WHERE download_id=? AND kind='montage' AND state='ready'",
+                                     (entry['id'],)).fetchone()
+            if known or self._nonempty(self.asset_path(entry, 'montage')):
+                try:
+                    self.register(entry, blocking=False)
+                except RegistrationBusy:
+                    return selected
+                selected = self.maintenance.delivery(entry, lease=lease)
+        return selected
+
+    def maintenance_status(self):
+        return self.maintenance.status()
+
+    def system_logs(self, **kwargs):
+        return self.maintenance.logs(**kwargs)
+
+    def _maintenance_hint(self):
+        if not self._maintenance_changed:
+            return
+        self._maintenance_changed = False
+        try:
+            self.notify_maintenance()
+        except Exception:
+            pass
+
     @staticmethod
     def _identity(path):
         info = os.stat(path)
@@ -127,34 +178,64 @@ class AssetQueue:
                     self._remove(path)
         with self.db_lock, self.db() as conn:
             conn.execute('DELETE FROM generated_assets WHERE download_id=?', (download_id,))
+            self.maintenance.skip(conn, download_id)
+            conn.execute('DELETE FROM preview_deliveries WHERE download_id=?', (download_id,))
 
-    def register(self, entry):
+    @contextmanager
+    def _registration_lock(self, blocking, lock=None):
+        lock = lock or self.db_lock
+        acquired = lock.acquire(blocking=blocking)
+        if not acquired:
+            raise RegistrationBusy()
+        try:
+            yield
+        finally:
+            lock.release()
+
+    def register(self, entry, *, blocking=True):
         """Register both kinds without decoding, preserving failure budgets."""
         download_id = entry['id']
-        with self.publication_lock:
+        with self._registration_lock(blocking, self.publication_lock):
             resolved = self._resolve(download_id)
             if resolved is None:
+                if not blocking:
+                    return {}
                 self._discard_ineligible(download_id)
                 return {}
             current, identity = resolved
             paths = {kind: self.asset_path(current, kind) for kind in self.versions}
             files = {kind: self._nonempty(path) for kind, path in paths.items()}
+            file_identities = {kind: self._identity(path) for kind, path in paths.items() if files[kind]}
+            with self.db() as snapshot:
+                all_records = snapshot.execute('SELECT * FROM generated_assets WHERE download_id=?', (download_id,)).fetchall()
+            records_by_kind = {kind: [row for row in all_records if row['kind'] == kind] for kind in self.versions}
+            legacy_files = []
+            for record in records_by_kind.get('montage', []):
+                if (record['version'] < self.versions['montage'] and record['source'] == identity
+                        and record['state'] == 'ready'):
+                    old_path = self.legacy_path(current, 'montage', record['version'])
+                    if old_path != paths['montage'] and self._nonempty(old_path) and self.confined(old_path):
+                        legacy_files.append((record['version'], old_path, self._identity(old_path)))
             result = {}
-            with self.db_lock, self.db() as conn:
+            with self._registration_lock(blocking), self.db() as conn:
                 if conn.execute('SELECT 1 FROM asset_invalidations WHERE download_id=?',
                                 (download_id,)).fetchone():
                     return {}
+                self.maintenance.skip(conn, download_id, identity)
                 for kind, version in self.versions.items():
-                    records = conn.execute('SELECT * FROM generated_assets WHERE download_id=? AND kind=?',
-                                           (download_id, kind)).fetchall()
+                    records = records_by_kind[kind]
                     previous = records[0] if records else None
                     if previous is not None and previous['source'] != identity:
                         self._remove(paths[kind])
                         files[kind] = False
-                    # Versions have their own retry budget; obsolete records must
-                    # never become candidates after a cache-version upgrade.
-                    # Even a DELETE matching no rows opens a write transaction.
-                    # Unchanged startup caches and readiness checks need only reads.
+                    # Preserve original source provenance before retiring queue records.
+                    legacy = False
+                    if kind == 'montage':
+                        for old_version, old_path, old_identity in legacy_files:
+                            self.maintenance.add_delivery(conn, current, identity, old_version, old_path, old_identity)
+                            legacy = True
+                        if legacy:
+                            self.maintenance.member(conn, download_id, identity)
                     if any(record['version'] != version for record in records):
                         conn.execute('DELETE FROM generated_assets WHERE download_id=? '
                                      'AND kind=? AND version<>?', (download_id, kind, version))
@@ -182,24 +263,40 @@ class AssetQueue:
                                          'WHERE sequence=?', (state, row['sequence']))
                         # A completed attempt is the only way an existing task
                         # may bless a sidecar after its identity was recorded.
+                    if kind == 'montage' and state == 'ready':
+                        serving = self.maintenance.add_delivery(conn, current, identity, version, paths[kind], file_identities.get(kind))
+                        if legacy:
+                            conn.execute('UPDATE preview_deliveries SET selected=0,lease_until=MAX(lease_until,?) '
+                                         'WHERE download_id=? AND identity<>?',
+                                         (self.clock() + self.maintenance.LEASE_SECONDS, download_id, serving))
+                            self.maintenance.outcome(conn, dict(kind=kind, download_id=download_id, source=identity), 'updated')
                     result[kind] = state
         self._wake.set()
+        self._maintenance_hint()
         return result
 
     def readiness(self, entry):
         return self.register(entry)
 
-    def readiness_many(self, entries):
+    def readiness_many(self, entries, *, include_delivery=False):
         """Read a collection's readiness with one database snapshot, no writes."""
         entries = list(entries)
         result = {}
         with self.db() as conn:
             records = {}
+            records_by_id = {}
+            deliveries = {}
+            invalidated = set()
             for offset in range(0, len(entries), self.BATCH_SIZE):
                 ids = [entry['id'] for entry in entries[offset:offset + self.BATCH_SIZE]]
                 placeholders = ','.join('?' for _ in ids)
                 for row in conn.execute('SELECT * FROM generated_assets WHERE download_id IN (' + placeholders + ')', ids):
                     records[(row['download_id'], row['kind'], row['version'])] = dict(row)
+                    records_by_id.setdefault(row['download_id'], []).append(dict(row))
+                if include_delivery:
+                    for row in conn.execute('SELECT * FROM preview_deliveries WHERE download_id IN (' + placeholders + ')', ids):
+                        deliveries.setdefault(row['download_id'], []).append(dict(row))
+                    invalidated.update(row[0] for row in conn.execute('SELECT download_id FROM asset_invalidations WHERE download_id IN (' + placeholders + ')', ids))
         for entry in entries:
             if not self.eligible(entry):
                 continue
@@ -222,6 +319,9 @@ class AssetQueue:
                 else:
                     state = row['state']
                 states[kind] = state
+            if include_delivery:
+                states['montage_delivery'] = (dict(available=False, current=False, identity=None) if entry['id'] in invalidated else
+                    self.maintenance.delivery_metadata(entry, identity, records_by_id.get(entry['id'], []), deliveries.get(entry['id'], [])))
             result[entry['id']] = states
         return result
 
@@ -234,6 +334,9 @@ class AssetQueue:
                     for download_id in ids:
                         connection.execute('INSERT OR IGNORE INTO asset_invalidations '
                                            'SELECT id FROM downloads WHERE id=?', (download_id,))
+                        self.maintenance.skip(connection, download_id)
+                        connection.execute('DELETE FROM preview_deliveries WHERE download_id=?', (download_id,))
+                        connection.execute('DELETE FROM preview_publications WHERE download_id=?', (download_id,))
                         connection.execute('DELETE FROM generated_assets WHERE download_id=?',
                                            (download_id,))
                         connection.execute('DELETE FROM asset_demands WHERE download_id=?',
@@ -300,31 +403,45 @@ class AssetQueue:
         with self.db_lock, self.db() as conn:
             conn.execute('DELETE FROM asset_demand_tabs WHERE touched<=?',
                          (now - self.DEMAND_SECONDS,))
-            ordinary = None
+            # SQL excludes cooling upgrades before LIMIT, so a delayed oldest
+            # task cannot hold the rest of the shared queue hostage.
+            eligible = ("a.state='queued' AND a.retry_at<=? AND a.version=CASE a.kind "
+                        "WHEN 'montage' THEN ? ELSE ? END AND (NOT EXISTS ("
+                        "SELECT 1 FROM preview_members m JOIN preview_campaigns c ON c.id=m.campaign_id "
+                        "WHERE m.download_id=a.download_id AND m.source=a.source AND m.state='left' "
+                        "AND c.target=a.version AND a.kind='montage') OR EXISTS ("
+                        "SELECT 1 FROM asset_demands h WHERE h.download_id=a.download_id "
+                        "AND h.kind=a.kind AND h.tier=2) OR EXISTS (SELECT 1 FROM preview_campaigns c "
+                        "WHERE c.target=a.version AND c.next_at<=?))")
+            args = (now, self.versions['montage'], self.versions['thumbnail'], now)
+            # A visible legacy sequence remains background work. Only intentional
+            # hover grants its target a foreground tier.
+            foreground = ("EXISTS (SELECT 1 FROM asset_demands d WHERE d.download_id=a.download_id "
+                          "AND d.kind=a.kind AND (d.tier<>3 OR NOT EXISTS (SELECT 1 FROM preview_members m "
+                          "JOIN preview_campaigns c ON c.id=m.campaign_id WHERE m.download_id=a.download_id "
+                          "AND m.source=a.source AND m.state='left' AND c.target=a.version AND a.kind='montage')))")
             if self._foreground_count >= 8:
-                ordinary = conn.execute(
-                    "SELECT a.* FROM generated_assets a WHERE state='queued' AND retry_at<=? "
-                    'AND NOT EXISTS (SELECT 1 FROM asset_demands d WHERE d.download_id=a.download_id '
-                    'AND d.kind=a.kind) ORDER BY sequence LIMIT 1', (now,)).fetchone()
-            if ordinary is not None:
-                self._foreground_count = 0
-                return dict(ordinary)
-            foreground = conn.execute(
-                'SELECT a.* FROM generated_assets a JOIN asset_demands d '
-                'ON d.download_id=a.download_id AND d.kind=a.kind '
-                'JOIN asset_demand_tabs t ON t.owner=d.owner AND t.tab=d.tab '
-                "WHERE a.state='queued' AND a.retry_at<=? "
-                'ORDER BY d.tier,t.changed DESC,d.position,a.sequence LIMIT 1', (now,)).fetchone()
-            if foreground is not None:
+                row = conn.execute('SELECT a.* FROM generated_assets a WHERE ' + eligible +
+                                   ' AND NOT ' + foreground + ' ORDER BY a.sequence LIMIT 1', args).fetchone()
+                if row:
+                    self._foreground_count = 0
+                    return dict(row)
+            row = conn.execute('SELECT a.* FROM generated_assets a JOIN asset_demands d '
+                               'ON d.download_id=a.download_id AND d.kind=a.kind '
+                               'JOIN asset_demand_tabs t ON t.owner=d.owner AND t.tab=d.tab WHERE ' + eligible +
+                               ' AND ' + foreground + ' ORDER BY d.tier,t.changed DESC,d.position,a.sequence LIMIT 1', args).fetchone()
+            if row:
                 self._foreground_count += 1
-                return dict(foreground)
+                return dict(row)
             self._foreground_count = 0
-            row = conn.execute("SELECT * FROM generated_assets WHERE state='queued' "
-                               'AND retry_at<=? ORDER BY sequence LIMIT 1', (now,)).fetchone()
+            row = conn.execute('SELECT a.* FROM generated_assets a WHERE ' + eligible +
+                               ' ORDER BY a.sequence LIMIT 1', args).fetchone()
             return dict(row) if row else None
 
     def _claim(self, task):
         with self.publication_lock:
+            if self._shutdown:
+                return None
             resolved = self._resolve(task['download_id'])
             if resolved is None:
                 self._discard_ineligible(task['download_id'])
@@ -355,6 +472,8 @@ class AssetQueue:
             return task
 
     def _finish(self, task, generated, failure):
+        if task['kind'] == 'montage':
+            return self._finish_montage(task, generated, failure)
         changed = False
         with self.publication_lock:
             resolved = self._resolve(task['download_id'])
@@ -394,10 +513,136 @@ class AssetQueue:
                 # durable queue progress. A later demand response reconciles it.
                 pass
 
+    @staticmethod
+    def _sync_file(path):
+        with open(path, 'rb') as output:
+            os.fsync(output.fileno())
+
+    @staticmethod
+    def _sync_directory(path):
+        descriptor = os.open(os.path.dirname(path), os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+        try:
+            try:
+                os.fsync(descriptor)
+            except OSError as error:
+                # Some filesystems do not implement directory synchronization.
+                if error.errno not in (errno.EINVAL, errno.ENOTSUP):
+                    raise
+        finally:
+            os.close(descriptor)
+
+    def _finish_montage(self, task, generated, failure):
+        with self.publication_lock:
+            resolved = self._resolve(task['download_id'])
+            with self.db_lock, self.db() as conn:
+                owned = conn.execute("SELECT 1 FROM generated_assets WHERE sequence=? AND token=? AND state='running'",
+                                     (task['sequence'], task['token'])).fetchone()
+                if not owned:
+                    return
+                if resolved is None or resolved[1] != task['source'] or task['version'] != self.versions['montage']:
+                    self.maintenance.skip(conn, task['download_id'], resolved[1] if resolved else None)
+                    conn.execute('DELETE FROM generated_assets WHERE sequence=?', (task['sequence'],))
+                    return
+                if self._shutdown:
+                    return
+            entry, source = resolved
+            output = self.asset_path(entry, 'montage')
+            try:
+                valid = (generated and self.confined(output) and self.confined(task['temporary_path'])
+                         and self.validate('montage', task['temporary_path']))
+            except Exception:
+                valid = False
+            if valid:
+                try:
+                    self._sync_file(task['temporary_path'])
+                except OSError:
+                    valid = False
+            if valid:
+                if self._shutdown:
+                    return
+                file_identity = self._identity(task['temporary_path'])
+                identity = uuid.uuid4().hex
+                with self.db_lock, self.db() as conn:
+                    conn.execute('INSERT OR REPLACE INTO preview_publications '
+                                 '(sequence,token,download_id,source,version,path,file_identity,identity) VALUES (?,?,?,?,?,?,?,?)',
+                                 (task['sequence'], task['token'], task['download_id'], source,
+                                  task['version'], output, file_identity, identity))
+                try:
+                    os.replace(task['temporary_path'], output)
+                except OSError:
+                    valid = False
+                else:
+                    self._sync_directory(output)
+                    with self.db_lock, self.db() as conn:
+                        self._commit_publication(conn, task, entry, output, file_identity, identity)
+            if not valid:
+                exhausted = task['attempts'] >= 3
+                delay = 0 if exhausted else self.RETRY_DELAYS[task['attempts'] - 1]
+                with self.db_lock, self.db() as conn:
+                    conn.execute('UPDATE generated_assets SET state=?,retry_at=?,failure=?,token=NULL,'
+                                 'temporary_path=NULL WHERE sequence=? AND token=?',
+                                 ('failed' if exhausted else 'queued', self.clock() + delay,
+                                  'Preview extraction failed', task['sequence'], task['token']))
+                    conn.execute('DELETE FROM preview_publications WHERE sequence=?', (task['sequence'],))
+                    self.maintenance.attempted(conn, task)
+                    if exhausted:
+                        self.maintenance.outcome(conn, task, 'failed')
+            self.maintenance.cleanup()
+        try:
+            self.notify([task['download_id']])
+        except Exception:
+            pass
+        self._maintenance_hint()
+
+    def _commit_publication(self, conn, task, entry, output, file_identity, identity):
+        self.maintenance.add_delivery(conn, entry, task['source'], task['version'], output, file_identity, identity)
+        conn.execute('UPDATE preview_deliveries SET selected=0,lease_until=MAX(lease_until,?) '
+                     'WHERE download_id=? AND identity<>?',
+                     (self.clock() + self.maintenance.LEASE_SECONDS, task['download_id'], identity))
+        conn.execute("UPDATE generated_assets SET state='ready',retry_at=0,failure='',token=NULL,temporary_path=NULL "
+                     'WHERE sequence=? AND token=?', (task['sequence'], task['token']))
+        self.maintenance.attempted(conn, task)
+        self.maintenance.outcome(conn, task, 'updated')
+        conn.execute('DELETE FROM preview_publications WHERE sequence=?', (task['sequence'],))
+
+    def _recover_publications(self):
+        with self.db() as conn:
+            rows = conn.execute('SELECT * FROM preview_publications ORDER BY sequence LIMIT ?', (self.BATCH_SIZE,)).fetchall()
+        for record in rows:
+            task = dict(record, kind='montage')
+            resolved = self._resolve(task['download_id'])
+            try:
+                valid = (resolved is not None and resolved[1] == task['source']
+                         and task['version'] == self.versions['montage'] and self.confined(task['path'])
+                         and task['path'] == self.asset_path(resolved[0], 'montage')
+                         and self._identity(task['path']) == task['file_identity']
+                         and self.validate('montage', task['path']))
+            except OSError:
+                valid = False
+            if valid:
+                self._sync_file(task['path'])
+                self._sync_directory(task['path'])
+            with self.db_lock, self.db() as conn:
+                owned = conn.execute("SELECT 1 FROM generated_assets WHERE sequence=? AND token=? AND state='running'",
+                                     (task['sequence'], task['token'])).fetchone()
+                if valid and owned:
+                    self._commit_publication(conn, task, resolved[0], task['path'], task['file_identity'], task['identity'])
+                else:
+                    conn.execute('DELETE FROM preview_publications WHERE sequence=?', (task['sequence'],))
+        if len(rows) == self.BATCH_SIZE:
+            self._recover_publications()
+
     def _settle_deferred_failure(self):
         if self._deferred_failure is None:
             return
         task, failure, failed_at = self._deferred_failure
+        if task['kind'] == 'montage':
+            self._recover_publications()
+            with self.db() as conn:
+                row = conn.execute('SELECT state FROM generated_assets WHERE sequence=?', (task['sequence'],)).fetchone()
+            if row is None or row['state'] == 'ready':
+                self._deferred_failure = None
+                return
         exhausted = task['attempts'] >= 3
         delay = 0 if exhausted else self.RETRY_DELAYS[task['attempts'] - 1]
         # A finalization transaction can fail after extraction has completed.
@@ -410,7 +655,12 @@ class AssetQueue:
                 ('failed' if exhausted else 'queued', failed_at + delay, failure,
                  task['sequence'], task['token']),
             ).rowcount
+            if changed and task['kind'] == 'montage':
+                self.maintenance.attempted(conn, task)
+                if exhausted:
+                    self.maintenance.outcome(conn, task, 'failed')
         self._deferred_failure = None
+        self._maintenance_hint()
         if changed and exhausted:
             try:
                 self.notify([task['download_id']])
@@ -422,7 +672,10 @@ class AssetQueue:
         if not self._generation_lock.acquire(blocking=False):
             return False
         try:
+            if self._shutdown:
+                return False
             self._settle_deferred_failure()
+            self.maintenance.cleanup()
             task = self._candidate()
             if task is None:
                 return False
@@ -434,7 +687,7 @@ class AssetQueue:
                 generated = bool(self.generate(task['kind'], task['entry']['filename'], task['temporary_path']))
             except Exception as exc:
                 # A broken tool or corrupt file must not kill the dispatcher.
-                failure = f'{type(exc).__name__}: {exc}'[:240]
+                failure = 'Preview extraction failed'
             try:
                 try:
                     self._finish(task, generated, failure)
@@ -470,6 +723,9 @@ class AssetQueue:
                                 (self._scan_cursor, self.BATCH_SIZE)).fetchall()
         if not rows:
             self._scan_done = True
+            with self.db_lock, self.db() as conn:
+                self.maintenance.discovery(conn, self._scan_cursor, complete=True)
+            self._maintenance_hint()
             return False
         for row in rows:
             if self._stop.is_set():
@@ -478,6 +734,8 @@ class AssetQueue:
             if entry is not None:
                 self.register(entry)
             self._scan_cursor = row['asset_rowid']
+            with self.db_lock, self.db() as conn:
+                self.maintenance.discovery(conn, self._scan_cursor)
             # A slow commit may consume the whole slice. Give queued foreground
             # work a turn before attempting another unrelated registration.
             if time.monotonic() >= deadline:
@@ -485,10 +743,13 @@ class AssetQueue:
         return True
 
     def _recover(self):
+        self._recover_publications()
+        with self.db_lock, self.db() as conn:
+            self.maintenance.recover_campaign(conn)
         # Running attempts count even when the previous process died. Reclaim
         # them with their bounded budget instead of treating restarts as retries.
         with self.db() as conn:
-            rows = conn.execute("SELECT sequence,temporary_path FROM generated_assets "
+            rows = conn.execute("SELECT * FROM generated_assets "
                                 "WHERE state='running' ORDER BY sequence LIMIT ?", (self.BATCH_SIZE,)).fetchall()
         while rows:
             for row in rows:
@@ -508,19 +769,26 @@ class AssetQueue:
             with self.db_lock, self.db() as conn:
                 conn.executemany("UPDATE generated_assets SET state=CASE WHEN attempts>=3 THEN 'failed' ELSE 'queued' END,"
                                  'token=NULL,temporary_path=NULL WHERE sequence=?', [(row['sequence'],) for row in rows])
+                for row in rows:
+                    self.maintenance.attempted(conn, dict(row))
+                    if row['attempts'] >= 3:
+                        self.maintenance.outcome(conn, dict(row), 'failed')
             with self.db() as conn:
-                rows = conn.execute("SELECT sequence,temporary_path FROM generated_assets WHERE state='running' "
+                rows = conn.execute("SELECT * FROM generated_assets WHERE state='running' "
                                     'ORDER BY sequence LIMIT ?', (self.BATCH_SIZE,)).fetchall()
         with self.db_lock, self.db() as conn:
             conn.execute('DELETE FROM asset_demand_tabs')
+            self.maintenance.refresh(conn)
+        self.maintenance.cleanup()
+        self._maintenance_hint()
 
     def _run(self):
-        try:
-            self._recover()
-        except (OSError, sqlite3.Error):
-            pass
+        recovered = False
         while not self._stop.is_set():
             try:
+                if not recovered:
+                    self._recover()
+                    recovered = True
                 scanning = self.reconcile_batch()
                 worked = self.step()
             except (OSError, sqlite3.Error):
@@ -534,6 +802,7 @@ class AssetQueue:
         with self._service_lock:
             if self._thread is not None and self._thread.is_alive():
                 return self._thread
+            self._shutdown = False
             self._stop.clear()
             self._scan_cursor, self._scan_done = 0, False
             self._thread = threading.Thread(target=self._run, name='vdl-assets', daemon=True)
@@ -542,9 +811,16 @@ class AssetQueue:
 
     def stop(self):
         with self._service_lock:
+            self._shutdown = True
             self._stop.set()
             self._wake.set()
             thread = self._thread
+        with self.db() as conn:
+            campaign = self.maintenance._campaign(conn)
+        if campaign is not None and campaign['state'] == 'running':
+            with self.db_lock, self.db() as conn:
+                self.maintenance.pause(conn)
+        self._maintenance_hint()
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=5)
         return thread
