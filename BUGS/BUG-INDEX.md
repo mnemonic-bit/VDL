@@ -388,6 +388,15 @@ the shared queue. Sampling, cache readiness/reuse, real-media generation through
 two-hour sources, and Chromium/Firefox hover and full playback were verified.
 The Python 3.12 unit gate passed with 92.0% `vdl.py` line coverage.
 
+Issue 76 was reported and resolved on 2026-11-03 in version `0.51.1`.
+Fullscreen controls now begin hiding immediately at the bottom edge, using a
+shared pointer/mouse handler and the existing interaction and recovery guards.
+Mouse controls are smaller while touch targets remain usable, seek icons omit
+numerals, and volume expands beside the speaker without overlapping the
+timeline or shifting other actions. All 90 relevant Chromium checks passed;
+desktop and narrow layouts were visually reviewed in both themes. The Python
+3.12 unit gate passed with 92.1% `vdl.py` line coverage.
+
 ## Bug reports
 
 - [Bug 0001 — Merged downloads kept the deleted temporary audio filename](bug-0001-merged-downloads-kept-deleted-temporary-audio-filename.md)
@@ -465,6 +474,7 @@ The Python 3.12 unit gate passed with 92.0% `vdl.py` line coverage.
 - [Bug 0073 — Player playback-event sequence fails in GitHub Actions](bug-0073-player-playback-event-sequence-fails-in-github-actions.md)
 - [Bug 0074 — Fullscreen player idle-slide endpoint fails in GitHub Actions](bug-0074-fullscreen-player-idle-slide-endpoint-fails-in-github-actions.md)
 - [Bug 0075 — Hover-preview sampling count does not scale with video duration](bug-0075-hover-preview-sampling-count-does-not-scale-with-duration.md)
+- [Bug 0076 — Fullscreen controls need immediate bottom-edge hiding, smaller sizing, and an animated inline volume slider](bug-0076-fullscreen-controls-bottom-edge-hide-size-and-volume-layout.md)
 
 ## Accepted UI decisions
 

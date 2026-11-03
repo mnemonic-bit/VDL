@@ -70,6 +70,11 @@ for (const { playlist, fullscreen, theme, motion } of [
                 await expect.poll(() => page.evaluate(() => document.fullscreenElement?.id)).toBe('playerContainer');
             }
             await expectCenteredBuffering(page);
+            if (fullscreen) {
+                const bounds = await page.locator('#playerContainer').boundingBox();
+                await page.mouse.move(bounds.x + 20, bounds.y + bounds.height - 1);
+                await expect(page.locator('#playerContainer')).toHaveClass(/player-controls-visible/);
+            }
             await expect(page.locator('#playerBufferingSpinner')).toHaveCSS('animation-name', motion === 'reduce' ? 'none' : 'options-spin');
             if (playlist) await expect(page.locator('#playlistQueue')).toBeVisible();
             const videoBounds = await page.locator('#playerVideo').boundingBox();
@@ -194,6 +199,11 @@ test('media errors replace buffering with distinct usable recovery actions', asy
     await refresh(page);
     await openVideo(page);
     await expect(page.locator('#playerStatus')).toContainText('missing or uses an unsupported format');
+    await page.locator('#playerFullscreen').click();
+    await expect.poll(() => page.evaluate(() => document.fullscreenElement?.id)).toBe('playerContainer');
+    const bounds = await page.locator('#playerContainer').boundingBox();
+    await page.mouse.move(20, bounds.y + bounds.height - 1);
+    await expect(page.locator('#playerContainer')).toHaveClass(/player-controls-visible/);
     await expect(page.locator('#playerBufferingSpinner')).toBeHidden();
     await expect(page.locator('#playerTransitionClose')).toBeVisible();
     await page.locator('#playerTransitionClose').click();
@@ -224,6 +234,7 @@ test('volume is hidden until speaker hover and stays usable while crossing onto 
     await page.keyboard.press('Tab');
     await expect(slider).toBeHidden();
     await page.locator('#playerMute').hover();
+    await expect(slider).toHaveCSS('width', '92px');
     const bounds = await slider.boundingBox();
     await page.mouse.move(bounds.x + 8, bounds.y + bounds.height / 2);
     await page.mouse.down();
@@ -235,6 +246,88 @@ test('volume is hidden until speaker hover and stays usable while crossing onto 
     await expect(slider).toBeHidden();
     expect(await page.locator('#playerVideo').evaluate(video => video.paused)).toBe(false);
 });
+
+for (const { fullscreen, motion, theme, width } of [
+    { fullscreen: false, motion: 'no-preference', theme: 'light', width: 1280 },
+    { fullscreen: true, motion: 'no-preference', theme: 'dark', width: 1280 },
+    { fullscreen: false, motion: 'reduce', theme: 'dark', width: 360 },
+    { fullscreen: true, motion: 'reduce', theme: 'light', width: 360 },
+]) {
+    test(`volume expands inline without shifting controls (${fullscreen ? 'fullscreen' : 'overlay'}, ${motion}, ${theme}, ${width})`, async ({ page }) => {
+        await page.setViewportSize({ width, height: 740 });
+        await page.emulateMedia({ reducedMotion: motion });
+        await page.evaluate(theme => document.documentElement.dataset.theme = theme, theme);
+        await addVideo(page);
+        await openVideo(page);
+        await playing(page);
+        if (fullscreen) {
+            await page.locator('#playerFullscreen').click();
+            await expect.poll(() => page.evaluate(() => document.fullscreenElement?.id)).toBe('playerContainer');
+        }
+        await page.locator('#playerContainer').focus();
+        await page.locator('#playerVideo').hover();
+        const speaker = page.locator('#playerMute');
+        const volume = page.locator('#playerVolume');
+        const controls = page.locator('#playerControls');
+        await expect(volume).toBeHidden();
+        expect(await volume.evaluate(node => getComputedStyle(node).pointerEvents)).toBe('none');
+        const before = await controls.boundingBox();
+        const videoBefore = await page.locator('#playerVideo').boundingBox();
+        const actionBounds = await page.locator('#playerSpeed, #playerRepeat, #playerFullscreen').evaluateAll(nodes =>
+            nodes.map(node => node.getBoundingClientRect().toJSON()));
+        await volume.evaluate(node => {
+            window.__volumeReveal = null;
+            node.addEventListener('transitionrun', function sample(event) {
+                if (event.propertyName !== 'width') return;
+                node.removeEventListener('transitionrun', sample);
+                const animations = node.getAnimations().map(animation => ({ animation, time: animation.currentTime }));
+                for (const { animation } of animations) {
+                    animation.pause();
+                    animation.currentTime = animation.effect.getTiming().duration / 2;
+                }
+                window.__volumeReveal = { width: node.getBoundingClientRect().width,
+                    opacity: Number(getComputedStyle(node).opacity) };
+                for (const { animation, time } of animations) {
+                    animation.currentTime = time;
+                    animation.play();
+                }
+            });
+        });
+        await speaker.hover();
+        await expect(volume).toBeVisible();
+        const finalWidth = width <= 640 ? 76 : 92;
+        await expect(volume).toHaveCSS('width', `${finalWidth}px`);
+        const button = await speaker.boundingBox();
+        const slider = await volume.boundingBox();
+        const timeline = await page.locator('#playerSeek').boundingBox();
+        expect(slider.x).toBeGreaterThanOrEqual(button.x + button.width);
+        expect(slider.y).toBeGreaterThanOrEqual(timeline.y + timeline.height);
+        expect(Math.abs(slider.y + slider.height / 2 - button.y - button.height / 2)).toBeLessThan(1);
+        expect(await controls.boundingBox()).toEqual(before);
+        expect(await page.locator('#playerVideo').boundingBox()).toEqual(videoBefore);
+        expect(await page.locator('#playerSpeed, #playerRepeat, #playerFullscreen').evaluateAll(nodes =>
+            nodes.map(node => node.getBoundingClientRect().toJSON()))).toEqual(actionBounds);
+        expect(await page.locator('#playerPlayPause svg').evaluate(node => node.getBoundingClientRect().width)).toBe(18);
+        if (width === 1280) expect(before.height).toBeLessThanOrEqual(72);
+        const sample = await page.evaluate(() => window.__volumeReveal);
+        if (motion === 'reduce') {
+            expect(sample).toBeNull();
+            await expect(volume).toHaveCSS('transition-duration', '0s');
+        } else {
+            expect(sample).not.toBeNull();
+            expect(sample.width).toBeGreaterThan(0);
+            expect(sample.width).toBeLessThan(finalWidth);
+            expect(sample.opacity).toBeGreaterThan(0);
+            expect(sample.opacity).toBeLessThan(1);
+        }
+        for (const control of await controls.locator('button:visible, input:visible, select:visible').all()) {
+            const bounds = await control.boundingBox();
+            expect(bounds.x).toBeGreaterThanOrEqual(before.x);
+            expect(bounds.x + bounds.width).toBeLessThanOrEqual(before.x + before.width);
+        }
+        await page.screenshot({ path: test.info().outputPath('compact-controls.png') });
+    });
+}
 
 for (const { mode, fullscreen, paused } of [
     { mode: 'direct', fullscreen: false, paused: true },
@@ -335,6 +428,7 @@ test('touch can reveal volume and mute while narrow controls stay inside the pla
         await expect(volume).toBeHidden();
         await page.locator('#playerMute').tap();
         await expect(volume).toBeVisible();
+        await expect(volume).toHaveCSS('width', '76px');
         expect(await page.locator('#playerVideo').evaluate(video => video.muted)).toBe(true);
         const bounds = await volume.boundingBox();
         await page.touchscreen.tap(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
@@ -344,6 +438,8 @@ test('touch can reveal volume and mute while narrow controls stay inside the pla
             const bounds = await control.boundingBox();
             expect(bounds.x).toBeGreaterThanOrEqual(player.x);
             expect(bounds.x + bounds.width).toBeLessThanOrEqual(player.x + player.width + 1);
+            expect(bounds.width).toBeGreaterThanOrEqual(44);
+            expect(bounds.height).toBeGreaterThanOrEqual(44);
         }
         await page.locator('#playerPlayPause').tap();
         await expect(volume).toBeHidden();

@@ -4605,7 +4605,7 @@ function initializePlayerControls() {
                 showPlayerControls();
             });
         }
-        listen(container, 'pointermove', showPlayerControls);
+        listen(container, 'pointermove', handlePlayerPointerMove);
         listen(container, 'pointerdown', () => {
             playerPointerFocus = true;
             showPlayerControls();
@@ -5660,6 +5660,21 @@ function hidePlayerControls({ force = false } = {}) {
         const chrome = container.querySelector('.player-chrome');
         if (chrome) chrome.inert = true;
     }
+}
+
+function handlePlayerPointerMove(event) {
+    const container = playerControl('playerContainer');
+    // The last four pixels are toolbar padding, outside every control's hit
+    // area. Share this path with mousemove so its compatibility event cannot
+    // immediately reveal bars that pointermove just hid.
+    const bounds = container.getBoundingClientRect();
+    if (playerInFullscreen() && event.pointerType !== 'touch'
+            && event.clientY >= bounds.bottom - 4 && event.clientY < bounds.bottom
+            && !event.target.closest('button, input, select, a, [role="slider"]')) {
+        hidePlayerControls();
+        return;
+    }
+    showPlayerControls();
 }
 
 function showPlayerControls() {
@@ -6880,7 +6895,7 @@ document.addEventListener('visibilitychange', () => {
 initializePlayerControls();
 
 document.getElementById('playerBackdrop').addEventListener(
-    'mousemove', showPlayerControls,
+    'mousemove', handlePlayerPointerMove,
 );
 
 function togglePlayerPlayback() {

@@ -75,6 +75,37 @@ test('stationary header and pointer-focused controls do not pin the idle bars', 
 
 const idleScenarios = ['no-preference', 'reduce'].flatMap(reducedMotion =>
     [false, true].map(fullscreen => ({ reducedMotion, fullscreen })));
+for (const reducedMotion of ['no-preference', 'reduce']) {
+    test(`fullscreen bottom edge hides immediately and stays hidden (${reducedMotion})`, async ({ page }) => {
+        await page.emulateMedia({ reducedMotion });
+        await addVideo(page, 'interaction-one', 'fit-16-9');
+        await openVideo(page);
+        // A media clock can advance before its first timeupdate announces
+        // playback recovery. Exercise the edge during settled normal playback.
+        await expect.poll(() => page.evaluate(() => playerMediaProgressing.has(playerControl('playerVideo')))).toBe(true);
+        const container = page.locator('#playerContainer');
+        await container.focus();
+        await page.keyboard.press('f');
+        await expect.poll(() => page.evaluate(() => document.fullscreenElement?.id)).toBe('playerContainer');
+        await container.focus();
+        await page.mouse.move(400, 300);
+        await expect(container).toHaveClass(/player-controls-visible/);
+        const { bottom } = await container.evaluate(node => ({ bottom: node.getBoundingClientRect().bottom }));
+        await page.mouse.move(400, bottom - 1);
+        // Assert the start of hiding without waiting out the three-second timer.
+        expect(await container.evaluate(node => node.classList.contains('player-controls-visible'))).toBe(false);
+        expect(await page.evaluate(() => playerControlsTimer)).toBeNull();
+        await page.mouse.move(410, bottom - 1);
+        await page.mouse.move(420, bottom - 2);
+        expect(await container.evaluate(node => node.classList.contains('player-controls-visible'))).toBe(false);
+        await expect(page.locator('#playerControls')).toBeHidden();
+        expect(await page.evaluate(y => document.elementFromPoint(420, y)?.tagName, bottom - 2)).toBe('VIDEO');
+        await page.mouse.move(400, 300);
+        await expect(container).toHaveClass(/player-controls-visible/);
+        await expect(page.locator('#playerControls')).toHaveCSS('transform', 'none');
+    });
+}
+
 for (const { reducedMotion, fullscreen } of idleScenarios) {
     test(`idle controls fade and slide, reveal and reset, with ${reducedMotion} motion (${fullscreen ? 'fullscreen' : 'overlay'})`, async ({ page }) => {
         test.setTimeout(20_000);
@@ -186,6 +217,62 @@ for (const { reducedMotion, fullscreen } of idleScenarios) {
         await expect(controls).toBeVisible();
     });
 }
+
+test('fullscreen edge preserves keyboard focus, slider drags and the open speed picker', async ({ page }) => {
+    test.setTimeout(20_000);
+    await addVideo(page, 'interaction-one', 'fit-16-9');
+    await openVideo(page);
+    const container = page.locator('#playerContainer');
+    await container.focus();
+    await page.keyboard.press('f');
+    await expect.poll(() => page.evaluate(() => document.fullscreenElement?.id)).toBe('playerContainer');
+    const { bottom } = await container.evaluate(node => ({ bottom: node.getBoundingClientRect().bottom }));
+    await page.locator('#playerMute').focus();
+    await page.mouse.move(300, bottom - 1);
+    await expect(container).toHaveClass(/player-controls-visible/);
+    await expect(page.locator('#playerMute')).toBeFocused();
+    await page.keyboard.press('Tab');
+    await expect(page.locator('#playerVolume')).toBeFocused();
+    await page.keyboard.press('ArrowLeft');
+    await expect.poll(() => page.locator('#playerVideo').evaluate(video => video.volume)).toBeLessThan(1);
+
+    for (const id of ['playerSeek', 'playerVolume']) {
+        await page.locator('#playerVideo').hover();
+        if (id === 'playerVolume') {
+            await page.locator('#playerMute').hover();
+            await expect(page.locator('#playerVolume')).toHaveCSS('width', '92px');
+        }
+        const slider = page.locator(`#${id}`);
+        const bounds = await slider.boundingBox();
+        await page.mouse.move(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
+        await page.mouse.down();
+        await page.mouse.move(bounds.x + bounds.width / 2, bottom - 1);
+        await expect(container).toHaveClass(/player-controls-visible/);
+        if (id === 'playerVolume') await expect(slider).toBeVisible();
+        await page.mouse.up();
+    }
+    await page.locator('#playerSpeed').click();
+    if (await page.evaluate(() => CSS.supports('selector(select:open)'))) {
+        await expect.poll(() => page.locator('#playerSpeed').evaluate(node => node.matches(':open'))).toBe(true);
+    }
+    await page.mouse.move(300, bottom - 1);
+    await expect(container).toHaveClass(/player-controls-visible/);
+    await page.keyboard.press('Escape');
+    // The edge strip must also leave the actual button hit areas usable.
+    await page.locator('#playerPlayPause').click();
+    await expect.poll(() => page.locator('#playerVideo').evaluate(video => video.paused)).toBe(true);
+});
+
+test('bottom edge movement in the overlay retains the normal idle behavior', async ({ page }) => {
+    await addVideo(page, 'interaction-one', 'fit-16-9');
+    await openVideo(page);
+    const container = page.locator('#playerContainer');
+    await container.focus();
+    const bounds = await container.boundingBox();
+    await page.mouse.move(bounds.x + 50, bounds.y + bounds.height - 1);
+    await expect(container).toHaveClass(/player-controls-visible/);
+    expect(await page.evaluate(() => playerControlsTimer)).not.toBeNull();
+});
 
 for (const fixture of ['fit-16-9', 'fit-wide', 'fit-portrait']) {
     test(`${fixture} fullscreen video fills the viewport before bars hide and never shifts`, async ({ page }) => {
