@@ -1,5 +1,7 @@
 import os
+import resource
 import shutil
+import subprocess
 import threading
 import time
 import unittest
@@ -12,6 +14,59 @@ from download_bandwidth import govern_download
 from tests.support.app_case import AppCase
 from tests.support.fixture_server import FixtureHandler, fixture_server
 from tests.support.media_factory import generate_media, require_media_tools, run, streams
+
+
+class HoverPreviewMediaTest(AppCase):
+    def setUp(self):
+        require_media_tools(self)
+        super().setUp()
+
+    def test_long_montages_encode_within_timeout_and_keep_chronological_excerpts(self):
+        for duration, picture in (
+            (600, "nullsrc=s=160x90:r=2,geq=lum='16+219*T/600':cb=128:cr=128"),
+            (7200, 'color=c=blue:s=640x360:r=1'),
+        ):
+            with self.subTest(duration=duration):
+                source = os.path.join(self.download_dir, f'source-{duration}.mp4')
+                preview = os.path.join(self.download_dir, f'preview-{duration}.mp4')
+                run([
+                    'ffmpeg', '-v', 'error', '-threads', '1', '-filter_threads', '1',
+                    '-f', 'lavfi', '-i', picture, '-t', str(duration),
+                    '-c:v', 'libx264', '-threads', '1', '-preset', 'ultrafast',
+                    '-pix_fmt', 'yuv420p', '-g', '2', '-y', source,
+                ])
+                started = time.monotonic()
+                self.assertTrue(vdl.generate_video_preview(source, preview))
+                elapsed = time.monotonic() - started
+                self.assertLess(elapsed, 180)
+                count = duration // 30 + 3
+                self.assertAlmostEqual(vdl.ffprobe_video_duration(preview), 2 * count, delta=0.5)
+                video, = streams(preview)
+                self.assertEqual((video['codec_name'], video['pix_fmt']), ('h264', 'yuv420p'))
+                self.assertEqual(video['r_frame_rate'], '12/1')
+                self.assertLessEqual(video['level'], 30)
+                self.assertLessEqual(video['width'], 480)
+                run(['ffmpeg', '-v', 'error', '-i', preview, '-f', 'null', '-'])
+                print(f'Preview {duration}s: {count} excerpts encoded in {elapsed:.2f}s; '
+                      f'child peak RSS {resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss} KiB')
+                if duration == 600:
+                    # One decoded midpoint per excerpt reveals actual cut order,
+                    # rather than merely checking the concat command text.
+                    samples = subprocess.check_output([
+                        'ffmpeg', '-v', 'error', '-i', preview,
+                        '-vf', 'select=eq(mod(n\\,24)\\,12),extractplanes=y,scale=1:1',
+                        '-vsync', 'vfr', '-pix_fmt', 'gray', '-f', 'rawvideo', '-',
+                    ])
+                    self.assertEqual(len(samples), count)
+                    self.assertLess(samples[0], 20)
+                    self.assertGreater(samples[-1], 225)
+                    for index, value in enumerate(samples):
+                        # Normalize away ffmpeg's platform-specific color-range
+                        # conversion while retaining the source-time gradient.
+                        position = (value - samples[0]) / (samples[-1] - samples[0])
+                        self.assertAlmostEqual(position, index / (count - 1), delta=0.015)
+                        if index:
+                            self.assertGreater(value, samples[index - 1])
 
 
 class RealMediaIntegrationTest(AppCase):
@@ -153,7 +208,7 @@ class RealMediaIntegrationTest(AppCase):
         self.assertEqual(preview_streams[0]["codec_name"], "h264")
         self.assertLessEqual(preview_streams[0]["level"], 30)
         self.assertLessEqual(preview_streams[0]["width"], 480)
-        self.assertAlmostEqual(vdl.ffprobe_video_duration(preview_path), 14, delta=0.5)
+        self.assertAlmostEqual(vdl.ffprobe_video_duration(preview_path), 6, delta=0.5)
         modified_at = os.path.getmtime(preview_path)
 
         second = self.client.get("/api/preview/preview1")

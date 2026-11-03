@@ -2232,7 +2232,7 @@ function toggleMenu(id, ev) {
 }
 
 const HOVER_PREVIEW_DELAY_MS = 250;
-const HOVER_PREVIEW_CACHE_VERSION = 4;
+const HOVER_PREVIEW_CACHE_VERSION = 5;
 let hoverPreviewTimer = null;
 let pendingHoverPreview = null;
 let activeHoverPreview = null;

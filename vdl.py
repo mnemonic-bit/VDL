@@ -5016,7 +5016,7 @@ def _thumbnail_path(entry, fallback_dir=None, *, version=_THUMBNAIL_CACHE_VERSIO
     )
 
 
-_PREVIEW_CACHE_VERSION = 4
+_PREVIEW_CACHE_VERSION = 5
 _PREVIEW_FRAMES_PER_SECOND = 12
 
 
@@ -5073,9 +5073,8 @@ def generate_video_thumbnail(media_path, thumbnail_path):
     return False
 
 
-_PREVIEW_SEGMENT_COUNT = 7
 _PREVIEW_SEGMENT_SECONDS = 2.0
-_PREVIEW_TOTAL_SECONDS = _PREVIEW_SEGMENT_COUNT * _PREVIEW_SEGMENT_SECONDS
+_PREVIEW_SAMPLE_INTERVAL_SECONDS = 30.0
 _PREVIEW_EDGE_MARGIN_SECONDS = 5.0
 
 
@@ -5114,11 +5113,15 @@ def ffprobe_video_duration(path):
 
 def _preview_segments(duration):
     """Return equally spaced (start, length) excerpts for a hover preview."""
+    if not isinstance(duration, (int, float)) or not math.isfinite(duration):
+        return []
     interior_duration = duration - (2 * _PREVIEW_EDGE_MARGIN_SECONDS)
     if interior_duration <= 0:
         return []
-    if interior_duration < _PREVIEW_TOTAL_SECONDS:
+    # Three excerpts first fit at 16 seconds; shorter interiors play once.
+    if interior_duration < 3 * _PREVIEW_SEGMENT_SECONDS:
         return [(_PREVIEW_EDGE_MARGIN_SECONDS, interior_duration)]
+    segment_count = math.floor(duration / _PREVIEW_SAMPLE_INTERVAL_SECONDS) + 3
     last_start = (
         duration
         - _PREVIEW_EDGE_MARGIN_SECONDS
@@ -5126,13 +5129,13 @@ def _preview_segments(duration):
     )
     spacing = (
         last_start - _PREVIEW_EDGE_MARGIN_SECONDS
-    ) / (_PREVIEW_SEGMENT_COUNT - 1)
+    ) / (segment_count - 1)
     return [
         (
             _PREVIEW_EDGE_MARGIN_SECONDS + spacing * index,
             _PREVIEW_SEGMENT_SECONDS,
         )
-        for index in range(_PREVIEW_SEGMENT_COUNT)
+        for index in range(segment_count)
     ]
 
 

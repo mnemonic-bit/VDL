@@ -380,6 +380,14 @@ All four idle scenarios passed five repetitions each, and the Python 3.12 unit
 gate passed with 92.0% coverage. The full browser suite passed all 409 tests.
 Hosted CI confirmation remains outstanding for both reports.
 
+Issue 75 was resolved in version `0.50.10`. Hover previews now use two endpoint
+excerpts plus `floor(t / 30) + 1` middle excerpts, equally spaced with source
+start gaps no greater than 30 seconds. Explicit short-video fallbacks preserve
+the edge exclusions, and cache version 5 regenerates existing montages through
+the shared queue. Sampling, cache readiness/reuse, real-media generation through
+two-hour sources, and Chromium/Firefox hover and full playback were verified.
+The Python 3.12 unit gate passed with 92.0% `vdl.py` line coverage.
+
 ## Bug reports
 
 - [Bug 0001 — Merged downloads kept the deleted temporary audio filename](bug-0001-merged-downloads-kept-deleted-temporary-audio-filename.md)
@@ -456,6 +464,7 @@ Hosted CI confirmation remains outstanding for both reports.
 - [Bug 0072 — Player idle-transition sampling fails in GitHub Actions](bug-0072-player-idle-transition-sampling-fails-in-github-actions.md)
 - [Bug 0073 — Player playback-event sequence fails in GitHub Actions](bug-0073-player-playback-event-sequence-fails-in-github-actions.md)
 - [Bug 0074 — Fullscreen player idle-slide endpoint fails in GitHub Actions](bug-0074-fullscreen-player-idle-slide-endpoint-fails-in-github-actions.md)
+- [Bug 0075 — Hover-preview sampling count does not scale with video duration](bug-0075-hover-preview-sampling-count-does-not-scale-with-duration.md)
 
 ## Accepted UI decisions
 
