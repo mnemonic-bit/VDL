@@ -35,7 +35,8 @@ def main():
         context = Path(temp) / 'context'
         context.mkdir()
         for name in ('Dockerfile', 'requirements-container.in', 'requirements-container.constraints',
-                     'requirements-container.txt', 'vdl.py', 'download_bandwidth.py',
+                     'requirements-container.txt', 'vdl.py', 'asset_generation.py',
+                     'preview_maintenance.py', 'download_bandwidth.py',
                      'download_history.py', 'docker-entrypoint.sh', 'VERSION'):
             shutil.copyfile(ROOT / name, context / name)
         for name in ('templates', 'static'):

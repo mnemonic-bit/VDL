@@ -17,7 +17,13 @@ test('Library reload requests the current thumbnail cache version', async ({ pag
     });
     const oldResponse = await page.goto('/api/thumbnail/thumb-version');
     expect(oldResponse.status()).toBe(200);
-    expect(oldResponse.headers()['cache-control']).toContain('max-age=0');
+    expect(oldResponse.headers()['cache-control']).toBe('private, no-cache');
+    const etag = oldResponse.headers()['etag'];
+    expect(etag).toBeTruthy();
+    const revalidated = await page.request.get('/api/thumbnail/thumb-version', {
+        headers: { 'If-None-Match': etag },
+    });
+    expect(revalidated.status()).toBe(304);
 
     const requests = [];
     page.on('request', request => {
@@ -26,6 +32,11 @@ test('Library reload requests the current thumbnail cache version', async ({ pag
         }
     });
     await page.goto('/');
+    await expect(page.locator('[data-row-id="thumb-version"] .history-preview img'))
+        .toHaveAttribute('src', '/api/thumbnail/thumb-version?v=2');
+    await expect.poll(() => requests).toContain('?v=2');
+    requests.length = 0;
+    await page.reload();
     await expect(page.locator('[data-row-id="thumb-version"] .history-preview img'))
         .toHaveAttribute('src', '/api/thumbnail/thumb-version?v=2');
     await expect.poll(() => requests).toContain('?v=2');
@@ -539,6 +550,18 @@ test('hover previews wait before loading and only play one montage at a time', a
         name: 'hover-two.mp4', title: 'Hover two',
     });
     await refresh(page);
+    const libraryResponse = await page.request.get('/api/library');
+    expect(libraryResponse.ok()).toBeTruthy();
+    const library = await libraryResponse.json();
+    const deliveries = Object.fromEntries(library.map(row => [row.id, row.assets.montage_delivery]));
+    for (const id of ['hover01', 'hover02']) {
+        expect(deliveries[id].available).toBe(true);
+        expect(deliveries[id].current).toBe(true);
+        expect(deliveries[id].identity).toMatch(/^[a-f0-9]{32}$/);
+        expect(deliveries[id].url).toBe(`/api/preview/${id}?asset=${deliveries[id].identity}`);
+    }
+    await page.clock.install();
+    await page.clock.pauseAt(new Date(Date.now() + 1000));
     await page.evaluate(() => {
         window.__hoverPreviewPlays = 0;
         window.__hoverPreviewPauses = 0;
@@ -565,26 +588,28 @@ test('hover previews wait before loading and only play one montage at a time', a
     await expect(first.locator('.history-preview-duration')).toBeHidden();
 
     await first.hover();
-    await page.waitForTimeout(150);
+    await page.clock.runFor(249);
     await expect(firstVideo).not.toHaveAttribute('src', /./);
     expect(await page.evaluate(() => window.__hoverPreviewPlays)).toBe(0);
+    await page.clock.runFor(1);
     await expect.poll(() => page.evaluate(() => window.__hoverPreviewPlays)).toBe(1);
-    await expect(firstVideo).toHaveAttribute('src', '/api/preview/hover01?v=5');
+    await expect(firstVideo).toHaveAttribute('src', deliveries.hover01.url);
     await expect(first).toHaveClass(/preview-playing/);
     await expect(first.locator('.history-preview-quality')).toBeHidden();
     await expect(first.locator('.history-preview-duration')).toHaveText('2:05');
     await expect(first.locator('.history-preview-duration')).toBeVisible();
 
     await page.locator('[data-row-id="hover01"] .favorite-toggle').hover();
-    await expect(firstVideo).toHaveAttribute('src', '/api/preview/hover01?v=5');
+    await expect(firstVideo).toHaveAttribute('src', deliveries.hover01.url);
     await expect(first).toHaveClass(/preview-playing/);
     expect(await page.evaluate(() => window.__hoverPreviewPauses)).toBe(0);
 
     await second.hover();
     await expect(firstVideo).not.toHaveAttribute('src', /./);
     await expect(first).not.toHaveClass(/preview-playing/);
+    await page.clock.runFor(250);
     await expect.poll(() => page.evaluate(() => window.__hoverPreviewPlays)).toBe(2);
-    await expect(secondVideo).toHaveAttribute('src', '/api/preview/hover02?v=5');
+    await expect(secondVideo).toHaveAttribute('src', deliveries.hover02.url);
     await expect(second).toHaveClass(/preview-playing/);
 
     await page.locator('.app-header').hover();

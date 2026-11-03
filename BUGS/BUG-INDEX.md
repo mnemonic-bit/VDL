@@ -397,6 +397,16 @@ timeline or shifting other actions. All 90 relevant Chromium checks passed;
 desktop and narrow layouts were visually reviewed in both themes. The Python
 3.12 unit gate passed with 92.1% `vdl.py` line coverage.
 
+Issue 77 is resolved locally in version `0.51.2`. Two stale History browser
+assertions now check private thumbnail revalidation and server-issued montage
+identities, preserving reload, delayed-loading, and single-montage behavior.
+The companion package-state check stages both required asset modules. The
+complete deterministic gate passes: all 424 Chromium tests, seven native media
+tests, a freshly built shipping-container smoke check, and Python 3.12 unit
+coverage of 92.1%. Both unsigned and synthetic-signed amd64 companion fixtures
+also build and pass independent smoke checks. No application delivery change
+was needed for the reported mismatches.
+
 ## Bug reports
 
 - [Bug 0001 — Merged downloads kept the deleted temporary audio filename](bug-0001-merged-downloads-kept-deleted-temporary-audio-filename.md)
@@ -475,6 +485,7 @@ desktop and narrow layouts were visually reviewed in both themes. The Python
 - [Bug 0074 — Fullscreen player idle-slide endpoint fails in GitHub Actions](bug-0074-fullscreen-player-idle-slide-endpoint-fails-in-github-actions.md)
 - [Bug 0075 — Hover-preview sampling count does not scale with video duration](bug-0075-hover-preview-sampling-count-does-not-scale-with-duration.md)
 - [Bug 0076 — Fullscreen controls need immediate bottom-edge hiding, smaller sizing, and an animated inline volume slider](bug-0076-fullscreen-controls-bottom-edge-hide-size-and-volume-layout.md)
+- [Bug 0077 — Full test run fails preview contracts and companion container build](bug-0077-full-test-run-fails-preview-contracts-and-companion-build.md)
 
 ## Accepted UI decisions
 
