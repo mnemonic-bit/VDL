@@ -38,13 +38,13 @@ test('exhausted refresh preserves existing rows, displays an error, and later re
     await seed(page, { id: 'busy-library', status: 'finished' });
     await refresh(page);
     let requests = 0;
-    await page.route('**/api/library', async route => { requests++; await busy(route); });
+    await page.route('**/api/library?include_order=true', async route => { requests++; await busy(route); });
     await refresh(page);
     expect(requests).toBe(3);
     await expect(page.locator('#historyList [data-row-id="busy-library"]')).toBeVisible();
     await expect(page.locator('#actionError')).toBeVisible();
     await expect(page.locator('#actionErrorMessage')).toContainText('Database is busy');
-    await page.unroute('**/api/library');
+    await page.unroute('**/api/library?include_order=true');
     await refresh(page);
     await expect(page.locator('#actionError')).toBeHidden();
     await expect(page.locator('#historyList [data-row-id="busy-library"]')).toBeVisible();

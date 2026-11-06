@@ -167,7 +167,7 @@ class PlaybackSessionTest(AppCase):
     def test_preparation_resolves_without_holding_session_lock_and_rechecks_lease(self):
         self.shuffle_video('only')
         state = self.create_session().get_json()
-        original = vdl.resolve_library_selection
+        original = vdl.resolve_library_snapshot
 
         def resolve(*args):
             self.assertTrue(vdl._playback_sessions_lock.acquire(blocking=False))
@@ -177,7 +177,7 @@ class PlaybackSessionTest(AppCase):
                 vdl._playback_sessions_lock.release()
             return original(*args)
 
-        with mock.patch.object(vdl, 'resolve_library_selection', side_effect=resolve):
+        with mock.patch.object(vdl, 'resolve_library_snapshot', side_effect=resolve):
             self.assertEqual(self.session_step(state, 'prepare').status_code, 404)
 
     def test_prepared_candidate_rechecks_safe_paths_and_shuffle_thresholds(self):

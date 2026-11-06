@@ -15,7 +15,7 @@ test('progress bursts and manual refreshes share one outstanding request per col
     const gate = deferred();
     const counts = { library: 0, 'current-downloads': 0, playlists: 0 };
     for (const collection of Object.keys(counts)) {
-        await page.route(`**/api/${collection}`, async route => {
+        await page.route(`**/api/${collection}${collection === 'library' ? '?include_order=true' : ''}`, async route => {
             counts[collection]++;
             await gate.promise;
             await route.continue();
@@ -46,7 +46,7 @@ test('a queued download accepted through the form appears while Library is delay
     const first = await page.request.post('/api/download', { data: { url: 'https://fixture.invalid/running-first' } });
     expect(first.ok()).toBe(true);
     await refresh(page);
-    await page.route('**/api/library', async route => {
+    await page.route('**/api/library?include_order=true', async route => {
         await gate.promise;
         await route.continue();
     });
@@ -152,17 +152,19 @@ test('a pending refresh performs one follow-up and finishes with the latest Curr
 test('initial Library failures show loading then error, preserve Current, and recover', async ({ page }) => {
     await seed(page, { id: 'failed-library-item', status: 'finished' });
     await seed(page, { id: 'independent-current', status: 'downloading' });
+    // Unload the seeded page so its pending SSE refresh cannot count as a retry.
+    await page.goto('about:blank');
     await page.addInitScript(() => { window.EventSource = class extends EventTarget {}; });
     await page.clock.install();
     const gate = deferred();
     let requests = 0;
-    await page.route('**/api/library', async route => {
+    await page.route('**/api/library?include_order=true', async route => {
         requests++;
         await gate.promise;
         await route.fulfill({ status: 500, contentType: 'application/json', body: '{"error":"Library unavailable"}' });
     });
     try {
-        await page.reload();
+        await page.goto('/');
         await expect.poll(() => requests).toBeGreaterThan(0);
         await expect(page.locator('#historyEmptyTitle')).toContainText(/loading/i);
         await expect(page.locator('#historyEmptyAction')).toBeHidden();
@@ -180,7 +182,7 @@ test('initial Library failures show loading then error, preserve Current, and re
     }
     await page.clock.fastForward(60_000);
     expect(requests).toBe(3);
-    await page.unroute('**/api/library');
+    await page.unroute('**/api/library?include_order=true');
     await refresh(page);
     await expect(page.locator('#historyList [data-row-id="failed-library-item"]')).toBeVisible();
     await expect(page.locator('#actionError')).toBeHidden();
@@ -191,7 +193,7 @@ test('a transient initial collection failure retries without requiring a new cha
     await seed(page, { id: 'retry-library-item', status: 'finished' });
     await page.addInitScript(() => { window.EventSource = class extends EventTarget {}; });
     let requests = 0;
-    await page.route('**/api/library', async route => {
+    await page.route('**/api/library?include_order=true', async route => {
         if (++requests === 1) {
             await route.fulfill({ status: 500, contentType: 'application/json', body: '{"error":"Temporary Library failure"}' });
         } else await route.continue();

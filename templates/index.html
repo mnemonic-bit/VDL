@@ -328,6 +328,7 @@
 
     <section id="tab-history" class="history-panel" aria-label="Library">
         <div id="historyMain">
+        <p id="libraryRotationStatus" class="library-rotation-status" hidden>Library rotation · renews <time id="libraryRotationExpiry"></time></p>
         <section id="playlistShelf" class="playlist-shelf" aria-labelledby="playlistShelfTitle" hidden>
             <div class="playlist-shelf-heading">
                 <h2 id="playlistShelfTitle">Playlists</h2>
@@ -558,6 +559,20 @@
                                 <span id="prefStartFullscreenHint">Automatically enter full screen when the built-in player opens.</span>
                             </div>
                             <input type="checkbox" id="prefStartFullscreen" aria-describedby="prefStartFullscreenHint">
+                        </div>
+                        <div class="setting-item" data-setting-keywords="rotation daily shuffle library order hours play all">
+                            <div class="setting-copy">
+                                <label for="prefLibraryRotation">Library rotation</label>
+                                <span id="prefLibraryRotationHint">Use the same shuffled order for Library and Play All. Shuffle and Shuffle Clips keep their own behavior.</span>
+                            </div>
+                            <input type="checkbox" id="prefLibraryRotation" aria-describedby="prefLibraryRotationHint">
+                        </div>
+                        <div class="setting-item" data-setting-keywords="rotation daily shuffle library order hours play all">
+                            <div class="setting-copy">
+                                <label for="prefLibraryRotationHours">Keep rotation for (hours)</label>
+                                <span id="prefLibraryRotationHoursHint">Show videos and play them in the same shuffled order for this many hours. Newly added videos join the next rotation.</span>
+                            </div>
+                            <input id="prefLibraryRotationHours" type="number" min="1" max="8760" step="1" value="24" required disabled aria-describedby="prefLibraryRotationHoursHint">
                         </div>
                         <h3 class="settings-subheading">Shuffle</h3>
                         <div class="setting-item" data-setting-keywords="shuffle random quality resolution">

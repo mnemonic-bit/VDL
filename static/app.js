@@ -18,6 +18,24 @@ function thumbnailUrl(id) {
 const collectionRefreshes = new Map();
 const collectionErrors = new Map();
 const collectionSnapshots = { library: [], current: [] };
+let libraryOrder = { kind: 'library', generation_id: null, created_at: null, expires_at: null };
+let libraryRequestEpoch = 0;
+let allLibraryEntries = [];
+
+function invalidateLibraryOrder() {
+    // A hint or save supersedes reads that started before the new server state.
+    libraryRequestEpoch += 1;
+}
+
+function renderLibraryRotationStatus() {
+    const status = document.getElementById('libraryRotationStatus');
+    status.hidden = libraryOrder.kind !== 'rotation';
+    if (status.hidden) return;
+    const date = new Date(Number(libraryOrder.expires_at) * 1000);
+    const time = document.getElementById('libraryRotationExpiry');
+    time.dateTime = date.toISOString();
+    time.textContent = date.toLocaleString();
+}
 let libraryLoaded = false;
 let currentLoaded = false;
 let requestedFavoriteSort = false;
@@ -56,7 +74,7 @@ function updateCollectionError(key, message = '') {
     updateHistoryEmptyState();
 }
 
-async function readCollection(url) {
+async function readCollection(url, { ordered = false } = {}) {
     for (let retry = 0; ; retry++) {
         try {
             const response = await apiFetch(url);
@@ -67,7 +85,9 @@ async function readCollection(url) {
                 });
             }
             const data = await response.json();
-            if (!Array.isArray(data)) throw new Error('Invalid collection response.');
+            if (ordered ? (!data || !Array.isArray(data.items) || !data.order) : !Array.isArray(data)) {
+                throw new Error('Invalid collection response.');
+            }
             return data;
         } catch (error) {
             if (error.name === 'AbortError' || error.retryable === false || retry >= 2) throw error;
@@ -162,12 +182,17 @@ function scheduleThumbnailRetry(image, delay = 1000) {
     }, delay);
 }
 
+function libraryEntryForAssets(id) {
+    return collectionSnapshots.library.find(info => String(info.id) === String(id))
+        || allLibraryEntries.find(info => String(info.id) === String(id));
+}
+
 function assetState(id, kind = 'thumbnail') {
-    return collectionSnapshots.library.find(info => String(info.id) === String(id))?.assets?.[kind] || 'queued';
+    return libraryEntryForAssets(id)?.assets?.[kind] || 'queued';
 }
 
 function montageDelivery(id) {
-    const assets = collectionSnapshots.library.find(info => String(info.id) === String(id))?.assets;
+    const assets = libraryEntryForAssets(id)?.assets;
     if (assets?.montage_delivery) return assets.montage_delivery;
     return {
         available: assets?.montage === 'ready', current: true,
@@ -270,9 +295,11 @@ async function flushAssetDemand() {
 
 function applyAssetReadiness(assets) {
     for (const [id, readiness] of Object.entries(assets)) {
-        const info = collectionSnapshots.library.find(item => String(item.id) === id);
+        const info = libraryEntryForAssets(id);
         if (!info) continue;
         info.assets = readiness;
+        const complete = allLibraryEntries.find(item => String(item.id) === id);
+        if (complete) complete.assets = readiness;
         // Only changed cards are patched. The retained template protects live
         // image/hover elements from unrelated readiness and progress events.
         const card = document.querySelector(`#historyList [data-row-id="${CSS.escape(id)}"]`);
@@ -2018,6 +2045,9 @@ function releaseRowActionPointer(ev) {
 }
 
 document.addEventListener('pointerup', releaseRowActionPointer, true);
+document.addEventListener('focusout', event => {
+    if (event.target.closest?.('.tag-editor-shell')) setTimeout(resumeDeferredHistoryFetch, 0);
+});
 document.addEventListener('pointercancel', releaseRowActionPointer, true);
 window.addEventListener('blur', () => {
     if (heldRowActionPointers.size === 0) return;
@@ -3866,9 +3896,15 @@ function updateHistoryEmptyState() {
         : hasFilter
             ? 'No download history matches these search terms.'
             : 'Add a video URL or drop a local video here to get started.';
-    document.getElementById('historyEmptyAction').hidden = hasFilter;
+    const emptyRotation = !hasFilter && libraryOrder.kind === 'rotation'
+        && collectionSnapshots.library.length === 0;
+    if (emptyRotation) {
+        document.getElementById('historyEmptyTitle').textContent = 'No videos in the current rotation.';
+        document.getElementById('historyEmptyMessage').textContent = 'New videos join the next rotation.';
+    }
+    document.getElementById('historyEmptyAction').hidden = hasFilter || emptyRotation;
     document.getElementById('historyEmpty').style.display =
-        historyTotal || visiblePlaylistCount ? 'none' : '';
+        emptyRotation ? '' : historyTotal || visiblePlaylistCount ? 'none' : '';
 }
 
 function endlessHistoryEnabled() {
@@ -4003,8 +4039,36 @@ function fetchHistory({ sortFavorites = false } = {}) {
 
 function fetchDownloadCollection(key) {
     return coordinateRefresh(key, async () => {
+        const requestEpoch = libraryRequestEpoch;
         try {
-            const data = await readCollection(key === 'library' ? '/api/library' : '/api/current-downloads');
+            const snapshot = await readCollection(key === 'library'
+                ? '/api/library?include_order=true' : '/api/current-downloads', { ordered: key === 'library' });
+            if (key === 'library' && requestEpoch !== libraryRequestEpoch) return;
+            const data = key === 'library' ? snapshot.items : snapshot;
+            if (key === 'library') {
+                const changed = libraryOrder.kind !== snapshot.order.kind
+                    || libraryOrder.generation_id !== snapshot.order.generation_id;
+                if (changed && (historyRefreshBlocked() || renameDrafts.size || editingTagIds.size)) {
+                    historyFetchDeferred = true;
+                    return;
+                }
+                const complete = snapshot.order.kind === 'rotation'
+                    ? await readCollection('/api/library-catalog') : data;
+                if (requestEpoch !== libraryRequestEpoch) return;
+                if (changed && (historyRefreshBlocked() || renameDrafts.size || editingTagIds.size)) {
+                    historyFetchDeferred = true;
+                    return;
+                }
+                if (changed) {
+                    historyPage = 0;
+                    historyEndlessVisibleCount = HISTORY_ENDLESS_BATCH_SIZE;
+                    historyOrderIds = [];
+                    if (snapshot.order.kind === 'library') requestedFavoriteSort = true;
+                }
+                libraryOrder = snapshot.order;
+                allLibraryEntries = complete;
+                renderLibraryRotationStatus();
+            }
             const removedCurrent = key === 'current' && collectionSnapshots.current.some(
                 previous => !data.some(info => info.id === previous.id));
             collectionSnapshots[key] = data;
@@ -4019,7 +4083,7 @@ function fetchDownloadCollection(key) {
                 fetchPlaylists();
             }
         } catch (error) {
-            if (error.name === 'AbortError') return;
+            if (error.name === 'AbortError' || (key === 'library' && requestEpoch !== libraryRequestEpoch)) return;
             const name = key === 'library' ? 'Library' : 'Current Downloads';
             updateCollectionError(key, `Could not refresh ${name}. ${error.message || 'Try again shortly.'}`);
             if (key === 'current') document.getElementById('currentEmpty').textContent = collectionErrors.get(key);
@@ -4040,9 +4104,16 @@ function renderDownloadCollections({ sortFavorites = false } = {}) {
     updateProgressIndicators(data);
     const active = data.filter(i => CURRENT_TAB_STATUSES.has(i.status));
     let historyEntries = data.filter(i => HISTORY_TAB_STATUSES.has(i.status));
-    libraryEntries = historyEntries.slice();
+    if (libraryOrder.kind === 'rotation') {
+        const members = new Set(collectionSnapshots.library.map(info => String(info.id)));
+        historyEntries = historyEntries.filter(info => members.has(String(info.id)));
+    }
+    libraryEntries = libraryOrder.kind === 'rotation' ? allLibraryEntries.slice() : historyEntries.slice();
     renderPlaylists();
-    if (sortFavorites) {
+    if (libraryOrder.kind === 'rotation') {
+        const byId = new Map(historyEntries.map(info => [String(info.id), info]));
+        historyEntries = collectionSnapshots.library.map(info => byId.get(String(info.id))).filter(Boolean);
+    } else if (sortFavorites) {
         historyOrdering = 'favorites_first';
         // The API is newest-first, and modern stable sorting preserves
         // that date order inside each favorite group.
@@ -4076,7 +4147,7 @@ function renderDownloadCollections({ sortFavorites = false } = {}) {
     const sequentialAvailable = pageItems.some(
         info => info.status === 'finished' && info.filename,
     );
-    const shuffleAvailable = historyEntries.some(
+    const shuffleAvailable = libraryEntries.some(
         info => info.status === 'finished' && info.filename,
     );
     document.getElementById('playbackMenuPlayAll').disabled = !sequentialAvailable;
@@ -5457,7 +5528,10 @@ async function commitPlayerFade(preparation) {
             usePreparedPlayerHandoff();
             return;
         }
-        const changed = preparation.data && (String(preparation.data.item.id) !== String(preparation.item.id)
+        const changed = preparation.data && ((endlessPlayback.mode === 'sequential'
+                    && (preparation.order?.kind !== preparation.data.order?.kind
+                        || preparation.order?.generation_id !== preparation.data.order?.generation_id))
+                || String(preparation.data.item.id) !== String(preparation.item.id)
                 || preparation.data.item.extension !== preparation.item.extension
                 || (clip
                     && (!preparation.data.item.source_revision
@@ -5597,6 +5671,7 @@ function maybePreparePlayer() {
             return;
         }
         clearTimeout(preparation.timer);
+        preparation.order = data.order;
         loadPreparedPlayer(preparation, data.item);
         maybeCommitPlayerFade(preparation);
     }).catch(() => {
@@ -6458,15 +6533,13 @@ function startEndlessPlayback(id = null, label = '', extension = '', mode = 'seq
         requestFullscreen: false,
     });
 
-    if (id && mode === 'sequential') {
-        loadPlaybackItem({ id, title: label, extension }, { automatic: true });
-        recordView(id);
-    } else {
-        showPlayerTransition(
-            mode === 'shuffle_clips' ? 'Starting Shuffle Clips…' : mode === 'shuffle' ? 'Starting shuffle…' : 'Starting endless playback…',
-            [],
-        );
-    }
+    const awaitSelection = mode === 'sequential';
+    // A settings save in another tab can invalidate even an ordinary launch.
+    // Wait for accepted selection before loading media or recording its view.
+    showPlayerTransition(
+        mode === 'shuffle_clips' ? 'Starting Shuffle Clips…' : mode === 'shuffle' ? 'Starting shuffle…' : 'Starting endless playback…',
+        [],
+    );
     if (startVideosFullscreen) requestPlayerFullscreen({ launch: true });
 
     const historyPosition = id ? historyPositionForId(id) : 0;
@@ -6485,7 +6558,10 @@ function startEndlessPlayback(id = null, label = '', extension = '', mode = 'seq
             ? historyPosition % playbackPageSize
             : historyPosition,
     };
-    if (id && mode === 'sequential') body.start_download_id = String(id);
+    if (mode === 'sequential') {
+        body.generation_id = libraryOrder.generation_id;
+        if (id) body.start_download_id = String(id);
+    }
     apiFetch('/api/playback-sessions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -6505,6 +6581,15 @@ function startEndlessPlayback(id = null, label = '', extension = '', mode = 'seq
                 showPlayerTransition(error.message,
                     mode === 'shuffle_clips' ? ['retry', 'settings', 'stop', 'close'] : ['settings', 'close'],
                     mode === 'shuffle_clips' ? 'retry' : 'settings');
+                return;
+            }
+            if (error.code === 'rotation_generation_changed') {
+                invalidateLibraryOrder();
+                await fetchHistory();
+                if (epoch !== endlessPlayback.epoch || !endlessPlayback.active) return;
+                endlessPlayback.phase = 'create-failed';
+                showPlayerTransition('The Library rotation changed. Retry to start from the refreshed selection.',
+                    ['retry', 'close'], 'retry');
                 return;
             }
             if (error.code === 'shuffle_metadata_pending') {
@@ -6530,16 +6615,17 @@ function startEndlessPlayback(id = null, label = '', extension = '', mode = 'seq
         endlessPlayback.currentDownloadId = String(data.item.id);
         startPlaybackKeepalive(epoch);
         syncPlayerControls();
-        if (!id || String(id) !== String(data.item.id)) {
-            loadPlaybackItem(data.item, { automatic: true });
-            if (mode !== 'shuffle_clips') recordView(data.item.id);
-        } else {
-            endlessPlayback.currentItem = data.item;
-            if (endlessPlayback.phase === 'failed') advanceEndlessPlayback();
-        }
+        loadPlaybackItem(data.item, { automatic: true });
+        if (mode !== 'shuffle_clips') recordView(data.item.id);
         maybePreparePlayer();
     }).catch(error => {
         if (epoch !== endlessPlayback.epoch || !endlessPlayback.active) return;
+        if (awaitSelection) {
+            endlessPlayback.phase = 'create-failed';
+            showPlayerTransition(error.message || 'Play All could not start. Try again.',
+                ['retry', 'close'], 'retry');
+            return;
+        }
         deactivateEndlessPlayback({ release: false });
         showPlayerTransition(
             `${error.message || 'Endless playback could not start.'} The current video can still be played.`,
@@ -6678,6 +6764,10 @@ function retryEndlessPlayback() {
             maybePreparePlayer();
         }
         showPlayerTransition('', []);
+        return;
+    }
+    if (endlessPlayback.phase === 'create-failed' && endlessPlayback.mode === 'sequential') {
+        startEndlessPlaybackFromView();
         return;
     }
     if (endlessPlayback.phase === 'create-failed'
@@ -7838,6 +7928,9 @@ function loadPreferences() {
         document.getElementById('prefPlayer').value = playerMode;
         updateSkipVideoEdges(p.skip_video_edges === 'true');
         document.getElementById('prefSkipVideoEdges').checked = skipVideoEdges;
+        document.getElementById('prefLibraryRotation').checked = p.library_rotation_enabled === 'true';
+        document.getElementById('prefLibraryRotationHours').value = p.library_rotation_hours || '24';
+        refreshLibraryRotationAvailability();
         startVideosFullscreen = p.start_fullscreen === 'true';
         document.getElementById('prefStartFullscreen').checked = startVideosFullscreen;
         refreshFullscreenAvailability();
@@ -7875,8 +7968,17 @@ document.getElementById('prefPlayer').addEventListener(
     'change', refreshFullscreenAvailability,
 );
 
+function refreshLibraryRotationAvailability() {
+    document.getElementById('prefLibraryRotationHours').disabled =
+        !document.getElementById('prefLibraryRotation').checked;
+}
+
+document.getElementById('prefLibraryRotation').addEventListener(
+    'change', refreshLibraryRotationAvailability,
+);
+
 function savePreferences() {
-    for (const id of ['prefMax', 'prefMaxPerHost', 'prefMaxMbps']) {
+    for (const id of ['prefMax', 'prefMaxPerHost', 'prefMaxMbps', 'prefLibraryRotationHours']) {
         if (!document.getElementById(id).reportValidity()) return;
     }
     const sel = document.getElementById('prefFormat');
@@ -7896,16 +7998,21 @@ function savePreferences() {
             ? 'true' : 'false',
         skip_video_edges: document.getElementById('prefSkipVideoEdges').checked
             ? 'true' : 'false',
+        library_rotation_enabled: document.getElementById('prefLibraryRotation').checked ? 'true' : 'false',
+        library_rotation_hours: document.getElementById('prefLibraryRotationHours').value,
         shuffle_min_height: document.getElementById('prefShuffleMinHeight').value,
         shuffle_min_duration_minutes:
             document.getElementById('prefShuffleMinDuration').value,
         theme: document.getElementById('prefTheme').value,
     };
+    invalidateLibraryOrder();
     apiAction('/api/preferences', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
     }).then(() => {
+        invalidateLibraryOrder();
+        fetchHistory();
         const nextPageSize = body.history_page_size === HISTORY_ENDLESS_MODE
             ? HISTORY_ENDLESS_MODE
             : Number(body.history_page_size);
@@ -7964,6 +8071,7 @@ function scheduleFetch({ sortFavorites = false, currentOnly = false } = {}) {
 function connectEventStream() {
     const es = new EventSource('/api/events');
     es.addEventListener('ready', () => {
+        invalidateLibraryOrder();
         hideServerStatus('events');
         scheduleFetch();
         scheduleAssetDemand({ reconcile: true, interaction: false });
@@ -7975,6 +8083,7 @@ function connectEventStream() {
     es.addEventListener('change', event => {
         let change;
         try { change = JSON.parse(event.data); } catch (_) { /* Reconcile unknown events fully. */ }
+        if (change?.reason === 'library_rotation') invalidateLibraryOrder();
         const currentOnly = change?.reason === 'update'
             && collectionSnapshots.current.some(info => String(info.id) === String(change.id));
         scheduleFetch({ currentOnly });
@@ -7986,6 +8095,11 @@ function connectEventStream() {
     });
     return es;
 }
+
+window.addEventListener('focus', () => { invalidateLibraryOrder(); scheduleFetch(); });
+document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) { invalidateLibraryOrder(); scheduleFetch(); }
+});
 
 connectEventStream();
 // A fresh page has no visual order to preserve, so establish favorite-first

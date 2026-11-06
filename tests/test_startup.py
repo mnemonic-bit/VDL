@@ -23,12 +23,14 @@ class StartupArgumentsTest(unittest.TestCase):
               mock.patch.object(vdl, 'stop_ingest_import'),
               mock.patch.object(vdl, 'stop_metadata_backfill'),
               mock.patch.object(vdl, 'stop_duplicate_backfill'),
+              mock.patch.object(vdl, '_cancel_rotation_timer') as stop_rotation,
               mock.patch.object(vdl, 'stop_asset_generation') as stop,
               mock.patch.object(vdl.app, 'run', side_effect=terminate),
               mock.patch('builtins.print'),
               self.assertRaises(SystemExit)):
             vdl.main([])
         stop.assert_called_once_with()
+        stop_rotation.assert_called_once_with()
         self.assertEqual(installed[-1], (vdl.signal.SIGTERM, 'previous-handler'))
 
     def test_command_line_port_overrides_environment(self):

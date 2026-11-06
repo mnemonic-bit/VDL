@@ -2114,3 +2114,11 @@ body.history-open .create-playlist-button { display: none; }
 .system-log-severity { border: 1px solid var(--border); border-radius: 4px; padding: 2px 6px; }
 .system-log-entry p { margin: 8px 0 0; white-space: pre-wrap; }
 .library-view-switch { flex-wrap: wrap; }
+
+.library-rotation-status {
+    color: var(--muted);
+    font-size: 0.85rem;
+    line-height: 1.5;
+    margin: 0 0 1rem;
+    overflow-wrap: anywhere;
+}

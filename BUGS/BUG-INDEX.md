@@ -427,6 +427,14 @@ Decoded native-media checks and Chromium/Firefox handoff checks pass.
 The Python 3.12 unit gate passes 462 tests (9 skipped), with 92.1% `vdl.py`
 line coverage; all 9 native-media tests and 12 selected checks per browser pass.
 
+Issue 80 is open. Escape closes overlay playback but also exits Firefox's
+macOS application fullscreen, according to the reporter. Chromium and Firefox
+probes on Linux confirm that the player closes and unloads its media while
+leaving the Escape event uncanceled. The player branch lacks `preventDefault()`
+despite neighboring dismissal handlers already using it. Native macOS window
+verification remains outstanding; the report includes reproduction steps,
+source evidence, and acceptance criteria.
+
 ## Bug reports
 
 - [Bug 0001 — Merged downloads kept the deleted temporary audio filename](bug-0001-merged-downloads-kept-deleted-temporary-audio-filename.md)
@@ -508,6 +516,7 @@ line coverage; all 9 native-media tests and 12 selected checks per browser pass.
 - [Bug 0077 — Full test run fails preview contracts and companion container build](bug-0077-full-test-run-fails-preview-contracts-and-companion-build.md)
 - [Bug 0078 — Obsolete thumbnail and preview caches accumulate across upgrades](bug-0078-obsolete-thumbnail-and-preview-caches-accumulate.md)
 - [Bug 0079 — Hover previews include unwanted first and last excerpts](bug-0079-hover-previews-include-unwanted-first-and-last-excerpts.md)
+- [Bug 0080 — Overlay Escape also exits Firefox macOS application fullscreen](bug-0080-overlay-escape-also-exits-firefox-macos-fullscreen.md)
 
 ## Accepted UI decisions
 

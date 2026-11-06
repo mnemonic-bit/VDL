@@ -131,6 +131,8 @@ class SchemaMigrationTest(unittest.TestCase):
                     "skip_video_edges": "false",
                     "shuffle_min_height": "0",
                     "shuffle_min_duration_minutes": "0",
+                    "library_rotation_enabled": "false",
+                    "library_rotation_hours": "24",
                     "theme": "dark",
                 })
             finally:

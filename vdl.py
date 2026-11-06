@@ -31,7 +31,7 @@ import sys
 import tempfile
 import unicodedata
 import zipfile
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import wraps
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -397,6 +397,11 @@ class EventBus:
             if (owner_user_id is not None
                     and subscriber_user_id != owner_user_id):
                 continue
+            if kind == 'change' and (payload or {}).get('reason') == 'library_rotation':
+                with q.mutex:
+                    if any(item[0] == 'change' and (item[1] or {}).get('reason')
+                           == 'library_rotation' for item in q.queue):
+                        continue
             if kind in ('assets', 'maintenance'):
                 # A slow client needs one bounded reconciliation hint, even
                 # when the worker finishes several cached assets in a burst.
@@ -468,6 +473,9 @@ BROWSER_VIDEO_EXTENSIONS = {
 # connection cause "database is locked" errors. We open a fresh connection
 # per operation and guard writes with this lock.
 _db_lock = threading.Lock()
+_rotation_lock = threading.RLock()
+_rotation_timer = None
+_rotation_timer_db = None
 _upload_lock = threading.Lock()
 # One queue instance belongs to one database and one serving process.
 _asset_queue = None
@@ -599,6 +607,16 @@ def init_db():
             CREATE TABLE IF NOT EXISTS preferences (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS library_rotation (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                generation_id TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                expires_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS library_rotation_members (
+                download_id TEXT PRIMARY KEY,
+                position INTEGER NOT NULL UNIQUE CHECK (position >= 0)
             );
             CREATE TABLE IF NOT EXISTS app_config (
                 key   TEXT PRIMARY KEY,
@@ -869,6 +887,8 @@ def init_db():
             "skip_video_edges": "false",
             "shuffle_min_height": "0",
             "shuffle_min_duration_minutes": "0",
+            "library_rotation_enabled": "false",
+            "library_rotation_hours": "24",
             "theme": "system",
         }
         for k, v in defaults.items():
@@ -894,6 +914,12 @@ def init_db():
             "UPDATE downloads SET status = 'interrupted', progress = 'Interrupted' "
             "WHERE status IN ('starting', 'downloading', 'paused')"
         )
+    # The debug reloader's parent must not renew the shared deck alongside
+    # its serving child. Ordinary WSGI imports still own their deadline timer.
+    if (__name__ != '__main__'
+            or os.environ.get('FLASK_DEBUG', '1') != '1'
+            or os.environ.get('WERKZEUG_RUN_MAIN') == 'true'):
+        _restore_rotation_timer()
 
 
 def db_insert_download(download_id, url, owner_user_id=None,
@@ -2018,18 +2044,179 @@ def _playable_library_entry(entry, allowed_bases=None):
     return _is_allowed_download_path(filename, allowed_bases)
 
 
+class RotationRefreshError(Exception):
+    pass
+
+
+@app.errorhandler(RotationRefreshError)
+def rotation_refresh_failed(_error):
+    response = jsonify({
+        'error': 'Library rotation could not be refreshed. Please retry refresh.',
+        'code': 'rotation_refresh_failed', 'retryable': True,
+    })
+    response.status_code = 503
+    response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+def _rotation_now():
+    return time.time()
+
+
+def _rotation_shuffle(ids):
+    # Unbiased bounded choices give every complete permutation equal weight.
+    for index in range(len(ids) - 1, 0, -1):
+        other = secrets.randbelow(index + 1)
+        ids[index], ids[other] = ids[other], ids[index]
+
+
+def _cancel_rotation_timer():
+    global _rotation_timer, _rotation_timer_db
+    if _rotation_timer is not None:
+        _rotation_timer.cancel()
+    _rotation_timer = None
+    _rotation_timer_db = None
+
+
+def _schedule_rotation_timer(expires_at, retry=False):
+    global _rotation_timer, _rotation_timer_db
+    deadline = _rotation_now() + 30 if retry else expires_at
+    if (_rotation_timer is not None and _rotation_timer_db == DB_PATH
+            and getattr(_rotation_timer, 'rotation_deadline', None) == deadline):
+        return
+    _cancel_rotation_timer()
+    database_path = DB_PATH
+
+    def wake():
+        global _rotation_timer
+        with _rotation_lock:
+            if DB_PATH != database_path or _rotation_timer is not timer:
+                return
+            _rotation_timer = None
+            try:
+                _current_library_rotation()
+            except RotationRefreshError:
+                # Keep the durable deadline intact; a read can retry immediately.
+                _schedule_rotation_timer(expires_at, retry=True)
+                event_bus.publish('change', {'reason': 'library_rotation'})
+
+    timer = threading.Timer(max(0, deadline - _rotation_now()), wake)
+    timer.daemon = True
+    timer.rotation_deadline = deadline
+    _rotation_timer = timer
+    _rotation_timer_db = database_path
+    timer.start()
+
+
+def _restore_rotation_timer():
+    with _rotation_lock:
+        _cancel_rotation_timer()
+        preferences = db_get_preferences()
+        if preferences.get('library_rotation_enabled') == 'true':
+            with db() as conn:
+                row = conn.execute('SELECT expires_at FROM library_rotation').fetchone()
+            _schedule_rotation_timer(row['expires_at'] if row else _rotation_now())
+
+
+def _new_rotation_members():
+    allowed_bases = _trusted_download_directories()
+    ids = list(dict.fromkeys(
+        str(entry['id']) for entry in db_list_downloads(statuses=('finished',))
+        if _playable_library_entry(entry, allowed_bases)
+    ))
+    _rotation_shuffle(ids)
+    return ids
+
+
+def _write_library_rotation(conn, ids, hours):
+    conn.execute('DELETE FROM library_rotation_members')
+    conn.executemany(
+        'INSERT INTO library_rotation_members(download_id, position) VALUES (?, ?)',
+        ((download_id, position) for position, download_id in enumerate(ids)),
+    )
+    # Start the lifetime at publication, after the potentially large deck write.
+    created_at = _rotation_now()
+    order = {
+        'kind': 'rotation', 'generation_id': secrets.token_urlsafe(24),
+        'created_at': created_at, 'expires_at': created_at + int(hours) * 3600,
+    }
+    conn.execute(
+        'INSERT INTO library_rotation(singleton, generation_id, created_at, expires_at) '
+        'VALUES (1, ?, ?, ?) ON CONFLICT(singleton) DO UPDATE SET '
+        'generation_id = excluded.generation_id, created_at = excluded.created_at, '
+        'expires_at = excluded.expires_at',
+        (order['generation_id'], order['created_at'], order['expires_at']),
+    )
+    return order
+
+
+def _current_library_rotation():
+    """Read or publish one complete deck. Callers serialize on _rotation_lock."""
+    try:
+        with db() as conn:
+            preferences = {row['key']: row['value'] for row in conn.execute(
+                'SELECT key, value FROM preferences'
+            )}
+            if has_request_context():
+                # Share the short read connection with the Library's root
+                # snapshot so disabled rotation keeps its fixed query budget.
+                _trusted_download_directories(conn)
+        if preferences.get('library_rotation_enabled') != 'true':
+            _cancel_rotation_timer()
+            return {'kind': 'library', 'generation_id': None,
+                    'created_at': None, 'expires_at': None}, {}
+        with db() as conn:
+            row = conn.execute('SELECT * FROM library_rotation').fetchone()
+            members = dict(conn.execute(
+                'SELECT download_id, position FROM library_rotation_members'
+            ).fetchall())
+        if row is not None and _rotation_now() < row['expires_at']:
+            order = {'kind': 'rotation', **{key: row[key] for key in (
+                'generation_id', 'created_at', 'expires_at')}}
+        else:
+            ids = _new_rotation_members()
+            with _db_lock, db() as conn:
+                order = _write_library_rotation(
+                    conn, ids, preferences['library_rotation_hours']
+                )
+            members = {download_id: position for position, download_id in enumerate(ids)}
+            event_bus.publish('change', {'reason': 'library_rotation'})
+        _schedule_rotation_timer(order['expires_at'])
+        return order, members
+    except (OSError, sqlite3.Error) as exc:
+        raise RotationRefreshError() from exc
+
+
+def resolve_library_snapshot(user_id, is_admin, normalized_filter, ordering):
+    """Keep public selection and metadata from the same current generation."""
+    with _rotation_lock:
+        while True:
+            order, positions = _current_library_rotation()
+            entries = _ordinary_library_selection(
+                user_id, is_admin, normalized_filter, ordering
+            )
+            if order['kind'] == 'library':
+                return entries, order, {}
+            entries = [entry for entry in entries if str(entry['id']) in positions]
+            entries.sort(key=lambda entry: positions[str(entry['id'])])
+            if _rotation_now() < order['expires_at']:
+                return entries, order, positions
+
+
 def resolve_library_selection(user_id, is_admin, normalized_filter, ordering):
+    return resolve_library_snapshot(
+        user_id, is_admin, normalized_filter, ordering
+    )[0]
+
+
+def _ordinary_library_selection(user_id, is_admin, normalized_filter, ordering):
     """Return the current canonical, visible, browser-playable selection."""
     duration_conditions = _parse_duration_filter(
         _parse_history_filter(normalized_filter)
     )
-    allowed_bases = _trusted_download_directories()
     entries = [
-        entry for entry in db_list_downloads(
-            user_id, is_admin=is_admin, statuses=('finished',),
-        )
-        if _playable_library_entry(entry, allowed_bases)
-        and _matches_history_filter(entry, normalized_filter, duration_conditions)
+        entry for entry in _visible_playable_library_entries(user_id, is_admin)
+        if _matches_history_filter(entry, normalized_filter, duration_conditions)
     ]
     if ordering == 'favorites_first':
         entries.sort(
@@ -2040,7 +2227,7 @@ def resolve_library_selection(user_id, is_admin, normalized_filter, ordering):
             ),
             reverse=True,
         )
-    else:
+    elif ordering == 'newest':
         entries.sort(
             key=lambda entry: (
                 float(entry.get('created_at') or 0),
@@ -2176,6 +2363,8 @@ def _playback_session_response(state, entry):
             entry, include_source_revision=state['mode'] == 'shuffle_clips',
         ),
     }
+    if state['mode'] == 'sequential':
+        response['order'] = state['order']
     if state['mode'] == 'playlist':
         response.update({
             'playlist_id': state['playlist_id'],
@@ -2694,7 +2883,17 @@ def db_get_preferences():
 
 def db_set_preferences(updates: dict):
     # Serialize persistence and live controller updates in the same order.
-    with _worker_condition:
+    with _worker_condition, _rotation_lock:
+        previous = db_get_preferences()
+        enabled = updates.get('library_rotation_enabled', previous.get('library_rotation_enabled')) == 'true'
+        hours = updates.get('library_rotation_hours', previous.get('library_rotation_hours', '24'))
+        rotation_changed = any(
+            key in updates and str(updates[key]) != previous.get(key)
+            for key in ('library_rotation_enabled', 'library_rotation_hours')
+        )
+        # Filesystem eligibility work happens before the write transaction.
+        ids = _new_rotation_members() if rotation_changed and enabled else None
+        order = None
         with _db_lock, db() as conn:
             for k, v in updates.items():
                 conn.execute(
@@ -2702,6 +2901,17 @@ def db_set_preferences(updates: dict):
                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                     (k, str(v)),
                 )
+            if ids is not None:
+                order = _write_library_rotation(conn, ids, hours)
+            elif rotation_changed and not enabled:
+                conn.execute('DELETE FROM library_rotation_members')
+                conn.execute('DELETE FROM library_rotation')
+        if rotation_changed:
+            if order is not None:
+                _schedule_rotation_timer(order['expires_at'])
+            elif not enabled:
+                _cancel_rotation_timer()
+            event_bus.publish('change', {'reason': 'library_rotation'})
         if 'max_total_download_mbps' in updates:
             _bandwidth.configure(updates['max_total_download_mbps'])
         if {'max_concurrent', 'max_concurrent_per_host'} & updates.keys():
@@ -6141,17 +6351,45 @@ def clear_library():
     return jsonify({"message": "Cleared", "removed": removed, "files_deleted": files_deleted})
 
 
-@app.route('/api/library', methods=['GET'])
-def get_library():
-    entries = [entry for entry in db_list_downloads(
-        g.current_user['id'], is_admin='admin' in g.current_user['roles'],
-        statuses=('finished',),
-    ) if _playable_library_entry(entry)]
+def _visible_playable_library_entries(user_id, is_admin):
+    allowed_bases = _trusted_download_directories()
+    return [entry for entry in db_list_downloads(
+        user_id, is_admin=is_admin, statuses=('finished',),
+    ) if _playable_library_entry(entry, allowed_bases)]
+
+
+def _library_response_items(entries):
     readiness = _asset_readiness_many(entries)
-    return jsonify([
+    return [
         {**_public_download_entry(entry), 'assets': readiness.get(entry['id'], {})}
         for entry in entries
-    ])
+    ]
+
+
+@app.route('/api/library-catalog', methods=['GET'])
+def get_library_catalog():
+    """Playlist editing and member search include videos awaiting rotation."""
+    return jsonify(_library_response_items(_visible_playable_library_entries(
+        g.current_user['id'], 'admin' in g.current_user['roles'],
+    )))
+
+
+@app.route('/api/library', methods=['GET'])
+def get_library():
+    user_id = g.current_user['id']
+    is_admin = 'admin' in g.current_user['roles']
+    with _rotation_lock:
+        while True:
+            entries, order, _positions = resolve_library_snapshot(
+                # None retains the legacy array's created-at tie behavior.
+                user_id, is_admin, '', None
+            )
+            items = _library_response_items(entries)
+            if order['kind'] == 'rotation' and _rotation_now() >= order['expires_at']:
+                continue
+            if request.args.get('include_order') == 'true':
+                return jsonify({'items': items, 'order': order})
+            return jsonify(items)
 
 
 @app.route('/api/current-downloads', methods=['GET'])
@@ -6391,6 +6629,18 @@ def create_playback_session():
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
         return jsonify({'error': 'A JSON object is required'}), 400
+    # Preference saves and deadline renewal share this lock, so the accepted
+    # starting member always belongs to the generation returned to the caller.
+    if payload.get('mode', 'sequential') == 'sequential':
+        with _rotation_lock:
+            while True:
+                response = _create_playback_session(payload)
+                if response is not None:
+                    return response
+    return _create_playback_session(payload)
+
+
+def _create_playback_session(payload):
     mode = payload.get('mode', 'sequential')
     if mode not in ('sequential', 'shuffle', 'shuffle_clips', 'playlist'):
         return jsonify({'error': 'Unknown playback mode'}), 400
@@ -6516,9 +6766,18 @@ def create_playback_session():
         except ValueError as exc:
             return jsonify({'error': str(exc)}), 400
 
-        selection = resolve_library_selection(
+        selection, order, rotation_positions = resolve_library_snapshot(
             user_id, is_admin, normalized_filter, ordering
         )
+        if (payload.get('generation_id') != order['generation_id']
+                or (order['kind'] == 'rotation'
+                    and 'generation_id' not in payload)):
+            return jsonify({
+                'code': 'rotation_generation_changed',
+                'error': 'Library order changed. Refresh the Library and try Play All again.',
+            }), 409
+        if order['kind'] == 'rotation' and start_download_id is None:
+            return jsonify({'error': 'start_download_id is required for Library rotation'}), 400
         if start_download_id is not None:
             start_index = next(
                 (index for index, candidate in enumerate(selection)
@@ -6542,6 +6801,8 @@ def create_playback_session():
             'page_size': page_size,
             'page': start_index // page_size,
             'position': start_index % page_size,
+            'order': order,
+            'rotation_position': rotation_positions.get(str(entry['id'])),
         }
 
     now = time.monotonic()
@@ -6558,6 +6819,8 @@ def create_playback_session():
         'last_activity': now,
     }
     with _playback_sessions_lock:
+        if mode == 'sequential' and _rotation_order_expired(order):
+            return None
         _prune_playback_sessions_locked(now)
         owned = sorted(
             (
@@ -6573,7 +6836,31 @@ def create_playback_session():
     return jsonify(_playback_session_response(state, entry)), 201
 
 
+def _rotation_order_expired(order):
+    return (order['kind'] == 'rotation'
+            and _rotation_now() >= order['expires_at'])
+
+
 def _library_session_step(session_id, expected_download_id, sequence, prepare):
+    # Never nest the lifecycle lock inside the lease lock: file checks and
+    # renewal must remain independent of lease cleanup and keepalives.
+    with _playback_sessions_lock:
+        state = _playback_sessions.get(session_id)
+        sequential = state is not None and state['mode'] == 'sequential'
+    if not sequential:
+        return _library_session_step_locked(
+            session_id, expected_download_id, sequence, prepare
+        )
+    with _rotation_lock:
+        while True:
+            response = _library_session_step_locked(
+                session_id, expected_download_id, sequence, prepare
+            )
+            if response is not None:
+                return response
+
+
+def _library_session_step_locked(session_id, expected_download_id, sequence, prepare):
     """Resolve files outside the lease lock, then atomically reserve or commit."""
     user_id = g.current_user['id']
     is_admin = 'admin' in g.current_user['roles']
@@ -6599,6 +6886,7 @@ def _library_session_step(session_id, expected_download_id, sequence, prepare):
                 or expected_download_id != state['current_download_id']):
             return None, (jsonify({'error': 'Playback position changed'}), 409)
         if (prepare and state.get('prepared')
+                and state['mode'] != 'sequential'
                 and (state['mode'] != 'shuffle_clips'
                      or state['prepared']['item']['id'] not in failed_ids)):
             state['last_activity'] = time.monotonic()
@@ -6627,13 +6915,30 @@ def _library_session_step(session_id, expected_download_id, sequence, prepare):
                          if str(entry['id']) != expected_download_id]
         next_index = None
     else:
-        selection = resolve_library_selection(
+        selection, order, rotation_positions = resolve_library_snapshot(
             user_id, is_admin, snapshot['filter'], snapshot['ordering']
         )
         metadata_pending = False
-        next_index = ((snapshot['page'] * snapshot['page_size']
-                       + snapshot['position'] + 1) % len(selection)
-                      if selection else None)
+        previous_order = snapshot['order']
+        if selection and order['kind'] == 'rotation' and order == previous_order:
+            # Keep the last committed deck position even when that member has
+            # disappeared. A dense index would skip its surviving successor.
+            last_position = snapshot['rotation_position']
+            next_index = next((
+                index for index, entry in enumerate(selection)
+                if rotation_positions[str(entry['id'])] > last_position
+            ), 0)
+        elif selection and order != previous_order:
+            current_index = next((
+                index for index, entry in enumerate(selection)
+                if str(entry['id']) == expected_download_id
+            ), None)
+            next_index = ((current_index + 1) % len(selection)
+                          if current_index is not None else 0)
+        else:
+            next_index = ((snapshot['page'] * snapshot['page_size']
+                           + snapshot['position'] + 1) % len(selection)
+                          if selection else None)
 
     with _playback_sessions_lock:
         state, response = check_state()
@@ -6641,6 +6946,10 @@ def _library_session_step(session_id, expected_download_id, sequence, prepare):
             return response
         if state is not original_state:
             return jsonify({'error': 'Unknown playback session'}), 404
+        if snapshot['mode'] == 'sequential' and _rotation_order_expired(order):
+            # The lease lock can be busy long enough to cross the deadline.
+            # Release it before asking the canonical resolver to renew.
+            return None
         state['last_activity'] = time.monotonic()
         if not selection:
             if prepare:
@@ -6676,12 +6985,17 @@ def _library_session_step(session_id, expected_download_id, sequence, prepare):
                     entry, include_source_revision=state['mode'] == 'shuffle_clips',
                 ),
             }
+            if state['mode'] == 'sequential':
+                response['order'] = order
             state['prepared'] = response
             return jsonify(response)
         state.pop('prepared', None)
         if next_index is not None:
             state['page'] = next_index // state['page_size']
             state['position'] = next_index % state['page_size']
+        if state['mode'] == 'sequential':
+            state['order'] = order
+            state['rotation_position'] = rotation_positions.get(str(entry['id']))
         state['current_download_id'] = str(entry['id'])
         state['sequence'] = sequence
         state['last_expected_download_id'] = expected_download_id
@@ -7065,14 +7379,14 @@ def events():
     return resp
 
 
-def _trusted_download_directories():
+def _trusted_download_directories(connection=None):
     """Snapshot trusted roots once, independently of the filenames being checked."""
     if has_request_context() and hasattr(g, 'download_path_bases'):
         return g.download_path_bases
     # Workers capture output_dir before yt-dlp reports a filename. Retaining
     # those roots keeps old media playable after the preference changes, while
     # preventing a corrupted filename from authorizing its own directory.
-    with db() as conn:
+    with db() if connection is None else nullcontext(connection) as conn:
         preference = conn.execute(
             "SELECT value FROM preferences WHERE key = 'download_dir'"
         ).fetchone()
@@ -7422,6 +7736,7 @@ def preferences():
         'start_fullscreen', 'theme', 'shuffle_min_height',
         'max_concurrent_per_host', 'max_total_download_mbps',
         'shuffle_min_duration_minutes', 'skip_video_edges',
+        'library_rotation_enabled', 'library_rotation_hours',
     }
     updates = {k: v for k, v in data.items() if k in allowed and v is not None}
     for key, label in (
@@ -7449,6 +7764,24 @@ def preferences():
             return jsonify({
                 'error': 'Skip video intro and outro must be true or false'
             }), 400
+    if 'library_rotation_enabled' in data:
+        value = data['library_rotation_enabled']
+        if isinstance(value, bool):
+            updates['library_rotation_enabled'] = 'true' if value else 'false'
+        elif isinstance(value, str) and value in {'true', 'false'}:
+            updates['library_rotation_enabled'] = value
+        else:
+            return jsonify({'error': 'Library rotation must be true or false'}), 400
+    if 'library_rotation_hours' in data:
+        value = data['library_rotation_hours']
+        digits = str(value).lstrip('0') or '0'
+        if (isinstance(value, bool) or not isinstance(value, (str, int))
+                or not re.fullmatch(r'[0-9]+', str(value))
+                or len(digits) > 4 or not 1 <= int(digits) <= 8760):
+            return jsonify({
+                'error': 'Library rotation hours must be a whole number from 1 through 8760'
+            }), 400
+        updates['library_rotation_hours'] = str(int(digits))
     if not updates:
         return jsonify({"error": "No valid preference fields provided"}), 400
     if "download_dir" in updates:
@@ -7780,6 +8113,8 @@ def main(argv=None):
         if threading.current_thread() is threading.main_thread():
             signal.signal(signal.SIGTERM, previous_sigterm)
         if owns_background_work:
+            with _rotation_lock:
+                _cancel_rotation_timer()
             stop_asset_generation()
         if ingest_thread is not None:
             stop_ingest_import()

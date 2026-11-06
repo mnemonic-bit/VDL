@@ -86,7 +86,7 @@ test('slow collection reads do not block uploads or preparation rows', async ({ 
     let reads = 0;
     await page.route('**/api/upload/*', () => { transfers++; });
     await page.route('**/api/current-downloads', () => { reads++; });
-    await page.route('**/api/library', () => {});
+    await page.route('**/api/library?include_order=true', () => {});
     await dropVideos(page, ['collection.mp4']);
     await expect.poll(() => transfers).toBe(1);
     await expect.poll(() => reads).toBeGreaterThan(0);

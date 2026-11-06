@@ -204,6 +204,15 @@ combined units, or clock notation such as `1:30:00`. Unknown durations do not
 match. Play All follows the filtered selection, while Shuffle and Shuffle
 Clips keep their separate Settings filters.
 
+In **Settings → Playback**, enable **Library rotation** to keep Library cards
+and sequential **Play All** in one shared shuffled order. Choose how long to
+keep it, from 1 to 8760 hours (default 24). The order and renewal time survive
+reloads and restarts; newly added videos join the next rotation. Each account
+sees its authorized videos in the shared relative order. Search filters that
+order, and the Library shows when it renews. Active playback adopts a renewed
+order at its next video. Shuffle, Shuffle Clips, and personal playlists keep
+their existing behavior. Rotation is off by default.
+
 History records accepted URL downloads, Firefox companion work, uploads, and
 mounted imports, including failures after acceptance. Pause/unpause belongs to
 one attempt; Resume and Retry create another attempt on the same download
