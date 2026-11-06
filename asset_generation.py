@@ -13,6 +13,7 @@ import time
 import uuid
 from contextlib import contextmanager, nullcontext
 from preview_maintenance import PreviewMaintenance
+from cache_retirement import CacheRetirement
 
 
 class RegistrationBusy(Exception):
@@ -42,6 +43,7 @@ class AssetQueue:
         self.validate = validate or (lambda kind, path: self._nonempty(path))
         self.legacy_path = legacy_path or self._legacy_path
         self.notify_maintenance = notify_maintenance or (lambda: None)
+        self.cache_retirement = CacheRetirement(self)
         self.maintenance = PreviewMaintenance(self)
         self._shutdown = False
         self._maintenance_changed = False
@@ -101,6 +103,7 @@ class AssetQueue:
         """)
 
         PreviewMaintenance.init_schema(conn)
+        CacheRetirement.init_schema(conn)
 
     def _legacy_path(self, entry, kind, version):
         path = self.asset_path(entry, kind)
@@ -271,6 +274,10 @@ class AssetQueue:
                                          (self.clock() + self.maintenance.LEASE_SECONDS, download_id, serving))
                             self.maintenance.outcome(conn, dict(kind=kind, download_id=download_id, source=identity), 'updated')
                     result[kind] = state
+            # Retain an identity snapshot before replacement so an unrelated
+            # file subsequently placed at a legacy name cannot be retired.
+            if blocking:
+                self.cache_retirement.discover(current)
         self._wake.set()
         self._maintenance_hint()
         return result
@@ -457,6 +464,8 @@ class AssetQueue:
             suffix = '.jpg' if task['kind'] == 'thumbnail' else '.mp4'
             token = uuid.uuid4().hex
             temporary = f'{output}.{token}.asset-tmp{suffix}'
+            if task['kind'] == 'thumbnail':
+                self.cache_retirement.discover(entry)
             with self.db_lock, self.db() as conn:
                 updated = conn.execute(
                     "UPDATE generated_assets SET state='running',attempts=attempts+1,token=?,temporary_path=? "
@@ -475,6 +484,7 @@ class AssetQueue:
         if task['kind'] == 'montage':
             return self._finish_montage(task, generated, failure)
         changed = False
+        published = False
         with self.publication_lock:
             resolved = self._resolve(task['download_id'])
             with self.db_lock, self.db() as conn:
@@ -488,15 +498,19 @@ class AssetQueue:
                     conn.execute('DELETE FROM generated_assets WHERE sequence=?', (task['sequence'],))
                     return
                 entry, _identity = resolved
-                if generated and self._nonempty(task['temporary_path']):
+                output = self.asset_path(entry, task['kind'])
+                if (generated and self._nonempty(task['temporary_path'])
+                        and self.confined(output) and self.confined(task['temporary_path'])
+                        and not os.path.islink(task['temporary_path'])):
                     try:
-                        os.replace(task['temporary_path'], self.asset_path(entry, task['kind']))
+                        os.replace(task['temporary_path'], output)
                     except OSError as exc:
                         failure = str(exc)
                     else:
                         conn.execute("UPDATE generated_assets SET state='ready',retry_at=0,failure='',"
                                      'token=NULL,temporary_path=NULL WHERE sequence=?', (task['sequence'],))
                         changed = True
+                        published = True
                 if not changed:
                     exhausted = task['attempts'] >= 3
                     delay = 0 if exhausted else self.RETRY_DELAYS[task['attempts'] - 1]
@@ -505,6 +519,8 @@ class AssetQueue:
                                  ('failed' if exhausted else 'queued', self.clock() + delay,
                                   (failure or 'Preview extraction failed')[:240], task['sequence']))
                     changed = exhausted
+            if published:
+                self.cache_retirement.replacement_ready(entry)
         if changed:
             try:
                 self.notify([task['download_id']])

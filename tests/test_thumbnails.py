@@ -165,7 +165,7 @@ class ThumbnailTest(AppCase):
         self.finished_file("audio001", "audio.mp3")
         self.assertEqual(self.client.get("/api/thumbnail/audio001").status_code, 404)
 
-    def test_old_sidecar_is_queued_and_never_served_as_the_new_image(self):
+    def test_successful_upgrade_retires_the_old_sidecar(self):
         self.finished_file()
         entry = vdl.db_get_download("test0001")
         old_path = vdl._thumbnail_path(entry, version=1)
@@ -186,10 +186,129 @@ class ThumbnailTest(AppCase):
         self.assertEqual(first.data, b"new-frame")
         self.assertEqual(second.data, b"new-frame")
         generator.assert_called_once()
-        with open(old_path, "rb") as image:
-            self.assertEqual(image.read(), b"old-frame")
         first.close()
         second.close()
+        vdl._get_asset_queue().maintenance.cleanup()
+        self.assertFalse(os.path.exists(old_path))
+
+    def test_failed_upgrade_preserves_the_legacy_jpeg(self):
+        self.finished_file()
+        entry = vdl.db_get_download("test0001")
+        old_path = vdl._thumbnail_path(entry, version=1)
+        with open(old_path, "wb") as image:
+            image.write(b"old-frame")
+        with mock.patch.object(vdl, "generate_video_thumbnail", return_value=False):
+            self.assertEqual(self.client.get("/api/thumbnail/test0001").status_code, 202)
+            self.assertTrue(vdl._get_asset_queue().step())
+        vdl._get_asset_queue().maintenance.cleanup()
+        self.assertFalse(os.path.exists(vdl._thumbnail_path(entry)))
+        with open(old_path, "rb") as image:
+            self.assertEqual(image.read(), b"old-frame")
+
+    def test_failed_publication_preserves_the_legacy_jpeg(self):
+        self.finished_file()
+        entry = vdl.db_get_download("test0001")
+        old_path = vdl._thumbnail_path(entry, version=1)
+        with open(old_path, "wb") as image:
+            image.write(b"old-frame")
+
+        def generate(_source, destination):
+            with open(destination, "wb") as image:
+                image.write(b"new-frame")
+            return True
+
+        self.assertEqual(self.client.get("/api/thumbnail/test0001").status_code, 202)
+        with mock.patch.object(vdl, "generate_video_thumbnail", side_effect=generate), \
+                mock.patch("asset_generation.os.replace", side_effect=OSError("disk full")):
+            self.assertTrue(vdl._get_asset_queue().step())
+        vdl._get_asset_queue().maintenance.cleanup()
+        self.assertFalse(os.path.exists(vdl._thumbnail_path(entry)))
+        self.assertTrue(os.path.exists(old_path))
+
+    def test_reconciliation_retires_preexisting_jpeg_after_restart(self):
+        self.finished_file()
+        entry = vdl.db_get_download("test0001")
+        old_path = vdl._thumbnail_path(entry, version=1)
+        current_path = vdl._thumbnail_path(entry)
+        unrelated = os.path.join(self.download_dir, "cover.jpg")
+        for path in (old_path, current_path, unrelated):
+            with open(path, "wb") as image:
+                image.write(b"existing-frame")
+        queue = vdl._get_asset_queue()
+        self.assertTrue(queue.reconcile_batch())
+        queue.stop()
+        with mock.patch.object(vdl, "_asset_queue", None):
+            replacement = vdl._get_asset_queue()
+            replacement._recover()
+            self.assertFalse(os.path.exists(old_path))
+            self.assertTrue(os.path.exists(current_path))
+            self.assertTrue(os.path.exists(unrelated))
+            replacement.stop()
+
+    def test_changed_source_during_upgrade_preserves_the_legacy_jpeg(self):
+        source = self.finished_file()
+        entry = vdl.db_get_download("test0001")
+        old_path = vdl._thumbnail_path(entry, version=1)
+        with open(old_path, "wb") as image:
+            image.write(b"old-frame")
+
+        def generate(_source, destination):
+            with open(destination, "wb") as image:
+                image.write(b"new-frame")
+            with open(source, "ab") as media:
+                media.write(b"changed")
+            return True
+
+        self.assertEqual(self.client.get("/api/thumbnail/test0001").status_code, 202)
+        with mock.patch.object(vdl, "generate_video_thumbnail", side_effect=generate):
+            self.assertTrue(vdl._get_asset_queue().step())
+        vdl._get_asset_queue().maintenance.cleanup()
+        self.assertFalse(os.path.exists(vdl._thumbnail_path(entry)))
+        self.assertTrue(os.path.exists(old_path))
+
+    def test_reused_legacy_filename_during_upgrade_is_preserved(self):
+        self.finished_file()
+        entry = vdl.db_get_download("test0001")
+        old_path = vdl._thumbnail_path(entry, version=1)
+        with open(old_path, "wb") as image:
+            image.write(b"old-frame")
+
+        def generate(_source, destination):
+            with open(destination, "wb") as image:
+                image.write(b"new-frame")
+            os.remove(old_path)
+            with open(old_path, "wb") as image:
+                image.write(b"unrelated-replacement")
+            return True
+
+        self.assertEqual(self.client.get("/api/thumbnail/test0001").status_code, 202)
+        with mock.patch.object(vdl, "generate_video_thumbnail", side_effect=generate):
+            self.assertTrue(vdl._get_asset_queue().step())
+        vdl._get_asset_queue().maintenance.cleanup()
+        with open(old_path, "rb") as image:
+            self.assertEqual(image.read(), b"unrelated-replacement")
+
+    def test_upgrade_preserves_legacy_symlink_and_its_target(self):
+        self.finished_file()
+        entry = vdl.db_get_download("test0001")
+        target = os.path.join(self.download_dir, "cover.jpg")
+        with open(target, "wb") as image:
+            image.write(b"unrelated-frame")
+        old_path = vdl._thumbnail_path(entry, version=1)
+        os.symlink(target, old_path)
+
+        def generate(_source, destination):
+            with open(destination, "wb") as image:
+                image.write(b"new-frame")
+            return True
+
+        self.assertEqual(self.client.get("/api/thumbnail/test0001").status_code, 202)
+        with mock.patch.object(vdl, "generate_video_thumbnail", side_effect=generate):
+            self.assertTrue(vdl._get_asset_queue().step())
+        vdl._get_asset_queue().maintenance.cleanup()
+        self.assertTrue(os.path.islink(old_path))
+        with open(target, "rb") as image:
+            self.assertEqual(image.read(), b"unrelated-frame")
 
     def test_remove_deletes_the_thumbnail_sidecar_with_the_media(self):
         media_path = self.finished_file()

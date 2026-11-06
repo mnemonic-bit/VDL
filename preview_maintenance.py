@@ -302,6 +302,7 @@ class PreviewMaintenance:
         return empty
 
     def cleanup(self):
+        self.q.cache_retirement.cleanup()
         with self.q.publication_lock:
             with self.q.db() as conn:
                 rows = conn.execute('SELECT * FROM preview_deliveries WHERE selected=0 AND lease_until<=? '

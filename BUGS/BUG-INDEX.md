@@ -407,6 +407,23 @@ coverage of 92.1%. Both unsigned and synthetic-signed amd64 companion fixtures
 also build and pass independent smoke checks. No application delivery change
 was needed for the reported mismatches.
 
+Issue 78 is fixed in version `0.51.3`. Successful static-thumbnail publication
+now retires verified obsolete JPEGs through a durable, bounded cleanup journal
+with restart recovery and retries. Startup reconciliation finds pre-existing
+JPEG leftovers; a read-only inventory tool reports cache counts and bytes,
+blocked cleanup, retained fallbacks, leases, and unattributable files. Montage
+provenance and reader protection remain intact. Python 3.12 validation passes
+456 tests (7 skipped), with `vdl.py` line coverage of 92.1%. The reported
+installation's four-to-five cache files per video remains unverified because
+its media directories are unavailable here.
+
+Issue 79 was reported on 2026-11-06 at version `0.51.2`. Duration-based hover
+previews include opening and closing excerpts that often show trailer-like
+material. The requested fix removes only the first and last excerpts while
+preserving every inner timestamp and length. Existing previews must stay
+playable during background regeneration, with replacement published before
+the old file is safely retired. The bug remains open.
+
 ## Bug reports
 
 - [Bug 0001 — Merged downloads kept the deleted temporary audio filename](bug-0001-merged-downloads-kept-deleted-temporary-audio-filename.md)
@@ -486,6 +503,8 @@ was needed for the reported mismatches.
 - [Bug 0075 — Hover-preview sampling count does not scale with video duration](bug-0075-hover-preview-sampling-count-does-not-scale-with-duration.md)
 - [Bug 0076 — Fullscreen controls need immediate bottom-edge hiding, smaller sizing, and an animated inline volume slider](bug-0076-fullscreen-controls-bottom-edge-hide-size-and-volume-layout.md)
 - [Bug 0077 — Full test run fails preview contracts and companion container build](bug-0077-full-test-run-fails-preview-contracts-and-companion-build.md)
+- [Bug 0078 — Obsolete thumbnail and preview caches accumulate across upgrades](bug-0078-obsolete-thumbnail-and-preview-caches-accumulate.md)
+- [Bug 0079 — Hover previews include unwanted first and last excerpts](bug-0079-hover-previews-include-unwanted-first-and-last-excerpts.md)
 
 ## Accepted UI decisions
 

@@ -174,6 +174,28 @@ that upgrade; a background pass also upgrades caches after an initial
 Active hovers keep their selected sequence until they end. Legacy caches
 without recorded source provenance are retained but cannot be served safely.
 
+After a current static thumbnail is published, the worker retires verified
+older JPEGs. Bounded startup discovery also finds leftovers from earlier
+versions. Cleanup checkpoints survive restarts; failed deletion is retried
+without regenerating the image. A missing replacement, changed source, or
+changed cache identity keeps the old file on disk.
+
+To inspect cache counts and bytes without changing the database or files, run:
+
+```bash
+python cache_inventory.py --database downloads.db --directory /absolute/media/path --limit 100
+```
+
+Repeat `--directory` for additional authorized output directories; each is
+scanned without descending into subdirectories. The JSON report separates
+cache families, versions, and retirement dispositions, including
+retained preview fallbacks, reader leases, blocked cleanup, orphan files, and
+files without sufficient ownership evidence. For another bounded page, pass
+the returned `next_after` as `--after`. Counts describe the reported page;
+aggregate every page for installation totals. The tool does not import the
+application or delete files. Unrecorded historical previews remain retained
+for manual investigation.
+
 Library search accepts duration comparisons such as `duration:>5m3s` for
 videos longer than five minutes and three seconds. Combine bounds with
 `duration:>5m3s duration:<10m` to select only videos inside that range; use
