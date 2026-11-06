@@ -1,12 +1,13 @@
-## 80. [Open] Overlay Escape also exits Firefox macOS application fullscreen
+## 80. [Pending native verification] Overlay Escape also exits Firefox macOS application fullscreen
 
 **Severity:** Medium — dismissing playback unexpectedly changes the browser
 window's presentation and interrupts the user's fullscreen workflow.
 
-**Status:** Open. Reported on 2026-11-06; analyzed against commit `a5cb65a`,
-version `0.51.4`. The uncanceled Escape event is reproduced in Chromium and
-Firefox on Linux. The macOS window transition is reporter-observed and still
-requires native verification. No application fix is included in this report.
+**Status:** Repair implemented in version `0.52.1`; native Firefox/macOS
+verification remains pending. Reported on 2026-11-06; originally analyzed
+against commit `a5cb65a`, version `0.51.4`. The uncanceled Escape event was
+reproduced in Chromium and Firefox on Linux. The reported macOS window
+transition still requires native verification before this issue is closed.
 
 **Affected environment:** Firefox on macOS, with the browser window in
 application fullscreen and video playing in VDL's overlay. The reporter's
@@ -41,7 +42,7 @@ does not require a fullscreen video element or a non-null
 `document.fullscreenElement`; checking that property alone cannot establish
 whether the macOS browser window stayed fullscreen.
 
-### Source evidence and diagnosis
+### Source evidence and diagnosis before the repair
 
 - The document `keydown` listener in
   [`static/app.js`](../static/app.js#L6955) respects `defaultPrevented`, then
@@ -61,12 +62,12 @@ whether the macOS browser window stayed fullscreen.
   cancellation as the likely explanation for the reported second action;
   native verification remains necessary for the reporter's browser version.
 
-The demonstrated defect is that VDL handles Escape but leaves the browser
+The demonstrated defect was that VDL handled Escape but left the browser
 default action available. Closing the DOM overlay successfully does not mean
 the key was consumed. The absence of cancellation matches the defect already
 fixed for History Info in Bug 0046.
 
-### Diagnostic verification
+### Original diagnostic verification
 
 A temporary Playwright probe opened the real overlay through the finished
 video's Play action, installed a bubbling `window.keydown` observer after the
@@ -130,11 +131,11 @@ VDL_PYTHON="$PWD/.venv/bin/python" VDL_TEST_BROWSER=firefox \
 These passing checks establish the coverage gap, not resolution of this bug.
 The full unit/coverage gate was not run for this documentation-only change.
 
-### Proposed repair and acceptance criteria
+### Repair and acceptance criteria
 
-Cancel the handled Escape event with `ev.preventDefault()` before
-`closePlayer()` in the existing player branch. Keep cancellation scoped to an
-open player and retain the existing `defaultPrevented` guard for controls
+The player branch now cancels its handled Escape event with
+`ev.preventDefault()` before `closePlayer()`. Cancellation stays scoped to an
+open player, and the existing `defaultPrevented` guard preserves controls
 that consume the key themselves. Confirm this change against the original
 native reproduction before calling the bug fixed.
 
@@ -154,5 +155,29 @@ native reproduction before calling the bug fixed.
    the overlay. Preserve inner controls' already-handled Escape behavior.
 5. Before completing a code fix, run `./tests/run-all.sh --unit` and verify
    at least **90% `vdl.py` line coverage**, plus the focused browser tests and
-   the native Firefox/macOS reproduction. The fix needs its own PATCH bump;
-   this documentation-only report leaves `VERSION` unchanged.
+   the native Firefox/macOS reproduction. The fix needs its own PATCH bump.
+
+### Repair verification (`0.52.1`)
+
+- The permanent overlay regression failed before the fix: the trusted Escape
+  event reached the window observer with `defaultPrevented: false`, although
+  the overlay had closed, media was paused, and sources had been removed.
+- After the fix, all six focused checks passed in Chromium and all six in
+  Firefox on Linux. They cover cancellation and teardown, focus on the player
+  container and playback/seek/volume/close controls, an already-handled child
+  Escape, an uncanceled Escape with no application layer open, both Bug 0045
+  fullscreen launch modes, and Space/F shortcuts.
+- `VDL_PYTHON="$PWD/.venv/bin/python" ./tests/run-all.sh --unit` passed
+  494 tests (9 skipped) on Python 3.11.2. `vdl.py` line coverage was **92.5%**
+  (5489/5937), above the enforced 90% minimum.
+- Native Firefox/macOS application fullscreen is unavailable in this Linux
+  workspace. Acceptance criterion 1 remains pending; the Fullscreen API
+  harness does not verify the native window transition.
+
+Run the focused checks with `VDL_TEST_BROWSER=chromium`, then `firefox`:
+
+```bash
+VDL_PYTHON="$PWD/.venv/bin/python" VDL_TEST_BROWSER=firefox \
+  .venv/bin/python tests/browser/run.py playback.spec.cjs \
+  --grep 'overlay playback assigns MIME|overlay Escape is consumed|Escape without an open application layer|Escape closes playback that started|Escape returns manually entered|player keyboard shortcuts'
+```

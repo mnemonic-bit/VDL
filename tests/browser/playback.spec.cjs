@@ -62,6 +62,23 @@ async function choosePlaybackMode(page, name) {
     await page.locator('#playbackModeMenu').getByRole('menuitem', { name, exact: true }).click();
 }
 
+async function observeNextOverlayEscape(page) {
+    await page.evaluate(() => {
+        window.__overlayEscape = null;
+        window.addEventListener('keydown', event => {
+            if (event.key !== 'Escape') return;
+            const video = document.getElementById('playerVideo');
+            window.__overlayEscape = {
+                defaultPrevented: event.defaultPrevented,
+                trusted: event.isTrusted,
+                overlayOpen: document.getElementById('playerBackdrop').classList.contains('open'),
+                paused: video.paused,
+                sources: video.querySelectorAll('source').length,
+            };
+        }, { once: true });
+    });
+}
+
 test('overlay playback assigns MIME, supports Range, and Escape closes it', async ({ page }) => {
     await seed(page, { id: 'play0001', status: 'finished', file: true, name: 'fixture.mp4' });
     await refresh(page);
@@ -71,8 +88,67 @@ test('overlay playback assigns MIME, supports Range, and Escape closes it', asyn
     const range = await page.request.get('/api/file/play0001', { headers: { Range: 'bytes=10-19' } });
     expect(range.status()).toBe(206);
     expect((await range.body()).length).toBe(10);
+    await observeNextOverlayEscape(page);
     await page.keyboard.press('Escape');
     await expect(page.locator('#playerBackdrop')).not.toHaveClass(/open/);
+    expect(await page.evaluate(() => window.__overlayEscape)).toEqual({
+        defaultPrevented: true,
+        trusted: true,
+        overlayOpen: false,
+        paused: true,
+        sources: 0,
+    });
+});
+
+test('overlay Escape is consumed from player controls but respects an already handled key', async ({ page }) => {
+    await holdNativeMedia(page);
+    await seed(page, { id: 'escape-controls', status: 'finished', file: true });
+    await refresh(page);
+    const play = page.locator('[data-row-id="escape-controls"]')
+        .getByRole('button', { name: 'Play', exact: true });
+    for (const selector of ['#playerContainer', '#playerPlayPause', '#playerSeek',
+        '#playerVolume', '.player-close']) {
+        await play.click();
+        // The fixture has no decodable metadata; expose a seekable timeline
+        // so Escape is exercised with the actual seek control focused.
+        await page.locator('#playerVideo').evaluate(video => {
+            Object.defineProperties(video, {
+                duration: { configurable: true, value: 60 },
+                readyState: { configurable: true, value: 1 },
+                seekable: { configurable: true, value: { length: 1, start: () => 0, end: () => 60 } },
+            });
+            video.dispatchEvent(new Event('loadedmetadata'));
+        });
+        if (selector === '#playerVolume') await page.locator('#playerMute').focus();
+        await page.locator(selector).focus();
+        await expect(page.locator(selector)).toBeFocused();
+        await observeNextOverlayEscape(page);
+        await page.keyboard.press('Escape');
+        expect(await page.evaluate(() => window.__overlayEscape), selector).toEqual({
+            defaultPrevented: true, trusted: true, overlayOpen: false, paused: true, sources: 0,
+        });
+    }
+
+    await play.click();
+    await page.locator('#playerPlayPause').evaluate(button => {
+        button.addEventListener('keydown', event => {
+            if (event.key === 'Escape') event.preventDefault();
+        }, { once: true });
+        button.focus();
+    });
+    await observeNextOverlayEscape(page);
+    await page.keyboard.press('Escape');
+    expect(await page.evaluate(() => window.__overlayEscape)).toMatchObject({
+        defaultPrevented: true, trusted: true, overlayOpen: true, sources: 1,
+    });
+});
+
+test('Escape without an open application layer retains the browser default action', async ({ page }) => {
+    await observeNextOverlayEscape(page);
+    await page.keyboard.press('Escape');
+    expect(await page.evaluate(() => window.__overlayEscape)).toEqual({
+        defaultPrevented: false, trusted: true, overlayOpen: false, paused: true, sources: 0,
+    });
 });
 
 test('Escape closes playback that started in full screen', async ({ page }) => {

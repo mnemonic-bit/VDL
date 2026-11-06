@@ -427,13 +427,13 @@ Decoded native-media checks and Chromium/Firefox handoff checks pass.
 The Python 3.12 unit gate passes 462 tests (9 skipped), with 92.1% `vdl.py`
 line coverage; all 9 native-media tests and 12 selected checks per browser pass.
 
-Issue 80 is open. Escape closes overlay playback but also exits Firefox's
-macOS application fullscreen, according to the reporter. Chromium and Firefox
-probes on Linux confirm that the player closes and unloads its media while
-leaving the Escape event uncanceled. The player branch lacks `preventDefault()`
-despite neighboring dismissal handlers already using it. Native macOS window
-verification remains outstanding; the report includes reproduction steps,
-source evidence, and acceptance criteria.
+Issue 80 has a repair in version `0.52.1`, pending native verification. Escape
+closed overlay playback but also exited Firefox's macOS application fullscreen,
+according to the reporter. Chromium and Firefox probes on Linux confirmed that
+the player closed and unloaded its media while leaving Escape uncanceled. The
+player branch now calls `preventDefault()` before closing, preserving the
+existing guard for controls that already handled Escape. Native Firefox/macOS
+window verification remains outstanding before the issue can be closed.
 
 ## Bug reports
 

@@ -7049,6 +7049,7 @@ document.addEventListener('keydown', (ev) => {
     // before treating the same key as a request to close an enclosing layer.
     if (ev.defaultPrevented) return;
     if (ev.key === 'Escape' && document.getElementById('playerBackdrop').classList.contains('open')) {
+        ev.preventDefault();
         closePlayer();
     } else if (ev.key === 'Escape' && document.getElementById('playlistEditorDialog').open) {
         ev.preventDefault();
