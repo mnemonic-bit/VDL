@@ -168,6 +168,44 @@ class PreviewMaintenanceApiTest(AppCase):
         response.close()
         self.assertTrue(os.path.isfile(legacy))
 
+    def test_no_inner_excerpts_never_publish_or_retire_a_previous_preview(self):
+        queue, entry, legacy = self.legacy_cache()
+        selected = self.demand(entry['id'])['montage_delivery']
+        with mock.patch.object(vdl, 'ffprobe_video_duration', return_value=15.999), \
+                mock.patch.object(vdl.subprocess, 'run') as encode:
+            self.assertTrue(queue.step())
+        encode.assert_not_called()
+        latest = self.demand(entry['id'], revision=2)['montage_delivery']
+        self.assertEqual(latest['identity'], selected['identity'])
+        self.assertFalse(latest['current'])
+        self.assertFalse(os.path.exists(vdl._preview_path(entry)))
+        self.assertTrue(os.path.exists(legacy))
+        self.assertEqual(queue.maintenance_status()['updated'], 0)
+        response = self.client.get(selected['url'], headers={'Range': 'bytes=10-19'})
+        self.assertEqual(response.status_code, 206)
+        self.assertEqual(response.data, bytes(range(10, 20)))
+        response.close()
+        queue.maintenance.cleanup()
+        self.assertTrue(os.path.exists(legacy))
+
+    def test_no_inner_excerpts_without_previous_preview_keep_static_thumbnail(self):
+        self.finished_file()
+        entry = vdl.db_get_download('test0001')
+        with open(vdl._thumbnail_path(entry), 'wb') as output:
+            output.write(b'cached thumbnail')
+        queue = vdl._get_asset_queue()
+        self.demand(entry['id'])
+        with mock.patch.object(vdl, 'ffprobe_video_duration', return_value=15.999), \
+                mock.patch.object(vdl.subprocess, 'run') as encode:
+            self.assertTrue(queue.step())
+        encode.assert_not_called()
+        readiness = self.demand(entry['id'], revision=2)
+        self.assertEqual(readiness['thumbnail'], 'ready')
+        self.assertFalse(readiness['montage_delivery']['available'])
+        self.assertEqual(self.client.get('/api/preview/' + entry['id']).status_code, 202)
+        self.assertTrue(os.path.isfile(vdl._thumbnail_path(entry)))
+        self.assertFalse(os.path.exists(vdl._preview_path(entry)))
+
     def test_unproven_old_sidecars_and_forged_tokens_are_not_playable(self):
         _queue, entry, legacy = self.legacy_cache(provenance=False)
         readiness = self.demand(entry['id'])

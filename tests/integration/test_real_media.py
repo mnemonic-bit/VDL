@@ -21,6 +21,55 @@ class HoverPreviewMediaTest(AppCase):
         require_media_tools(self)
         super().setUp()
 
+    def test_trimmed_montage_decodes_only_the_existing_inner_excerpts(self):
+        for duration in (16, 30):
+            with self.subTest(duration=duration):
+                source = os.path.join(self.download_dir, f'gradient-{duration}.mp4')
+                legacy = os.path.join(self.download_dir, f'legacy-{duration}.mp4')
+                trimmed = os.path.join(self.download_dir, f'trimmed-{duration}.mp4')
+                run([
+                    'ffmpeg', '-v', 'error', '-threads', '1', '-filter_threads', '1',
+                    '-f', 'lavfi', '-i',
+                    f"nullsrc=s=160x90:r=12,geq=lum='16+219*T/{duration}':cb=128:cr=128",
+                    '-t', str(duration), '-c:v', 'libx264', '-threads', '1',
+                    '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-g', '12', '-y', source,
+                ])
+                old_count = duration // 30 + 3
+                old_segments = [(5 + index * (duration - 12) / (old_count - 1), 2)
+                                for index in range(old_count)]
+                with mock.patch.object(vdl, '_preview_segments', return_value=old_segments):
+                    self.assertTrue(vdl.generate_video_preview(source, legacy))
+                self.assertTrue(vdl.generate_video_preview(source, trimmed))
+
+                def excerpt_midpoints(path):
+                    return subprocess.check_output([
+                        'ffmpeg', '-v', 'error', '-i', path,
+                        '-vf', 'select=eq(mod(n\\,24)\\,12),extractplanes=y,scale=1:1',
+                        '-vsync', 'vfr', '-pix_fmt', 'gray', '-f', 'rawvideo', '-',
+                    ])
+
+                old_samples = excerpt_midpoints(legacy)
+                samples = excerpt_midpoints(trimmed)
+                self.assertEqual(len(old_samples), old_count)
+                self.assertEqual(len(samples), old_count - 2)
+                self.assertAlmostEqual(vdl.ffprobe_video_duration(trimmed),
+                                       2 * (old_count - 2), delta=0.1)
+                for actual, expected in zip(samples, old_samples[1:-1]):
+                    # Compare decoded source content, allowing codec rounding;
+                    # re-spacing or retaining either endpoint changes this ramp.
+                    self.assertAlmostEqual(actual, expected, delta=2)
+
+    def test_short_source_keeps_the_static_fallback_without_an_empty_montage(self):
+        source = os.path.join(self.download_dir, 'short.mp4')
+        preview = os.path.join(self.download_dir, 'short-preview.mp4')
+        run([
+            'ffmpeg', '-v', 'error', '-f', 'lavfi', '-i',
+            'color=c=blue:s=160x90:r=12:d=12', '-c:v', 'libx264',
+            '-threads', '1', '-pix_fmt', 'yuv420p', '-y', source,
+        ])
+        self.assertFalse(vdl.generate_video_preview(source, preview))
+        self.assertFalse(os.path.exists(preview))
+
     def test_long_montages_encode_within_timeout_and_keep_chronological_excerpts(self):
         for duration, picture in (
             (600, "nullsrc=s=160x90:r=2,geq=lum='16+219*T/600':cb=128:cr=128"),
@@ -39,7 +88,7 @@ class HoverPreviewMediaTest(AppCase):
                 self.assertTrue(vdl.generate_video_preview(source, preview))
                 elapsed = time.monotonic() - started
                 self.assertLess(elapsed, 180)
-                count = duration // 30 + 3
+                count = duration // 30 + 1
                 self.assertAlmostEqual(vdl.ffprobe_video_duration(preview), 2 * count, delta=0.5)
                 video, = streams(preview)
                 self.assertEqual((video['codec_name'], video['pix_fmt']), ('h264', 'yuv420p'))
@@ -208,7 +257,7 @@ class RealMediaIntegrationTest(AppCase):
         self.assertEqual(preview_streams[0]["codec_name"], "h264")
         self.assertLessEqual(preview_streams[0]["level"], 30)
         self.assertLessEqual(preview_streams[0]["width"], 480)
-        self.assertAlmostEqual(vdl.ffprobe_video_duration(preview_path), 6, delta=0.5)
+        self.assertAlmostEqual(vdl.ffprobe_video_duration(preview_path), 2, delta=0.5)
         modified_at = os.path.getmtime(preview_path)
 
         second = self.client.get("/api/preview/preview1")

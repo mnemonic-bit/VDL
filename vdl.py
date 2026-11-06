@@ -5019,7 +5019,7 @@ def _thumbnail_path(entry, fallback_dir=None, *, version=_THUMBNAIL_CACHE_VERSIO
     )
 
 
-_PREVIEW_CACHE_VERSION = 5
+_PREVIEW_CACHE_VERSION = 6
 _PREVIEW_FRAMES_PER_SECOND = 12
 
 
@@ -5115,15 +5115,15 @@ def ffprobe_video_duration(path):
 
 
 def _preview_segments(duration):
-    """Return equally spaced (start, length) excerpts for a hover preview."""
+    """Return the duration-based recipe's inner (start, length) excerpts."""
     if not isinstance(duration, (int, float)) or not math.isfinite(duration):
         return []
     interior_duration = duration - (2 * _PREVIEW_EDGE_MARGIN_SECONDS)
     if interior_duration <= 0:
         return []
-    # Three excerpts first fit at 16 seconds; shorter interiors play once.
+    # Trimming both outer excerpts leaves nothing until three excerpts fit.
     if interior_duration < 3 * _PREVIEW_SEGMENT_SECONDS:
-        return [(_PREVIEW_EDGE_MARGIN_SECONDS, interior_duration)]
+        return []
     segment_count = math.floor(duration / _PREVIEW_SAMPLE_INTERVAL_SECONDS) + 3
     last_start = (
         duration
@@ -5138,7 +5138,8 @@ def _preview_segments(duration):
             _PREVIEW_EDGE_MARGIN_SECONDS + spacing * index,
             _PREVIEW_SEGMENT_SECONDS,
         )
-        for index in range(segment_count)
+        # Keep the original spacing so removing endpoints never moves a sample.
+        for index in range(1, segment_count - 1)
     ]
 
 

@@ -1,19 +1,22 @@
 const { test, expect } = require('@playwright/test');
 const { execFileSync, spawnSync } = require('node:child_process');
-const path = require('node:path');
 const { reset, seed, refresh } = require('./support.cjs');
 
 const hasFfmpeg = spawnSync('ffmpeg', ['-version'], { stdio: 'ignore' }).status === 0;
 
-test('native silent MP4 keeps decoding the pinned preview when its replacement becomes ready', async ({ page }) => {
+test('native MP4 pins the untrimmed preview until the next hover selects only its inner excerpt', async ({ page }) => {
     test.skip(!hasFfmpeg, 'Native MP4 handoff requires ffmpeg.');
     test.setTimeout(20_000);
-    const montage = execFileSync('ffmpeg', [
-        '-v', 'error', '-i', path.join(__dirname, 'fixtures/crossfade.webm'),
-        '-t', '3', '-an', '-vf', 'scale=160:-2', '-c:v', 'libx264',
-        '-threads', '1', '-pix_fmt', 'yuv420p', '-profile:v', 'baseline',
+    const makeMontage = colors => execFileSync('ffmpeg', [
+        '-v', 'error', '-filter_complex_threads', '1',
+        ...colors.flatMap(color => ['-f', 'lavfi', '-i', `color=c=${color}:s=160x90:r=12:d=2`]),
+        '-filter_complex', `${colors.map((_, index) => `[${index}:v]`).join('')}concat=n=${colors.length}:v=1:a=0[outv]`,
+        '-map', '[outv]', '-an', '-c:v', 'libx264', '-threads', '1',
+        '-pix_fmt', 'yuv420p', '-profile:v', 'baseline',
         '-movflags', 'frag_keyframe+empty_moov', '-f', 'mp4', 'pipe:1',
     ]);
+    // Red and blue identify the removed endpoints; the retained inner excerpt is green.
+    const montages = { legacy: makeMontage(['red', 'lime', 'blue']), current: makeMontage(['lime']) };
     await page.addInitScript(() => {
         window.__nativePreviewStreams = [];
         const BrowserEventSource = window.EventSource;
@@ -32,6 +35,7 @@ test('native silent MP4 keeps decoding the pinned preview when its replacement b
         }])) } });
     });
     await page.route('**/api/preview/native-hover?*', route => {
+        const montage = montages[new URL(route.request().url()).searchParams.get('asset')];
         const range = /^bytes=(\d+)-(\d*)$/.exec(route.request().headers().range || '');
         const headers = { 'Accept-Ranges': 'bytes', 'Content-Type': 'video/mp4', ETag: `"${new URL(route.request().url()).searchParams.get('asset')}"` };
         if (!range) return route.fulfill({ status: 200, headers, body: montage });
@@ -47,6 +51,7 @@ test('native silent MP4 keeps decoding the pinned preview when its replacement b
     await expect(preview).toHaveClass(/preview-playing/);
     const video = preview.locator('video');
     await expect.poll(() => video.evaluate(video => video.currentTime)).toBeGreaterThan(0.1);
+    await expect.poll(() => video.evaluate(video => video.duration)).toBe(6);
     const before = await video.evaluate(video => {
         window.__nativePinnedPreview = video;
         return video.currentTime;
@@ -67,6 +72,15 @@ test('native silent MP4 keeps decoding the pinned preview when its replacement b
     await preview.hover();
     await expect(video).toHaveAttribute('src', '/api/preview/native-hover?asset=current');
     await expect(preview).toHaveClass(/preview-playing/);
+    await expect.poll(() => video.evaluate(video => video.duration)).toBe(2);
+    await expect.poll(() => video.evaluate(video => {
+        const canvas = document.createElement('canvas');
+        canvas.width = canvas.height = 1;
+        const context = canvas.getContext('2d');
+        context.drawImage(video, 0, 0, 1, 1);
+        const [red, green, blue] = context.getImageData(0, 0, 1, 1).data;
+        return green > 200 && red < 30 && blue < 30;
+    })).toBe(true);
     const library = await page.request.get('/api/library').then(response => response.json());
     expect(library.find(item => item.id === 'native-hover').view_count).toBe(0);
 });

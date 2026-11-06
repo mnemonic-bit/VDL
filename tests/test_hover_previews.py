@@ -22,25 +22,22 @@ class HoverPreviewTest(AppCase):
 
         self.assertEqual(
             preview_path,
-            os.path.join(self.download_dir, ".vdl_test0001.preview-v5.mp4"),
+            os.path.join(self.download_dir, ".vdl_test0001.preview-v6.mp4"),
         )
 
-    def test_preview_segments_span_long_videos_without_repeating_short_ones(self):
-        for duration in (0, 9.999, 10):
+    def test_preview_segments_remove_only_outer_excerpts(self):
+        for duration in (0, 9.999, 10, 10.001, 12, 15.999):
             with self.subTest(duration=duration):
                 self.assertEqual(vdl._preview_segments(duration), [])
-        for duration in (10.001, 12, 15.999):
-            with self.subTest(duration=duration):
-                self.assertEqual(vdl._preview_segments(duration), [(5.0, duration - 10)])
 
         examples = {
-            16: [5, 7, 9],
-            19: [5, 8.5, 12],
-            29: [5, 13.5, 22],
-            30: [5, 11, 17, 23],
-            31: [5, 34 / 3, 53 / 3, 24],
-            59: [5, 62 / 3, 109 / 3, 52],
-            60: [5, 17, 29, 41, 53],
+            16: [7],
+            19: [8.5],
+            29: [13.5],
+            30: [11, 17],
+            31: [34 / 3, 53 / 3],
+            59: [62 / 3, 109 / 3],
+            60: [17, 29, 41],
         }
         for duration, expected in examples.items():
             with self.subTest(duration=duration):
@@ -50,17 +47,17 @@ class HoverPreviewTest(AppCase):
                     self.assertAlmostEqual(start, expected_start)
                     self.assertEqual(length, 2)
 
-        durations = [16.001, 63, 600, 3600, 7200, 86400]
+        durations = [16.001, 63.125, 600, 3600, 7200, 86400]
         for multiple in (30, 60, 90, 600, 7200):
             durations.extend((multiple - 0.001, multiple, multiple + 0.001))
         for duration in durations:
             with self.subTest(duration=duration):
+                old_count = math.floor(duration / 30) + 3
+                spacing = (duration - 12) / (old_count - 1)
+                old_segments = [(5 + index * spacing, 2) for index in range(old_count)]
                 segments = vdl._preview_segments(duration)
-                self.assertEqual(len(segments), math.floor(duration / 30) + 3)
-                self.assertEqual(segments[0][0], 5)
-                self.assertAlmostEqual(sum(segments[-1]), duration - 5)
-                self.assertTrue(all(length == 2 for _start, length in segments))
-                spacing = (duration - 12) / (len(segments) - 1)
+                self.assertEqual(len(segments), math.floor(duration / 30) + 1)
+                self.assertEqual(segments, old_segments[1:-1])
                 rounded_intervals = []
                 for (start, length), (following, _) in zip(segments, segments[1:]):
                     self.assertGreater(following, start)
@@ -68,7 +65,16 @@ class HoverPreviewTest(AppCase):
                     self.assertAlmostEqual(following - start, spacing)
                     self.assertLessEqual(following - start, 30)
                     rounded_intervals.append(round(following, 3) - round(start, 3))
-                self.assertLessEqual(max(rounded_intervals) - min(rounded_intervals), 0.001 + 1e-9)
+                if rounded_intervals:
+                    self.assertLessEqual(max(rounded_intervals) - min(rounded_intervals), 0.001 + 1e-9)
+
+    def test_no_inner_excerpts_keeps_static_thumbnail_without_encoding(self):
+        for duration in (9.999, 10, 10.001, 12, 15.999):
+            with self.subTest(duration=duration):
+                with mock.patch.object(vdl, 'ffprobe_video_duration', return_value=duration), \
+                        mock.patch.object(vdl.subprocess, 'run') as encoder:
+                    self.assertFalse(vdl.generate_video_preview('movie.mp4', 'preview.mp4'))
+                encoder.assert_not_called()
 
     def test_invalid_duration_keeps_preview_unavailable(self):
         for duration in (None, float('nan'), float('inf'), -float('inf'), -1, 'invalid'):
@@ -133,18 +139,18 @@ class HoverPreviewTest(AppCase):
 
         self.assertTrue(os.path.isfile(preview_path))
         command = commands[0]
-        self.assertEqual(command.count("-i"), 23)
+        self.assertEqual(command.count("-i"), 21)
         self.assertEqual(
             [command[index + 1] for index, value in enumerate(command) if value == "-ss"],
-            [f'{5 + index * (588 / 22):.3f}' for index in range(23)],
+            [f'{5 + index * (588 / 22):.3f}' for index in range(1, 22)],
         )
         self.assertEqual(
             [command[index + 1] for index, value in enumerate(command) if value == '-t'],
-            ['2.000'] * 23,
+            ['2.000'] * 21,
         )
         filters = command[command.index('-filter_complex') + 1]
-        self.assertIn(''.join(f'[v{index}]' for index in range(23))
-                      + 'concat=n=23:v=1:a=0[outv]', filters)
+        self.assertIn(''.join(f'[v{index}]' for index in range(21))
+                      + 'concat=n=21:v=1:a=0[outv]', filters)
         self.assertEqual(command[command.index("-c:v") + 1], "libx264")
         self.assertEqual(command[command.index("-r") + 1], "12")
         self.assertEqual(command[command.index("-pix_fmt") + 1], "yuv420p")
@@ -221,16 +227,16 @@ class HoverPreviewTest(AppCase):
         first.close()
         second.close()
 
-    def test_existing_library_item_regenerates_v4_montage_and_publishes_readiness(self):
+    def test_existing_library_item_regenerates_v5_montage_and_publishes_readiness(self):
         self.finished_file()
         entry = vdl.db_get_download('test0001')
-        stale_path = os.path.join(self.download_dir, '.vdl_test0001.preview-v4.mp4')
+        stale_path = os.path.join(self.download_dir, '.vdl_test0001.preview-v5.mp4')
         thumbnail_path = vdl._thumbnail_path(entry)
         for path in (stale_path, thumbnail_path):
             with open(path, 'wb') as asset:
-                asset.write(b'cached-v4-era-asset')
+                asset.write(b'cached-v5-era-asset')
         with vdl._db_lock, vdl.db() as connection:
-            connection.execute("UPDATE generated_assets SET version=4,state='ready' "
+            connection.execute("UPDATE generated_assets SET version=5,state='ready' "
                                "WHERE download_id='test0001' AND kind='montage'")
         queue = vdl._get_asset_queue()
         readiness = self.client.get('/api/library').get_json()[0]['assets']
@@ -257,7 +263,7 @@ class HoverPreviewTest(AppCase):
             self.assertEqual((readiness['thumbnail'], readiness['montage']), ('ready', 'ready'))
             self.assertTrue(readiness['montage_delivery']['current'])
             for _ in range(2):
-                response = self.client.get('/api/preview/test0001?v=5')
+                response = self.client.get('/api/preview/test0001?v=6')
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(response.data, b'current-montage')
                 response.close()
@@ -268,7 +274,7 @@ class HoverPreviewTest(AppCase):
         with vdl.db() as connection:
             versions = connection.execute("SELECT version FROM generated_assets "
                                           "WHERE download_id='test0001' AND kind='montage'").fetchall()
-        self.assertEqual([row['version'] for row in versions], [5])
+        self.assertEqual([row['version'] for row in versions], [6])
 
     def test_preview_endpoint_rejects_missing_non_video_and_external_media(self):
         self.insert("active01")

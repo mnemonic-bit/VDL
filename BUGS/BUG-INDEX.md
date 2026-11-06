@@ -417,12 +417,15 @@ provenance and reader protection remain intact. Python 3.12 validation passes
 installation's four-to-five cache files per video remains unverified because
 its media directories are unavailable here.
 
-Issue 79 was reported on 2026-11-06 at version `0.51.2`. Duration-based hover
-previews include opening and closing excerpts that often show trailer-like
-material. The requested fix removes only the first and last excerpts while
-preserving every inner timestamp and length. Existing previews must stay
-playable during background regeneration, with replacement published before
-the old file is safely retired. The bug remains open.
+Issue 79 is fixed in version `0.51.4`. Duration-based hover previews now omit
+only the first and last excerpts, preserving all inner timestamps and lengths.
+Montage cache version 6 uses the existing background upgrade queue and keeps
+old previews playable until safe replacement and reader-lease expiry. Sources
+below 16 seconds produce no new montage and keep the static thumbnail;
+previously valid previews remain protected when no replacement is possible.
+Decoded native-media checks and Chromium/Firefox handoff checks pass.
+The Python 3.12 unit gate passes 462 tests (9 skipped), with 92.1% `vdl.py`
+line coverage; all 9 native-media tests and 12 selected checks per browser pass.
 
 ## Bug reports
 

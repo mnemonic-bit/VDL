@@ -3,9 +3,11 @@
 **Severity:** Low — opening and closing excerpts often show trailer, intro,
 or outro material instead of the video's main content.
 
-**Status:** Open. Reported on 2026-11-06 against commit `fd91eaf`, version
-`0.51.2`. Current sampling behavior confirmed by source inspection; no fix
-or preview regeneration is included in this report.
+**Status:** Resolved in version `0.51.4`. Reported on 2026-11-06 against commit
+`fd91eaf`, version `0.51.2`. The sampler now removes only the two outer
+excerpts, and montage cache version 6 schedules existing previews for safe
+background replacement. Videos below 16 seconds produce no new montage;
+an existing valid preview stays available until a successful replacement.
 
 **Related:** [Bug 0075](bug-0075-hover-preview-sampling-count-does-not-scale-with-duration.md)
 introduced duration-based sampling with source start gaps of at most 30
@@ -109,7 +111,7 @@ excerpt. Invalid or unavailable duration retains the static fallback.
 These are requirements for this recipe upgrade using Feature 0048's existing
 mechanism, not a claim that background replacement is currently broken.
 
-### Source evidence and repair scope
+### Original source evidence and repair scope
 
 - [`_preview_segments()`](../vdl.py#L5117) currently returns the full list,
   including both endpoints. Its normal branch uses `floor(duration / 30) + 3`
@@ -146,4 +148,24 @@ mechanism, not a claim that background replacement is currently broken.
    `./tests/run-all.sh --unit` and verify at least **90% `vdl.py` line coverage**,
    using Python 3.12 when close to the threshold, plus relevant media and
    Chromium/Firefox handoff checks. The code fix requires its own PATCH bump
-   in `VERSION`; this documentation-only report leaves `VERSION` unchanged.
+   in `VERSION`; the original documentation-only report left `VERSION`
+   unchanged.
+
+### Implementation and validation
+
+Version `0.51.4` preserves the original sample count when calculating spacing
+and generates only indices `1 .. old_count - 2`. The montage identity advances
+from version 5 to 6; the thumbnail recipe and shared publication, retry,
+recovery, and reader-lease lifecycle are unchanged. Below 16 seconds, no encode
+or empty replacement is attempted, so an existing valid preview is not retired.
+
+Regression checks failed against the old recipe before the fix. Validation
+passes all 9 native-media tests, including decoded comparisons with the old
+montage's inner excerpts, and 12 selected checks in each of Chromium and
+Firefox (`asset-demand`, `system-logs`, and `preview-handoff-media`). The native
+handoff check distinguishes the untrimmed six-second asset from its two-second
+replacement and verifies that the active old preview continues decoding.
+`./tests/run-all.sh --unit` passes with `VDL_PYTHON` selecting Python 3.12.14:
+462 tests, 9 intentional media skips, and **92.1% `vdl.py`
+line coverage** (5244/5692 executable lines; minimum 90%). The separate media
+run enables all 9 native-media tests.

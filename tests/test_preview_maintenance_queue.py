@@ -17,15 +17,15 @@ class PreviewMaintenanceQueueTests(unittest.TestCase):
     drain = support.AssetQueueTests.drain
 
     def path(self, entry, kind):
-        suffix = '.thumbnail' if kind == 'thumbnail' else '.preview-v5.mp4'
+        suffix = '.thumbnail' if kind == 'thumbnail' else '.preview-v6.mp4'
         return os.path.join(os.path.dirname(entry['filename']), entry['id'] + suffix)
 
     def make_queue(self, generate=None, versions=None):
-        return support.AssetQueueTests.make_queue(self, generate, versions or {'thumbnail': 2, 'montage': 5})
+        return support.AssetQueueTests.make_queue(self, generate, versions or {'thumbnail': 2, 'montage': 6})
 
     def legacy(self, name='legacy', *, known=True):
         entry = self.add(name, register=False)
-        path = self.path(entry, 'montage').replace('preview-v5', 'preview-v4')
+        path = self.path(entry, 'montage').replace('preview-v6', 'preview-v5')
         with open(path, 'wb') as output:
             output.write(b'legacy montage')
         with open(self.path(entry, 'thumbnail'), 'wb') as output:
@@ -33,7 +33,7 @@ class PreviewMaintenanceQueueTests(unittest.TestCase):
         if known:
             with self.db() as conn:
                 conn.execute('INSERT INTO generated_assets(download_id,kind,version,source,state) VALUES (?,?,?,?,?)',
-                             (name, 'montage', 4, self.queue._identity(entry['filename']), 'ready'))
+                             (name, 'montage', 5, self.queue._identity(entry['filename']), 'ready'))
         self.queue.register(entry)
         return entry, path
 
@@ -72,6 +72,44 @@ class PreviewMaintenanceQueueTests(unittest.TestCase):
         self.queue.maintenance.cleanup()
         self.assertFalse(os.path.exists(path))
         self.assertFalse(self.queue.delivery(entry, old['identity'])['available'])
+
+    def test_pending_recipe_upgrade_serves_old_reader_during_encode_and_restart_cleanup(self):
+        entry, path = self.legacy()
+        old = self.queue.delivery(entry, lease=True)
+        entered, release = threading.Event(), threading.Event()
+
+        def blocked(kind, source, target):
+            entered.set()
+            if not release.wait(3):
+                return False
+            return self.generate(kind, source, target)
+
+        self.queue.generate = blocked
+        self.queue.replace_demand('user', 'tab', 1, [entry['id']], entry['id'])
+        thread = threading.Thread(target=self.queue.step)
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(2))
+            self.assertEqual(self.queue.delivery(entry)['identity'], old['identity'])
+            self.assertEqual(self.queue.delivery(entry, old['identity'], lease=True)['path'], path)
+            self.assertTrue(os.path.isfile(path))
+        finally:
+            release.set()
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(self.queue.delivery(entry)['current'])
+        self.assertTrue(os.path.exists(path))
+
+        # Restart after publication must resume retirement, not encode again.
+        replacement = self.make_queue()
+        replacement._recover()
+        self.assertTrue(replacement.delivery(entry, old['identity'])['available'])
+        self.now += 121
+        replacement.maintenance.cleanup()
+        self.assertFalse(os.path.exists(path))
+        self.assertTrue(replacement.delivery(entry)['current'])
+        self.assertFalse(replacement.step())
+        self.assertEqual(len(self.generated), 1)
 
     def test_missing_provenance_never_adopts_an_old_named_file(self):
         entry, path = self.legacy(known=False)
@@ -313,12 +351,12 @@ class PreviewMaintenanceQueueTests(unittest.TestCase):
 
     def test_bulk_read_snapshot_identity_matches_later_provenance_adoption(self):
         entry = self.add('bulk-read', register=False)
-        old = self.path(entry, 'montage').replace('preview-v5', 'preview-v4')
+        old = self.path(entry, 'montage').replace('preview-v6', 'preview-v5')
         with open(old, 'wb') as output:
             output.write(b'old')
         with self.db() as conn:
             conn.execute('INSERT INTO generated_assets(download_id,kind,version,source,state) VALUES (?,?,?,?,?)',
-                         (entry['id'], 'montage', 4, self.queue._identity(entry['filename']), 'ready'))
+                         (entry['id'], 'montage', 5, self.queue._identity(entry['filename']), 'ready'))
         with self.lock:
             metadata = self.queue.readiness_many([entry], include_delivery=True)[entry['id']]['montage_delivery']
         self.assertTrue(metadata['available'])
@@ -348,10 +386,10 @@ class PreviewMaintenanceQueueTests(unittest.TestCase):
 
     def test_legacy_lazy_adoption_before_startup_discovery(self):
         entry = self.add('lazy', register=False)
-        old = self.path(entry, 'montage').replace('preview-v5', 'preview-v4')
+        old = self.path(entry, 'montage').replace('preview-v6', 'preview-v5')
         with open(old, 'wb') as output:
             output.write(b'old')
         with self.db() as conn:
             conn.execute('INSERT INTO generated_assets(download_id,kind,version,source,state) VALUES (?,?,?,?,?)',
-                         ('lazy','montage',4,self.queue._identity(entry['filename']),'ready'))
+                         ('lazy','montage',5,self.queue._identity(entry['filename']),'ready'))
         self.assertEqual(self.queue.delivery(entry)['path'], old)
