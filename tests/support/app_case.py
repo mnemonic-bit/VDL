@@ -12,6 +12,10 @@ class AppCase(unittest.TestCase):
     """Give each test an isolated database, download tree, and runtime state."""
 
     def setUp(self):
+        vdl.stop_library_storage()
+        self._storage_start_patch = mock.patch.object(vdl, 'start_library_storage')
+        self._storage_start_patch.start()
+        self.addCleanup(self._storage_start_patch.stop)
         self.temp_dir = tempfile.TemporaryDirectory()
         self.download_dir = os.path.join(self.temp_dir.name, "downloads")
         os.mkdir(self.download_dir)
@@ -44,6 +48,8 @@ class AppCase(unittest.TestCase):
             vdl._token_download_rates.clear()
         with vdl._playback_sessions_lock:
             vdl._playback_sessions.clear()
+        # Tests explicitly start the daily service when exercising scheduling;
+        # ordinary fixtures must not race a scan of their half-built Library.
         vdl.init_db()
         vdl.db_set_preferences({"download_dir": self.download_dir, "max_total_download_mbps": "0"})
         vdl.app.config.update(TESTING=True)
@@ -52,6 +58,7 @@ class AppCase(unittest.TestCase):
         self.client = self.authenticated_client()
 
     def tearDown(self):
+        vdl.stop_library_storage()
         # Wake every worker owned by this test before restoring shared globals.
         for row in vdl.db_list_downloads():
             if row["status"] in ("starting", "downloading", "paused"):

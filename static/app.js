@@ -489,7 +489,7 @@ async function apiFetch(url, options) {
             if (res.status === 401) {
                 resetPlayerListening();
                 window.location.assign('/login');
-                throw Object.assign(new Error('Your session has ended. Sign in again.'), { retryable: false });
+                throw Object.assign(new Error('Your session has ended. Sign in again.'), { retryable: false, status: 401 });
             }
             if (safeRead && res.status === 503) {
                 const data = await res.clone().json().catch(() => ({}));
@@ -882,6 +882,111 @@ function checkHealth() {
             updateUptime(null, true);
         });
 }
+
+let libraryStorageSnapshot = null;
+let libraryStorageEpoch = 0;
+
+function formatVideoStorage(bytes) {
+    if (typeof bytes !== 'number' || !Number.isFinite(bytes)
+            || !Number.isInteger(bytes) || bytes < 0) return null;
+    const total = BigInt(bytes);
+    if (total < 1000n) return `${total} B`;
+    const units = ['B', 'k', 'M', 'G', 'T', 'P', 'E'];
+    let unit = 1;
+    let divisor = 1000n;
+    while (unit < units.length - 1 && total >= divisor * 1000n) {
+        divisor *= 1000n;
+        unit += 1;
+    }
+    // Integer arithmetic preserves upward ties at decimal unit boundaries.
+    let tenths = (total * 10n + divisor / 2n) / divisor;
+    if (tenths >= 10000n && unit < units.length - 1) {
+        divisor *= 1000n;
+        unit += 1;
+        tenths = (total * 10n + divisor / 2n) / divisor;
+    }
+    return `${tenths / 10n}.${tenths % 10n} ${units[unit]}`;
+}
+
+function parseLibraryStorage(data) {
+    if (!data || !['calculating', 'ready', 'stale', 'unavailable'].includes(data.state)) return null;
+    if (data.state === 'calculating' || data.state === 'unavailable') {
+        return data.total_bytes === null && data.measured_at === null && data.next_refresh_at === null
+            ? { total_bytes: null, measured_at: null, next_refresh_at: null, state: data.state } : null;
+    }
+    const utcTime = value => typeof value === 'string'
+        && /(?:Z|\+00:00)$/.test(value) && Number.isFinite(Date.parse(value));
+    if (formatVideoStorage(data.total_bytes) === null
+            || !utcTime(data.measured_at) || !utcTime(data.next_refresh_at)
+            || Date.parse(data.next_refresh_at) <= Date.parse(data.measured_at)) return null;
+    return {
+        total_bytes: data.total_bytes, measured_at: data.measured_at,
+        next_refresh_at: data.next_refresh_at, state: data.state,
+    };
+}
+
+function renderLibraryStorage() {
+    const snapshot = libraryStorageSnapshot;
+    const state = snapshot?.state || 'calculating';
+    let label = state === 'unavailable' ? 'Videos unavailable' : 'Videos calculating…';
+    let detail = state === 'unavailable'
+        ? 'A measurement is unavailable. The server will retry automatically.'
+        : 'The first measurement is being calculated.';
+    if (snapshot?.total_bytes !== null && snapshot?.total_bytes !== undefined) {
+        label = `Videos ${formatVideoStorage(snapshot.total_bytes)}${state === 'stale' ? ' (stale)' : ''}`;
+        const measured = new Date(snapshot.measured_at);
+        detail = `Last successful measurement: ${measured.toLocaleString()}.`;
+        if (state === 'stale') detail += ' This measurement is stale; a refresh is pending or unavailable.';
+    }
+    const summary = document.getElementById('libraryStorageLabel');
+    const updated = document.getElementById('libraryStorageUpdated');
+    // Focus and SSE can reconcile the same generation repeatedly. Leave the
+    // accessible text intact when its meaning has not changed.
+    if (summary.textContent !== label) summary.textContent = label;
+    if (updated.textContent !== detail) updated.textContent = detail;
+    document.getElementById('libraryStorage').dataset.state = state;
+}
+
+function clearLibraryStorage() {
+    libraryStorageEpoch += 1;
+    libraryStorageSnapshot = null;
+    document.getElementById('libraryStorage').open = false;
+    renderLibraryStorage();
+}
+
+function fetchLibraryStorage() {
+    return coordinateRefresh('library-storage', async () => {
+        const epoch = libraryStorageEpoch;
+        try {
+            const response = await apiFetch('/api/library-storage', { cache: 'no-store' });
+            if (!response.ok) throw Object.assign(new Error('Video storage is unavailable.'), { status: response.status });
+            const snapshot = parseLibraryStorage(await response.json());
+            if (!snapshot) throw new Error('Invalid video storage response.');
+            if (epoch !== libraryStorageEpoch) return;
+            libraryStorageSnapshot = snapshot;
+        } catch (error) {
+            if (epoch !== libraryStorageEpoch) return;
+            if (error.status === 401 || error.status === 403) clearLibraryStorage();
+            libraryStorageSnapshot = libraryStorageSnapshot?.total_bytes !== null
+                    && libraryStorageSnapshot?.total_bytes !== undefined
+                ? { ...libraryStorageSnapshot, state: 'stale' }
+                : { total_bytes: null, measured_at: null, next_refresh_at: null, state: 'unavailable' };
+        }
+        renderLibraryStorage();
+    });
+}
+
+const storageAccountChannel = typeof BroadcastChannel === 'function'
+    ? new BroadcastChannel('vdl-account') : null;
+if (storageAccountChannel) storageAccountChannel.onmessage = clearLibraryStorage;
+document.querySelector('form.logout-form')?.addEventListener('submit', () => {
+    clearLibraryStorage();
+    storageAccountChannel?.postMessage('signed-out');
+});
+window.addEventListener('pagehide', clearLibraryStorage);
+window.addEventListener('pageshow', event => {
+    if (event.persisted) fetchLibraryStorage();
+});
 
 setInterval(() => {
     checkHealth();
@@ -8058,6 +8163,7 @@ function scheduleFetch({ sortFavorites = false, currentOnly = false } = {}) {
         if (fullRefresh) {
             fetchHistory({ sortFavorites: applyFavoriteSort });
             fetchPlaylists();
+            fetchLibraryStorage();
         } else {
             fetchDownloadCollection('current');
         }
@@ -8090,6 +8196,7 @@ function connectEventStream() {
         scheduleFetch({ currentOnly });
     });
     es.addEventListener('maintenance', fetchSystemLogs);
+    es.addEventListener('library_storage', fetchLibraryStorage);
     es.addEventListener('playlist-progress', fetchPlaylists);
     es.addEventListener('error', () => {
         showServerStatus();
@@ -8107,6 +8214,7 @@ connectEventStream();
 // ordering once. Later reconciliations keep that order until a filter runs.
 fetchHistory({ sortFavorites: true });
 fetchPlaylists();
+fetchLibraryStorage();
 
 document.getElementById('playlistName').addEventListener(
     'input', markPlaylistEditorDirty,

@@ -2018,6 +2018,37 @@ details[open] > .history-summary::before { transform: rotate(90deg); }
     text-align: center;
 }
 .version-footer.version-mismatch { color: var(--error-fg); }
+.library-storage { display: inline-block; }
+.library-storage > summary {
+    cursor: pointer;
+    list-style: none;
+    text-decoration: underline dotted;
+    text-underline-offset: 0.2em;
+    white-space: nowrap;
+}
+.library-storage > summary::-webkit-details-marker { display: none; }
+.library-storage > summary:focus-visible {
+    outline: 2px solid var(--fg);
+    outline-offset: 3px;
+    border-radius: 2px;
+}
+.library-storage-details {
+    position: absolute;
+    right: 16px;
+    bottom: calc(100% + 8px);
+    left: 16px;
+    max-width: 30rem;
+    margin: 0 auto;
+    padding: 10px 14px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface);
+    box-shadow: 0 2px 8px var(--menu-shadow);
+    color: var(--fg);
+    overflow-wrap: anywhere;
+}
+.library-storage-details > span { display: block; }
+.library-storage[data-state="stale"] > summary { color: var(--fg); }
 .server-status {
     flex: 0 0 100%;
     color: var(--fg);

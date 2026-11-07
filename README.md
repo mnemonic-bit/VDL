@@ -81,6 +81,18 @@ mixed deployments visible. The server also prints both values to its console
 when it starts. Maintainers update the root `VERSION` file when cutting a
 behavior-changing release according to the policy in `AGENTS.md`.
 
+The footer's **Videos** value reports stored video bytes from a daily snapshot,
+separately from the live item count. Open it for the last successful update
+time and freshness information. Measurements persist in SQLite and refresh in
+the background every 24 hours, even without a browser open. Users see only
+videos they can currently access; administrators see the installation total.
+Files added or changed appear at the next measurement. Removing a Library
+record or changing its visibility updates access to the saved total immediately.
+Failed refreshes retain the previous measurement and retry after 30 minutes.
+Missing or replaced source directories also retain a stale measurement. Restore
+the original storage, or configure a new directory path when intentionally
+changing storage, so an unmounted volume cannot look like an empty collection.
+
 ## Run with Docker Compose
 
 The default deployment publishes port 5000 on all host interfaces and stores

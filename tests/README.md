@@ -109,6 +109,15 @@ The runners can use `CONTAINER_ENGINE=podman` and `VDL_IMAGE=vdl:local`.
 Developer media runs skip when tools are absent; `--media`, `--container`, and
 `--all` treat missing required tools as failures with setup guidance.
 
+Daily video storage has focused checks for persistent scheduling, current
+authorization, filesystem aliases, failure recovery, and the accessible footer:
+
+```bash
+python -m unittest tests.test_library_storage -v
+node --test tests/library-storage-client.test.cjs
+python3 tests/browser/run.py library-storage.spec.cjs version-status.spec.cjs
+```
+
 ## Expected failures
 
 Open bugs assert desired behavior using `unittest.expectedFailure` or

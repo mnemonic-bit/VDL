@@ -971,7 +971,15 @@
 
     <footer id="versionFooter" class="version-footer" data-ui-version="{{ ui_version }}">
         <span id="serverStatus" class="server-status" role="alert" hidden>Server is not available — actions will not work until the connection is restored.</span>
-        <span id="itemCount">0 items</span><span aria-hidden="true"> · </span><span>UI v{{ ui_version }}</span><span aria-hidden="true"> · </span><span id="apiVersion">API checking…</span>
+        <span id="itemCount">0 items</span><span aria-hidden="true"> · </span>
+        <details id="libraryStorage" class="library-storage">
+            <summary id="libraryStorageLabel" aria-describedby="libraryStorageDescription">Videos calculating…</summary>
+            <div class="library-storage-details">
+                <span id="libraryStorageDescription">Video storage, updated daily.</span>
+                <span id="libraryStorageUpdated">The first measurement is being calculated.</span>
+            </div>
+        </details>
+        <span aria-hidden="true"> · </span><span>UI v{{ ui_version }}</span><span aria-hidden="true"> · </span><span id="apiVersion">API checking…</span>
         <span aria-hidden="true"> · </span><span id="uptime">Uptime checking…</span>
         <span id="versionWarning" class="version-warning" hidden>
             <span>version mismatch</span>

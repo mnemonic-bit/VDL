@@ -32,6 +32,7 @@ import tempfile
 import unicodedata
 import zipfile
 from contextlib import contextmanager, nullcontext
+from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -335,6 +336,8 @@ def require_authenticated_user():
 @app.after_request
 def companion_response_headers(response):
     """Apply the narrow CORS and cache boundary to companion responses."""
+    if request.endpoint == 'library_storage':
+        response.headers['Cache-Control'] = 'no-store'
     if request.endpoint not in EXTENSION_NO_STORE_ENDPOINTS:
         return response
     response.headers['Cache-Control'] = 'no-store'
@@ -402,14 +405,14 @@ class EventBus:
                     if any(item[0] == 'change' and (item[1] or {}).get('reason')
                            == 'library_rotation' for item in q.queue):
                         continue
-            if kind in ('assets', 'maintenance'):
+            if kind in ('assets', 'maintenance', 'library_storage'):
                 # A slow client needs one bounded reconciliation hint, even
                 # when the worker finishes several cached assets in a burst.
                 with q.mutex:
                     pending = next((i for i, item in enumerate(q.queue)
                                     if item[0] == kind), None)
                     if pending is not None:
-                        if kind == 'maintenance':
+                        if kind in ('maintenance', 'library_storage'):
                             continue
                         previous = q.queue[pending][1] or {}
                         merged = list(dict.fromkeys(
@@ -732,6 +735,48 @@ def init_db():
                   );
             END;
         """)
+        # New tables are additive, so retained database volumes need no rebuild.
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS library_storage_snapshot (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                measured_at REAL,
+                next_refresh_at REAL,
+                retry_at REAL,
+                failed INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT OR IGNORE INTO library_storage_snapshot(singleton) VALUES (1);
+            CREATE TABLE IF NOT EXISTS library_storage_members (
+                download_id TEXT PRIMARY KEY,
+                entry_created_at REAL NOT NULL,
+                device TEXT NOT NULL,
+                inode TEXT NOT NULL,
+                byte_size INTEGER NOT NULL CHECK (byte_size >= 0)
+            );
+            CREATE TABLE IF NOT EXISTS library_storage_roots (
+                path TEXT PRIMARY KEY,
+                device TEXT NOT NULL,
+                inode TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS library_storage_staging_roots (
+                generation TEXT NOT NULL,
+                path TEXT NOT NULL,
+                device TEXT NOT NULL,
+                inode TEXT NOT NULL,
+                PRIMARY KEY (generation, path)
+            );
+            CREATE TABLE IF NOT EXISTS library_storage_staging (
+                generation TEXT NOT NULL,
+                download_id TEXT NOT NULL,
+                entry_created_at REAL NOT NULL,
+                filename TEXT NOT NULL,
+                output_dir TEXT,
+                device TEXT NOT NULL,
+                inode TEXT NOT NULL,
+                byte_size INTEGER NOT NULL CHECK (byte_size >= 0),
+                mtime_ns INTEGER NOT NULL,
+                PRIMARY KEY (generation, download_id)
+            );
+        """)
         # --- lightweight migrations: add new columns if missing ---
         existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(downloads)")}
         for col, ddl in [
@@ -920,6 +965,10 @@ def init_db():
             or os.environ.get('FLASK_DEBUG', '1') != '1'
             or os.environ.get('WERKZEUG_RUN_MAIN') == 'true'):
         _restore_rotation_timer()
+    if ((__name__ != '__main__' and os.environ.get('FLASK_RUN_FROM_CLI') != 'true')
+            or os.environ.get('FLASK_DEBUG', '1') != '1'
+            or os.environ.get('WERKZEUG_RUN_MAIN') == 'true'):
+        start_library_storage()
 
 
 def db_insert_download(download_id, url, owner_user_id=None,
@@ -2042,6 +2091,325 @@ def _playable_library_entry(entry, allowed_bases=None):
     if not filename or not os.path.isfile(filename):
         return False
     return _is_allowed_download_path(filename, allowed_bases)
+
+
+# ---------------------------------------------------------------------------
+# Durable daily video-storage observations
+# ---------------------------------------------------------------------------
+
+LIBRARY_STORAGE_INTERVAL = 86_400
+LIBRARY_STORAGE_RETRY = 1_800
+LIBRARY_STORAGE_BATCH = 200
+_storage_lock = threading.RLock()
+_storage_refresh_lock = threading.Lock()
+_storage_timer = None
+_storage_timer_db = None
+_storage_retry_at = 0
+_storage_epoch = 0
+_storage_scan_owner = threading.local()
+
+
+class _StorageInterrupted(Exception):
+    pass
+
+
+def _storage_check_owner():
+    owner = getattr(_storage_scan_owner, 'value', None)
+    if owner is not None and owner != (DB_PATH, _storage_epoch):
+        raise _StorageInterrupted()
+
+
+def _storage_now():
+    return time.time()
+
+
+def _storage_timestamp(value):
+    return (datetime.fromtimestamp(value, timezone.utc).isoformat()
+            if value is not None else None)
+
+
+def _storage_deadline(snapshot):
+    return max(snapshot['next_refresh_at'] or 0, snapshot['retry_at'] or 0)
+
+
+def _storage_directory_available(path):
+    path = os.path.abspath(path)
+    info = os.stat(path)
+    if not stat.S_ISDIR(info.st_mode) or not os.access(path, os.R_OK | os.X_OK):
+        raise OSError('Video storage directory is unavailable')
+    roots = getattr(_storage_scan_owner, 'roots', None)
+    if roots is not None:
+        identity = (str(info.st_dev), str(info.st_ino))
+        expected = _storage_scan_owner.expected_roots.get(path, identity)
+        # An unmounted volume can expose an accessible empty directory. Keep
+        # the previous snapshot until the previously observed source returns.
+        if identity != expected or identity != roots.get(path, identity):
+            raise OSError('Video storage directory identity changed')
+        roots[path] = identity
+
+
+def _storage_file(entry, allowed_bases):
+    filename = entry['filename']
+    if (not filename or Path(filename).suffix.lower() not in BROWSER_VIDEO_EXTENSIONS
+            or Path(os.path.realpath(filename)).suffix.lower() not in BROWSER_VIDEO_EXTENSIONS
+            or not _is_allowed_download_path(filename, allowed_bases)):
+        return None
+    # Validate captured roots even when an unmount left a readable directory
+    # behind; a missing individual file inside the original root is harmless.
+    _storage_directory_available(entry['output_dir'] or os.path.dirname(filename) or '.')
+    try:
+        info = os.stat(filename)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        return None
+    return (str(info.st_dev), str(info.st_ino), info.st_size, info.st_mtime_ns)
+
+
+def _measure_library_storage(generation):
+    """Stage bounded observations without holding a writer lock over stat calls."""
+    _storage_check_owner()
+    with db() as conn:
+        allowed_bases = _trusted_download_directories(conn)
+        _storage_scan_owner.roots = {}
+        _storage_scan_owner.expected_roots = {
+            row['path']: (row['device'], row['inode'])
+            for row in conn.execute('SELECT * FROM library_storage_roots')
+        }
+        preference = conn.execute(
+            "SELECT value FROM preferences WHERE key = 'download_dir'"
+        ).fetchone()
+        maximum = conn.execute('SELECT MAX(rowid) FROM downloads').fetchone()[0] or 0
+    _storage_directory_available(preference[0] if preference else DEFAULT_DOWNLOAD_DIR)
+    configured_source = os.environ.get('VDL_INGEST_DIR', '').strip()
+    if configured_source:
+        _storage_directory_available(configured_source)
+    after = 0
+    while after < maximum:
+        _storage_check_owner()
+        with db() as conn:
+            entries = conn.execute(
+                "SELECT rowid AS scan_rowid, id, created_at, filename, output_dir "
+                "FROM downloads WHERE status = 'finished' AND rowid > ? "
+                "AND rowid <= ? ORDER BY rowid LIMIT ?",
+                (after, maximum, LIBRARY_STORAGE_BATCH),
+            ).fetchall()
+        if not entries:
+            break
+        after = entries[-1]['scan_rowid']
+        measurements = []
+        for entry in entries:
+            _storage_check_owner()
+            info = _storage_file(entry, allowed_bases)
+            if info is not None:
+                measurements.append((generation, entry['id'], entry['created_at'],
+                                     entry['filename'], entry['output_dir'], *info))
+        _storage_check_owner()
+        with _db_lock, db() as conn:
+            _storage_check_owner()
+            conn.executemany(
+                'INSERT INTO library_storage_staging '
+                '(generation, download_id, entry_created_at, filename, output_dir, '
+                'device, inode, byte_size, mtime_ns) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                measurements,
+            )
+    # Recheck file identity after discovery. A replacement or rename must not
+    # attach the old file's size to a newly published Library record.
+    after = 0
+    while True:
+        _storage_check_owner()
+        with db() as conn:
+            rows = conn.execute(
+                'SELECT rowid AS scan_rowid, * FROM library_storage_staging '
+                'WHERE generation = ? AND rowid > ? ORDER BY rowid LIMIT ?',
+                (generation, after, LIBRARY_STORAGE_BATCH),
+            ).fetchall()
+        if not rows:
+            break
+        after = rows[-1]['scan_rowid']
+        rejected = []
+        for row in rows:
+            _storage_check_owner()
+            current = _storage_file(row, allowed_bases)
+            if current != (row['device'], row['inode'], row['byte_size'], row['mtime_ns']):
+                rejected.append((generation, row['download_id']))
+        _storage_check_owner()
+        with _db_lock, db() as conn:
+            _storage_check_owner()
+            conn.executemany(
+                'DELETE FROM library_storage_staging WHERE generation = ? AND download_id = ?',
+                rejected,
+            )
+
+    _storage_check_owner()
+    for path in _storage_scan_owner.roots:
+        _storage_directory_available(path)
+    with _db_lock, db() as conn:
+        _storage_check_owner()
+        conn.executemany(
+            'INSERT INTO library_storage_staging_roots '
+            '(generation, path, device, inode) VALUES (?, ?, ?, ?)',
+            ((generation, path, *identity)
+             for path, identity in _storage_scan_owner.roots.items()),
+        )
+
+
+def _publish_library_storage(generation):
+    _storage_check_owner()
+    with _storage_lock, _db_lock, db() as conn:
+        _storage_check_owner()
+        conn.execute('DELETE FROM library_storage_members')
+        conn.execute(
+            'INSERT INTO library_storage_members '
+            '(download_id, entry_created_at, device, inode, byte_size) '
+            'SELECT s.download_id, s.entry_created_at, s.device, s.inode, s.byte_size '
+            'FROM library_storage_staging s JOIN downloads d '
+            'ON d.id = s.download_id AND d.created_at = s.entry_created_at '
+            "AND d.status = 'finished' AND d.filename = s.filename "
+            'AND d.output_dir IS s.output_dir WHERE s.generation = ?',
+            (generation,),
+        )
+        conn.execute('DELETE FROM library_storage_roots')
+        conn.execute(
+            'INSERT INTO library_storage_roots(path, device, inode) '
+            'SELECT path, device, inode FROM library_storage_staging_roots '
+            'WHERE generation = ?', (generation,),
+        )
+        measured_at = _storage_now()
+        conn.execute(
+            'UPDATE library_storage_snapshot SET measured_at = ?, next_refresh_at = ?, '
+            'retry_at = NULL, failed = 0 WHERE singleton = 1',
+            (measured_at, measured_at + LIBRARY_STORAGE_INTERVAL),
+        )
+        conn.execute('DELETE FROM library_storage_staging')
+        conn.execute('DELETE FROM library_storage_staging_roots')
+
+
+def refresh_library_storage():
+    """Run at most one due observation; requests only ever read saved results."""
+    global _storage_retry_at
+    if not _storage_refresh_lock.acquire(blocking=False):
+        return False
+    try:
+        _storage_scan_owner.value = (DB_PATH, _storage_epoch)
+        with db() as conn:
+            snapshot = conn.execute('SELECT * FROM library_storage_snapshot').fetchone()
+        if _storage_now() < max(_storage_deadline(snapshot), _storage_retry_at):
+            return False
+        generation = uuid.uuid4().hex
+        _storage_check_owner()
+        with _db_lock, db() as conn:
+            _storage_check_owner()
+            conn.execute('DELETE FROM library_storage_staging')
+            conn.execute('DELETE FROM library_storage_staging_roots')
+        _measure_library_storage(generation)
+        _publish_library_storage(generation)
+        _storage_retry_at = 0
+        event_bus.publish('library_storage', {})
+        return True
+    except _StorageInterrupted:
+        return False
+    except Exception:
+        if getattr(_storage_scan_owner, 'value', None) != (DB_PATH, _storage_epoch):
+            return False
+        # If SQLite itself is unavailable the in-process retry deadline still
+        # prevents a hot loop; the last committed generation remains intact.
+        _storage_retry_at = _storage_now() + LIBRARY_STORAGE_RETRY
+        try:
+            with _storage_lock, _db_lock, db() as conn:
+                _storage_check_owner()
+                conn.execute(
+                    'UPDATE library_storage_snapshot SET failed = 1, retry_at = ? '
+                    'WHERE singleton = 1', (_storage_retry_at,),
+                )
+        except (sqlite3.Error, _StorageInterrupted):
+            pass
+        app.logger.exception('Daily video-storage measurement failed')
+        event_bus.publish('library_storage', {})
+        return False
+    finally:
+        _storage_scan_owner.value = None
+        _storage_scan_owner.roots = None
+        _storage_scan_owner.expected_roots = None
+        _storage_refresh_lock.release()
+
+
+def stop_library_storage():
+    global _storage_timer, _storage_timer_db, _storage_retry_at, _storage_epoch
+    with _storage_lock:
+        _storage_epoch += 1
+        if _storage_timer is not None:
+            _storage_timer.cancel()
+        _storage_timer = None
+        _storage_timer_db = None
+        _storage_retry_at = 0
+
+
+def start_library_storage():
+    """Restore the saved deadline; the serving process owns one daemon timer."""
+    global _storage_timer, _storage_timer_db
+    with _storage_lock:
+        if _storage_timer is not None and _storage_timer_db == DB_PATH:
+            return
+        if _storage_timer_db is not None and _storage_timer_db != DB_PATH:
+            stop_library_storage()
+        try:
+            with db() as conn:
+                snapshot = conn.execute('SELECT * FROM library_storage_snapshot').fetchone()
+            deadline = max(_storage_deadline(snapshot), _storage_retry_at)
+        except sqlite3.Error:
+            deadline = max(_storage_retry_at, _storage_now() + LIBRARY_STORAGE_RETRY)
+        database = DB_PATH
+
+        def wake():
+            global _storage_timer
+            with _storage_lock:
+                if _storage_timer is not timer or DB_PATH != database:
+                    return
+            refresh_library_storage()
+            with _storage_lock:
+                if _storage_timer is not timer or DB_PATH != database:
+                    return
+                _storage_timer = None
+                start_library_storage()
+
+        timer = threading.Timer(max(0, deadline - _storage_now()), wake)
+        timer.daemon = True
+        _storage_timer = timer
+        _storage_timer_db = database
+        timer.start()
+
+
+@app.route('/api/library-storage')
+def library_storage():
+    with db() as conn:
+        conn.execute('BEGIN')
+        snapshot = conn.execute('SELECT * FROM library_storage_snapshot').fetchone()
+        measured_at = snapshot['measured_at']
+        total = None
+        if measured_at is not None:
+            is_admin = 'admin' in g.current_user['roles']
+            # Authorize associations before collapsing aliases, so a private
+            # alias cannot hide a shared file or expose its owner's collection.
+            rows = conn.execute(
+                'SELECT m.device, m.inode, MAX(m.byte_size) AS byte_size '
+                'FROM library_storage_members m JOIN downloads d '
+                'ON d.id = m.download_id AND d.created_at = m.entry_created_at '
+                "WHERE d.status = 'finished' AND (? OR d.visibility = 'public' "
+                'OR d.owner_user_id = ?) GROUP BY m.device, m.inode',
+                (is_admin, g.current_user['id']),
+            )
+            total = sum(row['byte_size'] for row in rows)
+        state = ('unavailable' if snapshot['failed'] or _storage_retry_at else 'calculating')
+        if measured_at is not None:
+            state = ('stale' if snapshot['failed'] or _storage_retry_at
+                     or _storage_now() >= snapshot['next_refresh_at'] else 'ready')
+        response = jsonify(
+            total_bytes=total, measured_at=_storage_timestamp(measured_at),
+            next_refresh_at=_storage_timestamp(snapshot['next_refresh_at']), state=state,
+        )
+    response.headers['Cache-Control'] = 'no-store'
+    return response
 
 
 class RotationRefreshError(Exception):
@@ -8098,6 +8466,7 @@ def main(argv=None):
     duplicate_thread = start_duplicate_backfill() if owns_background_work else None
     if owns_background_work:
         start_asset_generation()
+        start_library_storage()
     print(
         f'VDL startup: UI v{APP_VERSION} | API v{APP_VERSION}',
         flush=True,
@@ -8115,6 +8484,7 @@ def main(argv=None):
         if owns_background_work:
             with _rotation_lock:
                 _cancel_rotation_timer()
+            stop_library_storage()
             stop_asset_generation()
         if ingest_thread is not None:
             stop_ingest_import()
