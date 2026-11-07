@@ -2,7 +2,7 @@
 
 **Source:** User-requested feature  
 **Status:** Implemented  
-**Last refined:** 2026-10-04
+**Last refined:** 2026-11-07
 
 ## Decision summary
 
@@ -20,6 +20,11 @@ a separate browser tab.
 
 - Handle `f` and `F` without requiring the video element to have keyboard
   focus. Ignore modified forms using Control, Command, or Alt.
+- After using custom player buttons, seek or volume sliders, or the closed
+  speed selector, `F` still enters fullscreen without moving focus or changing
+  playback state. Editable fields and open selectors retain their typing.
+  See [Bug 0081](../BUGS/bug-0081-overlay-fullscreen-shortcut-ignored-after-control-interaction.md)
+  for the custom-control focus clarification and compatibility fallback.
 - Enable `F` only while the player presentation is `original`. Once standard
   or native WebKit fullscreen is active, another `F` press must not issue a
   duplicate fullscreen request.

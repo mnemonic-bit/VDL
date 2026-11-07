@@ -435,6 +435,15 @@ player branch now calls `preventDefault()` before closing, preserving the
 existing guard for controls that already handled Escape. Native Firefox/macOS
 window verification remains outstanding before the issue can be closed.
 
+Issue 81 is fixed in version `0.53.1`. A browser regression reproduced retained
+playback-button focus preventing F from entering fullscreen. F now works after
+using player buttons, seek and volume sliders, and the closed speed selector,
+without changing focus or playback state. Native Space/Enter and arrow keys,
+open selectors, and editable fields retain their handling. The reporter's
+browser and operating system were not supplied. All 11 new regressions pass
+in Chromium and Firefox on Linux; the Python 3.12 unit gate passes 525 tests
+(9 skipped) with 92.7% `vdl.py` line coverage.
+
 ## Bug reports
 
 - [Bug 0001 — Merged downloads kept the deleted temporary audio filename](bug-0001-merged-downloads-kept-deleted-temporary-audio-filename.md)
@@ -517,6 +526,7 @@ window verification remains outstanding before the issue can be closed.
 - [Bug 0078 — Obsolete thumbnail and preview caches accumulate across upgrades](bug-0078-obsolete-thumbnail-and-preview-caches-accumulate.md)
 - [Bug 0079 — Hover previews include unwanted first and last excerpts](bug-0079-hover-previews-include-unwanted-first-and-last-excerpts.md)
 - [Bug 0080 — Overlay Escape also exits Firefox macOS application fullscreen](bug-0080-overlay-escape-also-exits-firefox-macos-fullscreen.md)
+- [Bug 0081 — Overlay fullscreen shortcut is ignored after interacting with player controls](bug-0081-overlay-fullscreen-shortcut-ignored-after-control-interaction.md)
 
 ## Accepted UI decisions
 

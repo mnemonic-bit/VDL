@@ -194,9 +194,13 @@ when replacing the fullscreen layout; writing this spec does not resolve it.
   not fall through to surface or backdrop actions.
 - Retain Space for play/pause and `F` for fullscreen entry while the player
   is open. Ignore repeated shortcut keydowns and Control/Command/Alt forms.
-  Do not intercept shortcuts in editable fields, selectors, sliders, or
-  buttons; Space/Enter and arrow keys keep native control semantics. No
-  additional global shortcuts are required for this release.
+  Space/Enter and arrow keys keep native control semantics on buttons,
+  sliders, and selectors. As clarified by [Bug 0081](../BUGS/bug-0081-overlay-fullscreen-shortcut-ignored-after-control-interaction.md),
+  `F` remains available with focus on player buttons, sliders, and the closed
+  speed selector, without changing playback state or moving focus. Editable
+  fields and open selectors retain their typing. Browsers without native
+  selector-open detection keep the speed selector's native key handling.
+  No additional global shortcuts are required for this release.
 - Use semantic buttons, labeled ranges, and a labeled native speed selector
   or equivalent accessible menu. Provide visible focus, state-dependent names
   such as Play/Pause and Enter/Exit fullscreen, and readable seek values such

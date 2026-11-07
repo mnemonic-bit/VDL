@@ -7133,11 +7133,20 @@ function handlePlayerShortcut(ev) {
     const playbackShortcut = ev.key === ' ' && !ev.shiftKey;
     if (!fullscreenShortcut && !playbackShortcut) return false;
 
-    // Space must retain its native activation when a visible player action has focus.
-    if (ev.target instanceof Element
-            && (ev.target.isContentEditable
-                || ev.target.closest('button, input, textarea, select, [role="slider"]'))) {
-        return false;
+    if (ev.target instanceof Element) {
+        if (ev.target.isContentEditable
+                || ev.target.closest('textarea, input:not([type="range"])')) return false;
+
+        const control = ev.target.closest('button, input, select, [role="slider"]');
+        if (control) {
+            // Space belongs to the focused control; F remains available after
+            // using player buttons and ranges without moving keyboard focus.
+            if (!fullscreenShortcut || !control.closest('#playerContainer')) return false;
+            // Native popups own their typing. Older browsers without :open
+            // cannot distinguish a closed selector, so leave it native too.
+            if (control.matches('select') && (control.id !== 'playerSpeed'
+                    || !CSS.supports('selector(:open)') || control.matches(':open'))) return false;
+        }
     }
 
     ev.preventDefault();

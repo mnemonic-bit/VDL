@@ -246,8 +246,6 @@ test('modal focus stays inside and returns to the direct playback launcher', asy
     await page.keyboard.press('Shift+Tab');
     expect(await page.evaluate(() => document.getElementById('playerContainer').contains(document.activeElement))).toBe(true);
     await page.locator('#playerSpeed').focus();
-    await page.keyboard.press('f');
-    expect(await page.evaluate(() => document.fullscreenElement)).toBeNull();
     await page.keyboard.press('Escape');
     await expect(page.locator('#playerBackdrop')).not.toHaveClass(/open/);
     await expect(launcher).toBeFocused();
