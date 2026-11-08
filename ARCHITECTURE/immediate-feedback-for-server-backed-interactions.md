@@ -1,6 +1,6 @@
 # Architecture: immediate feedback for server-backed interactions
 
-**Status:** Foundation and tag protocol implemented; additional adapters remain proposed.\
+**Status:** Foundation, tag protocol, and favorite adapter implemented; additional adapters remain proposed.\
 **Date:** 2026-11-08\
 **Requirements:** [Feature 0051](../FEATURES/feature-0051-immediate-feedback-for-server-backed-interactions.md)
 
@@ -18,8 +18,8 @@ Keep changes to those responsibilities here and link to the feature for its
 detailed requirements. If implementation requires changing a requirement, update
 the feature explicitly rather than silently contradicting it here.
 
-The initial implementation adds the shared modules and tag protocol described
-below. Other actions still use handlers and collection snapshots in
+The implementation adds the shared modules, tag protocol, and independent
+`favorite.set` adapter described below. Other actions still use handlers and collection snapshots in
 `static/app.js`, server routes and persistence in `vdl.py`, and SSE hints that
 trigger collection reads. The [rollout inventory](feature-0051-rollout.md) records
 which adapters remain staged. Existing
@@ -57,8 +57,8 @@ reconciliation may still use the existing batching delays.
 
 ## Module responsibilities and proposed placement
 
-The client modules below now host the initial tag delivery. Additional action
-adapters remain staged. The client remains raw browser JavaScript;
+The client modules below host tags and favorites. Additional action adapters
+remain staged. The client remains raw browser JavaScript;
 new scripts expose factory functions through one `window.VDL` namespace and load
 in dependency order before `app.js`. No bundler or runtime package is required.
 

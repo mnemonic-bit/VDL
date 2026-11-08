@@ -19,6 +19,7 @@ class HistoryApiTest(AppCase):
         self.assertEqual(response.get_json(), {
             "id": older_id,
             "favorite": True,
+            "favorite_revision": "1",
             "changed": True,
         })
         rows = self.client.get("/api/library").get_json()

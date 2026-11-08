@@ -482,7 +482,7 @@ test('History cards show preview first and preview click starts playback', async
     const preview = card.locator('.history-preview');
     await expect(preview).toBeVisible();
     await expect(preview).not.toHaveAttribute('title', /.+/);
-    await expect(card.locator('.favorite-toggle')).toHaveAttribute(
+    await expect(card.locator('.history-preview-wrap .favorite-toggle')).toHaveAttribute(
         'title', 'Add to favorites');
     await expect(card.locator('.history-card-title')).toHaveText('Preview title');
     await expect(card.locator('.history-info-popover')).toBeHidden();
@@ -599,7 +599,7 @@ test('hover previews wait before loading and only play one montage at a time', a
     await expect(first.locator('.history-preview-duration')).toHaveText('2:05');
     await expect(first.locator('.history-preview-duration')).toBeVisible();
 
-    await page.locator('[data-row-id="hover01"] .favorite-toggle').hover();
+    await page.locator('[data-row-id="hover01"] .history-preview-wrap .favorite-toggle').hover();
     await expect(firstVideo).toHaveAttribute('src', deliveries.hover01.url);
     await expect(first).toHaveClass(/preview-playing/);
     expect(await page.evaluate(() => window.__hoverPreviewPauses)).toBe(0);

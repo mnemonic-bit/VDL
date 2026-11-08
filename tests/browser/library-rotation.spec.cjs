@@ -51,9 +51,13 @@ test('rotation retains server order across favorites, search, reload, and waitin
     const expected = snapshot.items.map(item => item.id);
     await expect.poll(() => cardIds(page)).toEqual(expected);
     const first = page.locator(`#historyList [data-row-id="${expected[0]}"]`);
-    await first.locator('[data-favorite-action]').click();
+    await first.locator('.history-preview-wrap [data-favorite-action]').click();
     await refresh(page);
     await expect.poll(() => cardIds(page)).toEqual(expected);
+    await expect(first.locator('.history-preview-wrap .favorite-feedback')).toBeHidden();
+    // A programmatic search must start after the active favorite interaction.
+    await first.locator('.history-preview-wrap [data-favorite-action]').evaluate(button => button.blur());
+    await page.mouse.move(0, 0);
     await page.evaluate(() => {
         historySearchInput.value = 'Matching';
         historySearchInput.dispatchEvent(new Event('input', { bubbles: true }));

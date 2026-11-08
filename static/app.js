@@ -1321,15 +1321,24 @@ let tagCapabilities = null;
 let tagRenderScheduled = false;
 let acceptingTagSnapshots = false;
 const tagMutationMetrics = {
-    submissions: 0, acknowledgements: 0, unconfirmedOutcomes: 0, conflicts: 0,
+    submissions: 0, acknowledgements: 0, rejectedOutcomes: 0, unconfirmedOutcomes: 0, conflicts: 0,
     latestLocalFeedbackMs: null, latestAcknowledgementMs: null, reconciliationReads: 0,
     pending: 0, unconfirmed: 0, conflicted: 0,
 };
 VDL.tagMutationMetrics = () => Object.freeze({ ...tagMutationMetrics });
+// Favorite presentation shares the coordinator, but never the tag conflict domain.
+const favoriteEditPositions = new Map();
+const compatibilityFavorites = new Map();
+const favoriteNotices = new Map();
+const favoriteMutationMetrics = { ...tagMutationMetrics };
+const mutationMetrics = { ...tagMutationMetrics };
+VDL.favoriteMutationMetrics = () => Object.freeze({ ...favoriteMutationMetrics });
+VDL.mutationMetrics = () => Object.freeze({ ...mutationMetrics });
 const tagState = VDL.createClientState();
 const tagMutations = VDL.createMutations({
     state: tagState,
     transport: async ({ url, method, body }) => {
+        if (method === 'GET') mutationMetrics.reconciliationReads++;
         const response = await apiFetch(url, {
             method,
             ...(body === undefined ? {} : {
@@ -1340,16 +1349,29 @@ const tagMutations = VDL.createMutations({
         return { status: response.status, body: await response.json().catch(() => null) };
     },
     onEvent: event => {
-        if (event.outcome === 'presented') tagMutationMetrics.submissions++;
-        if (event.outcome === 'confirmed') {
-            tagMutationMetrics.acknowledgements++;
-            tagMutationMetrics.latestAcknowledgementMs = event.elapsedMs;
+        const domainMetrics = event.action === 'favorite.set' ? favoriteMutationMetrics : tagMutationMetrics;
+        for (const metrics of [domainMetrics, mutationMetrics]) {
+            if (event.outcome === 'presented') metrics.submissions++;
+            if (event.outcome === 'confirmed') {
+                metrics.acknowledgements++;
+                metrics.latestAcknowledgementMs = event.elapsedMs;
+            }
+            if (event.outcome === 'rejected') metrics.rejectedOutcomes++;
+            if (event.outcome === 'unconfirmed') metrics.unconfirmedOutcomes++;
+            if (event.outcome === 'conflicted') metrics.conflicts++;
         }
-        if (event.outcome === 'unconfirmed') tagMutationMetrics.unconfirmedOutcomes++;
-        if (event.outcome === 'conflicted') tagMutationMetrics.conflicts++;
-        tagMutationMetrics.pending = event.pending;
-        tagMutationMetrics.unconfirmed = event.unconfirmed;
-        tagMutationMetrics.conflicted = event.conflicted;
+        mutationMetrics.pending = event.pending;
+        mutationMetrics.unconfirmed = event.unconfirmed;
+        mutationMetrics.conflicted = event.conflicted;
+        if (event.action === 'favorite.set') {
+            const messages = {
+                presented: 'Saving favorite', confirmed: 'Favorite saved.',
+                rejected: 'Could not save favorite. Retry or dismiss the failed save.',
+                conflicted: 'Favorite changed elsewhere. Review the current favorite before retrying.',
+                unconfirmed: 'Favorite save not confirmed. Check its status before retrying.',
+            };
+            if (messages[event.outcome]) announceTagStatus(messages[event.outcome]);
+        }
     },
     onAuthLoss: resetTagSession,
     onNotice: ({ message }) => announceTagStatus(message),
@@ -1367,6 +1389,9 @@ function resetTagSession() {
     submittedTagIntents.clear();
     recoveredTagIntents.clear();
     checkingTagAvailability.clear();
+    favoriteEditPositions.clear();
+    compatibilityFavorites.clear();
+    favoriteNotices.clear();
     announceTagStatus('');
     updateTagMutationSummary();
     collectionSnapshots.library = [];
@@ -1389,7 +1414,15 @@ function updateTagMutationSummary() {
         submittedTagIntents.delete(intentId);
         recoveredTagIntents.delete(intentId);
     }
-    const intents = tagMutations.pending();
+    const allIntents = tagMutations.pending();
+    const intents = allIntents.filter(intent => intent.kind !== 'favorite.set');
+    const favoriteIntents = allIntents.filter(intent => intent.kind === 'favorite.set');
+    updateFavoriteMutationSummary(favoriteIntents);
+    for (const [metrics, entries] of [[favoriteMutationMetrics, favoriteIntents], [mutationMetrics, allIntents]]) {
+        metrics.pending = entries.filter(intent => ['queued', 'sending', 'unconfirmed', 'conflicted'].includes(intent.status)).length;
+        metrics.unconfirmed = entries.filter(intent => intent.status === 'unconfirmed').length;
+        metrics.conflicted = entries.filter(intent => intent.status === 'conflicted').length;
+    }
     tagMutationMetrics.pending = intents.filter(intent => ['queued', 'sending', 'unconfirmed', 'conflicted'].includes(intent.status)).length;
     tagMutationMetrics.unconfirmed = intents.filter(intent => intent.status === 'unconfirmed').length;
     tagMutationMetrics.conflicted = intents.filter(intent => intent.status === 'conflicted').length;
@@ -1416,7 +1449,8 @@ function projectTagEntry(info) {
     const projected = tagState.selectDownload(String(info.id));
     if (!projected) return info;
     return { ...info, tags: projected.tags, tag_items: projected.tag_items,
-        tags_revision: projected.tags_revision, tag_chips: projected.tag_chips };
+        tags_revision: projected.tags_revision, tag_chips: projected.tag_chips,
+        favorite: projected.favorite, favorite_revision: projected.favorite_revision, favorite_intents: projected.favorite_intents };
 }
 
 function hasTagProtocol() {
@@ -1446,6 +1480,9 @@ tagState.subscribe(ids => {
             collectionSnapshots[key] = collectionSnapshots[key].filter(info => String(info.id) !== String(id));
         }
         allLibraryEntries = allLibraryEntries.filter(info => String(info.id) !== String(id));
+        favoriteEditPositions.delete(String(id));
+        compatibilityFavorites.delete(String(id));
+        favoriteNotices.delete(String(id));
         editingTagIds.delete(String(id));
         tagDrafts.delete(String(id));
         tagEditPositions.delete(String(id));
@@ -1455,11 +1492,15 @@ tagState.subscribe(ids => {
     tagRenderScheduled = true;
     queueMicrotask(() => {
         tagRenderScheduled = false;
+        releaseSettledFavoriteInteractions();
         renderDownloadCollections();
         const statuses = ids.flatMap(id => tagState.selectDownload(id)?.tag_chips || [])
             .filter(chip => chip.status !== 'confirmed')
             .map(chip => chip.message || `${chip.operation === 'tag.remove' ? 'Removing' : 'Saving'} tag ${chip.name}`);
-        if (statuses.length) announceTagStatus(statuses.join('. '));
+        const delayedFavorites = ids.flatMap(id => tagState.selectDownload(id)?.favorite_intents || [])
+            .filter(intent => intent.delayed && intent.status === 'sending')
+            .map(intent => intent.message);
+        if (statuses.length || delayedFavorites.length) announceTagStatus([...statuses, ...delayedFavorites].join('. '));
     });
 });
 
@@ -2321,22 +2362,130 @@ function deleteDownload(id) {
         });
 }
 
+function hasFavoriteProtocol() {
+    return tagCapabilities?.mutation_protocol === 1 && tagCapabilities.actions?.includes('favorite.set');
+}
+
+function pinFavoriteInteraction(id) {
+    if (favoriteEditPositions.has(id)) return;
+    const cards = [...document.getElementById('historyList').children];
+    favoriteEditPositions.set(id, cards.findIndex(card => card.dataset.rowId === id));
+}
+
+function releaseSettledFavoriteInteractions() {
+    const before = favoriteEditPositions.size;
+    for (const id of favoriteEditPositions.keys()) {
+        const model = tagState.selectDownload(id);
+        const busy = model?.favorite_intents.length || compatibilityFavorites.has(id);
+        const controls = [...document.querySelectorAll('[data-favorite-control]')].filter(control => control.dataset.favoriteControl === id);
+        const interacting = controls.some(control => control.contains(document.activeElement) || control.matches(':hover'));
+        if (!busy && !interacting) favoriteEditPositions.delete(id);
+    }
+    if (before && !favoriteEditPositions.size) resumeDeferredHistoryFetch();
+}
+
+function updateFavoriteMutationSummary(intents) {
+    for (const id of ['favoriteMutationSummary', 'currentFavoriteMutationSummary']) {
+        const summary = document.getElementById(id);
+        if (!summary) continue;
+        const count = intents.length + compatibilityFavorites.size;
+        summary.hidden = !count;
+        summary.textContent = count ? `${count} favorite ${count === 1 ? 'edit' : 'edits'} ${intents.some(intent => intent.status === 'unconfirmed') ? 'not confirmed' : 'pending or needing attention'}. Open the entry’s favorite for details.` : '';
+    }
+}
+
+function renderFavoriteControl(info, inline = false) {
+    const id = String(info.id);
+    const favorite = Boolean(info.favorite);
+    const label = favorite ? 'Remove from favorites' : 'Add to favorites';
+    const intents = info.favorite_intents || [];
+    const pending = compatibilityFavorites.get(id);
+    const status = intents.find(intent => ['unconfirmed', 'conflicted', 'rejected'].includes(intent.status)) || intents[0];
+    const state = status?.status || pending?.status || 'confirmed';
+    let message = status?.message || pending?.message || (status ? 'Saving favorite' : favoriteNotices.get(id) || '');
+    if (status && ['sending', 'queued'].includes(status.status) && !status.delayed) message = 'Saving favorite';
+    const action = (name, text) => `<button type="button" data-favorite-recovery="${name}" data-intent-id="${escapeAttr(status.id)}">${text}</button>`;
+    let recovery = '';
+    if (status?.status === 'unconfirmed') recovery = action('check', 'Check save') + action('recover', 'Replay') + action('dismiss', 'Use current favorite');
+    else if (status && ['rejected', 'conflicted'].includes(status.status)) recovery = action('retry', 'Retry') + action('dismiss', 'Dismiss');
+    const queued = intents.filter(intent => intent.status === 'queued');
+    if (queued.length) recovery += queued.map(intent => `<button type="button" data-favorite-recovery="dismiss" data-intent-id="${escapeAttr(intent.id)}">Discard queued favorite ${intent.value ? 'add' : 'removal'}</button>`).join('');
+    return `<span data-favorite-control="${escapeAttr(id)}" class="favorite-control${inline ? ' favorite-control-inline' : ''}">
+        <button class="favorite-toggle${inline ? ' favorite-toggle-inline' : ''}" type="button" data-favorite-action data-download-id="${escapeAttr(id)}" data-favorite="${!favorite}" aria-label="${label}" title="${label}" aria-pressed="${favorite}"${pending ? ' disabled' : ''}><svg aria-hidden="true"><use href="#i-star"/></svg></button>
+        <span class="favorite-feedback" data-favorite-state="${state}"${message ? '' : ' hidden'}><span>${escapeHtml(message)}</span>${recovery}</span>
+    </span>`;
+}
+
 function toggleFavorite(button) {
     if (button.disabled) return;
-    button.disabled = true;
-    const id = button.dataset.downloadId;
-    const favorite = button.dataset.favorite === 'true';
-    apiAction('/api/favorite/' + encodeURIComponent(id), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ favorite }),
-    })
-        .then(() => fetchHistory())
-        .catch(() => {
-            button.disabled = false;
-            return fetchHistory();
-        }).finally(() => { button.disabled = false; });
+    const id = String(button.dataset.downloadId);
+    const model = tagState.selectDownload(id);
+    if (!model || unavailableTagIds.has(id)) return;
+    const favorite = !model.favorite;
+    pinFavoriteInteraction(id);
+    favoriteNotices.delete(id);
+    if (hasFavoriteProtocol()) {
+        const result = tagMutations.submit({ kind: 'favorite.set', targetId: id, value: favorite });
+        if (!result.accepted) {
+            favoriteNotices.set(id, result.message);
+            announceTagStatus(result.message);
+        } else if (result.intentId) submittedTagIntents.add(result.intentId);
+        const feedbackStartedAt = performance.now();
+        renderDownloadCollections();
+        favoriteMutationMetrics.latestLocalFeedbackMs = performance.now() - feedbackStartedAt;
+        mutationMetrics.latestLocalFeedbackMs = favoriteMutationMetrics.latestLocalFeedbackMs;
+        announceTagStatus(result.accepted ? 'Saving favorite' : result.message);
+        return;
+    }
+    // A legacy server has no receipt contract: show request feedback only.
+    const epoch = tagSessionEpoch;
+    compatibilityFavorites.set(id, { status: 'sending', message: 'Saving favorite' });
+    renderDownloadCollections();
+    const timer = setTimeout(() => {
+        if (epoch !== tagSessionEpoch || !compatibilityFavorites.has(id)) return;
+        compatibilityFavorites.set(id, { status: 'sending', message: 'Still waiting for favorite confirmation.' });
+        renderDownloadCollections();
+    }, 5000);
+    apiFetch('/api/favorite/' + encodeURIComponent(id), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ favorite }),
+    }).then(async response => {
+        if (epoch !== tagSessionEpoch) return;
+        if ([403, 404].includes(response.status)) { tagMutations.fence(id); return; }
+        if (!response.ok) throw new Error('Save not confirmed. Refresh to check the current favorite.');
+        const body = await response.json();
+        if (epoch !== tagSessionEpoch) return;
+        if (String(body.id) !== id || typeof body.favorite !== 'boolean') throw new Error('Save not confirmed. Refresh to check the current favorite.');
+        tagState.acceptDownload({ id, favorite: body.favorite, ...(typeof body.favorite_revision === 'string' && /^(0|[1-9]\d*)$/.test(body.favorite_revision) ? { favorite_revision: body.favorite_revision } : {}) });
+    }).catch(error => {
+        if (epoch === tagSessionEpoch && tagState.isAvailable(id)) favoriteNotices.set(id, error.message || 'Save not confirmed. Refresh to check the current favorite.');
+    }).finally(() => {
+        clearTimeout(timer);
+        if (epoch !== tagSessionEpoch) return;
+        compatibilityFavorites.delete(id);
+        releaseSettledFavoriteInteractions();
+        renderDownloadCollections();
+    });
 }
+
+document.addEventListener('click', event => {
+    const button = event.target.closest('[data-favorite-recovery]');
+    if (!button) return;
+    const id = button.dataset.intentId;
+    const action = button.dataset.favoriteRecovery;
+    if (action === 'check') tagMutations.recover(id);
+    else if (action === 'recover') tagMutations.recover(id, { replay: true });
+    else if (action === 'retry') tagMutations.retry(id);
+    else if (!tagMutations.resolve(id)) announceTagStatus('The original favorite save may still complete. Check its status before using the current favorite.');
+});
+for (const eventName of ['focusout', 'pointerout']) document.addEventListener(eventName, event => {
+    if (!event.target.closest?.('[data-favorite-control]')) return;
+    queueMicrotask(() => {
+        const before = favoriteEditPositions.size;
+        releaseSettledFavoriteInteractions();
+        if (before !== favoriteEditPositions.size) renderDownloadCollections();
+    });
+});
+
 
 function changeDownloadVisibility(select) {
     if (select.disabled) return;
@@ -3395,12 +3544,7 @@ function renderHistoryCard(info) {
     }
     menuItems.push(`<button class="danger" onclick="deleteDownload('${id}')"><svg class="menu-icon"><use href="#i-trash"/></svg>Delete</button>`);
 
-    const favorite = Boolean(info.favorite);
-    const favoriteLabel = favorite ? 'Remove from favorites' : 'Add to favorites';
-    const favoriteButton = `
-                    <button class="favorite-toggle" type="button" data-favorite-action data-download-id="${escapeAttr(id)}" data-favorite="${favorite ? 'false' : 'true'}" aria-label="${favoriteLabel}" title="${favoriteLabel}" aria-pressed="${favorite}">
-                        <svg aria-hidden="true"><use href="#i-star"/></svg>
-                    </button>`;
+    const favoriteButton = renderFavoriteControl(info);
     const viewCount = Math.max(0, Number.parseInt(info.view_count, 10) || 0);
     const newBadge = viewCount === 0
         ? '<span class="history-preview-label history-preview-new">new</span>'
@@ -3539,6 +3683,7 @@ function renderHistoryCard(info) {
                                 <div class="history-info-label">Tags</div>
                                 ${renderTagControl(info)}
                             </div>
+                            <div class="history-info-section"><div class="history-info-label">Favorite</div>${renderFavoriteControl(info, true)}</div>
                             ${fileControl}
                             ${visibilityControl}
                             ${sourceControl}
@@ -3728,6 +3873,7 @@ function renderItem(info, inHistoryView = false) {
                 <div class="history-item" data-row-id="${id}">
                     <div class="row-actions">${actions}</div>
                     ${titleRow}
+                    ${renderFavoriteControl(info, true)}
                     ${tagRow}
                     ${bottom}
                     ${downloadSummaryRow}
@@ -4408,6 +4554,7 @@ async function checkTagAvailability(id, { authoritative = false } = {}) {
     checkingTagAvailability.add(id);
     const epoch = tagSessionEpoch;
     const context = tagState.capture();
+    mutationMetrics.reconciliationReads++;
     try {
         const response = await apiFetch(`/api/downloads/${encodeURIComponent(id)}/editable-state`);
         if (epoch !== tagSessionEpoch) return;
@@ -4434,7 +4581,7 @@ function checkMissingTagTargets(previous, next) {
         const id = String(entry.id);
         if (present.has(id)) continue;
         const model = tagState.selectDownload(id);
-        if (!model?.tag_chips.some(chip => chip.status !== 'confirmed') && !editingTagIds.has(id)) continue;
+        if (!model?.tag_chips.some(chip => chip.status !== 'confirmed') && !model?.favorite_intents.length && !editingTagIds.has(id)) continue;
         checkTagAvailability(id);
     }
 }
@@ -4454,6 +4601,8 @@ function fetchDownloadCollection(key) {
         const authEpoch = tagSessionEpoch;
         const tagContext = tagState.capture();
         tagMutationMetrics.reconciliationReads++;
+        favoriteMutationMetrics.reconciliationReads++;
+        mutationMetrics.reconciliationReads++;
         try {
             const snapshot = await readCollection(key === 'library'
                 ? '/api/library?include_order=true' : '/api/current-downloads', { ordered: key === 'library' });
@@ -4463,14 +4612,14 @@ function fetchDownloadCollection(key) {
             if (key === 'library') {
                 const changed = libraryOrder.kind !== snapshot.order.kind
                     || libraryOrder.generation_id !== snapshot.order.generation_id;
-                if (changed && (historyRefreshBlocked() || renameDrafts.size || editingTagIds.size)) {
+                if (changed && (historyRefreshBlocked() || renameDrafts.size || editingTagIds.size || favoriteEditPositions.size)) {
                     historyFetchDeferred = true;
                     return;
                 }
                 const complete = snapshot.order.kind === 'rotation'
                     ? await readCollection('/api/library-catalog') : data;
                 if (authEpoch !== tagSessionEpoch || requestEpoch !== libraryRequestEpoch) return;
-                if (changed && (historyRefreshBlocked() || renameDrafts.size || editingTagIds.size)) {
+                if (changed && (historyRefreshBlocked() || renameDrafts.size || editingTagIds.size || favoriteEditPositions.size)) {
                     historyFetchDeferred = true;
                     return;
                 }
@@ -4554,8 +4703,8 @@ function renderDownloadCollections({ sortFavorites = false } = {}) {
     }
     historyOrderIds = historyEntries.map(info => String(info.id));
     refreshAvailableTags(historyEntries);
-    const done = historyEntries.filter(info => matchesSearchFilter(info) || editingTagIds.has(String(info.id)));
-    for (const [id, position] of tagEditPositions) {
+    const done = historyEntries.filter(info => matchesSearchFilter(info) || editingTagIds.has(String(info.id)) || favoriteEditPositions.has(String(info.id)));
+    for (const [id, position] of new Map([...tagEditPositions, ...favoriteEditPositions])) {
         const index = done.findIndex(info => String(info.id) === id);
         if (index < 0 || position < 0) continue;
         const [entry] = done.splice(index, 1);

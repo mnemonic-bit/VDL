@@ -81,7 +81,7 @@ class SchemaMigrationTest(unittest.TestCase):
                     "filename", "resolution", "filesize", "speed", "eta",
                     "title", "finished_at", "formats", "requested_format",
                     "output_dir", "requested_filename",
-                    "downloaded_bytes", "total_bytes", "favorite",
+                    "downloaded_bytes", "total_bytes", "favorite", "favorite_revision",
                     "view_count",
                     "source_type", "owner_user_id", "owner_username",
                     "visibility", "browser_authenticated",
@@ -110,6 +110,7 @@ class SchemaMigrationTest(unittest.TestCase):
                     "interrupted",
                 )
                 self.assertIs(vdl.db_get_download("legacy1")["favorite"], False)
+                self.assertEqual(vdl.db_get_download("legacy1")["favorite_revision"], "0")
                 self.assertEqual(vdl.db_get_download("legacy1")["view_count"], 0)
                 self.assertEqual(
                     vdl.db_get_download("legacy1")["source_type"],

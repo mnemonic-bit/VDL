@@ -35,7 +35,7 @@ class TagMutationProtocolTest(AppCase):
         self.assertEqual(capabilities.headers['Cache-Control'], 'no-store')
         self.assertEqual(capabilities.json['mutation_protocol'], 1)
         self.assertEqual(capabilities.json['tag_identity_version'], vdl.TAG_IDENTITY_VERSION)
-        self.assertEqual(set(capabilities.json['actions']), {'tag.add', 'tag.remove'})
+        self.assertEqual(set(capabilities.json['actions']), {'tag.add', 'tag.remove', 'favorite.set'})
         payload = self.attempt('  Straße   Videos ')
         response = self.mutate(payload)
         self.assertEqual(response.status_code, 200)
@@ -49,7 +49,7 @@ class TagMutationProtocolTest(AppCase):
             self.assertEqual(state['tags'], ['Straße Videos'])
             self.assertEqual(state['tag_items'], body['tag_items'])
             self.assertEqual(state['tags_revision'], '1')
-        self.assertEqual(self.state().json['permissions'], {'tags': True})
+        self.assertEqual(self.state().json['permissions'], {'tags': True, 'favorite': True})
 
     def test_legacy_noop_progress_remove_and_restart_revisions(self):
         self.assertEqual(self.mutate({'tag': 'First'}).json['tags_revision'], '1')

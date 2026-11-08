@@ -23,7 +23,7 @@ function harness() {
     const requests = [];
     const events = [];
     let authLoss = 0;
-    const capabilities = { mutation_protocol: 1, actions: ['tag.add', 'tag.remove'], tag_identity_version: VDL.tagIdentity.version, server_time: clock };
+    const capabilities = { mutation_protocol: 1, actions: ['tag.add', 'tag.remove', 'favorite.set'], tag_identity_version: VDL.tagIdentity.version, server_time: clock };
     const mutations = VDL.createMutations({
         state, capabilities, onEvent: event => events.push(plain(event)), now: () => clock,
         random: () => (++random).toString(16).padStart(32, '0'),
@@ -33,7 +33,7 @@ function harness() {
         onAuthLoss: () => { authLoss++; },
     });
     function snapshot(id = 'a', names = [], revision = '0', extra = {}) {
-        return { id, tags: names, tag_items: names.map(name => plain(VDL.tagIdentity.normalize(name))), tags_revision: revision, tag_identity_version: VDL.tagIdentity.version, permissions: { tags: true }, ...extra };
+        return { id, favorite: false, favorite_revision: '0', tags: names, tag_items: names.map(name => plain(VDL.tagIdentity.normalize(name))), tags_revision: revision, tag_identity_version: VDL.tagIdentity.version, permissions: { tags: true }, ...extra };
     }
     function ack(request, names, revision, extra = {}) {
         return { status: 200, body: { ...snapshot(decodeURIComponent(request.url.split('/').pop()), names, revision), mutation: { id: request.body.client_mutation_id, domain: 'tags', outcome: 'committed', revision }, submitted_tag: plain(VDL.tagIdentity.normalize(request.body.tag)), ...extra } };
@@ -97,7 +97,7 @@ test('older acknowledgement retires intent without replacing a newer remote snap
     const h = harness();
     h.mutations.submit({ kind: 'tag.add', targetId: 'a', value: 'Music' });
     await tick();
-    h.state.acceptDownload(h.snapshot('a', ['Remote'], '10', { favorite: true }));
+    h.state.acceptDownload(h.snapshot('a', ['Remote'], '10', { favorite: true, favorite_revision: '1' }));
     h.requests[0].resolve(h.ack(h.requests[0], ['Music'], '2'));
     await tick();
     const model = h.state.selectDownload('a');
@@ -485,4 +485,161 @@ test('contradictory acknowledgement domain revisions leave the immutable attempt
     assert.equal(h.mutations.status(admitted.intentId).status, 'unconfirmed');
     assert.equal(h.state.selectDownload('a').tags_revision, '0');
     assert.deepEqual(plain(h.state.selectDownload('a').tags), ['Music']);
+});
+
+
+function favoriteReply(request, favorite, revision, outcome = 'committed') {
+    return { status: outcome === 'committed' ? 200 : outcome === 'conflicted' ? 409 : 400, body: {
+        id: decodeURIComponent(request.url.split('/').pop()), favorite, favorite_revision: revision,
+        mutation: { id: request.body.client_mutation_id, domain: 'favorite', outcome, revision },
+    } };
+}
+
+test('favorite projection is immediate, explicit true false true stays FIFO, and tags use an independent queue', async () => {
+    const h = harness();
+    const first = h.mutations.submit({ kind: 'favorite.set', targetId: 'a', value: true });
+    const second = h.mutations.submit({ kind: 'favorite.set', targetId: 'a', value: false });
+    const third = h.mutations.submit({ kind: 'favorite.set', targetId: 'a', value: true });
+    h.mutations.submit({ kind: 'tag.add', targetId: 'a', value: 'Independent' });
+    assert.equal(h.state.selectDownload('a').favorite, true);
+    assert.equal(h.state.selectDownload('a').favorite_intents.length, 3);
+    assert.deepEqual(plain(h.state.selectDownload('a').tags), ['Independent']);
+    assert.notEqual(first.intentId, third.intentId);
+    await tick();
+    assert.equal(h.requests.length, 2);
+    assert.equal(h.requests[0].url, '/api/favorite/a');
+    assert.equal(h.requests[1].url, '/api/tags/a');
+    h.requests[0].resolve(favoriteReply(h.requests[0], true, '1'));
+    await tick();
+    assert.equal(h.requests[2].body.favorite, false);
+    assert.equal(h.requests[2].body.expected_revision, '1');
+    assert.equal(h.state.selectDownload('a').favorite, true);
+    h.requests[2].resolve(favoriteReply(h.requests[2], false, '2'));
+    await tick();
+    assert.equal(h.requests[3].body.favorite, true);
+    h.requests[3].resolve(favoriteReply(h.requests[3], true, '3'));
+    await tick();
+    assert.equal(h.state.selectDownload('a').favorite_revision, '3');
+    assert.equal(h.state.selectDownload('a').favorite_intents.length, 0);
+    assert.equal(h.mutations.status(second.intentId), null);
+});
+
+test('favorite rejects only its own projection while later opposite intents survive', async () => {
+    const h = harness();
+    const first = h.mutations.submit({ kind: 'favorite.set', targetId: 'a', value: true });
+    h.mutations.submit({ kind: 'favorite.set', targetId: 'a', value: false });
+    h.mutations.submit({ kind: 'favorite.set', targetId: 'a', value: true });
+    await tick();
+    h.requests[0].resolve(favoriteReply(h.requests[0], false, '0', 'rejected'));
+    await tick();
+    assert.equal(h.mutations.status(first.intentId).status, 'rejected');
+    assert.equal(h.state.selectDownload('a').favorite, true);
+    assert.equal(h.requests.length, 2);
+    assert.equal(h.requests[1].body.favorite, false);
+    assert.deepEqual(plain(h.state.selectDownload('a').tag_chips), []);
+});
+
+test('favorite acknowledgement is atomic and older responses and GETs cannot regress confirmed state', async () => {
+    const h = harness();
+    h.mutations.submit({ kind: 'favorite.set', targetId: 'a', value: true });
+    await tick();
+    h.state.acceptDownload({ id: 'a', favorite: false, favorite_revision: '2' });
+    const notifications = [];
+    h.state.subscribe(() => notifications.push(plain(h.state.selectDownload('a'))));
+    h.requests[0].resolve(favoriteReply(h.requests[0], true, '1'));
+    await tick();
+    assert.equal(notifications.length, 1);
+    assert.equal(notifications[0].favorite, false);
+    assert.equal(notifications[0].favorite_intents.length, 0);
+    h.state.acceptDownload({ id: 'a', favorite: true, favorite_revision: '1' });
+    assert.equal(h.state.selectDownload('a').favorite, false);
+    assert.equal(h.state.selectDownload('a').favorite_revision, '2');
+    assert.equal(h.state.acceptDownload({ id: 'a', favorite: true, favorite_revision: '2' }), false);
+});
+
+test('favorite receipt recovery confirms a lost response without automatic replay', async () => {
+    const h = harness();
+    const intent = h.mutations.submit({ kind: 'favorite.set', targetId: 'a', value: true });
+    await tick();
+    h.requests[0].reject(new Error('response lost'));
+    await tick();
+    assert.equal(h.requests[1].method, 'GET');
+    assert.equal(h.mutations.status(intent.intentId).status, 'unconfirmed');
+    assert.equal(h.state.selectDownload('a').favorite, true);
+    h.requests[1].resolve(favoriteReply(h.requests[0], true, '1'));
+    await tick();
+    assert.equal(h.state.selectDownload('a').favorite_revision, '1');
+    assert.equal(h.mutations.status(intent.intentId), null);
+    assert.equal(h.requests.length, 2);
+});
+
+test('favorite recovery deliberately replays the frozen attempt and cannot dismiss ambiguous outcomes', async () => {
+    const h = harness();
+    const intent = h.mutations.submit({ kind: 'favorite.set', targetId: 'a', value: true });
+    await tick();
+    h.requests[0].reject(new Error('lost'));
+    await tick();
+    h.requests[1].resolve({ status: 404, body: { error: 'Mutation unavailable', final: false } });
+    await tick();
+    assert.equal(h.mutations.resolve(intent.intentId), false);
+    const recovery = h.mutations.recover(intent.intentId, { replay: true });
+    h.requests[2].resolve({ status: 404, body: { error: 'Mutation unavailable', final: false } });
+    await recovery;
+    await tick();
+    assert.deepEqual(h.requests[3].body, h.requests[0].body);
+    h.requests[3].resolve(favoriteReply(h.requests[0], true, '1'));
+    await tick();
+    assert.equal(h.mutations.status(intent.intentId), null);
+});
+
+test('favorite conflict pauses only its own domain and explicit retry uses an authorized fresh revision', async () => {
+    const h = harness();
+    const intent = h.mutations.submit({ kind: 'favorite.set', targetId: 'a', value: true });
+    await tick();
+    h.requests[0].resolve(favoriteReply(h.requests[0], false, '2', 'conflicted'));
+    await tick();
+    assert.equal(h.state.selectDownload('a').favorite, false);
+    h.mutations.submit({ kind: 'tag.add', targetId: 'a', value: 'Still usable' });
+    await tick();
+    assert.equal(h.requests[1].url, '/api/tags/a');
+    h.mutations.retry(intent.intentId);
+    h.requests[2].resolve({ status: 200, body: { id: 'a', favorite: false, favorite_revision: '3' } });
+    await tick();
+    assert.equal(h.requests[3].body.expected_revision, '3');
+    assert.notEqual(h.requests[3].body.client_mutation_id, h.requests[0].body.client_mutation_id);
+});
+
+test('malformed favorite acknowledgements stay unknown, and access loss fences both domains', async () => {
+    for (const extra of [{ favorite: 'true' }, { favorite: false }, { favorite_revision: '2' }, { mutation: { domain: 'tags' } }]) {
+        const h = harness();
+        const intent = h.mutations.submit({ kind: 'favorite.set', targetId: 'a', value: true });
+        await tick();
+        const reply = favoriteReply(h.requests[0], true, '1');
+        Object.assign(reply.body, extra);
+        h.requests[0].resolve(reply);
+        await tick();
+        assert.equal(h.mutations.status(intent.intentId).status, 'unconfirmed');
+        assert.equal(h.state.selectDownload('a').favorite_revision, '0');
+    }
+    const h = harness();
+    h.mutations.submit({ kind: 'favorite.set', targetId: 'a', value: true });
+    h.mutations.submit({ kind: 'tag.add', targetId: 'a', value: 'Private' });
+    await tick();
+    h.requests[0].resolve({ status: 403, body: {} });
+    await tick();
+    h.requests[1].resolve(h.ack(h.requests[1], ['Private'], '1'));
+    await tick();
+    assert.equal(h.state.selectDownload('a'), null);
+    assert.equal(h.mutations.pending().length, 0);
+});
+
+test('favorite capability does not depend on tag identity, and duplicate explicit desired values do not write twice', async () => {
+    const h = harness();
+    h.mutations.setCapabilities({ ...h.capabilities, tag_identity_version: 'unsupported' });
+    assert.equal(h.mutations.submit({ kind: 'favorite.set', targetId: 'a', value: false }).settled, true);
+    assert.equal(h.mutations.submit({ kind: 'favorite.set', targetId: 'a', value: 'true' }).reason, 'validation');
+    const first = h.mutations.submit({ kind: 'favorite.set', targetId: 'a', value: true });
+    assert.equal(h.mutations.submit({ kind: 'favorite.set', targetId: 'a', value: true }).intentId, first.intentId);
+    await tick();
+    assert.equal(h.requests.length, 1);
 });

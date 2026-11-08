@@ -1,7 +1,7 @@
 # Immediate feedback for favorites
 
 **Source:** Remaining Feature 0051 rollout item\
-**Status:** Proposed; not implemented\
+**Status:** Implemented in 0.55.0\
 **Last refined:** 2026-11-08\
 **Extends:** [Feature 0051](feature-0051-immediate-feedback-for-server-backed-interactions.md), [Feature 0020, Favorites](feature-0020-favorite-downloads.md)\
 **Rollout:** [Shared requirements and inventory](../ARCHITECTURE/feature-0051-rollout.md#shared-requirements-for-the-remaining-specs)
@@ -58,6 +58,37 @@ Advertise the adapter only after all writers and read serializers participate.
 Without that capability, show pending request feedback using the existing
 server contract, without fabricated revisions or receipt recovery. Access loss,
 deletion, and authentication reset override every projected star.
+
+## Adapter contract
+
+The trusted action is `favorite.set`, with an explicit boolean value and the
+independent `(entry ID, favorite)` queue. A visible entry remains editable by
+the same authenticated users as before; this feature adds no owner-only rule.
+Authorization is checked again inside the write transaction and on recovery.
+Library cards, Info, Current downloads, and playlist presentations select the
+same projected value. Collection membership and playback selection remain
+server-owned.
+
+`POST /api/favorite/<id>` retains its legacy `{favorite: boolean}` request and
+adds `client_mutation_id` and decimal-string `expected_revision` for adopted
+clients. Canonical responses carry `id`, boolean `favorite`, decimal-string
+`favorite_revision`, `changed`, and
+`mutation: {id, domain: "favorite", outcome, revision}`. The acknowledgement
+decoder checks the target, mutation correlation, domain, boolean, revision,
+and outcome before retiring an intent. A committed response must confirm the
+frozen desired boolean. Malformed success remains unconfirmed.
+
+Collection/item serializers and `GET /api/downloads/<id>/editable-state` expose
+the same favorite value/revision snapshot. `GET /api/client-capabilities`
+advertises `favorite.set` only when this contract is supported. Favorite support
+does not depend on the Unicode identity helper used by tags.
+
+`GET /api/mutations/<mutation-id>` performs the shared actor-scoped receipt
+check. Recovery may read status automatically within the shared bounds; writes
+are replayed only after deliberate user action, using the frozen request and
+original ID. Conflict retry first reads current authorized state and creates a
+new attempt. Matching reads alone cannot release an unknown attempt: receipt,
+newer favorite revision, or serialized expired-attempt finality is required.
 
 ## Acceptance criteria
 

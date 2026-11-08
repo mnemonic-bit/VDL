@@ -39,6 +39,7 @@
         function acceptDownload(snapshot, context = {}) {
             if (!snapshot || snapshot.id == null || (context.epoch !== undefined && context.epoch !== epoch)) return false;
             if (snapshot.tags_revision !== undefined && (!revision(snapshot.tags_revision) || !Array.isArray(snapshot.tags) || !Array.isArray(snapshot.tag_items) || snapshot.tags.length !== snapshot.tag_items.length || snapshot.tag_items.some((tag, index) => !tag || typeof tag.key !== 'string' || typeof tag.name !== 'string' || tag.name !== snapshot.tags[index]) || new Set(snapshot.tag_items.map(tag => tag.key)).size !== snapshot.tag_items.length)) return false;
+            if (snapshot.favorite_revision !== undefined && (!revision(snapshot.favorite_revision) || typeof snapshot.favorite !== 'boolean')) return false;
             const id = String(snapshot.id);
             const fence = fences.get(id);
             if (fence !== undefined) {
@@ -58,6 +59,14 @@
                     return false;
                 }
             }
+            if (old && revision(old.favorite_revision)) {
+                if (!revision(snapshot.favorite_revision) || BigInt(snapshot.favorite_revision) < BigInt(old.favorite_revision)) {
+                    next.favorite = old.favorite;
+                    next.favorite_revision = old.favorite_revision;
+                } else if (snapshot.favorite_revision === old.favorite_revision && snapshot.favorite !== old.favorite) {
+                    return false;
+                }
+            }
             downloads.set(id, next);
             notify(id);
             return true;
@@ -66,12 +75,19 @@
             const id = String(value);
             const download = downloads.get(id);
             if (!download || fences.has(id)) return null;
+            let favorite = Boolean(download.favorite);
+            const favoriteIntents = [];
             const chips = new Map();
             for (const tag of download.tag_items || (download.tags || []).map(name => VDL.tagIdentity.normalize(name))) {
                 chips.set(tag.key, { ...tag, status: 'confirmed', intentId: null, operation: null, effective: true });
             }
             for (const intent of intents.values()) {
                 if (intent.targetId !== id) continue;
+                if (intent.kind === 'favorite.set') {
+                    favoriteIntents.push(copy(intent));
+                    if (!['rejected', 'conflicted'].includes(intent.status)) favorite = intent.value;
+                    continue;
+                }
                 const failed = intent.status === 'rejected' || intent.status === 'conflicted';
                 const current = chips.get(intent.key);
                 const effective = failed ? !!(current && current.effective) : intent.kind === 'tag.add';
@@ -91,7 +107,7 @@
                 rows.sort((a, b) => a.name.localeCompare(b.name));
             }
             const effective = rows.filter(tag => tag.effective).map(tag => ({ key: tag.key, name: tag.name }));
-            return freeze(copy({ ...download, tags: effective.map(tag => tag.name), tag_items: effective, tag_chips: rows }));
+            return freeze(copy({ ...download, favorite, favorite_intents: favoriteIntents, tags: effective.map(tag => tag.name), tag_items: effective, tag_chips: rows }));
         }
         function fence(id) {
             id = String(id);

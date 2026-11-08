@@ -841,6 +841,7 @@
                 </button>
             </div>
             <div class="current-drawer-body">
+                <p id="currentFavoriteMutationSummary" class="tag-mutation-summary" hidden></p>
                 <p id="currentTagMutationSummary" class="tag-mutation-summary" hidden></p>
                 <div id="currentTagMutationStatus" class="visually-hidden" role="status" aria-live="polite" aria-atomic="true"></div>
                 <div id="currentDrawerError" class="action-error" role="alert" aria-live="assertive" hidden>
@@ -971,6 +972,7 @@
         </div>
     </div>
 
+    <p id="favoriteMutationSummary" class="tag-mutation-summary" hidden></p>
     <p id="tagMutationSummary" class="tag-mutation-summary" hidden></p>
     <footer id="versionFooter" class="version-footer" data-ui-version="{{ ui_version }}">
         <span id="serverStatus" class="server-status" role="alert" hidden>Server is not available — actions will not work until the connection is restored.</span>

@@ -209,7 +209,7 @@ test('retained Library controls remain usable after successful actions', async (
     await seed(page, { id: 'retained-controls', status: 'finished' });
     await refresh(page);
     const row = page.locator('#historyList [data-row-id="retained-controls"]');
-    const favorite = row.locator('.favorite-toggle');
+    const favorite = row.locator('.history-preview-wrap .favorite-toggle');
     await favorite.click();
     await expect(favorite).toBeEnabled();
     await expect(favorite).toHaveAttribute('aria-pressed', 'true');

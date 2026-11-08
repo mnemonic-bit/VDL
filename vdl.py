@@ -337,7 +337,8 @@ def require_authenticated_user():
 def companion_response_headers(response):
     """Apply the narrow CORS and cache boundary to companion responses."""
     if request.endpoint in ('library_storage', 'client_capabilities',
-                            'editable_download_state', 'mutation_receipt', 'download_tags'):
+                            'editable_download_state', 'mutation_receipt', 'download_tags',
+                            'set_download_favorite'):
         response.headers['Cache-Control'] = 'no-store'
     if request.endpoint not in EXTENSION_NO_STORE_ENDPOINTS:
         return response
@@ -813,6 +814,7 @@ def init_db():
             # Existing libraries start unstarred; favorites are an explicit
             # user choice rather than something inferred during migration.
             ("favorite", "ALTER TABLE downloads ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0"),
+            ("favorite_revision", "ALTER TABLE downloads ADD COLUMN favorite_revision INTEGER NOT NULL DEFAULT 0"),
             ("tags_revision", "ALTER TABLE downloads ADD COLUMN tags_revision INTEGER NOT NULL DEFAULT 0"),
             # A view is an explicit preview activation. Keeping the counter
             # independent of media requests avoids counting range fetches,
@@ -844,9 +846,14 @@ def init_db():
         ]:
             if col not in existing_cols:
                 conn.execute(ddl)
-        # Attachment triggers include legacy clients, imports and cleanup writers.
-        # Revisions therefore describe stored membership, independent of progress.
+        # Triggers include legacy clients, imports and cleanup writers, so each
+        # metadata revision stays independent of progress and other domains.
         conn.executescript("""
+            CREATE TRIGGER IF NOT EXISTS download_favorite_revision
+            AFTER UPDATE OF favorite ON downloads WHEN NEW.favorite != OLD.favorite BEGIN
+                UPDATE downloads SET favorite_revision = OLD.favorite_revision + 1
+                WHERE id = NEW.id;
+            END;
             CREATE TRIGGER IF NOT EXISTS download_tag_insert_revision
             AFTER INSERT ON download_tags BEGIN
                 UPDATE downloads SET tags_revision = tags_revision + 1
@@ -1268,7 +1275,7 @@ def db_get_download(download_id):
         if row is None:
             return None
         result = dict(row)
-        result["favorite"] = bool(result["favorite"])
+        result.update(_favorite_snapshot(conn, download_id, row))
         result["quality"] = classify_video_quality(result["resolution"])
         result.update(_tag_snapshot(conn, download_id, row))
         return result
@@ -1312,7 +1319,7 @@ def db_set_download_favorite(download_id, favorite):
                 (int(favorite), download_id),
             )
     if changed:
-        event_bus.publish("change", {"reason": "favorite", "id": download_id})
+        _publish_metadata_change('favorite')
     return changed
 
 
@@ -1415,7 +1422,7 @@ def _tag_actor(conn):
 
 def _tag_visible_row(conn, download_id, actor):
     row = conn.execute(
-        "SELECT id, visibility, owner_user_id, tags_revision "
+        "SELECT id, visibility, owner_user_id, tags_revision, favorite, favorite_revision "
         "FROM downloads WHERE id = ?", (download_id,),
     ).fetchone()
     if row is not None and (row['visibility'] == 'public'
@@ -1455,16 +1462,49 @@ def _apply_tag(conn, download_id, name, key, method):
     return cursor.rowcount == 1
 
 
-def _publish_tag_change():
-    # Broadcast hints must not disclose a private entry's identity. A publishing
-    # failure after commit cannot turn a durable success into a failed mutation.
+def _favorite_snapshot(conn, download_id, row=None):
+    if row is None:
+        row = conn.execute(
+            'SELECT favorite, favorite_revision FROM downloads WHERE id = ?',
+            (download_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    return _serialize_favorite_state(download_id, row['favorite'], row['favorite_revision'])
+
+
+def _serialize_favorite_state(download_id, favorite, revision):
+    return {'id': download_id, 'favorite': bool(favorite), 'favorite_revision': str(revision)}
+
+
+def _publish_metadata_change(domain):
+    # Private identities stay on authorized responses. Publication cannot undo
+    # the already committed mutation and receipt.
     try:
-        event_bus.publish('change', {'reason': 'tag'})
+        event_bus.publish('change', {'reason': 'tag' if domain == 'tags' else domain})
     except Exception:
-        app.logger.warning('mutation action=tag outcome=committed publish=failed')
+        app.logger.warning('mutation action=%s outcome=committed publish=failed', domain)
+
+
+def _publish_tag_change():
+    _publish_metadata_change('tags')
 
 
 def _execute_tag_mutation(download_id, payload, method):
+    return _execute_metadata_mutation(download_id, payload, method, 'tags')
+
+
+def _execute_favorite_mutation(download_id, payload):
+    return _execute_metadata_mutation(download_id, payload, 'POST', 'favorite')
+
+
+def _execute_metadata_mutation(download_id, payload, method, domain):
+    # Only the route's trusted adapter selects a domain; all database-backed
+    # metadata shares authorization, admission, receipt and commit ordering.
+    is_tag = domain == 'tags'
+    snapshot = _tag_snapshot if is_tag else _favorite_snapshot
+    action = ('tag.add' if method == 'POST' else 'tag.remove') if is_tag else 'favorite.set'
+    revision_field = 'tags_revision' if is_tag else 'favorite_revision'
     protocol = 'client_mutation_id' in payload or 'expected_revision' in payload
     mutation_id = payload.get('client_mutation_id')
     changed = False
@@ -1476,19 +1516,37 @@ def _execute_tag_mutation(download_id, payload, method):
         row = _tag_visible_row(conn, download_id, actor)
         if row is None:
             return {'error': 'Unknown download id'}, 404
-        state = _tag_snapshot(conn, download_id, row)
+        state = snapshot(conn, download_id, row)
         error = None
-        try:
-            name, key = _validated_tag_name(payload.get('tag'))
-        except ValueError as exc:
-            name, key, error = None, None, str(exc)
-        submitted_before = next((item for item in state['tag_items'] if item['key'] == key), None)
+        name = key = submitted_before = None
+        if is_tag:
+            try:
+                name, key = _validated_tag_name(payload.get('tag'))
+            except ValueError as exc:
+                error = str(exc)
+            value = key if key is not None else payload.get('tag')
+            submitted_before = next((item for item in state['tag_items'] if item['key'] == key), None)
+        else:
+            value = payload.get('favorite')
+            if not isinstance(value, bool):
+                error = 'Favorite must be true or false'
+
+        def apply():
+            if is_tag:
+                return _apply_tag(conn, download_id, name, key, method)
+            if state['favorite'] == value:
+                return False
+            conn.execute('UPDATE downloads SET favorite = ? WHERE id = ?', (int(value), download_id))
+            return True
+
         if not protocol:
             if error:
                 return {'error': error}, 400
-            changed = _apply_tag(conn, download_id, name, key, method)
-            result = _tag_snapshot(conn, download_id)
-            result.update(changed=changed, available_tags=_tag_vocabulary(conn, actor))
+            changed = apply()
+            result = snapshot(conn, download_id)
+            result['changed'] = changed
+            if is_tag:
+                result['available_tags'] = _tag_vocabulary(conn, actor)
             status = 200
         else:
             match = MUTATION_ID_PATTERN.fullmatch(mutation_id) if isinstance(mutation_id, str) else None
@@ -1496,8 +1554,7 @@ def _execute_tag_mutation(download_id, payload, method):
                 return {'error': 'Invalid mutation identifier'}, 400
             expected = payload.get('expected_revision')
             fingerprint = hashlib.sha256(json.dumps(
-                [method, 'tag.add' if method == 'POST' else 'tag.remove',
-                 download_id, key if key is not None else payload.get('tag'), expected],
+                [method, action, download_id, value, expected],
                 sort_keys=True, ensure_ascii=True, separators=(',', ':'),
             ).encode()).hexdigest()
             receipt = conn.execute(
@@ -1508,7 +1565,8 @@ def _execute_tag_mutation(download_id, payload, method):
                 if receipt['fingerprint'] != fingerprint:
                     return {'error': 'Mutation identifier already used', 'code': 'mutation_id_conflict'}, 409
                 result = json.loads(receipt['response'])
-                result['available_tags'] = _tag_vocabulary(conn, actor)
+                if is_tag:
+                    result['available_tags'] = _tag_vocabulary(conn, actor)
                 return result, receipt['status']
             now = time.time()
             created = int(match.group(1)) / 1000
@@ -1530,20 +1588,22 @@ def _execute_tag_mutation(download_id, payload, method):
                 error, status, outcome = 'Expected revision must be a decimal string', 400, 'rejected'
             elif error:
                 status, outcome = 400, 'rejected'
-            elif expected != state['tags_revision']:
-                error, status, outcome = 'Tags changed; review the current state', 409, 'conflicted'
+            elif expected != state[revision_field]:
+                error, status, outcome = 'Editable state changed; review the current state', 409, 'conflicted'
             else:
-                changed = _apply_tag(conn, download_id, name, key, method)
-                state = _tag_snapshot(conn, download_id)
+                changed = apply()
+                state = snapshot(conn, download_id)
             result = dict(state)
-            canonical = next((item for item in state['tag_items'] if item['key'] == key), submitted_before)
             result.update({
-                'changed': changed, 'available_tags': _tag_vocabulary(conn, actor),
-                'submitted_tag': canonical or ({'key': key, 'name': name} if key else None),
-                'mutation': {'id': mutation_id, 'outcome': outcome, 'domain': 'tags',
-                             'revision': state['tags_revision']},
+                'changed': changed,
+                'mutation': {'id': mutation_id, 'outcome': outcome, 'domain': domain,
+                             'revision': state[revision_field]},
                 'server_time': int(now * 1000),
             })
+            if is_tag:
+                canonical = next((item for item in state['tag_items'] if item['key'] == key), submitted_before)
+                result.update(available_tags=_tag_vocabulary(conn, actor),
+                              submitted_tag=canonical or ({'key': key, 'name': name} if key else None))
             if error:
                 result['error'] = error
             conn.execute(
@@ -1554,7 +1614,10 @@ def _execute_tag_mutation(download_id, payload, method):
                              if key != 'available_tags'}, separators=(',', ':')), now),
             )
     if changed:
-        _publish_tag_change()
+        if is_tag:
+            _publish_tag_change()
+        else:
+            _publish_metadata_change(domain)
     return result, status
 
 
@@ -1851,7 +1914,7 @@ def db_list_downloads(user_id=None, is_admin=False, statuses=None):
             "filename, display_filename, resolution, filesize, speed, eta, title, finished_at, "
             "duration_seconds, media_metadata_probed, "
             "formats, requested_format, downloaded_bytes, total_bytes, favorite, "
-            "view_count, tags_revision, "
+            "view_count, tags_revision, favorite_revision, "
             "source_type, owner_user_id, visibility, browser_authenticated, "
             "(downloads.ingest_source_path IS NOT NULL) AS mounted_import, "
             "COALESCE(users.username, downloads.owner_username) "
@@ -1877,7 +1940,9 @@ def db_list_downloads(user_id=None, is_admin=False, statuses=None):
                 {"key": row["normalized_name"], "name": row["name"]}
             )
         for download in downloads:
-            download["favorite"] = bool(download["favorite"])
+            download.update(_serialize_favorite_state(
+                download['id'], download['favorite'], download['favorite_revision'],
+            ))
             download["browser_authenticated"] = bool(
                 download["browser_authenticated"]
             )
@@ -7858,21 +7923,13 @@ def set_download_visibility(download_id):
 
 @app.route('/api/favorite/<download_id>', methods=['POST'])
 def set_download_favorite(download_id):
-    if _visible_download(download_id) is None:
-        return jsonify({"error": "Unknown download id"}), 404
-    payload = request.get_json(silent=True) or {}
-    favorite = payload.get('favorite')
-    if not isinstance(favorite, bool):
-        return jsonify({"error": "Favorite must be true or false"}), 400
-
-    changed = db_set_download_favorite(download_id, favorite)
-    if changed is None:
-        return jsonify({"error": "Unknown download id"}), 404
-    return jsonify({
-        "id": download_id,
-        "favorite": favorite,
-        "changed": changed,
-    })
+    payload, error = _read_json_body(4096)
+    if error is not None:
+        return error
+    result, status = _execute_favorite_mutation(download_id, payload)
+    response = jsonify(result)
+    response.status_code = status
+    return response
 
 
 @app.route('/api/view/<download_id>', methods=['POST'])
@@ -7896,7 +7953,7 @@ def record_download_view(download_id):
 @app.route('/api/client-capabilities', methods=['GET'])
 def client_capabilities():
     response = jsonify({
-        'mutation_protocol': 1, 'actions': ['tag.add', 'tag.remove'],
+        'mutation_protocol': 1, 'actions': ['tag.add', 'tag.remove', 'favorite.set'],
         'tag_identity_version': TAG_IDENTITY_VERSION,
         'server_time': int(time.time() * 1000),
     })
@@ -7915,7 +7972,8 @@ def editable_download_state(download_id):
         if row is None:
             return jsonify({'error': 'Unknown download id'}), 404
         result = _tag_snapshot(conn, download_id, row)
-        result['permissions'] = {'tags': True}
+        result.update(_favorite_snapshot(conn, download_id, row))
+        result['permissions'] = {'tags': True, 'favorite': True}
     response = jsonify(result)
     response.headers['Cache-Control'] = 'no-store'
     return response
@@ -7939,7 +7997,8 @@ def mutation_receipt(mutation_id):
                 final = bool(match and int(match.group(1)) / 1000 < time.time() - MUTATION_REPLAY_SECONDS)
                 return jsonify({'error': 'Mutation unavailable', 'final': final}), 404
             result = json.loads(receipt['response'])
-            result['available_tags'] = _tag_vocabulary(conn, actor)
+            if result.get('mutation', {}).get('domain') == 'tags':
+                result['available_tags'] = _tag_vocabulary(conn, actor)
             response = jsonify(result)
             response.status_code = receipt['status']
         else:

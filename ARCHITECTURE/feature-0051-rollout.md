@@ -2,7 +2,7 @@
 
 This inventory separates the initial tag delivery from the remaining app-wide
 migration in [Feature 0051](../FEATURES/feature-0051-immediate-feedback-for-server-backed-interactions.md).
-The shared coordinator currently registers only `tag.add` and `tag.remove`.
+The shared coordinator registers `tag.add`, `tag.remove`, and `favorite.set`.
 An existing API call does not gain receipt recovery merely because the new
 scripts are loaded. Mutating requests are never retried by `apiFetch`'s GET
 contention recovery.
@@ -29,6 +29,25 @@ The checked-in identity helper negotiates tables generated from Python 3.11,
 3.12, 3.13 and 3.14. Unsupported identity versions keep the conservative legacy
 presentation rather than guessing case-folding or character validation rules.
 
+## Delivered action adapters
+
+[Feature 0052: Favorites](../FEATURES/feature-0052-immediate-feedback-for-favorites.md)
+adds the independent favorite domain. Stars project explicit boolean intents
+immediately in Library, Info, and Current downloads, with adjacent saving and
+recovery text. Each entry/domain has its own FIFO queue; tag edits remain usable
+while a favorite save waits. Canonical acknowledgements confirm without SSE or
+a collection read. Active favorite interactions retain their card and focus in
+filtered views, without changing rotation membership.
+
+The persistent `favorite_revision` is serialized as a decimal string. A database
+trigger includes legacy writers and increments only when the value changes.
+Favorite mutations share the authorized transaction/receipt executor, expiry,
+quotas, actor-scoped lookup, and deliberate frozen-attempt replay used by tags.
+Current authorization gates original execution and recovery. Authentication
+reset and target unavailability fence pending favorites and old callbacks.
+`VDL.favoriteMutationMetrics()` and `VDL.mutationMetrics()` expose bounded
+in-memory aggregates without content or resource identifiers.
+
 ## Remaining action adapters
 
 The rows below are explicit migration work, not claims that the app-wide
@@ -37,12 +56,11 @@ remain in force. They need their own behavior and regression evidence before
 adopting automatic recovery.
 
 Each remaining row now has a proposed feature spec. These links allocate work;
-they do not mark any adapter implemented. Features 0052–0067 inherit Feature
+they do not mark any remaining adapter implemented. Features 0053–0067 inherit Feature
 0051 and the shared requirements below.
 
 | Controls / production entry points in `static/app.js` | Existing mechanism | Required migration / recovery boundary | Feature spec |
 | --- | --- | --- | --- |
-| Favorite: `toggleFavorite` | Explicit desired boolean; later collection reconciliation | Independent favorite revision, pending star projection, FIFO intents, canonical acknowledgement and receipts. Preserve card order. | [0052: Favorites](../FEATURES/feature-0052-immediate-feedback-for-favorites.md) |
 | Rename: `renameStart`, `renameCommit`, `renameCancel` | Separate draft and disabled submit controls; server owns final path | Local editor transitions and requested display name. Durable filesystem journal and crash recovery must precede replay. | [0053: Rename](../FEATURES/feature-0053-immediate-feedback-and-safe-recovery-for-rename.md) |
 | Preferences: `savePreferences` | Captured form submission; effects apply after acknowledgement; local theme preview | Saving presentation, newer draft generations, duplicate guards and canonical acknowledgement. Sensitive effects wait for confirmation. | [0054: Preferences](../FEATURES/feature-0054-immediate-feedback-for-preference-saves.md) |
 | Playlist create/replace: `savePlaylistEditor` | Local draft, existing `expected_revision` on replace, server conflict response | Saving state, duplicate guards, retained newer drafts and explicit conflict recovery. Preserve the existing revision type. | [0055: Playlist editor](../FEATURES/feature-0055-immediate-feedback-for-playlist-editor-saves.md) |
@@ -160,14 +178,15 @@ mark the wider rollout complete without that evidence.
 ## Verification commands
 
 Run the Python coverage gate with Python 3.12, the production-module Node tests,
-and real browser tag interactions. Browser runs use controlled request gates to
-exercise pending chips and canonical confirmation with SSE unavailable.
+and real browser tag and favorite interactions. Browser runs use controlled
+request gates to exercise pending presentation and canonical confirmation with
+SSE unavailable.
 
 ```bash
 VDL_PYTHON=/path/to/python3.12 ./tests/run-all.sh --unit
 node --test tests/*.test.cjs
-VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py tags.spec.cjs immediate-feedback.spec.cjs
-VDL_TEST_BROWSER=firefox VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py tags.spec.cjs immediate-feedback.spec.cjs
+VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py tags.spec.cjs immediate-feedback.spec.cjs favorites-feedback.spec.cjs
+VDL_TEST_BROWSER=firefox VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py tags.spec.cjs immediate-feedback.spec.cjs favorites-feedback.spec.cjs
 ```
 
 Verified on 2026-11-08 for version `0.54.0`:
@@ -185,3 +204,27 @@ Verified on 2026-11-08 for version `0.54.0`:
 
 The controlled browser checks cover the initial tag delivery. They do not
 establish completion of the remaining action adapters listed above.
+
+Feature 0052 verified on 2026-11-08 for version `0.55.0`:
+
+- Python 3.12 unit gate: 558 tests, 9 skipped; `vdl.py` line coverage **92.7%**
+  (5941/6410 executable lines; enforced minimum 90%). The 19 favorite protocol
+  tests cover legacy writers, migration/restart persistence, independent
+  revisions, concurrent replay, fingerprint mismatch, authorization changes,
+  receipt insertion rollback, post-commit response loss, quotas, and expiry.
+- Node: **68 tests passed**, including favorite FIFO isolation, atomic
+  acknowledgement merging, stale attempts after receipt recovery, retried
+  rejection ordering, malformed acknowledgements, and domain-release safety.
+- Chromium and Firefox with Python 3.12: **15 favorite browser checks passed
+  in each browser**. Controlled gates establish feedback below 50 ms,
+  confirmation without SSE or collection GETs, retained card/control identity,
+  visible and announced failures, deliberate replay, queued-intent discard,
+  filtered-card retention, rotation renewal deferral, and authentication fences.
+- Chromium regression coverage: **88 existing scenarios passed** across tags,
+  immediate feedback, history actions, rotation, live updates, refresh
+  contention, database contention, playlists, and authentication. The 46 checks
+  in the affected history/rotation/refresh suites were rerun after scoping
+  preview-star selectors to distinguish the added Info controls.
+
+Favorites inherit authentication fencing for their adopted callbacks. This
+does not complete Feature 0067 or any other remaining adapter.

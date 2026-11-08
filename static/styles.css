@@ -2172,3 +2172,17 @@ body.history-open .create-playlist-button { display: none; }
     margin: 0 0 1rem;
     overflow-wrap: anywhere;
 }
+
+/* The status shares a stable wrapper with the star so queued acknowledgements
+   do not replace the active keyboard target. */
+.favorite-control { display: contents; }
+.favorite-control-inline { display: inline-flex; align-items: center; gap: 6px; }
+.favorite-toggle.favorite-toggle-inline { position: static; flex: 0 0 36px; }
+.favorite-feedback {
+    position: absolute; top: 48px; right: 7px; z-index: 4;
+    max-width: calc(100% - 14px); padding: 4px 6px; border-radius: 5px;
+    color: var(--fg); background: var(--surface); font-size: 0.78rem;
+}
+.favorite-control-inline .favorite-feedback { position: static; }
+.favorite-feedback[hidden] { display: none; }
+.favorite-feedback button { margin: 2px 3px; font: inherit; }
