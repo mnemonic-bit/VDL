@@ -4,12 +4,18 @@
     const active = new Set(['queued', 'sending', 'unconfirmed', 'conflicted']);
     const validRevision = value => typeof value === 'string' && /^(0|[1-9]\d*)$/.test(value);
     const clone = value => JSON.parse(JSON.stringify(value));
+    function immutable(value) {
+        if (value && typeof value === 'object') { Object.values(value).forEach(immutable); Object.freeze(value); }
+        return value;
+    }
+    const equalPreferences = (left, right) => VDL.preferenceFields.every(key => left[key] === right[key]);
     // Only these descriptors can select a domain or encode a mutation route.
     const actions = Object.freeze({
         'tag.add': Object.freeze({ domain: 'tags', revision: 'tags_revision', noun: 'tags', method: 'POST', route: 'tags', field: 'tag' }),
         'tag.remove': Object.freeze({ domain: 'tags', revision: 'tags_revision', noun: 'tags', method: 'DELETE', route: 'tags', field: 'tag' }),
         'rename.set': Object.freeze({ domain: 'rename', revision: 'rename_revision', noun: 'rename', method: 'POST', route: 'rename', field: 'filename' }),
         'favorite.set': Object.freeze({ domain: 'favorite', revision: 'favorite_revision', noun: 'favorite', method: 'POST', route: 'favorite', field: 'favorite' }),
+        'preference.set': Object.freeze({ domain: 'preferences', revision: 'preferences_revision', noun: 'settings', method: 'POST', route: 'preferences', field: 'values' }),
     });
     const descriptor = intent => actions[intent.kind];
     const queueKey = intent => JSON.stringify([intent.targetId, descriptor(intent).domain]);
@@ -61,6 +67,7 @@
                 id: intent.id, targetId: intent.targetId, kind: intent.kind, key: intent.key,
                 value: intent.value, status: intent.status, message: intent.message || '',
                 delayed: !!intent.delayed, viewToken: intent.viewToken || null,
+                ...(intent.fieldErrors ? { fieldErrors: intent.fieldErrors } : {}),
             };
         }
         function clearTimers(intent) {
@@ -105,6 +112,7 @@
             return true;
         }
         function snapshot(body, intent) {
+            if (intent.kind === 'preference.set') return { id: intent.targetId, values: body.values, preferences_revision: body.preferences_revision };
             if (intent.kind === 'rename.set') return { id: intent.targetId, filename: body.filename, display_filename: body.display_filename, rename_revision: body.rename_revision };
             if (intent.kind === 'favorite.set') return { id: intent.targetId, favorite: body.favorite, favorite_revision: body.mutation?.revision ?? body.favorite_revision };
             return {
@@ -120,6 +128,13 @@
         }
         function validResult(body, intent, committed) {
             const mutation = body?.mutation;
+            if (intent.kind === 'preference.set') {
+                return !!mutation && mutation.id === intent.attempt.body.client_mutation_id
+                    && mutation.domain === 'preferences' && body.id === 'installation'
+                    && validRevision(mutation.revision) && body.preferences_revision === mutation.revision
+                    && VDL.validPreferenceValues(body.values)
+                    && (committed ? mutation.outcome === 'committed' : ['rejected', 'conflicted'].includes(mutation.outcome));
+            }
             if (intent.kind === 'rename.set') {
                 return !!mutation && mutation.id === intent.attempt.body.client_mutation_id
                     && mutation.domain === 'rename' && String(body.id) === intent.targetId
@@ -182,7 +197,12 @@
                 const status = body.mutation.outcome;
                 state.writer.transaction(() => {
                     state.acceptDownload(snapshot(body, intent));
-                    update(intent, { status, message: status === 'conflicted' ? `${descriptor(intent).noun} changed elsewhere. Check the current state, then retry or dismiss.` : intent.kind === 'rename.set' ? `Could not rename. ${typeof body.error === 'string' ? body.error : 'Correct the name or retry.'}` : `Could not save ${descriptor(intent).noun}. Retry or dismiss it.` });
+                    const fieldErrors = intent.kind === 'preference.set' && body.field_errors && typeof body.field_errors === 'object'
+                        ? Object.fromEntries(Object.entries(body.field_errors).filter(([key, value]) => VDL.preferenceFields.includes(key) && typeof value === 'string')) : undefined;
+                    update(intent, { status, fieldErrors, message: intent.kind === 'preference.set'
+                        ? status === 'conflicted' ? 'Settings changed elsewhere. Review the current values, then save your draft explicitly.'
+                            : `Could not save settings. ${typeof body.error === 'string' ? body.error : 'Correct the retained draft and save again.'}`
+                        : status === 'conflicted' ? `${descriptor(intent).noun} changed elsewhere. Check the current state, then retry or dismiss.` : intent.kind === 'rename.set' ? `Could not rename. ${typeof body.error === 'string' ? body.error : 'Correct the name or retry.'}` : `Could not save ${descriptor(intent).noun}. Retry or dismiss it.` });
                 });
                 emit(intent.kind, status, intent, intent.sentAt);
                 if (status === 'rejected') {
@@ -222,9 +242,9 @@
             const mutationId = `${Math.trunc(now() + timeOffset)}-${random()}`;
             if (!/^\d+-[a-f0-9]{32}$/.test(mutationId)) throw new Error('Invalid mutation identifier source');
             intent.attempt = Object.freeze({
-                url: `/api/${descriptor(intent).route}/${encodeURIComponent(targetId)}`,
+                url: intent.kind === 'preference.set' ? '/api/preferences' : `/api/${descriptor(intent).route}/${encodeURIComponent(targetId)}`,
                 method: descriptor(intent).method,
-                body: Object.freeze({ [descriptor(intent).field]: intent.value, client_mutation_id: mutationId, expected_revision: confirmed[descriptor(intent).revision] }),
+                body: immutable({ [descriptor(intent).field]: intent.value, client_mutation_id: mutationId, expected_revision: confirmed[descriptor(intent).revision] }),
             });
             intent.sentAt = now();
             update(intent, { status: 'sending' });
@@ -255,11 +275,11 @@
             } finally { if (timer !== undefined) cancel(timer); }
         }
         async function checkState(intent, capturedEpoch) {
-            const reply = await read({ url: `/api/downloads/${encodeURIComponent(intent.targetId)}/editable-state`, method: 'GET' });
+            const reply = await read({ url: intent.kind === 'preference.set' ? '/api/preferences' : `/api/downloads/${encodeURIComponent(intent.targetId)}/editable-state`, method: 'GET' });
             if (capturedEpoch !== epoch || !intents.has(intent.id) || !state.isAvailable(intent.targetId)) return false;
             if (!authorizedReply(reply, intent)) return false;
             const body = reply.body;
-            if (reply.status !== 200 || !body || String(body.id) !== intent.targetId || !validRevision(body[descriptor(intent).revision]) || (intent.kind === 'favorite.set' ? typeof body.favorite !== 'boolean' : intent.kind === 'rename.set' ? !(body.filename === null || typeof body.filename === 'string') || !(body.display_filename === null || typeof body.display_filename === 'string') : !canonical(body))) return false;
+            if (reply.status !== 200 || !body || String(body.id) !== intent.targetId || !validRevision(body[descriptor(intent).revision]) || (intent.kind === 'preference.set' ? !VDL.validPreferenceValues(body.values) : intent.kind === 'favorite.set' ? typeof body.favorite !== 'boolean' : intent.kind === 'rename.set' ? !(body.filename === null || typeof body.filename === 'string') || !(body.display_filename === null || typeof body.display_filename === 'string') : !canonical(body))) return false;
             state.acceptDownload(body);
             return true;
         }
@@ -268,6 +288,7 @@
             if (!supported(input.kind)) return { accepted: false, reason: 'unsupported', message: 'Refresh this page to use immediate saving.' };
             const startedAt = now();
             const targetId = String(input.targetId);
+            if (input.kind === 'preference.set' && targetId !== 'installation') return { accepted: false, reason: 'unavailable', message: 'This settings scope is unavailable.' };
             const model = state.selectDownload(targetId);
             if (!model || model.permissions?.[actions[input.kind].domain] === false) return { accepted: false, reason: 'unavailable', message: 'This entry is unavailable.' };
             if (input.kind === 'rename.set' && (typeof model.filename !== 'string' || !model.filename || (model.status !== undefined && model.status !== 'finished'))) return { accepted: false, reason: 'unavailable', message: 'Only finished files can be renamed.' };
@@ -275,7 +296,10 @@
             let tag;
             try {
                 if (input.kind === 'favorite.set' && typeof input.value !== 'boolean') throw new Error('Favorite must be true or false.');
-                if (input.kind === 'rename.set') {
+                if (input.kind === 'preference.set') {
+                    if (!VDL.validPreferenceValues(input.value)) throw new Error('Capture every editable setting before saving.');
+                    tag = { key: 'preferences', name: immutable(clone(input.value)) };
+                } else if (input.kind === 'rename.set') {
                     if (typeof input.value !== 'string' || !input.value.trim() || /[/\\\x00]/.test(input.value) || ['.', '..'].includes(input.value.trim())) throw new Error('Enter a filename without path separators.');
                     tag = { key: 'rename', name: input.value.trim() };
                 } else tag = input.kind === 'favorite.set' ? { key: 'favorite', name: input.value } : VDL.tagIdentity.normalize(input.value);
@@ -283,6 +307,12 @@
             catch (error) { return { accepted: false, reason: 'validation', message: error.message }; }
             const domainKey = queueKey({ kind: input.kind, targetId });
             const queue = queues.get(domainKey) || [];
+            if (input.kind === 'preference.set') {
+                const existing = Array.from(intents.values()).find(intent => intent.targetId === targetId && intent.kind === input.kind);
+                if (existing) return equalPreferences(existing.value, tag.name) && !['rejected', 'conflicted'].includes(existing.status)
+                    ? { accepted: true, intentId: existing.id, duplicate: true }
+                    : { accepted: false, reason: 'unresolved', message: 'Resolve the current settings save before submitting another draft.' };
+            }
             if (input.kind === 'rename.set') {
                 const existing = Array.from(intents.values()).find(intent => intent.targetId === targetId && intent.kind === 'rename.set');
                 if (existing) return existing.value === tag.name && !['rejected', 'conflicted'].includes(existing.status)
@@ -297,7 +327,7 @@
                     break;
                 }
             }
-            const satisfied = input.kind === 'rename.set' ? tag.name === String(model.display_filename || model.filename || '').split('/').pop().split('\\').pop() : input.kind === 'favorite.set' ? model.favorite === input.value : (input.kind === 'tag.add') === model.tag_items.some(item => item.key === tag.key);
+            const satisfied = input.kind === 'preference.set' ? equalPreferences(model.values, tag.name) : input.kind === 'rename.set' ? tag.name === String(model.display_filename || model.filename || '').split('/').pop().split('\\').pop() : input.kind === 'favorite.set' ? model.favorite === input.value : (input.kind === 'tag.add') === model.tag_items.some(item => item.key === tag.key);
             if (satisfied) return { accepted: true, intentId: null, settled: true };
             const unresolved = Array.from(intents.values()).filter(intent => intent.status !== 'confirmed' && intent.status !== 'resolved');
             if (unresolved.filter(intent => queueKey(intent) === domainKey).length >= 32 || unresolved.length >= 128) return { accepted: false, reason: 'limit', message: 'Too many pending edits. Resolve existing edits before adding more.' };
@@ -360,6 +390,7 @@
         function retry(id) {
             const intent = intents.get(id);
             if (!intent || !['rejected', 'conflicted'].includes(intent.status) || intent.checking) return { accepted: false, reason: 'unconfirmed' };
+            if (intent.kind === 'preference.set') return { accepted: false, reason: 'review_required', message: 'Review current settings, then save the draft explicitly.' };
             const wasConflict = intent.status === 'conflicted';
             function enqueue() {
                 state.writer.transaction(() => {

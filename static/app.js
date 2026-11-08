@@ -1338,13 +1338,26 @@ const compatibilityFavorites = new Map();
 const favoriteNotices = new Map();
 const favoriteMutationMetrics = { ...tagMutationMetrics };
 const mutationMetrics = { ...tagMutationMetrics };
+const preferenceMutationMetrics = { ...tagMutationMetrics };
+VDL.preferenceMutationMetrics = () => Object.freeze({ ...preferenceMutationMetrics });
+let preferenceSubmission = null;
+let preferenceDraftGeneration = 0;
+let preferenceViewToken = 0;
+let preferenceDirty = false;
+let preferenceMessage = '';
+let preferenceReviewVisible = false;
+let preferenceSavedTimer = null;
 VDL.favoriteMutationMetrics = () => Object.freeze({ ...favoriteMutationMetrics });
 VDL.mutationMetrics = () => Object.freeze({ ...mutationMetrics });
 const tagState = VDL.createClientState();
 const tagMutations = VDL.createMutations({
     state: tagState,
     transport: async ({ url, method, body }) => {
-        if (method === 'GET') mutationMetrics.reconciliationReads++;
+        if (method === 'POST' && url === '/api/preferences' && preferenceSubmission) preferenceSubmission.mutationId = body?.client_mutation_id;
+        if (method === 'GET') {
+            mutationMetrics.reconciliationReads++;
+            if (url === '/api/preferences' || (preferenceSubmission?.mutationId && url === `/api/mutations/${encodeURIComponent(preferenceSubmission.mutationId)}`)) preferenceMutationMetrics.reconciliationReads++;
+        }
         const response = await apiFetch(url, {
             method,
             ...(body === undefined ? {} : {
@@ -1355,7 +1368,7 @@ const tagMutations = VDL.createMutations({
         return { status: response.status, body: await response.json().catch(() => null) };
     },
     onEvent: event => {
-        const domainMetrics = event.action === 'rename.set' ? renameMutationMetrics : event.action === 'favorite.set' ? favoriteMutationMetrics : tagMutationMetrics;
+        const domainMetrics = event.action === 'preference.set' ? preferenceMutationMetrics : event.action === 'rename.set' ? renameMutationMetrics : event.action === 'favorite.set' ? favoriteMutationMetrics : tagMutationMetrics;
         for (const metrics of [domainMetrics, mutationMetrics]) {
             if (event.outcome === 'presented') metrics.submissions++;
             if (event.outcome === 'confirmed') {
@@ -1369,6 +1382,7 @@ const tagMutations = VDL.createMutations({
         mutationMetrics.pending = event.pending;
         mutationMetrics.unconfirmed = event.unconfirmed;
         mutationMetrics.conflicted = event.conflicted;
+        if (event.action === 'preference.set') handlePreferenceMutationEvent(event);
         if (event.action === 'rename.set') {
             const intent = tagMutations.status(event.intentId);
             const draft = intent && renameDrafts.get(intent.targetId);
@@ -1394,11 +1408,15 @@ const tagMutations = VDL.createMutations({
         }
     },
     onAuthLoss: resetTagSession,
-    onNotice: ({ message }) => announceTagStatus(message),
+    onNotice: ({ targetId, message }) => {
+        if (targetId === 'installation') { preferenceMessage = message; renderPreferenceStatus(); }
+        else announceTagStatus(message);
+    },
 });
 
 function resetTagSession() {
     tagSessionEpoch += 1;
+    resetPreferenceSession();
     tagMutations.reset();
     tagDrafts.clear();
     editingTagIds.clear();
@@ -1438,7 +1456,7 @@ function updateTagMutationSummary() {
         submittedTagIntents.delete(intentId);
         recoveredTagIntents.delete(intentId);
     }
-    const allIntents = tagMutations.pending();
+    const allIntents = tagMutations.pending().concat(preferenceSubmission?.legacy ? [{ ...preferenceSubmission.legacy, kind: 'preference.set' }] : []);
     const intents = allIntents.filter(intent => intent.kind.startsWith('tag.'));
     const favoriteIntents = allIntents.filter(intent => intent.kind === 'favorite.set');
     updateFavoriteMutationSummary(favoriteIntents);
@@ -1500,6 +1518,12 @@ async function loadTagCapabilities() {
 }
 
 tagState.subscribe(ids => {
+    if (ids.includes('installation')) {
+        if (!tagState.selectPreferences() && (preferenceSubmission || preferenceDirty)) resetPreferenceSession();
+        else renderPreferenceStatus();
+    }
+    ids = ids.filter(id => id !== 'installation');
+    if (!ids.length) return;
     for (const id of ids) {
         if (tagState.selectDownload(id) !== null) continue;
         unavailableTagIds.add(String(id));
@@ -1539,7 +1563,7 @@ tagState.subscribe(ids => {
 });
 
 window.addEventListener('beforeunload', event => {
-    if (!tagMutations.hasPending() && ![...tagDrafts.values()].some(value => value.trim()) && !renameDrafts.size && !compatibilityRenames.size) return;
+    if (!preferenceDirty && !preferenceSubmission && !tagMutations.hasPending() && ![...tagDrafts.values()].some(value => value.trim()) && !renameDrafts.size && !compatibilityRenames.size) return;
     event.preventDefault();
     event.returnValue = '';
 });
@@ -8023,11 +8047,14 @@ function openSettings() {
     hideActionError();
     // Keep the form unavailable until its server values are applied so a late
     // response cannot overwrite a choice made immediately after opening it.
+    const viewToken = ++preferenceViewToken;
+    const epoch = tagSessionEpoch;
     settingsOpenPromise = Promise.allSettled([
         loadPreferences(),
         loadUsers(),
         loadExtensionConnections(),
     ]).then(() => {
+        if (epoch !== tagSessionEpoch || viewToken !== preferenceViewToken) return;
         document.getElementById('tab-history').hidden = true;
         scheduleAssetDemand();
         document.getElementById('attemptHistoryPage').hidden = true;
@@ -8035,6 +8062,7 @@ function openSettings() {
         document.body.classList.add('settings-open');
         window.scrollTo({ top: 0 });
         scheduleSettingsSectionUpdate();
+        renderPreferenceStatus();
     }).finally(() => {
         settingsOpenPromise = null;
     });
@@ -8045,6 +8073,8 @@ function closeSettings() {
     const page = document.getElementById('settingsPage');
     if (page.hidden) return;
     page.hidden = true;
+    preferenceViewToken++;
+    renderPreferenceStatus();
     document.getElementById('tab-history').hidden = attemptHistoryOpen;
     scheduleAssetDemand({ reconcile: true });
     document.getElementById('attemptHistoryPage').hidden = !attemptHistoryOpen;
@@ -8722,65 +8752,98 @@ if (window.matchMedia) {
 
 let preferencesLoadGeneration = 0;
 
-function loadPreferences() {
-    const generation = ++preferencesLoadGeneration;
-    return apiFetch('/api/preferences').then(r => r.json()).then(p => {
-        // A settings-open refresh supersedes the bootstrap request if the two
-        // overlap; only the newest response may populate editable controls.
-        if (generation !== preferencesLoadGeneration) return;
-        document.getElementById('prefDir').value = p.download_dir || '';
-        document.getElementById('prefMax').value = p.max_concurrent || '3';
-        document.getElementById('prefMaxPerHost').value = p.max_concurrent_per_host || '2';
-        document.getElementById('prefMaxMbps').value = p.max_total_download_mbps || '0';
-        const configuredPageSize = Number(p.history_page_size);
-        const nextPageSize = p.history_page_size === HISTORY_ENDLESS_MODE
-            ? HISTORY_ENDLESS_MODE
-            : (HISTORY_PAGE_SIZES.has(configuredPageSize)
-                ? configuredPageSize
-                : DEFAULT_HISTORY_PAGE_SIZE);
-        document.getElementById('prefPageSize').value = String(nextPageSize);
-        if (historyPageSize !== nextPageSize) {
-            historyPageSize = nextPageSize;
+function fillPreferenceControls(p) {
+    document.getElementById('prefDir').value = p.download_dir || '';
+    document.getElementById('prefMax').value = p.max_concurrent || '3';
+    document.getElementById('prefMaxPerHost').value = p.max_concurrent_per_host || '2';
+    document.getElementById('prefMaxMbps').value = p.max_total_download_mbps || '0';
+    const configuredPageSize = Number(p.history_page_size);
+    const nextPageSize = p.history_page_size === HISTORY_ENDLESS_MODE
+        ? HISTORY_ENDLESS_MODE
+        : (HISTORY_PAGE_SIZES.has(configuredPageSize)
+            ? configuredPageSize
+            : DEFAULT_HISTORY_PAGE_SIZE);
+    document.getElementById('prefPageSize').value = String(nextPageSize);
+
+    const stored = p.format || 'bestvideo+bestaudio/best';
+    const sel = document.getElementById('prefFormat');
+    if (isPresetValue(stored)) {
+        sel.value = stored;
+        document.getElementById('prefFormatCustom').value = '';
+    } else {
+        sel.value = '__custom__';
+        document.getElementById('prefFormatCustom').value = stored;
+    }
+    refreshCustomVisibility();
+
+    document.getElementById('prefPlayer').value = p.player_mode === 'new_tab' ? 'new_tab' : 'overlay';
+    document.getElementById('prefSkipVideoEdges').checked = p.skip_video_edges === 'true';
+    document.getElementById('prefLibraryRotation').checked = p.library_rotation_enabled === 'true';
+    document.getElementById('prefLibraryRotationHours').value = p.library_rotation_hours || '24';
+    refreshLibraryRotationAvailability();
+    document.getElementById('prefStartFullscreen').checked = p.start_fullscreen === 'true';
+    refreshFullscreenAvailability();
+    const shuffleHeights = new Set([
+        '0', '360', '480', '720', '1080', '1440', '2160', '4320',
+    ]);
+    const shuffleHeight = String(p.shuffle_min_height ?? '0');
+    document.getElementById('prefShuffleMinHeight').value =
+        shuffleHeights.has(shuffleHeight) ? shuffleHeight : '0';
+    const shuffleMinutes = String(p.shuffle_min_duration_minutes ?? '0');
+    document.getElementById('prefShuffleMinDuration').value =
+        /^\d+$/.test(shuffleMinutes)
+            && Number(shuffleMinutes) <= 1440 ? shuffleMinutes : '0';
+
+    const theme = ['light', 'dark', 'system'].includes(p.theme) ? p.theme : 'system';
+    document.getElementById('prefTheme').value = theme;
+}
+
+function applyConfirmedPreferences(p, { preview = true } = {}) {
+    const size = p.history_page_size === HISTORY_ENDLESS_MODE ? HISTORY_ENDLESS_MODE : Number(p.history_page_size);
+    if (size === HISTORY_ENDLESS_MODE || HISTORY_PAGE_SIZES.has(size)) {
+        if (historyPageSize !== size) {
+            historyPageSize = size;
             historyPage = 0;
             historyEndlessVisibleCount = HISTORY_ENDLESS_BATCH_SIZE;
-            if (historyTotal > 0) fetchHistory();
+            renderDownloadCollections();
         }
+    }
+    playerMode = p.player_mode === 'new_tab' ? 'new_tab' : 'overlay';
+    startVideosFullscreen = p.start_fullscreen === 'true';
+    updateSkipVideoEdges(p.skip_video_edges === 'true');
+    if (preview) applyTheme(['light', 'dark', 'system'].includes(p.theme) ? p.theme : 'system');
+}
 
-        const stored = p.format || 'bestvideo+bestaudio/best';
-        const sel = document.getElementById('prefFormat');
-        if (isPresetValue(stored)) {
-            sel.value = stored;
-            document.getElementById('prefFormatCustom').value = '';
-        } else {
-            sel.value = '__custom__';
-            document.getElementById('prefFormatCustom').value = stored;
+function loadPreferences() {
+    const generation = ++preferencesLoadGeneration;
+    const epoch = tagSessionEpoch;
+    const draftGeneration = preferenceDraftGeneration;
+    const viewToken = preferenceViewToken;
+    const context = tagState.capture();
+    preferenceMutationMetrics.reconciliationReads++;
+    mutationMetrics.reconciliationReads++;
+    return apiFetch('/api/preferences').then(async response => {
+        if (epoch !== tagSessionEpoch || generation !== preferencesLoadGeneration) return null;
+        if (response.status === 403) { tagMutations.fence('installation'); resetPreferenceSession(); return null; }
+        if (!response.ok) throw new Error('Could not load settings.');
+        return response.json();
+    }).then(p => {
+        if (!p || epoch !== tagSessionEpoch || generation !== preferencesLoadGeneration) return;
+        if (p.values && p.preferences_revision) {
+            tagState.acceptPreferences(p, { ...context, authoritative: true });
+            if (!tagState.selectPreferences()) return;
         }
-        refreshCustomVisibility();
-
-        playerMode = (p.player_mode === 'new_tab') ? 'new_tab' : 'overlay';
-        document.getElementById('prefPlayer').value = playerMode;
-        updateSkipVideoEdges(p.skip_video_edges === 'true');
-        document.getElementById('prefSkipVideoEdges').checked = skipVideoEdges;
-        document.getElementById('prefLibraryRotation').checked = p.library_rotation_enabled === 'true';
-        document.getElementById('prefLibraryRotationHours').value = p.library_rotation_hours || '24';
-        refreshLibraryRotationAvailability();
-        startVideosFullscreen = p.start_fullscreen === 'true';
-        document.getElementById('prefStartFullscreen').checked = startVideosFullscreen;
-        refreshFullscreenAvailability();
-        const shuffleHeights = new Set([
-            '0', '360', '480', '720', '1080', '1440', '2160', '4320',
-        ]);
-        const shuffleHeight = String(p.shuffle_min_height ?? '0');
-        document.getElementById('prefShuffleMinHeight').value =
-            shuffleHeights.has(shuffleHeight) ? shuffleHeight : '0';
-        const shuffleMinutes = String(p.shuffle_min_duration_minutes ?? '0');
-        document.getElementById('prefShuffleMinDuration').value =
-            /^\d+$/.test(shuffleMinutes)
-                && Number(shuffleMinutes) <= 1440 ? shuffleMinutes : '0';
-
-        const theme = ['light', 'dark', 'system'].includes(p.theme) ? p.theme : 'system';
-        document.getElementById('prefTheme').value = theme;
-        applyTheme(theme);
+        const values = tagState.selectPreferences()?.values || p.values || p;
+        // A read may reconcile confirmed state, but it cannot acknowledge a
+        // transmitted save or take ownership of a newer editor generation.
+        if (!preferenceSubmission) applyConfirmedPreferences(values, { preview: !preferenceDirty });
+        if (viewToken === preferenceViewToken && draftGeneration === preferenceDraftGeneration && !preferenceDirty && !preferenceSubmission) fillPreferenceControls(values);
+        renderPreferenceStatus();
+    }).catch(error => {
+        if (epoch === tagSessionEpoch && generation === preferencesLoadGeneration) {
+            preferenceMessage = error.message;
+            renderPreferenceStatus();
+        }
     });
 }
 
@@ -8810,16 +8873,13 @@ document.getElementById('prefLibraryRotation').addEventListener(
     'change', refreshLibraryRotationAvailability,
 );
 
-function savePreferences() {
-    for (const id of ['prefMax', 'prefMaxPerHost', 'prefMaxMbps', 'prefLibraryRotationHours']) {
-        if (!document.getElementById(id).reportValidity()) return;
-    }
+function readPreferenceDraft() {
     const sel = document.getElementById('prefFormat');
     const fmt = sel.value === '__custom__'
         ? document.getElementById('prefFormatCustom').value.trim()
         : sel.value;
 
-    const body = {
+    return {
         download_dir: document.getElementById('prefDir').value,
         format: fmt || 'best',
         history_page_size: document.getElementById('prefPageSize').value,
@@ -8838,35 +8898,256 @@ function savePreferences() {
             document.getElementById('prefShuffleMinDuration').value,
         theme: document.getElementById('prefTheme').value,
     };
-    invalidateLibraryOrder();
-    apiAction('/api/preferences', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-    }).then(() => {
+}
+
+function preferenceIntent() {
+    return preferenceSubmission?.intentId ? tagMutations.status(preferenceSubmission.intentId) : preferenceSubmission?.legacy || null;
+}
+
+function hasPreferenceProtocol() {
+    return tagCapabilities?.mutation_protocol === 1 && tagCapabilities.actions?.includes('preference.set')
+        && !!tagState.selectPreferences()?.preferences_revision;
+}
+
+function renderPreferenceStatus() {
+    const intent = preferenceIntent();
+    const status = document.getElementById('preferenceSaveStatus');
+    if (!status) return;
+    const pending = intent && ['queued', 'sending'].includes(intent.status);
+    const unknown = intent?.status === 'unconfirmed';
+    const conflict = intent?.status === 'conflicted';
+    const rejected = intent?.status === 'rejected';
+    let message = preferenceMessage || (preferenceDirty ? 'Unsaved settings.' : '');
+    if (pending) message = intent.delayed ? 'Still waiting for settings confirmation. Your settings are not yet confirmed.' : 'Saving settings…';
+    if (unknown) message = (preferenceSubmission?.legacy ? 'Save not confirmed. This server has no receipt recovery. Reload to read current settings; the earlier request may still complete.' : 'Save not confirmed. Your submitted settings are retained. Check its status before replaying.') + (preferenceMessage ? ` ${preferenceMessage}` : '');
+    if (conflict) message = 'Settings changed elsewhere. Review the current settings before saving your draft again.';
+    if (rejected) message = intent.message || 'Settings were not saved. Correct the retained draft and save again.';
+    if (pending && preferenceSubmission.generation !== preferenceDraftGeneration) message += ' Newer edits are unsaved.';
+    if (status.textContent !== message) status.textContent = message;
+    const button = document.getElementById('saveBtn');
+    const unavailable = tagCapabilities?.actions?.includes('preference.set') && !tagState.selectPreferences();
+    button.disabled = !!pending || !!unknown || !!conflict || !!unavailable;
+    button.setAttribute('aria-busy', String(!!pending));
+    button.querySelector('span:last-child').textContent = pending ? 'Saving…' : preferenceMessage === 'Settings saved.' && !preferenceDirty && !intent ? 'Saved' : 'Save';
+    button.querySelector('use').setAttribute('href', preferenceMessage === 'Settings saved.' && !preferenceDirty && !intent ? '#i-check' : '#i-save');
+    document.getElementById('preferenceSavingSpinner').hidden = !pending;
+    document.getElementById('preferenceRecovery').hidden = !unknown && !conflict && !rejected;
+    document.getElementById('preferenceCheck').hidden = !unknown || !!preferenceSubmission?.legacy;
+    document.getElementById('preferenceReplay').hidden = !unknown || !!preferenceSubmission?.legacy;
+    document.getElementById('preferenceReview').hidden = !conflict;
+    document.getElementById('preferenceResubmit').hidden = !conflict || !preferenceReviewVisible;
+    document.getElementById('preferenceUseCurrent').hidden = (!conflict && !unknown) || !!preferenceSubmission?.legacy;
+    document.getElementById('preferenceReload').hidden = !unknown || !preferenceSubmission?.legacy;
+    document.getElementById('preferenceCurrentValues').hidden = !preferenceReviewVisible;
+    if (preferenceReviewVisible) {
+        const values = tagState.selectPreferences()?.values || {};
+        document.getElementById('preferenceCurrentValues').textContent = Object.entries(values).map(([key, value]) => `${key.replaceAll('_', ' ')}: ${value}`).join('\n');
+    }
+    const fields = intent?.fieldErrors || {};
+    const currentDraft = Object.keys(fields).length ? readPreferenceDraft() : {};
+    for (const [key, id] of Object.entries(preferenceFieldIds)) {
+        const element = document.getElementById(id);
+        const error = currentDraft[key] === preferenceSubmission?.values[key] ? fields[key] : null;
+        element.setAttribute('aria-invalid', error ? 'true' : 'false');
+        const output = document.getElementById(`${id}SaveError`);
+        if (error && !output) {
+            const text = document.createElement('span');
+            text.id = `${id}SaveError`; text.className = 'preference-field-error'; text.textContent = error;
+            element.setAttribute('aria-describedby', [...new Set([...(element.getAttribute('aria-describedby') || '').split(' ').filter(Boolean), text.id])].join(' '));
+            element.parentElement.appendChild(text);
+        } else if (output) {
+            if (error) output.textContent = error;
+            else {
+                const descriptions = (element.getAttribute('aria-describedby') || '').split(' ').filter(id => id && id !== output.id);
+                if (descriptions.length) element.setAttribute('aria-describedby', descriptions.join(' '));
+                else element.removeAttribute('aria-describedby');
+                output.remove();
+            }
+        }
+    }
+    const summary = document.getElementById('preferenceMutationSummary');
+    summary.hidden = !document.getElementById('settingsPage').hidden || (!intent && !preferenceDirty);
+    const summaryText = summary.querySelector('span');
+    if (summaryText.textContent !== message) summaryText.textContent = message;
+    const entries = tagMutations.pending().filter(entry => entry.kind === 'preference.set');
+    if (preferenceSubmission?.legacy) entries.push(preferenceSubmission.legacy);
+    preferenceMutationMetrics.pending = entries.filter(entry => ['queued', 'sending', 'unconfirmed', 'conflicted'].includes(entry.status)).length;
+    preferenceMutationMetrics.unconfirmed = entries.filter(entry => entry.status === 'unconfirmed').length;
+    preferenceMutationMetrics.conflicted = entries.filter(entry => entry.status === 'conflicted').length;
+}
+
+function handlePreferenceMutationEvent(event) {
+    if (!preferenceSubmission || preferenceSubmission.epoch !== tagSessionEpoch) return;
+    if (event.outcome === 'presented') preferenceSubmission.intentId = event.intentId;
+    if (event.intentId !== preferenceSubmission.intentId) return;
+    if (event.outcome === 'confirmed') {
+        finishPreferenceSave(tagState.selectPreferences().values);
+    } else renderPreferenceStatus();
+}
+
+function finishPreferenceSave(values) {
+    const submission = preferenceSubmission;
+    if (!submission || submission.epoch !== tagSessionEpoch) return;
+    if (submission.legacy) {
+        for (const metrics of [preferenceMutationMetrics, mutationMetrics]) {
+            metrics.acknowledgements++;
+            metrics.latestAcknowledgementMs = Math.max(0, performance.now() - submission.sentAt);
+        }
+    }
+    const currentEditor = submission.viewToken === preferenceViewToken && submission.generation === preferenceDraftGeneration;
+    applyConfirmedPreferences(values, { preview: currentEditor || !preferenceDirty });
+    if (currentEditor) fillPreferenceControls(values);
+    if (submission.generation === preferenceDraftGeneration) preferenceDirty = false;
+    preferenceSubmission = null;
+    preferenceReviewVisible = false;
+    preferenceMessage = preferenceDirty ? 'Settings saved. Newer edits remain unsaved.' : 'Settings saved.';
+    renderPreferenceStatus();
+    clearTimeout(preferenceSavedTimer);
+    const epoch = tagSessionEpoch;
+    const viewToken = preferenceViewToken;
+    const generation = preferenceDraftGeneration;
+    const message = preferenceMessage;
+    preferenceSavedTimer = setTimeout(() => {
+        if (epoch !== tagSessionEpoch || preferenceSubmission || viewToken !== preferenceViewToken || generation !== preferenceDraftGeneration || preferenceMessage !== message) return;
+        preferenceMessage = '';
+        renderPreferenceStatus();
+    }, 1500);
+    // Rotation membership remains server-owned. Its derived view may reconcile
+    // after confirmation without making the save depend on this read.
+    if (['library_rotation_enabled', 'library_rotation_hours'].some(key => submission.values[key] !== submission.previous?.[key])) {
         invalidateLibraryOrder();
         fetchHistory();
-        const nextPageSize = body.history_page_size === HISTORY_ENDLESS_MODE
-            ? HISTORY_ENDLESS_MODE
-            : Number(body.history_page_size);
-        if (historyPageSize !== nextPageSize) {
-            historyPageSize = nextPageSize;
-            historyPage = 0;
-            historyEndlessVisibleCount = HISTORY_ENDLESS_BATCH_SIZE;
-            fetchHistory();
+    }
+}
+
+function savePreferences() {
+    if (tagCapabilities?.actions?.includes('preference.set') && !tagState.selectPreferences()) return;
+    const previousIntent = preferenceIntent();
+    if (previousIntent && !['rejected'].includes(previousIntent.status)) return;
+    for (const id of ['prefMax', 'prefMaxPerHost', 'prefMaxMbps', 'prefLibraryRotationHours', 'prefShuffleMinDuration']) {
+        if (!document.getElementById(id).reportValidity()) return;
+    }
+    if (previousIntent && preferenceSubmission.intentId) tagMutations.resolve(preferenceSubmission.intentId);
+    const started = performance.now();
+    const values = readPreferenceDraft();
+    preferenceMessage = '';
+    preferenceReviewVisible = false;
+    preferencesLoadGeneration++;
+    preferenceSubmission = {
+        values, generation: preferenceDraftGeneration, viewToken: preferenceViewToken,
+        epoch: tagSessionEpoch, previous: tagState.selectPreferences()?.values,
+    };
+    if (hasPreferenceProtocol()) {
+        const result = tagMutations.submit({ kind: 'preference.set', targetId: 'installation', value: values, viewToken: preferenceViewToken });
+        if (!result.accepted) {
+            preferenceSubmission = null;
+            preferenceMessage = result.message;
+        } else if (result.settled) finishPreferenceSave(tagState.selectPreferences().values);
+        else preferenceSubmission.intentId = result.intentId;
+    } else {
+        saveLegacyPreferences(preferenceSubmission);
+    }
+    renderPreferenceStatus();
+    preferenceMutationMetrics.latestLocalFeedbackMs = performance.now() - started;
+    mutationMetrics.latestLocalFeedbackMs = preferenceMutationMetrics.latestLocalFeedbackMs;
+}
+
+async function saveLegacyPreferences(submission) {
+    submission.legacy = { status: 'sending' };
+    submission.sentAt = performance.now();
+    for (const metrics of [preferenceMutationMetrics, mutationMetrics]) metrics.submissions++;
+    renderPreferenceStatus();
+    const delayed = setTimeout(() => {
+        if (preferenceSubmission !== submission) return;
+        submission.legacy.delayed = true; renderPreferenceStatus();
+    }, 5000);
+    const timeout = setTimeout(() => {
+        if (preferenceSubmission !== submission || submission.legacy.status !== 'sending') return;
+        setLegacyPreferenceOutcome(submission, 'unconfirmed');
+    }, 30000);
+    try {
+        const response = await apiFetch('/api/preferences', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(submission.values) });
+        const data = await response.json().catch(() => null);
+        if (submission.epoch !== tagSessionEpoch || preferenceSubmission !== submission) return;
+        if (response.status === 401 || response.status === 403) { resetPreferenceSession(); return; }
+        if (response.ok && data && Object.keys(submission.values).every(key => typeof data[key] === 'string')) {
+            finishPreferenceSave(data);
+        } else {
+            setLegacyPreferenceOutcome(submission, [400, 409, 422].includes(response.status) ? 'rejected' : 'unconfirmed', typeof data?.error === 'string' ? data.error : 'Settings were not saved. Your draft is retained.');
         }
-        playerMode = body.player_mode;
-        startVideosFullscreen = body.start_fullscreen === 'true';
-        updateSkipVideoEdges(body.skip_video_edges === 'true');
-        applyTheme(body.theme);
-        const btn = document.getElementById('saveBtn');
-        btn.innerHTML = '<svg class="btn-icon"><use href="#i-check"/></svg><span>Saved</span>';
-        btn.disabled = true;
-        setTimeout(() => {
-            btn.innerHTML = '<svg class="btn-icon"><use href="#i-save"/></svg><span>Save</span>';
-            btn.disabled = false;
-        }, 1500);
-    }).catch(() => {});
+    } catch (_) {
+        if (submission.epoch === tagSessionEpoch && preferenceSubmission === submission) {
+            setLegacyPreferenceOutcome(submission, 'unconfirmed');
+        }
+    } finally { clearTimeout(delayed); clearTimeout(timeout); }
+}
+
+function setLegacyPreferenceOutcome(submission, status, message = '') {
+    if (submission.legacy.status !== status) {
+        for (const metrics of [preferenceMutationMetrics, mutationMetrics]) metrics[status === 'rejected' ? 'rejectedOutcomes' : 'unconfirmedOutcomes']++;
+    }
+    submission.legacy.status = status;
+    submission.legacy.message = message;
+    renderPreferenceStatus();
+}
+
+function preferenceRecovery(action) {
+    const intent = preferenceIntent();
+    if (!intent) return;
+    if (action === 'check') return tagMutations.recover(intent.id);
+    if (action === 'replay') return tagMutations.recover(intent.id, { replay: true });
+    if (action === 'review') { preferenceReviewVisible = true; renderPreferenceStatus(); return; }
+    if (!preferenceSubmission.intentId || !tagMutations.resolve(preferenceSubmission.intentId)) {
+        preferenceMessage = 'The original save may still complete. Check its status before using current settings.';
+        renderPreferenceStatus(); return;
+    }
+    preferenceSubmission = null;
+    preferenceReviewVisible = false;
+    if (action === 'current') {
+        const values = tagState.selectPreferences()?.values;
+        if (values) { fillPreferenceControls(values); applyConfirmedPreferences(values); }
+        preferenceDirty = false;
+        preferenceMessage = 'Current settings loaded.';
+    } else {
+        preferenceMessage = 'Current settings reviewed. Your draft remains unsaved.';
+    }
+    renderPreferenceStatus();
+    if (action === 'resubmit') savePreferences();
+}
+
+function resetPreferenceSession() {
+    preferencesLoadGeneration++;
+    preferenceDraftGeneration++;
+    preferenceViewToken++;
+    preferenceSubmission = null;
+    preferenceDirty = false;
+    preferenceMessage = '';
+    preferenceReviewVisible = false;
+    clearTimeout(preferenceSavedTimer);
+    for (const id of Object.values(preferenceFieldIds)) {
+        const element = document.getElementById(id);
+        if (element.type === 'checkbox') element.checked = false;
+        else element.value = '';
+    }
+    document.getElementById('prefFormatCustom').value = '';
+    document.getElementById('preferenceCurrentValues').textContent = '';
+    renderPreferenceStatus();
+}
+
+const preferenceFieldIds = {
+    download_dir: 'prefDir', format: 'prefFormat', history_page_size: 'prefPageSize', max_concurrent: 'prefMax',
+    max_concurrent_per_host: 'prefMaxPerHost', max_total_download_mbps: 'prefMaxMbps', player_mode: 'prefPlayer',
+    start_fullscreen: 'prefStartFullscreen', skip_video_edges: 'prefSkipVideoEdges', library_rotation_enabled: 'prefLibraryRotation',
+    library_rotation_hours: 'prefLibraryRotationHours', shuffle_min_height: 'prefShuffleMinHeight',
+    shuffle_min_duration_minutes: 'prefShuffleMinDuration', theme: 'prefTheme',
+};
+for (const id of [...Object.values(preferenceFieldIds), 'prefFormatCustom']) {
+    for (const type of ['input', 'change']) document.getElementById(id).addEventListener(type, () => {
+        preferenceDraftGeneration++;
+        preferenceDirty = true;
+        preferenceMessage = '';
+        renderPreferenceStatus();
+    });
 }
 
 loadPreferences();

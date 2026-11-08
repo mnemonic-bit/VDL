@@ -2,8 +2,8 @@
 
 This inventory separates the initial tag delivery from the remaining app-wide
 migration in [Feature 0051](../FEATURES/feature-0051-immediate-feedback-for-server-backed-interactions.md).
-The shared coordinator registers `tag.add`, `tag.remove`, `favorite.set`, and
-`rename.set`.
+The shared coordinator registers `tag.add`, `tag.remove`, `favorite.set`,
+`rename.set`, and `preference.set`.
 An existing API call does not gain receipt recovery merely because the new
 scripts are loaded. Mutating requests are never retried by `apiFetch`'s GET
 contention recovery.
@@ -69,6 +69,32 @@ lock across filesystem effects. Recovery uses the same frozen attempt, with
 current authorization, shared quotas and expiry, and no automatic replay.
 `VDL.renameMutationMetrics()` exposes bounded in-memory aggregate diagnostics.
 
+[Feature 0054: Preferences](../FEATURES/feature-0054-immediate-feedback-for-preference-saves.md)
+adds the installation-wide `preferences` domain through `preference.set`.
+Settings show saving feedback synchronously, retain editable newer drafts and
+local theme preview, and apply sensitive client effects only from confirmed
+canonical values. Duplicate Save is guarded; close/reopen, old reads, and late
+callbacks cannot replace a newer draft. A compact summary preserves access to
+pending and recovery status outside Settings.
+
+The persistent decimal-string `preferences_revision` covers legacy, helper,
+and direct SQL writers. The final serialized transaction rechecks current
+authorization, expected revision, receipt namespace, admission time, and shared
+quotas after filesystem preparation, then commits values, rotation state,
+runtime-reconciliation marker, and receipt together. Directory creation is an
+idempotent prerequisite; a precommit crash may leave an empty directory.
+Recovery reapplies current desired runtime configuration without regenerating
+the rotation deck/deadline or creating download commands. Existing worker
+ownership and debug-reloader timer ownership remain authoritative.
+
+Conflicts require explicit review and a new submission. Unknown outcomes offer
+actor-scoped receipt checks and deliberate replay of the same frozen attempt;
+matching reads alone never confirm a save. Unsupported servers retain pending
+feedback and drafts without inventing revisions or receipt recovery.
+Authentication and installation-access fences clear private draft state and
+ignore obsolete callbacks. `VDL.preferenceMutationMetrics()` exposes bounded,
+content-free in-memory aggregates through the shared diagnostic seam.
+
 ## Remaining action adapters
 
 The rows below are explicit migration work, not claims that the app-wide
@@ -77,12 +103,11 @@ remain in force. They need their own behavior and regression evidence before
 adopting automatic recovery.
 
 Each remaining row now has a proposed feature spec. These links allocate work;
-they do not mark any remaining adapter implemented. Features 0054–0067 inherit Feature
+they do not mark any remaining adapter implemented. Features 0055–0067 inherit Feature
 0051 and the shared requirements below.
 
 | Controls / production entry points in `static/app.js` | Existing mechanism | Required migration / recovery boundary | Feature spec |
 | --- | --- | --- | --- |
-| Preferences: `savePreferences` | Captured form submission; effects apply after acknowledgement; local theme preview | Saving presentation, newer draft generations, duplicate guards and canonical acknowledgement. Sensitive effects wait for confirmation. | [0054: Preferences](../FEATURES/feature-0054-immediate-feedback-for-preference-saves.md) |
 | Playlist create/replace: `savePlaylistEditor` | Local draft, existing `expected_revision` on replace, server conflict response | Saving state, duplicate guards, retained newer drafts and explicit conflict recovery. Preserve the existing revision type. | [0055: Playlist editor](../FEATURES/feature-0055-immediate-feedback-for-playlist-editor-saves.md) |
 | Playlist add/delete: `quickAddToPlaylist`, `deletePlaylist` | Server response, deletion confirmation, playlist refresh | Pending initiating controls and receipt-safe recovery before retries. | [0056: Playlist add/delete](../FEATURES/feature-0056-immediate-feedback-for-playlist-add-and-delete.md) |
 | Pause/unpause/stop/retry/resume: download controls and attempt-history actions | Worker status remains server-owned; collection reconciliation | Request feedback is separate from worker transition. Durable job acceptance and crash recovery are required before replay. | [0057: Download commands](../FEATURES/feature-0057-immediate-feedback-and-durable-download-commands.md) |
@@ -198,15 +223,15 @@ mark the wider rollout complete without that evidence.
 ## Verification commands
 
 Run the Python coverage gate with Python 3.12, the production-module Node tests,
-and real browser tag, favorite, and rename interactions. Browser runs use controlled
+and real browser tag, favorite, rename, and preference interactions. Browser runs use controlled
 request gates to exercise pending presentation and canonical confirmation with
 SSE unavailable.
 
 ```bash
 VDL_PYTHON=/path/to/python3.12 ./tests/run-all.sh --unit
 node --test tests/*.test.cjs
-VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py tags.spec.cjs immediate-feedback.spec.cjs favorites-feedback.spec.cjs rename-feedback.spec.cjs
-VDL_TEST_BROWSER=firefox VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py tags.spec.cjs immediate-feedback.spec.cjs favorites-feedback.spec.cjs rename-feedback.spec.cjs
+VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py tags.spec.cjs immediate-feedback.spec.cjs favorites-feedback.spec.cjs rename-feedback.spec.cjs preferences-feedback.spec.cjs preferences.spec.cjs
+VDL_TEST_BROWSER=firefox VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py tags.spec.cjs immediate-feedback.spec.cjs favorites-feedback.spec.cjs rename-feedback.spec.cjs preferences-feedback.spec.cjs preferences.spec.cjs
 ```
 
 Verified on 2026-11-08 for version `0.54.0`:
@@ -282,3 +307,38 @@ an explicit intervention requirement. Completed cleanup journals cannot replace
 newer canonical file identities. Rename delivery does not complete Features
 0054–0067; authentication fencing and removal/retry serialization here cover
 the rename integration boundary only.
+
+Feature 0054 verified on 2026-11-08 for version `0.57.0`:
+
+- Python 3.12 unit gate: **613 tests, 9 skipped**; `vdl.py` line coverage
+  **92.8%** (6494/6999 executable lines; enforced minimum 90%). The 27
+  preference protocol tests cover canonical normalization, migrations and all
+  writers, atomic snapshots, concurrent replay and conflicts, actor-scoped
+  receipts, fingerprint mismatch, shared quotas and expiry, preflight admission
+  races, rollback, directory preparation, durable rotation deadlines, controller
+  failures, worker ownership, restart, and debug-reloader timer ownership.
+- Node: **102 tests passed**, including 16 preference production-interface
+  checks for status-only pending presentation, immutable attempts, canonical
+  acknowledgements, stale reads/receipts, explicit conflict review, unknown
+  finality, independent domains, authentication/access fences, and diagnostics.
+- Chromium and Firefox with Python 3.12: **21 distinct preference browser
+  checks passed in each browser**. Controlled gates establish feedback below
+  50 ms, confirmation without SSE or collection GETs, retained newer drafts
+  and focus, theme preview, duplicate guards, close/reopen, canonical
+  normalization, explicit conflict review, deliberate frozen replay, malformed
+  success, unknown outcomes, legacy fallback, old denied loads, access loss,
+  real account switching, and existing playback paths after directory changes.
+  Keyboard, both themes, reduced motion, narrow action layouts, and a polite
+  closed-Settings recovery announcement without repeated DOM churn are covered.
+- Chromium: **248 distinct scenarios passed**: the 247-scenario regression
+  run plus the closed-Settings announcement follow-up. Coverage includes
+  preferences/settings, tags/favorites/rename, immediate feedback, history
+  actions and pagination, rotation, playback and edge skipping, live updates
+  and contention, playlists, uploads, authentication, extension settings, and
+  worker recovery. Firefox's 21 distinct preference checks include the final
+  stale-denial and announcement follow-ups.
+
+Preference delivery does not complete Features 0055–0067. Authentication fencing
+here covers the preference integration boundary; specialized playback,
+progress, lease, upload, worker, and companion sequences retain their existing
+ownership and recovery contracts.

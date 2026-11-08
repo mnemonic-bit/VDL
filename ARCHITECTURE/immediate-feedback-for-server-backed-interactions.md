@@ -1,6 +1,6 @@
 # Architecture: immediate feedback for server-backed interactions
 
-**Status:** Foundation, tag protocol, favorite adapter, and rename recovery implemented; additional adapters remain proposed.\
+**Status:** Foundation, tag protocol, favorite adapter, rename recovery, and preference saves implemented; additional adapters remain proposed.\
 **Date:** 2026-11-08\
 **Requirements:** [Feature 0051](../FEATURES/feature-0051-immediate-feedback-for-server-backed-interactions.md)
 
@@ -19,7 +19,7 @@ detailed requirements. If implementation requires changing a requirement, update
 the feature explicitly rather than silently contradicting it here.
 
 The implementation adds the shared modules, tag protocol, and independent
-`favorite.set` and `rename.set` adapters described below. Other actions still use handlers and collection snapshots in
+`favorite.set`, `rename.set`, and `preference.set` adapters described below. Other actions still use handlers and collection snapshots in
 `static/app.js`, server routes and persistence in `vdl.py`, and SSE hints that
 trigger collection reads. The [rollout inventory](feature-0051-rollout.md) records
 which adapters remain staged. Existing
@@ -57,7 +57,7 @@ reconciliation may still use the existing batching delays.
 
 ## Module responsibilities and proposed placement
 
-The client modules below host tags and favorites. Additional action adapters
+The client modules below host tags, favorites, rename, and preferences. Additional action adapters
 remain staged. The client remains raw browser JavaScript;
 new scripts expose factory functions through one `window.VDL` namespace and load
 in dependency order before `app.js`. No bundler or runtime package is required.
@@ -319,6 +319,33 @@ admissions survive terminal receipt cleanup. The public recovery response
 contains canonical editable state or a generic unresolved status, never raw
 journal paths. The UI projects requested display text while retaining confirmed
 file identity; only a canonical acknowledgement changes that identity.
+
+### Preference transactions and runtime reconciliation
+
+`preference.set` targets the existing installation-wide save scope, retaining
+its authenticated-user authorization. The shared store owns canonical values
+and decimal-string revisions; pending intent is status only. Settings owns
+draft generations and view tokens, including the local theme preview. A save
+acknowledgement applies canonical values without a collection read. Conflicts
+require review and explicit submission of the current draft as a new attempt.
+
+Database triggers cover every preference writer. Short preliminary admission
+precedes directory validation and rotation membership preparation outside the
+database write lock; the final transaction repeats current authorization,
+receipt, namespace, revision, expiry, and quota checks. It atomically commits
+the settings, accepted rotation deck/deadline, runtime-pending marker, and
+terminal receipt. Directory creation is an idempotent prerequisite and can
+leave an empty directory after a precommit crash.
+
+Runtime reconciliation uses the latest durable desired configuration under
+the existing worker and rotation locks. It configures bandwidth, schedules
+the stored rotation deadline, and wakes existing queued work using established
+worker-ownership guards. The marker clears only for the reconciled revision;
+failure leaves it pending for authorized recovery or startup. Receipt replay
+does not generate a new rotation or download command. Startup restores
+process-local configuration while retaining the debug reloader's timer-owner
+restriction. The [preference effect audit](../FEATURES/feature-0054-immediate-feedback-for-preference-saves.md#preference-effect-audit)
+records each boundary.
 
 ## Bootstrap, compatibility, and deployment
 

@@ -128,6 +128,7 @@ def test_row():
     }
     if filename:
         updates["filename"] = filename
+        updates["output_dir"] = os.path.dirname(filename)
     if data.get("status") in ("finished", "error", "cancelled", "interrupted"):
         updates.setdefault("finished_at", time.time())
     if updates:

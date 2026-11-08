@@ -684,7 +684,17 @@
 
                     <p id="settingsNoResults" class="settings-no-results" role="status" hidden>No settings match your search.</p>
                     <div class="pref-actions">
-                        <button id="saveBtn" type="button" onclick="savePreferences()"><svg class="btn-icon"><use href="#i-save"/></svg><span>Save</span></button>
+                        <p id="preferenceSaveStatus" role="status" aria-live="polite"></p>
+                        <button id="saveBtn" type="button" onclick="savePreferences()" aria-describedby="preferenceSaveStatus"><span id="preferenceSavingSpinner" class="options-spinner" aria-hidden="true" hidden></span><svg class="btn-icon" aria-hidden="true"><use href="#i-save"/></svg><span>Save</span></button>
+                    </div>
+                    <div id="preferenceRecovery" class="preference-recovery" hidden>
+                        <button id="preferenceCheck" type="button" onclick="preferenceRecovery('check')">Check save status</button>
+                        <button id="preferenceReplay" type="button" onclick="preferenceRecovery('replay')">Replay original save</button>
+                        <button id="preferenceReview" type="button" onclick="preferenceRecovery('review')">Review current settings</button>
+                        <button id="preferenceResubmit" type="button" onclick="preferenceRecovery('resubmit')">Save current draft</button>
+                        <button id="preferenceReload" type="button" onclick="window.location.reload()">Reload page to check settings</button>
+                        <button id="preferenceUseCurrent" type="button" onclick="preferenceRecovery('current')">Use current settings</button>
+                        <pre id="preferenceCurrentValues" hidden></pre>
                     </div>
                 </div>
             </div>
@@ -974,6 +984,7 @@
     </div>
 
     <p id="renameMutationSummary" class="tag-mutation-summary" hidden></p>
+    <p id="preferenceMutationSummary" class="tag-mutation-summary" role="status" aria-live="polite" hidden><span></span> <button type="button" onclick="openSettings()">Open Settings</button></p>
     <p id="favoriteMutationSummary" class="tag-mutation-summary" hidden></p>
     <p id="tagMutationSummary" class="tag-mutation-summary" hidden></p>
     <footer id="versionFooter" class="version-footer" data-ui-version="{{ ui_version }}">

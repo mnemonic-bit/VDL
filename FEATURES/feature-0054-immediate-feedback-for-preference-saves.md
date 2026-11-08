@@ -1,7 +1,7 @@
 # Immediate feedback for preference saves
 
 **Source:** Remaining Feature 0051 rollout item\
-**Status:** Proposed; not implemented\
+**Status:** Implemented in version `0.57.0`; verification recorded in the rollout inventory\
 **Last refined:** 2026-11-08\
 **Extends:** [Feature 0051](feature-0051-immediate-feedback-for-server-backed-interactions.md), [Feature 0022, Settings](feature-0022-move-settings-to-a-searchable-page.md)\
 **Rollout:** [Shared requirements and inventory](../ARCHITECTURE/feature-0051-rollout.md#shared-requirements-for-the-remaining-specs)
@@ -34,6 +34,29 @@ without waiting for SSE or declaring unsaved newer drafts saved.
 
 ## State and server contract
 
+### Adopted action boundary
+
+- **Action:** `preference.set`; target `installation`; domain `preferences`.
+  The existing form is one installation-wide atomic scope, available to
+  authenticated users under the existing permission rules. There is no
+  user-specific preference scope in the current application.
+- **Affected views:** Settings controls and status, the compact recovery
+  summary outside Settings, and confirmed playback, pagination, theme, and
+  Library-order consumers. Pending values do not change these consumers,
+  except for the existing local theme preview.
+- **Wire:** `POST /api/preferences` accepts `values`, `client_mutation_id`,
+  and decimal-string `expected_revision`. Canonical results bind target,
+  mutation ID, domain, outcome, all editable `values`, and
+  `preferences_revision`. The flattened legacy read/write contract remains
+  available; unsupported clients receive no invented revision or replay.
+- **Conflict:** the complete captured form shares one revision. Review the
+  current canonical settings before explicitly submitting the retained draft
+  as a new attempt; never automatically resubmit the stale captured form.
+- **Recovery:** actor-scoped `GET /api/mutations/<id>` and deliberate replay
+  of the frozen request. Missing receipts and matching settings alone cannot
+  establish success. Shared expiry, quotas, authorization, and finality rules
+  apply. Authentication changes clear drafts and fence all prior callbacks.
+
 Treat each existing atomic preference save scope as a conflict domain; preserve
 user-specific versus installation-wide authorization. Introduce a persistent
 revision for an adopted scope and return its canonical editable values and
@@ -51,6 +74,16 @@ If a save starts external work, durable acceptance and operation-specific
 recovery must prevent receipt replay from starting it again. Database receipts
 alone cover only transactional effects. Do not advertise a stronger capability
 for a mixed save until every included effect meets its recovery contract.
+
+### Preference effect audit
+
+| Effect | Persistence and recovery boundary |
+| --- | --- |
+| Editable preference values | Values, the persistent revision, the terminal receipt, and a runtime-reconciliation marker commit together. Legacy and direct SQL writers advance the revision through database triggers. |
+| Download directory | Directory creation with `exist_ok=True` is an idempotent prerequisite. A crash before commit can leave an empty directory; it creates no media or job. A committed replay returns its receipt without creating the directory again. Existing playback continues to use each entry's stored filename. |
+| Library rotation | Members, generation, and deadline commit with the settings and receipt. Runtime recovery schedules the stored deadline; it does not reshuffle the accepted deck or restart its lifetime. The debug reloader parent retains its existing timer-ownership restriction. |
+| Bandwidth and concurrency | Runtime controllers apply the latest persisted desired configuration after commit. The persistent pending marker survives controller failure; authorized recovery retries pending configuration, and startup restores process-local configuration. Worker dispatch retains existing ownership guards and only wakes already-enqueued work. Settings saves do not create or replay download commands. |
+| Playback, pagination, theme, and shuffle consumers | Client effects use confirmed canonical values. The form and theme preview retain newer drafts. A save response confirms without SSE or a collection read; rotation membership may reconcile separately afterward. |
 
 ## Recovery and compatibility
 

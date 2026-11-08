@@ -340,7 +340,7 @@ def companion_response_headers(response):
     """Apply the narrow CORS and cache boundary to companion responses."""
     if request.endpoint in ('library_storage', 'client_capabilities',
                             'editable_download_state', 'mutation_receipt', 'download_tags',
-                            'set_download_favorite'):
+                            'set_download_favorite', 'preferences'):
         response.headers['Cache-Control'] = 'no-store'
     if request.endpoint not in EXTENSION_NO_STORE_ENDPOINTS:
         return response
@@ -1020,6 +1020,28 @@ def init_db():
                 (k, v),
             )
 
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS preference_state (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                revision INTEGER NOT NULL DEFAULT 0,
+                runtime_pending INTEGER NOT NULL DEFAULT 1
+            );
+            INSERT OR IGNORE INTO preference_state(singleton) VALUES (1);
+            UPDATE preference_state SET runtime_pending = 1;
+            CREATE TRIGGER IF NOT EXISTS preference_insert_revision
+            AFTER INSERT ON preferences BEGIN
+                UPDATE preference_state SET revision = revision + 1, runtime_pending = 1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS preference_update_revision
+            AFTER UPDATE ON preferences WHEN NEW.key IS NOT OLD.key OR NEW.value IS NOT OLD.value BEGIN
+                UPDATE preference_state SET revision = revision + 1, runtime_pending = 1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS preference_delete_revision
+            AFTER DELETE ON preferences BEGIN
+                UPDATE preference_state SET revision = revision + 1, runtime_pending = 1;
+            END;
+        """)
+
         # Tags have no independent lifecycle. This also repairs orphan rows
         # left by an interrupted migration or a manually edited database.
         conn.execute(
@@ -1038,6 +1060,7 @@ def init_db():
             "WHERE status IN ('starting', 'downloading', 'paused')"
         )
     _recover_rename_operations()
+    _reconcile_preference_runtime(restore_rotation=False)
     # The debug reloader's parent must not renew the shared deck alongside
     # its serving child. Ordinary WSGI imports still own their deadline timer.
     if (__name__ != '__main__'
@@ -4091,42 +4114,72 @@ def db_get_preferences():
         return {r["key"]: r["value"] for r in rows}
 
 
-def db_set_preferences(updates: dict):
-    # Serialize persistence and live controller updates in the same order.
+def _preference_snapshot(conn):
+    values = {row['key']: row['value'] for row in conn.execute('SELECT key, value FROM preferences')
+              if row['key'] in PREFERENCE_FIELDS}
+    revision = conn.execute('SELECT revision FROM preference_state WHERE singleton = 1').fetchone()[0]
+    return {'id': 'installation', 'values': values, 'preferences_revision': str(revision)}
+
+
+def _write_preferences(conn, updates, previous, ids):
+    for key, value in updates.items():
+        conn.execute(
+            'INSERT INTO preferences(key, value) VALUES (?, ?) '
+            'ON CONFLICT(key) DO UPDATE SET value = excluded.value', (key, str(value)),
+        )
+    changed = any(key in updates and str(updates[key]) != previous.get(key)
+                  for key in ('library_rotation_enabled', 'library_rotation_hours'))
+    if changed:
+        enabled = updates.get('library_rotation_enabled', previous.get('library_rotation_enabled')) == 'true'
+        if enabled:
+            _write_library_rotation(conn, ids, updates.get('library_rotation_hours', previous.get('library_rotation_hours', '24')))
+        else:
+            conn.execute('DELETE FROM library_rotation_members')
+            conn.execute('DELETE FROM library_rotation')
+
+
+def _reconcile_preference_runtime(restore_rotation=True):
+    # Durable desired state drives idempotent controllers. Recovery never
+    # regenerates a deck/deadline or creates a download command. Existing queue
+    # ownership guards still decide which already-enqueued worker may start.
+    with _worker_condition, _rotation_lock:
+        with db() as conn:
+            conn.execute('BEGIN')
+            pending = conn.execute('SELECT revision, runtime_pending FROM preference_state').fetchone()
+            if not pending['runtime_pending']:
+                return
+            values = _preference_snapshot(conn)['values']
+            rotation = conn.execute('SELECT expires_at FROM library_rotation').fetchone()
+        _bandwidth.configure(values.get('max_total_download_mbps', '0'))
+        if restore_rotation:
+            if values.get('library_rotation_enabled') == 'true':
+                if rotation is not None:
+                    _schedule_rotation_timer(rotation['expires_at'])
+            else:
+                _cancel_rotation_timer()
+        _dispatch_worker_queue()
+        _worker_condition.notify_all()
+        with _db_lock, db() as conn:
+            conn.execute('UPDATE preference_state SET runtime_pending = 0 WHERE revision = ?',
+                         (pending['revision'],))
+
+
+def db_set_preferences(updates: dict, request_actor=False):
     with _worker_condition, _rotation_lock:
         previous = db_get_preferences()
+        rotation_changed = any(key in updates and str(updates[key]) != previous.get(key)
+                               for key in ('library_rotation_enabled', 'library_rotation_hours'))
         enabled = updates.get('library_rotation_enabled', previous.get('library_rotation_enabled')) == 'true'
-        hours = updates.get('library_rotation_hours', previous.get('library_rotation_hours', '24'))
-        rotation_changed = any(
-            key in updates and str(updates[key]) != previous.get(key)
-            for key in ('library_rotation_enabled', 'library_rotation_hours')
-        )
-        # Filesystem eligibility work happens before the write transaction.
         ids = _new_rotation_members() if rotation_changed and enabled else None
-        order = None
         with _db_lock, db() as conn:
-            for k, v in updates.items():
-                conn.execute(
-                    "INSERT INTO preferences(key, value) VALUES (?, ?) "
-                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                    (k, str(v)),
-                )
-            if ids is not None:
-                order = _write_library_rotation(conn, ids, hours)
-            elif rotation_changed and not enabled:
-                conn.execute('DELETE FROM library_rotation_members')
-                conn.execute('DELETE FROM library_rotation')
+            conn.execute('BEGIN IMMEDIATE')
+            if request_actor and _tag_actor(conn) is None:
+                return False
+            _write_preferences(conn, updates, previous, ids)
+        _reconcile_preference_runtime()
         if rotation_changed:
-            if order is not None:
-                _schedule_rotation_timer(order['expires_at'])
-            elif not enabled:
-                _cancel_rotation_timer()
-            event_bus.publish('change', {'reason': 'library_rotation'})
-        if 'max_total_download_mbps' in updates:
-            _bandwidth.configure(updates['max_total_download_mbps'])
-        if {'max_concurrent', 'max_concurrent_per_host'} & updates.keys():
-            _dispatch_worker_queue()
-            _worker_condition.notify_all()
+            _publish_metadata_change('library_rotation')
+        return True
 
 
 def _db_user(conn, where, values):
@@ -8445,7 +8498,7 @@ def record_download_view(download_id):
 @app.route('/api/client-capabilities', methods=['GET'])
 def client_capabilities():
     response = jsonify({
-        'mutation_protocol': 1, 'actions': ['tag.add', 'tag.remove', 'favorite.set', 'rename.set'],
+        'mutation_protocol': 1, 'actions': ['tag.add', 'tag.remove', 'favorite.set', 'rename.set', 'preference.set'],
         'tag_identity_version': TAG_IDENTITY_VERSION,
         'server_time': int(time.time() * 1000),
     })
@@ -8495,11 +8548,12 @@ def mutation_receipt(mutation_id):
                 'WHERE actor_id = ? AND mutation_id = ?', (actor['id'], mutation_id),
             ).fetchone()
             if receipt is not None:
-                if _tag_visible_row(conn, receipt['target_id'], actor) is None:
+                result = json.loads(receipt['response'])
+                preference_receipt = result.get('mutation', {}).get('domain') == 'preferences' and receipt['target_id'] == 'installation'
+                if not preference_receipt and _tag_visible_row(conn, receipt['target_id'], actor) is None:
                     match = MUTATION_ID_PATTERN.fullmatch(mutation_id)
                     final = bool(match and int(match.group(1)) / 1000 < time.time() - MUTATION_REPLAY_SECONDS)
                     return jsonify({'error': 'Mutation unavailable', 'final': final}), 404
-                result = json.loads(receipt['response'])
                 if result.get('mutation', {}).get('domain') == 'tags':
                     result['available_tags'] = _tag_vocabulary(conn, actor)
                 response = jsonify(result)
@@ -8510,7 +8564,12 @@ def mutation_receipt(mutation_id):
                 response = jsonify({'error': 'Mutation unavailable', 'final': final})
                 response.status_code = 404
         response.headers['Cache-Control'] = 'no-store'
-        return response
+    if receipt is not None and preference_receipt:
+        try:
+            _reconcile_preference_runtime()
+        except Exception:
+            app.logger.warning('mutation action=preference.set runtime=pending')
+    return response
 
 @app.route('/api/tags/<download_id>', methods=['POST', 'DELETE'])
 def download_tags(download_id):
@@ -8949,100 +9008,231 @@ def preview_maintenance():
     return jsonify(_get_asset_queue().maintenance_status())
 
 
-@app.route('/api/preferences', methods=['GET', 'POST'])
-def preferences():
-    if request.method == 'GET':
-        return jsonify(db_get_preferences())
-    data = request.json or {}
-    allowed = {
-        'download_dir', 'format', 'history_page_size', 'max_concurrent', 'player_mode',
-        'start_fullscreen', 'theme', 'shuffle_min_height',
-        'max_concurrent_per_host', 'max_total_download_mbps',
-        'shuffle_min_duration_minutes', 'skip_video_edges',
-        'library_rotation_enabled', 'library_rotation_hours',
-    }
-    updates = {k: v for k, v in data.items() if k in allowed and v is not None}
-    for key, label in (
-        ('max_concurrent', 'Max concurrent downloads (total)'),
-        ('max_concurrent_per_host', 'Max concurrent downloads per server'),
-    ):
+PREFERENCE_FIELDS = frozenset({
+    'download_dir', 'format', 'history_page_size', 'max_concurrent', 'player_mode',
+    'start_fullscreen', 'theme', 'shuffle_min_height', 'max_concurrent_per_host',
+    'max_total_download_mbps', 'shuffle_min_duration_minutes', 'skip_video_edges',
+    'library_rotation_enabled', 'library_rotation_hours',
+})
+
+
+class PreferenceValidationError(ValueError):
+    def __init__(self, field, message):
+        super().__init__(message)
+        self.field = field
+
+
+def _validated_preferences(data):
+    if not isinstance(data, dict):
+        raise PreferenceValidationError('settings', 'Settings must be an object')
+    updates = {key: value for key, value in data.items() if key in PREFERENCE_FIELDS and value is not None}
+    for key, label in (('max_concurrent', 'Max concurrent downloads (total)'),
+                       ('max_concurrent_per_host', 'Max concurrent downloads per server')):
         if key in data:
             value = data[key]
             if (isinstance(value, bool) or not isinstance(value, (str, int))
-                    or not re.fullmatch(r'[0-9]+', str(value)) or int(value) < 1):
-                return jsonify({'error': f'{label} must be a positive whole number'}), 400
+                    or not re.fullmatch(r'[0-9]+', str(value)) or len(str(value)) > 9 or int(value) < 1):
+                raise PreferenceValidationError(key, f'{label} must be a positive whole number')
             updates[key] = str(int(value))
     if 'max_total_download_mbps' in data:
         try:
             updates['max_total_download_mbps'] = canonical_mbps(data['max_total_download_mbps'])
-        except ValueError as exc:
-            return jsonify({'error': str(exc)}), 400
-    if 'skip_video_edges' in data:
-        value = data['skip_video_edges']
-        if isinstance(value, bool):
-            updates['skip_video_edges'] = 'true' if value else 'false'
-        elif isinstance(value, str) and value in {'true', 'false'}:
-            updates['skip_video_edges'] = value
-        else:
-            return jsonify({
-                'error': 'Skip video intro and outro must be true or false'
-            }), 400
-    if 'library_rotation_enabled' in data:
-        value = data['library_rotation_enabled']
-        if isinstance(value, bool):
-            updates['library_rotation_enabled'] = 'true' if value else 'false'
-        elif isinstance(value, str) and value in {'true', 'false'}:
-            updates['library_rotation_enabled'] = value
-        else:
-            return jsonify({'error': 'Library rotation must be true or false'}), 400
-    if 'library_rotation_hours' in data:
-        value = data['library_rotation_hours']
-        digits = str(value).lstrip('0') or '0'
-        if (isinstance(value, bool) or not isinstance(value, (str, int))
-                or not re.fullmatch(r'[0-9]+', str(value))
-                or len(digits) > 4 or not 1 <= int(digits) <= 8760):
-            return jsonify({
-                'error': 'Library rotation hours must be a whole number from 1 through 8760'
-            }), 400
-        updates['library_rotation_hours'] = str(int(digits))
-    if not updates:
-        return jsonify({"error": "No valid preference fields provided"}), 400
-    if "download_dir" in updates:
-        try:
-            updates["download_dir"] = _prepare_download_directory(
-                updates["download_dir"]
-            )
-        except ValueError as exc:
-            return jsonify({"error": str(exc)}), 400
-    if "history_page_size" in updates:
-        updates["history_page_size"] = str(updates["history_page_size"])
-        if updates["history_page_size"] not in {'5', '10', '20', '50', 'endless'}:
-            return jsonify({
-                "error": "Videos per page must be 5, 10, 20, 50, or endless"
-            }), 400
+        except ValueError as error:
+            raise PreferenceValidationError('max_total_download_mbps', str(error)) from error
+    for key, label in (('skip_video_edges', 'Skip video intro and outro'),
+                       ('library_rotation_enabled', 'Library rotation'),
+                       ('start_fullscreen', 'Start fullscreen')):
+        if key in data:
+            value = data[key]
+            if isinstance(value, bool):
+                updates[key] = 'true' if value else 'false'
+            elif isinstance(value, str) and value in {'true', 'false'}:
+                updates[key] = value
+            else:
+                raise PreferenceValidationError(key, f'{label} must be true or false')
+    for key, minimum, maximum, message in (
+            ('library_rotation_hours', 1, 8760, 'Library rotation hours must be a whole number from 1 through 8760'),
+            ('shuffle_min_duration_minutes', 0, 1440, 'Shuffle minimum length must be a whole number from 0 through 1440')):
+        if key in data:
+            value = data[key]
+            digits = str(value).lstrip('0') or '0'
+            if (isinstance(value, bool) or not isinstance(value, (str, int))
+                    or not re.fullmatch(r'[0-9]+', str(value))
+                    or len(digits) > 4 or not minimum <= int(digits) <= maximum):
+                raise PreferenceValidationError(key, message)
+            updates[key] = str(int(digits))
+    if 'history_page_size' in updates:
+        updates['history_page_size'] = str(updates['history_page_size'])
+        if updates['history_page_size'] not in {'5', '10', '20', '50', 'endless'}:
+            raise PreferenceValidationError('history_page_size', 'Videos per page must be 5, 10, 20, 50, or endless')
     if 'shuffle_min_height' in updates:
         value = updates['shuffle_min_height']
-        if (isinstance(value, bool)
-                or not isinstance(value, (str, int))
-                or not str(value).isascii()
-                or not str(value).isdigit()
-                or int(str(value), 10) not in SHUFFLE_MIN_HEIGHTS):
-            return jsonify({
-                'error': 'Shuffle minimum quality is invalid'
-            }), 400
-        updates['shuffle_min_height'] = str(int(str(value), 10))
-    if 'shuffle_min_duration_minutes' in updates:
-        value = updates['shuffle_min_duration_minutes']
-        if (isinstance(value, bool)
-                or not isinstance(value, (str, int))
-                or not str(value).isascii()
-                or not str(value).isdigit()
-                or not 0 <= int(str(value), 10) <= 1440):
-            return jsonify({
-                'error': 'Shuffle minimum length must be a whole number from 0 through 1440'
-            }), 400
-        updates['shuffle_min_duration_minutes'] = str(int(str(value), 10))
-    db_set_preferences(updates)
+        if (isinstance(value, bool) or not isinstance(value, (str, int))
+                or not str(value).isascii() or not str(value).isdigit()
+                or len(str(value)) > 9 or int(value) not in SHUFFLE_MIN_HEIGHTS):
+            raise PreferenceValidationError('shuffle_min_height', 'Shuffle minimum quality is invalid')
+        updates['shuffle_min_height'] = str(int(value))
+    for key in ('download_dir', 'format', 'player_mode', 'theme'):
+        if key in updates and not isinstance(updates[key], str):
+            raise PreferenceValidationError(key, 'Setting must be text')
+    if not updates:
+        raise PreferenceValidationError('settings', 'No valid preference fields provided')
+    return updates
+
+
+def _prepare_preference_directory(updates):
+    if 'download_dir' in updates:
+        try:
+            updates['download_dir'] = _prepare_download_directory(updates['download_dir'])
+        except ValueError as error:
+            # Filesystem exception details can contain private absolute paths.
+            raise PreferenceValidationError('download_dir', 'Download directory is not usable or writable') from error
+
+
+def _admit_preference_mutation(conn, payload, fingerprint, match):
+    actor = _tag_actor(conn)
+    if actor is None:
+        return {'reply': {'error': 'Authentication required'}, 'status': 401}
+    mutation_id = payload['client_mutation_id']
+    state = _preference_snapshot(conn)
+    receipt = conn.execute('SELECT fingerprint, status, response FROM mutation_receipts WHERE actor_id = ? AND mutation_id = ?',
+                           (actor['id'], mutation_id)).fetchone()
+    if receipt is not None:
+        if receipt['fingerprint'] != fingerprint:
+            return {'reply': {'error': 'Mutation identifier already used', 'code': 'mutation_id_conflict'}, 'status': 409}
+        return {'reply': json.loads(receipt['response']), 'status': receipt['status']}
+    if conn.execute("SELECT 1 FROM rename_operations WHERE actor_id = ? AND mutation_id = ? AND phase != 'done'",
+                    (actor['id'], mutation_id)).fetchone():
+        return {'reply': {'error': 'Mutation identifier already used', 'code': 'mutation_id_conflict'}, 'status': 409}
+    now = time.time()
+    conn.execute('DELETE FROM mutation_receipts WHERE recorded_at < ?', (now - MUTATION_RETENTION_SECONDS,))
+    counts = conn.execute('SELECT COUNT(*) AS total, COALESCE(SUM(recorded_at > ?), 0) AS recent FROM mutation_receipts WHERE actor_id = ?',
+                          (now - 60, actor['id'])).fetchone()
+    active = conn.execute("SELECT COUNT(*) FROM rename_operations WHERE actor_id = ? AND (phase != 'done' OR NOT EXISTS (SELECT 1 FROM mutation_receipts r WHERE r.actor_id = rename_operations.actor_id AND r.mutation_id = rename_operations.mutation_id))", (actor['id'],)).fetchone()[0]
+    if counts['total'] + active >= MUTATION_ACTOR_RECEIPT_LIMIT or counts['recent'] + active >= MUTATION_ACTOR_MINUTE_LIMIT:
+        return {'reply': {'error': 'Too many mutations; wait before submitting more', 'code': 'mutation_limit'}, 'status': 429}
+    gate = {'actor': actor, 'state': state, 'now': now, 'status': 200,
+            'outcome': 'committed', 'error': None, 'field_errors': {}}
+    expected = payload.get('expected_revision')
+    created = int(match.group(1)) / 1000
+    if created < now - MUTATION_REPLAY_SECONDS or created > now + 300:
+        gate.update(error='Mutation identifier expired or clock is incorrect', status=400, outcome='rejected')
+    elif not isinstance(expected, str) or not re.fullmatch(r'0|[1-9][0-9]{0,18}', expected):
+        gate.update(error='Expected revision must be a decimal string', status=400, outcome='rejected')
+    elif expected != state['preferences_revision']:
+        gate.update(error='Settings changed elsewhere; review current values before saving again', status=409, outcome='conflicted')
+    return gate
+
+
+def _reject_preference_validation(gate, invalid):
+    gate.update(error=str(invalid), field_errors={invalid.field: str(invalid)},
+                status=400, outcome='rejected')
+
+
+def _record_preference_result(conn, gate, payload, fingerprint):
+    state = gate['state']
+    result = dict(state, mutation={'id': payload['client_mutation_id'], 'domain': 'preferences',
+                                   'outcome': gate['outcome'], 'revision': state['preferences_revision']},
+                  server_time=int(gate['now'] * 1000))
+    if gate['error']:
+        result.update(error=gate['error'], field_errors=gate['field_errors'])
+    conn.execute('INSERT INTO mutation_receipts(actor_id, mutation_id, target_id, fingerprint, status, response, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                 (gate['actor']['id'], payload['client_mutation_id'], 'installation', fingerprint,
+                  gate['status'], json.dumps(result, separators=(',', ':')), gate['now']))
+    return result, gate['status']
+
+
+def _execute_preference_mutation(payload):
+    mutation_id = payload.get('client_mutation_id')
+    match = MUTATION_ID_PATTERN.fullmatch(mutation_id) if isinstance(mutation_id, str) else None
+    if match is None:
+        return {'error': 'Invalid mutation identifier'}, 400
+    fingerprint = hashlib.sha256(json.dumps(
+        ['POST', 'preference.set', 'installation', payload.get('values'), payload.get('expected_revision')],
+        sort_keys=True, ensure_ascii=True, separators=(',', ':'),
+    ).encode()).hexdigest()
+    with _worker_condition, _rotation_lock:
+        # Check admission before idempotent filesystem preparation. The second
+        # transaction repeats every check after that work: raw writers, account
+        # changes, clock expiry and shared-domain receipts can race preparation.
+        with _db_lock, db() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            gate = _admit_preference_mutation(conn, payload, fingerprint, match)
+            if 'reply' in gate:
+                result, status = gate['reply'], gate['status']
+                prepare = False
+            else:
+                if not gate['error']:
+                    try:
+                        updates = _validated_preferences(payload.get('values'))
+                    except PreferenceValidationError as invalid:
+                        _reject_preference_validation(gate, invalid)
+                prepare = not gate['error']
+                if not prepare:
+                    result, status = _record_preference_result(conn, gate, payload, fingerprint)
+        if prepare:
+            preflight_error = None
+            ids = None
+            try:
+                # mkdir(exist_ok=True) is an idempotent prerequisite: a crash
+                # may leave an empty directory, never a playable file or job.
+                # Already committed replay returns before this preparation.
+                _prepare_preference_directory(updates)
+                previous = gate['state']['values']
+                rotation_changed = any(key in updates and str(updates[key]) != previous.get(key)
+                                       for key in ('library_rotation_enabled', 'library_rotation_hours'))
+                enabled = updates.get('library_rotation_enabled', previous.get('library_rotation_enabled')) == 'true'
+                ids = _new_rotation_members() if rotation_changed and enabled else None
+            except PreferenceValidationError as invalid:
+                preflight_error = invalid
+            with _db_lock, db() as conn:
+                conn.execute('BEGIN IMMEDIATE')
+                gate = _admit_preference_mutation(conn, payload, fingerprint, match)
+                if 'reply' in gate:
+                    result, status = gate['reply'], gate['status']
+                else:
+                    if not gate['error']:
+                        if preflight_error is not None:
+                            _reject_preference_validation(gate, preflight_error)
+                        else:
+                            _write_preferences(conn, updates, gate['state']['values'], ids)
+                            gate['state'] = _preference_snapshot(conn)
+                    result, status = _record_preference_result(conn, gate, payload, fingerprint)
+        # Committed settings and receipts survive controller failure. Resume
+        # from current durable values, never an older receipt's captured form.
+        if status != 401:
+            try:
+                _reconcile_preference_runtime()
+            except Exception:
+                app.logger.warning('mutation action=preference.set runtime=pending')
+        if status == 200:
+            _publish_metadata_change('preferences')
+        return result, status
+
+
+@app.route('/api/preferences', methods=['GET', 'POST'])
+def preferences():
+    if request.method == 'GET':
+        with db() as conn:
+            conn.execute('BEGIN')
+            actor = _tag_actor(conn)
+            if actor is None:
+                return jsonify({'error': 'Authentication required'}), 401
+            state = _preference_snapshot(conn)
+        return jsonify(dict(state['values'], **state))
+    data, invalid = _read_json_body(32768)
+    if invalid is not None:
+        return invalid
+    if 'client_mutation_id' in data or 'expected_revision' in data:
+        result, status = _execute_preference_mutation(data)
+        return jsonify(result), status
+    try:
+        updates = _validated_preferences(data)
+        _prepare_preference_directory(updates)
+    except PreferenceValidationError as invalid:
+        return jsonify({'error': str(invalid), 'field_errors': {invalid.field: str(invalid)}}), 400
+    if db_set_preferences(updates, request_actor=True) is False:
+        return jsonify({'error': 'Authentication required'}), 401
     return jsonify(db_get_preferences())
 
 
@@ -9051,7 +9241,6 @@ def preferences():
 # ---------------------------------------------------------------------------
 
 init_db()
-_bandwidth.configure(db_get_preferences()['max_total_download_mbps'])
 
 _ingest_service_lock = threading.Lock()
 _ingest_thread = None

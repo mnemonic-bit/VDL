@@ -1738,7 +1738,13 @@ details[open] > .history-summary::before { transform: rotate(90deg); }
 .settings-error { margin: 0 0 18px; }
 .settings-no-results { padding: 48px 20px; color: var(--muted); text-align: center; }
 .settings-no-results[hidden] { display: none; }
-.pref-actions { display: flex; justify-content: flex-end; margin-top: 20px; }
+.pref-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 12px; margin-top: 20px; }
+#preferenceSaveStatus { flex: 1 1 200px; margin: 0; color: var(--muted); }
+.preference-recovery { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
+.preference-recovery[hidden], .preference-recovery button[hidden], #preferenceCurrentValues[hidden] { display: none; }
+.preference-recovery button { padding: 8px 12px; color: var(--fg); background: var(--surface-2); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; }
+#preferenceCurrentValues { flex-basis: 100%; max-width: 100%; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--muted); }
+.preference-field-error { display: block; color: var(--error-fg); }
 #saveBtn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 0 16px; font-size: 1em; line-height: 1; height: 42px; min-width: 100px; border: 1px solid var(--border); border-radius: 4px; background-color: var(--surface-2); color: var(--fg); cursor: pointer; }
 #saveBtn:hover { background-color: var(--surface-hover); }
 .new-download-dialog {

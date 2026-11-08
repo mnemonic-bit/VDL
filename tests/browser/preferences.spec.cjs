@@ -66,7 +66,7 @@ test('preferences persist and the temporary Saved icon restores to Save', async 
     expect(preferences.shuffle_min_duration_minutes).toBe('12');
 });
 
-test('rejected preferences stay editable and are not displayed as saved', async ({ page }) => {
+test('unknown preference saves retain drafts and do not apply sensitive settings', async ({ page }) => {
     await openSettings(page);
     const original = await (await page.request.get('/api/preferences')).json();
     await page.route('**/api/preferences', async route => {
@@ -86,9 +86,10 @@ test('rejected preferences stay editable and are not displayed as saved', async 
     await page.locator('#prefTheme').selectOption('dark');
     await page.locator('#saveBtn').click();
 
-    await expect(page.locator('#saveBtn')).toBeEnabled();
+    await expect(page.locator('#saveBtn')).toBeDisabled();
     await expect(page.locator('#saveBtn')).toContainText('Save');
-    await expect(page.getByText('preferences were not saved')).toBeVisible();
+    await expect(page.locator('#preferenceSaveStatus')).toContainText('Save not confirmed');
+    await expect(page.locator('#prefMax')).toBeEnabled();
     await expect(page.locator('#prefMax')).toHaveValue('1');
     const persisted = await (await page.request.get('/api/preferences')).json();
     expect(persisted).toEqual(original);
