@@ -865,6 +865,7 @@
         </div>
     </dialog>
 
+    <div id="playlistMutationSummary" class="tag-mutation-summary" hidden><span role="status" aria-live="polite"></span> <button id="playlistRecoveryOpen" type="button" onclick="openPlaylistRecovery()">Review playlist save</button></div>
     <dialog id="playlistEditorDialog" class="playlist-editor-dialog" aria-labelledby="playlistEditorTitle">
         <form method="dialog" class="playlist-editor-shell" onsubmit="savePlaylistEditor(event)">
             <div class="playlist-editor-header">
@@ -894,9 +895,20 @@
                 </div>
                 <div id="playlistMoveStatus" class="visually-hidden" role="status" aria-live="polite"></div>
             </div>
+            <div class="playlist-save-feedback">
+                <p id="playlistSaveStatus" role="status" aria-live="polite"></p>
+                <div id="playlistRecovery" class="playlist-recovery" hidden>
+                    <button id="playlistCheck" type="button" onclick="playlistRecovery('check')">Check save status</button>
+                    <button id="playlistReplay" type="button" onclick="playlistRecovery('replay')">Replay original save</button>
+                    <button id="playlistReview" type="button" onclick="playlistRecovery('review')">Review current version</button>
+                    <button id="playlistUseCurrent" type="button" onclick="playlistRecovery('current')">Use current version</button>
+                    <button id="playlistResubmit" type="button" onclick="playlistRecovery('resubmit')">Save reviewed draft</button>
+                </div>
+                <pre id="playlistCurrentVersion" hidden></pre>
+            </div>
             <div class="playlist-editor-actions">
                 <button type="button" onclick="closePlaylistEditor()">Cancel</button>
-                <button id="playlistSaveButton" type="submit">Save playlist</button>
+                <button id="playlistSaveButton" type="submit"><i id="playlistSavingSpinner" class="playlist-saving-spinner" aria-hidden="true" hidden></i><span>Save playlist</span></button>
             </div>
         </form>
     </dialog>

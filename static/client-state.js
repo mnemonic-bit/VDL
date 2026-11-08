@@ -60,6 +60,7 @@
                 fences.delete(id);
             }
             const old = downloads.get(id);
+            if (snapshot.playlist_revision !== undefined && (!Number.isSafeInteger(snapshot.playlist_revision) || snapshot.playlist_revision < 0 || !snapshot.playlist || !Array.isArray(snapshot.playlist.items))) return false;
             const next = { ...(old || {}), ...copy(snapshot), id };
             if (old && revision(old.tags_revision)) {
                 if (!revision(snapshot.tags_revision) || BigInt(snapshot.tags_revision) < BigInt(old.tags_revision)) {
@@ -95,6 +96,21 @@
                     return false;
                 }
             }
+            if (old && Number.isSafeInteger(old.playlist_revision)) {
+                if (!Number.isSafeInteger(snapshot.playlist_revision) || snapshot.playlist_revision < old.playlist_revision) {
+                    next.playlist = old.playlist;
+                    next.playlist_revision = old.playlist_revision;
+                } else if (snapshot.playlist_revision === old.playlist_revision) {
+                    if (snapshot.playlist.name !== old.playlist.name || snapshot.playlist.items.length !== old.playlist.items.length || snapshot.playlist.items.some((item, index) => item.id !== null && old.playlist.items[index].id !== null && item.id !== old.playlist.items[index].id)) return false;
+                    // Visibility can redact a member without advancing playlist
+                    // revision. Retain that redaction against older callbacks.
+                    next.playlist.items = next.playlist.items.map((item, index) => old.playlist.items[index].id === null ? copy(old.playlist.items[index]) : item);
+                    const visible = new Set(next.playlist.items.map(item => item.id).filter(Boolean));
+                    next.playlist.member_ids = next.playlist.items.map(item => item.id);
+                    next.playlist.mosaic_ids = (next.playlist.mosaic_ids || []).filter(id => visible.has(id));
+                    if (next.playlist.progress && !visible.has(next.playlist.progress.download_id)) next.playlist.progress = null;
+                }
+            }
             downloads.set(id, next);
             notify(id);
             return true;
@@ -107,6 +123,7 @@
             const favoriteIntents = [];
             const renameIntents = [];
             const preferenceIntents = [];
+            const playlistIntents = [];
             let requestedFilename = null;
             const chips = new Map();
             for (const tag of download.tag_items || (download.tags || []).map(name => VDL.tagIdentity.normalize(name))) {
@@ -114,6 +131,7 @@
             }
             for (const intent of intents.values()) {
                 if (intent.targetId !== id) continue;
+                if (intent.kind.startsWith('playlist.')) { playlistIntents.push(copy(intent)); continue; }
                 if (intent.kind === 'preference.set') {
                     // Pending settings describe a request; only acknowledged values apply effects.
                     preferenceIntents.push(copy(intent));
@@ -148,7 +166,7 @@
                 rows.sort((a, b) => a.name.localeCompare(b.name));
             }
             const effective = rows.filter(tag => tag.effective).map(tag => ({ key: tag.key, name: tag.name }));
-            return freeze(copy({ ...download, requested_filename: requestedFilename, rename_intents: renameIntents, preference_intents: preferenceIntents, favorite, favorite_intents: favoriteIntents, tags: effective.map(tag => tag.name), tag_items: effective, tag_chips: rows }));
+            return freeze(copy({ ...download, playlist_intents: playlistIntents, requested_filename: requestedFilename, rename_intents: renameIntents, preference_intents: preferenceIntents, favorite, favorite_intents: favoriteIntents, tags: effective.map(tag => tag.name), tag_items: effective, tag_chips: rows }));
         }
         function fence(id) {
             id = String(id);
@@ -160,6 +178,16 @@
         }
         return Object.freeze({
             acceptDownload,
+            acceptPlaylist(snapshot, context = {}, localId = null) {
+                if (!snapshot || !Number.isSafeInteger(snapshot.revision) || snapshot.revision < 0 || !Array.isArray(snapshot.items)) return false;
+                const id = localId || snapshot.id;
+                if (!id) return false;
+                return acceptDownload({ id: `playlist:${id}`, playlist: snapshot, playlist_revision: snapshot.revision }, context);
+            },
+            selectPlaylist(id) {
+                const model = selectDownload(`playlist:${id}`);
+                return model ? freeze(copy({ ...model.playlist, playlist_intents: model.playlist_intents })) : null;
+            },
             selectDownload,
             acceptPreferences(snapshot, context = {}) {
                 if (!snapshot || snapshot.id !== undefined && snapshot.id !== 'installation') return false;

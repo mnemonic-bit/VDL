@@ -167,3 +167,18 @@ folds, whitespace, category boundaries and non-BMP input. Set `VDL_PYTHON` to
 select the server interpreter. Unknown Unicode versions deliberately use the
 compatibility path until matching identity data ships. Remaining action adapters
 are tracked in [the rollout inventory](../ARCHITECTURE/feature-0051-rollout.md).
+
+Feature 0055's playlist editor saves use the same production coordinator and
+actor-bound receipts while retaining integer playlist revisions:
+
+```bash
+python -m unittest tests.test_playlist_mutations tests.test_playlists -v
+node --test tests/playlists-client.test.cjs
+python3 tests/browser/run.py playlists-feedback.spec.cjs playlists.spec.cjs
+VDL_TEST_BROWSER=firefox python3 tests/browser/run.py playlists-feedback.spec.cjs playlists.spec.cjs
+```
+
+The feedback suite holds requests to exercise immediate saving, newer drafts,
+canonical confirmation without SSE, explicit conflict review, receipt recovery,
+and stale callbacks. Feature 0032's proposed import and collaborative-sharing
+controls are outside the current personal-playlist implementation.

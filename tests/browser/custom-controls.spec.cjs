@@ -539,7 +539,7 @@ test('cancelled drag and its late native change never seek a replacement item', 
     await seek.dispatchEvent('pointerup', { pointerId: 25, pointerType: 'touch' });
     await seek.evaluate(range => { range.value = '9'; range.dispatchEvent(new Event('change', { bubbles: true })); });
     expect(await page.locator('#playerVideo').evaluate(video => video.currentTime)).toBeLessThan(2);
-    await expect(page.locator('#playerTitle')).toHaveText('Replacement');
+    await expect(page.locator('#playerTitle')).toHaveText('controls-replacement.webm');
 });
 
 test('listening choices persist from direct playback through a session advance and back', async ({ page }) => {

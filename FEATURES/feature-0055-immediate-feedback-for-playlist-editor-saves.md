@@ -1,7 +1,7 @@
 # Immediate feedback for playlist editor saves
 
 **Source:** Remaining Feature 0051 rollout item\
-**Status:** Proposed; not implemented\
+**Status:** Implemented in version `0.58.0`; verification recorded in the rollout inventory\
 **Last refined:** 2026-11-08\
 **Extends:** [Feature 0051](feature-0051-immediate-feedback-for-server-backed-interactions.md), [Feature 0031, Playlists](feature-0031-add-personal-video-playlists.md), [Feature 0032, Advanced playlists](feature-0032-expand-playlists-with-import-sharing-and-advanced-playback.md)\
 **Rollout:** [Shared requirements and inventory](../ARCHITECTURE/feature-0051-rollout.md#shared-requirements-for-the-remaining-specs)
@@ -32,6 +32,34 @@ that membership, sharing, or playback selection changed on the server.
 
 ## State and server contract
 
+### Adopted action boundary
+
+- **Actions:** `playlist.create` and `playlist.replace`; domain `playlist`.
+  Creation uses an in-memory editor identity until acknowledgement assigns the
+  server ID. Replacement serializes against that playlist's existing integer
+  revision. Whole-list saves are never silently queued behind unresolved work.
+- **Affected views:** the playlist editor, its closed-editor recovery summary,
+  and the affected confirmed shelf card. Pending requests retain the editor's
+  requested name and ordered members without changing playback selection,
+  rotation membership, or confirmed access.
+- **Wire:** `POST /api/playlists` and `PUT /api/playlists/<id>` retain their
+  existing fields and accept `client_mutation_id`. Replacement also requires
+  the existing integer `expected_revision`. Canonical responses include the
+  full authorized playlist and a correlated `mutation` with domain `playlist`,
+  integer revision, and outcome. Legacy clients retain the existing contract.
+- **Permissions:** personal playlists remain owner-scoped; the transaction
+  rechecks the current actor/session and every member's visibility and
+  playability. Recovery rechecks current access before returning recorded
+  results and hides member data that is no longer visible.
+- **Recovery:** actor-scoped `GET /api/mutations/<id>` and deliberate replay of
+  the identical frozen attempt, with the shared namespace, admission, quota,
+  expiry, and finality rules. Conflict resolution reviews current state and
+  submits a new attempt explicitly.
+
+Feature 0032's import and collaborative-sharing controls remain proposed.
+This delivery preserves the existing personal-playlist and shared-visible-video
+rules; it does not implement those future controls or grant pending authority.
+
 Replacement remains serialized per playlist and carries the existing
 `expected_revision` with its existing type. Do not convert that revision to the
 decimal-string type used by new domains. Creation uses a local editor identity
@@ -61,6 +89,11 @@ Conflict resubmission uses a new attempt against the reviewed current revision.
 Without receipt capability, retain the existing conflict response and truthful
 pending state; do not retry creation after a lost response. Authentication reset
 or loss of access clears private editor and recovery presentation.
+
+Member redactions remain conservative within a playlist revision so an older
+read or receipt cannot restore private details. If access later returns without
+a playlist revision change, reload the page to obtain the newly authorized
+member presentation.
 
 ## Acceptance criteria
 

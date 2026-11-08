@@ -44,7 +44,9 @@ async function installMediaHarness(page, { denyFirstPlay = false } = {}) {
 
 async function startEndlessFromCard(page, id) {
     const card = page.locator(`[data-row-id="${id}"]`);
+    await expect(card).not.toHaveClass(/item-fade-in/);
     await card.locator('.kebab-btn').click();
+    await expect(card.getByRole('button', { name: 'Play All', exact: true })).toBeVisible();
     await card.getByRole('button', { name: 'Play All' }).click();
     await expect.poll(() => page.evaluate(() => endlessPlayback.sessionId)).not.toBeNull();
 }

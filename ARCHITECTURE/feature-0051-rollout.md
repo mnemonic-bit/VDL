@@ -3,7 +3,7 @@
 This inventory separates the initial tag delivery from the remaining app-wide
 migration in [Feature 0051](../FEATURES/feature-0051-immediate-feedback-for-server-backed-interactions.md).
 The shared coordinator registers `tag.add`, `tag.remove`, `favorite.set`,
-`rename.set`, and `preference.set`.
+`rename.set`, `preference.set`, `playlist.create`, and `playlist.replace`.
 An existing API call does not gain receipt recovery merely because the new
 scripts are loaded. Mutating requests are never retried by `apiFetch`'s GET
 contention recovery.
@@ -95,6 +95,28 @@ Authentication and installation-access fences clear private draft state and
 ignore obsolete callbacks. `VDL.preferenceMutationMetrics()` exposes bounded,
 content-free in-memory aggregates through the shared diagnostic seam.
 
+[Feature 0055: Playlist editor](../FEATURES/feature-0055-immediate-feedback-for-playlist-editor-saves.md)
+adds `playlist.create` and `playlist.replace` in the independent `playlist`
+domain. Saving feedback is synchronous; duplicate submissions and unresolved
+whole-list replacements are guarded. Editor drafts and view generations remain
+separate from the confirmed playlist. Canonical acknowledgements update only
+the affected playlist without SSE or a collection refresh. Conflict recovery
+retains the draft for comparison and requires an explicit choice of current
+state or review and resubmission.
+
+The existing integer playlist revision is preserved. Ordered membership and
+submitted fields are bound to actor-scoped receipts committed atomically with
+creation or replacement. Replay returns the original result before checking
+its now-old expected revision; creation replay cannot create a second playlist.
+Current authorization gates execution and recovery, including member-data
+redaction after visibility loss. Missing receipts and matching reads do not
+confirm a save. Recovery checks and deliberate frozen-attempt replay use the
+shared expiry and quota rules, with no persistent browser queue or automatic
+write replay. Quick-add and deletion retain their existing mechanisms and
+revision boundary; their complete adapters remain Feature 0056.
+`VDL.playlistMutationMetrics()` exposes bounded, content-free aggregate
+diagnostics through the shared seam.
+
 ## Remaining action adapters
 
 The rows below are explicit migration work, not claims that the app-wide
@@ -103,12 +125,11 @@ remain in force. They need their own behavior and regression evidence before
 adopting automatic recovery.
 
 Each remaining row now has a proposed feature spec. These links allocate work;
-they do not mark any remaining adapter implemented. Features 0055–0067 inherit Feature
+they do not mark any remaining adapter implemented. Features 0056–0067 inherit Feature
 0051 and the shared requirements below.
 
 | Controls / production entry points in `static/app.js` | Existing mechanism | Required migration / recovery boundary | Feature spec |
 | --- | --- | --- | --- |
-| Playlist create/replace: `savePlaylistEditor` | Local draft, existing `expected_revision` on replace, server conflict response | Saving state, duplicate guards, retained newer drafts and explicit conflict recovery. Preserve the existing revision type. | [0055: Playlist editor](../FEATURES/feature-0055-immediate-feedback-for-playlist-editor-saves.md) |
 | Playlist add/delete: `quickAddToPlaylist`, `deletePlaylist` | Server response, deletion confirmation, playlist refresh | Pending initiating controls and receipt-safe recovery before retries. | [0056: Playlist add/delete](../FEATURES/feature-0056-immediate-feedback-for-playlist-add-and-delete.md) |
 | Pause/unpause/stop/retry/resume: download controls and attempt-history actions | Worker status remains server-owned; collection reconciliation | Request feedback is separate from worker transition. Durable job acceptance and crash recovery are required before replay. | [0057: Download commands](../FEATURES/feature-0057-immediate-feedback-and-durable-download-commands.md) |
 | New download: `submitDownload` | `downloadSubmitting`, probe generation and dialog-session guards | Retain existing immediate submission state. Lost acceptance needs a durable job identity before replay. | [0058: New downloads](../FEATURES/feature-0058-durable-acceptance-for-new-downloads.md) |
@@ -342,3 +363,54 @@ Preference delivery does not complete Features 0055–0067. Authentication fenci
 here covers the preference integration boundary; specialized playback,
 progress, lease, upload, worker, and companion sequences retain their existing
 ownership and recovery contracts.
+
+Playlist editor verification commands for Feature 0055:
+
+```bash
+VDL_PYTHON=/path/to/python3.12 ./tests/run-all.sh --unit
+VDL_PYTHON=/path/to/python3.12 node --test tests/*.test.cjs
+VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py playlists-feedback.spec.cjs playlists.spec.cjs
+VDL_TEST_BROWSER=firefox VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py playlists-feedback.spec.cjs playlists.spec.cjs
+```
+
+Feature 0055 verified on 2026-11-08 for version `0.58.0`:
+
+- Python 3.12 unit gate: **635 tests, 9 skipped**; `vdl.py` line coverage
+  **92.7%** (6607/7131 executable lines; enforced minimum 90%). The 22 new
+  playlist protocol tests cover canonical ordered snapshots, integer revisions,
+  concurrent replay and competing replacements, fingerprints, actor-scoped
+  recovery, rollback, restart, legacy writers, shared quotas and expiry,
+  authorization races, member/progress redaction, and unchanged playback and
+  rotation ownership. Run the gate separately from browser work: its existing
+  1,500-video queue test exceeded its instrumentation deadline under concurrent
+  browser load, then passed in the isolated full gate without changing code,
+  assertions, or deadlines.
+- Node: **118 tests passed**, including 16 playlist production-interface checks
+  for synchronous status, immutable ordered attempts, explicit conflict review,
+  canonical acknowledgement validation, independent domains, stale snapshots,
+  frozen replay, missing-receipt finality, privacy redaction, and auth/deletion
+  fences. A retained newer draft keeps its acknowledged base revision even when
+  a later quick-add has already advanced the confirmed store.
+- Chromium and Firefox with Python 3.12: **29 distinct playlist feedback
+  scenarios and 3 existing playlist scenarios passed in each browser** across
+  the full runs and focused follow-ups. Controlled gates establish feedback
+  below 50 ms, confirmation without SSE or collection reads, stable creation
+  identity, duplicate guards, newer ordered drafts and focus, closed/reopened
+  editor safety, explicit conflict choices, deliberate replay, malformed or
+  unknown outcomes, legacy fallback, access loss, real account switching,
+  keyboard errors, both themes, reduced motion, and narrow layouts. A creation
+  discovered by reconciliation and then deleted cannot revive its editor,
+  shelf card, or recovery presentation when its old acknowledgement arrives.
+- Chromium: **381 distinct scenarios passed** across the broad regression run
+  and focused follow-ups, covering all adopted mutation adapters, playlists,
+  history, playback and controls, rotation, assets, live updates/contention,
+  uploads, authentication, Settings, extension settings, and worker recovery.
+  Two existing playback tests were corrected to wait for card insertion
+  animation and expect the confirmed filename; those checks and a transient
+  Settings scroll failure passed their focused rerun.
+
+Playlist editor delivery does not complete Features 0056–0067. Quick-add,
+deletion, progress writes, leases, playback sessions, downloads, uploads, and
+companion requests retain their existing ownership and recovery contracts.
+Feature 0032's import and collaborative-sharing controls remain proposed;
+verification here covers personal playlists and videos visible across users.

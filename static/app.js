@@ -1339,6 +1339,8 @@ const favoriteNotices = new Map();
 const favoriteMutationMetrics = { ...tagMutationMetrics };
 const mutationMetrics = { ...tagMutationMetrics };
 const preferenceMutationMetrics = { ...tagMutationMetrics };
+const playlistMutationMetrics = { ...tagMutationMetrics };
+VDL.playlistMutationMetrics = () => Object.freeze({ ...playlistMutationMetrics });
 VDL.preferenceMutationMetrics = () => Object.freeze({ ...preferenceMutationMetrics });
 let preferenceSubmission = null;
 let preferenceDraftGeneration = 0;
@@ -1353,9 +1355,14 @@ const tagState = VDL.createClientState();
 const tagMutations = VDL.createMutations({
     state: tagState,
     transport: async ({ url, method, body }) => {
+        if (['POST', 'PUT'].includes(method) && url.startsWith('/api/playlists')) {
+            const submission = [...playlistSubmissions.values()].find(entry => !entry.mutationId && !entry.legacy);
+            if (submission) submission.mutationId = body?.client_mutation_id;
+        }
         if (method === 'POST' && url === '/api/preferences' && preferenceSubmission) preferenceSubmission.mutationId = body?.client_mutation_id;
         if (method === 'GET') {
             mutationMetrics.reconciliationReads++;
+            if (url.startsWith('/api/playlists') || [...playlistSubmissions.values()].some(entry => entry.mutationId && url.endsWith(entry.mutationId))) playlistMutationMetrics.reconciliationReads++;
             if (url === '/api/preferences' || (preferenceSubmission?.mutationId && url === `/api/mutations/${encodeURIComponent(preferenceSubmission.mutationId)}`)) preferenceMutationMetrics.reconciliationReads++;
         }
         const response = await apiFetch(url, {
@@ -1368,7 +1375,7 @@ const tagMutations = VDL.createMutations({
         return { status: response.status, body: await response.json().catch(() => null) };
     },
     onEvent: event => {
-        const domainMetrics = event.action === 'preference.set' ? preferenceMutationMetrics : event.action === 'rename.set' ? renameMutationMetrics : event.action === 'favorite.set' ? favoriteMutationMetrics : tagMutationMetrics;
+        const domainMetrics = event.action.startsWith('playlist.') ? playlistMutationMetrics : event.action === 'preference.set' ? preferenceMutationMetrics : event.action === 'rename.set' ? renameMutationMetrics : event.action === 'favorite.set' ? favoriteMutationMetrics : tagMutationMetrics;
         for (const metrics of [domainMetrics, mutationMetrics]) {
             if (event.outcome === 'presented') metrics.submissions++;
             if (event.outcome === 'confirmed') {
@@ -1383,6 +1390,7 @@ const tagMutations = VDL.createMutations({
         mutationMetrics.unconfirmed = event.unconfirmed;
         mutationMetrics.conflicted = event.conflicted;
         if (event.action === 'preference.set') handlePreferenceMutationEvent(event);
+        if (event.action.startsWith('playlist.')) handlePlaylistMutationEvent(event);
         if (event.action === 'rename.set') {
             const intent = tagMutations.status(event.intentId);
             const draft = intent && renameDrafts.get(intent.targetId);
@@ -1417,6 +1425,7 @@ const tagMutations = VDL.createMutations({
 function resetTagSession() {
     tagSessionEpoch += 1;
     resetPreferenceSession();
+    resetPlaylistSession();
     tagMutations.reset();
     tagDrafts.clear();
     editingTagIds.clear();
@@ -1456,7 +1465,7 @@ function updateTagMutationSummary() {
         submittedTagIntents.delete(intentId);
         recoveredTagIntents.delete(intentId);
     }
-    const allIntents = tagMutations.pending().concat(preferenceSubmission?.legacy ? [{ ...preferenceSubmission.legacy, kind: 'preference.set' }] : []);
+    const allIntents = tagMutations.pending().concat(preferenceSubmission?.legacy ? [{ ...preferenceSubmission.legacy, kind: 'preference.set' }] : []).concat([...playlistSubmissions.values()].filter(entry => entry.legacy).map(entry => ({ ...entry.legacy, kind: entry.kind })));
     const intents = allIntents.filter(intent => intent.kind.startsWith('tag.'));
     const favoriteIntents = allIntents.filter(intent => intent.kind === 'favorite.set');
     updateFavoriteMutationSummary(favoriteIntents);
@@ -1518,6 +1527,14 @@ async function loadTagCapabilities() {
 }
 
 tagState.subscribe(ids => {
+    if (ids.some(id => id.startsWith('playlist:'))) {
+        for (const id of ids.filter(id => id.startsWith('playlist:'))) {
+            if (tagState.isAvailable(id)) continue;
+            fencePlaylistPresentation(id.slice(9));
+        }
+        renderPlaylistSaveStatus();
+    }
+    ids = ids.filter(id => !id.startsWith('playlist:'));
     if (ids.includes('installation')) {
         if (!tagState.selectPreferences() && (preferenceSubmission || preferenceDirty)) resetPreferenceSession();
         else renderPreferenceStatus();
@@ -1563,7 +1580,7 @@ tagState.subscribe(ids => {
 });
 
 window.addEventListener('beforeunload', event => {
-    if (!preferenceDirty && !preferenceSubmission && !tagMutations.hasPending() && ![...tagDrafts.values()].some(value => value.trim()) && !renameDrafts.size && !compatibilityRenames.size) return;
+    if (!playlistSubmissions.size && !playlistRetainedDrafts.size && !(playlistEditorDraft && playlistEditorSnapshot() !== playlistEditorBaseline) && !preferenceDirty && !preferenceSubmission && !tagMutations.hasPending() && ![...tagDrafts.values()].some(value => value.trim()) && !renameDrafts.size && !compatibilityRenames.size) return;
     event.preventDefault();
     event.returnValue = '';
 });
@@ -3426,6 +3443,14 @@ let libraryEntries = [];
 let playlistEditorDraft = null;
 let playlistEditorBaseline = '';
 let playlistEditorReturnFocus = null;
+let playlistEditorViewToken = 0;
+let playlistLocalSequence = 0;
+let playlistCollectionGeneration = 0;
+let playlistSaveMessage = '';
+let playlistReviewVisible = false;
+const playlistSubmissions = new Map();
+const playlistRetainedDrafts = new Map();
+const playlistDeletedIds = new Set();
 let playlistChooserDownloadId = null;
 let playlistChooserReturnFocus = null;
 
@@ -3505,12 +3530,19 @@ function renderPlaylists() {
 
 function fetchPlaylists() {
     return coordinateRefresh('playlists', async () => {
+        const generation = playlistCollectionGeneration;
+        const epoch = tagSessionEpoch;
         try {
-            playlistSummaries = await readCollection('/api/playlists');
+            const snapshots = await readCollection('/api/playlists');
+            if (epoch !== tagSessionEpoch || generation !== playlistCollectionGeneration) return;
+            playlistSummaries = snapshots.filter(item => !playlistDeletedIds.has(item.id)).map(item => {
+                const known = tagState.selectPlaylist(item.id);
+                return known && known.revision > item.revision ? { ...item, ...known } : item;
+            });
             renderPlaylists();
             updateCollectionError('playlists');
         } catch (error) {
-            if (error.name !== 'AbortError') updateCollectionError('playlists', `Could not refresh Playlists. ${error.message}`);
+            if (epoch === tagSessionEpoch && error.name !== 'AbortError') updateCollectionError('playlists', `Could not refresh Playlists. ${error.message}`);
         }
     });
 }
@@ -3534,8 +3566,14 @@ function playlistEditorSnapshot() {
 function markPlaylistEditorDirty() {
     if (!playlistEditorDraft) return;
     playlistEditorDraft.name = document.getElementById('playlistName').value;
-    const dirty = playlistEditorSnapshot() !== playlistEditorBaseline;
+    const snapshot = playlistEditorSnapshot();
+    if (snapshot !== playlistEditorDraft.lastSnapshot) {
+        playlistEditorDraft.generation++;
+        playlistEditorDraft.lastSnapshot = snapshot;
+    }
+    const dirty = snapshot !== playlistEditorBaseline;
     document.getElementById('playlistEditorDirty').hidden = !dirty;
+    renderPlaylistSaveStatus();
 }
 
 function playableLibraryEntries() {
@@ -3583,37 +3621,46 @@ function showPlaylistEditorError(message) {
 
 async function openPlaylistEditor(id = null, initialDownloadId = null) {
     closeAllMenus();
+    const viewToken = ++playlistEditorViewToken;
+    const epoch = tagSessionEpoch;
+    const context = tagState.capture();
     playlistEditorReturnFocus = document.activeElement;
     showPlaylistEditorError('');
+    playlistSaveMessage = '';
+    playlistReviewVisible = false;
     let detail = null;
-    if (id) {
+    const retained = [...playlistSubmissions.values()].find(entry => entry.key === id || entry.draft.id === id) || playlistRetainedDrafts.get(id);
+    if (id && !retained) {
         const response = await apiFetch('/api/playlists/' + encodeURIComponent(id));
+        if (viewToken !== playlistEditorViewToken || epoch !== tagSessionEpoch || playlistDeletedIds.has(id)) return;
         if (!response.ok) {
-            showActionError('The playlist could not be opened.');
-            return;
+            if ([403, 404].includes(response.status)) tagMutations.fence(`playlist:${id}`);
+            showActionError('The playlist could not be opened.'); return;
         }
         detail = await response.json();
+        if (viewToken !== playlistEditorViewToken || epoch !== tagSessionEpoch) return;
+        if (!tagState.acceptPlaylist(detail, { ...context, authoritative: true })) return;
+        detail = tagState.selectPlaylist(id);
     }
-    const initial = initialDownloadId
-        ? playableLibraryEntries().find(item => String(item.id) === String(initialDownloadId))
-        : null;
-    playlistEditorDraft = {
+    const initial = initialDownloadId ? playableLibraryEntries().find(item => String(item.id) === String(initialDownloadId)) : null;
+    playlistEditorDraft = retained ? retained.draft : {
+        key: detail ? detail.id : `local-${++playlistLocalSequence}`,
         id: detail ? detail.id : null,
-        revision: detail ? detail.revision : null,
+        revision: detail ? detail.revision : 0,
         name: detail ? detail.name : '',
-        items: detail ? detail.items.map(item => ({ ...item }))
-            : (initial ? [{
-                id: String(initial.id), title: libraryTitle(initial), unavailable: false,
-            }] : []),
+        items: detail ? detail.items.map(item => ({ ...item })) : (initial ? [{ id: String(initial.id), title: libraryTitle(initial), unavailable: false }] : []),
+        generation: 0,
     };
-    document.getElementById('playlistEditorTitle').textContent =
-        detail ? 'Edit playlist' : 'Create playlist';
+    if (!detail && !retained) tagState.acceptPlaylist({ id: null, revision: 0, name: '', items: [] }, {}, playlistEditorDraft.key);
+    document.getElementById('playlistEditorTitle').textContent = playlistEditorDraft.id ? 'Edit playlist' : 'Create playlist';
     document.getElementById('playlistName').value = playlistEditorDraft.name;
     document.getElementById('playlistVideoSearch').value = '';
-    playlistEditorBaseline = playlistEditorSnapshot();
+    playlistEditorBaseline = retained ? retained.baseline : playlistEditorSnapshot();
+    playlistEditorDraft.lastSnapshot = playlistEditorSnapshot();
     renderPlaylistEditor();
     const dialog = document.getElementById('playlistEditorDialog');
-    dialog.showModal();
+    if (!dialog.open) dialog.showModal();
+    renderPlaylistSaveStatus();
     document.getElementById('playlistName').focus();
 }
 
@@ -3621,13 +3668,13 @@ function closePlaylistEditor(force = false) {
     const dialog = document.getElementById('playlistEditorDialog');
     if (!dialog.open) return;
     markPlaylistEditorDirty();
-    if (!force && !document.getElementById('playlistEditorDirty').hidden
-            && !window.confirm('Discard unsaved playlist changes?')) return;
+    if (!force && !playlistSubmissions.has(playlistEditorDraft?.key) && !document.getElementById('playlistEditorDirty').hidden && !window.confirm('Discard unsaved playlist changes?')) return;
+    ++playlistEditorViewToken;
+    if (!playlistSubmissions.has(playlistEditorDraft?.key)) playlistRetainedDrafts.delete(playlistEditorDraft?.key);
     dialog.close();
     playlistEditorDraft = null;
-    if (playlistEditorReturnFocus && playlistEditorReturnFocus.isConnected) {
-        playlistEditorReturnFocus.focus();
-    }
+    renderPlaylistSaveStatus();
+    if (playlistEditorReturnFocus?.isConnected) playlistEditorReturnFocus.focus();
 }
 
 function playlistEditorAdd(id) {
@@ -3680,41 +3727,255 @@ function bindPlaylistDragging() {
     });
 }
 
-async function savePlaylistEditor(event) {
+function hasPlaylistProtocol(kind = 'playlist.replace') {
+    return tagCapabilities?.mutation_protocol === 1 && tagCapabilities.actions?.includes(kind);
+}
+
+function playlistSubmissionIntent(submission) {
+    return submission?.intentId ? tagMutations.status(submission.intentId) : submission?.legacy || null;
+}
+
+function renderPlaylistSaveStatus() {
+    const status = document.getElementById('playlistSaveStatus');
+    if (!status) return;
+    const submission = playlistEditorDraft && playlistSubmissions.get(playlistEditorDraft.key);
+    const intent = playlistSubmissionIntent(submission);
+    const pending = intent && ['queued', 'sending'].includes(intent.status);
+    const unknown = intent?.status === 'unconfirmed';
+    const conflict = intent?.status === 'conflicted';
+    let message = playlistSaveMessage;
+    if (pending) message = intent.delayed ? 'Still waiting for playlist confirmation. Your submitted draft is retained.' : submission.kind === 'playlist.create' ? 'Creating playlist…' : 'Saving playlist…';
+    if (unknown) message = (submission.legacy ? 'Save not confirmed. This server has no receipt recovery. Reload to read current playlists; the earlier request may still complete.' : 'Save not confirmed. Check its status before replaying the original save.') + (playlistSaveMessage ? ` ${playlistSaveMessage}` : '');
+    if (conflict) message = 'Playlist changed elsewhere. Review the current version before saving your draft again.';
+    if (intent?.status === 'rejected') { message = intent.message || 'The playlist could not be saved. Your draft is retained.'; showPlaylistEditorError(message); }
+    if (pending && submission.generation !== submission.draft.generation) message += ' Newer edits remain unsaved.';
+    if (status.textContent !== message) status.textContent = message || '';
+    const button = document.getElementById('playlistSaveButton');
+    button.disabled = !!pending || !!unknown || !!conflict;
+    button.setAttribute('aria-busy', String(!!pending));
+    button.querySelector('span').textContent = pending ? submission.kind === 'playlist.create' ? 'Creating…' : 'Saving…' : 'Save playlist';
+    document.getElementById('playlistSavingSpinner').hidden = !pending;
+    document.getElementById('playlistRecovery').hidden = !unknown && !conflict;
+    document.getElementById('playlistCheck').hidden = !unknown || !!submission?.legacy;
+    document.getElementById('playlistReplay').hidden = !unknown || !!submission?.legacy;
+    document.getElementById('playlistReview').hidden = !conflict;
+    document.getElementById('playlistResubmit').hidden = !conflict || !playlistReviewVisible;
+    document.getElementById('playlistUseCurrent').hidden = !conflict && !unknown || !!submission?.legacy && !conflict;
+    const current = submission && tagState.selectPlaylist(submission.key);
+    const comparison = document.getElementById('playlistCurrentVersion');
+    comparison.hidden = !playlistReviewVisible;
+    if (playlistReviewVisible) comparison.textContent = current ? `${current.name}\n${current.items.map((item, index) => `${index + 1}. ${item.title || 'Unavailable video'}`).join('\n')}` : 'Playlist unavailable.';
+    const error = intent?.fieldErrors?.name;
+    document.getElementById('playlistName').setAttribute('aria-invalid', String(!!error));
+    if (error) showPlaylistEditorError(error);
+    const summary = document.getElementById('playlistMutationSummary');
+    const entries = [...playlistSubmissions.values()];
+    const closed = entries.filter(entry => entry.key !== playlistEditorDraft?.key);
+    const closedDrafts = [...playlistRetainedDrafts.values()].filter(entry => entry.key !== playlistEditorDraft?.key);
+    summary.hidden = !closed.length && !closedDrafts.length;
+    const summaryMessage = closed.length === 1 && ['queued', 'sending'].includes(playlistSubmissionIntent(closed[0])?.status) ? closed[0].kind === 'playlist.create' ? 'Creating playlist…' : 'Saving playlist…' : closed.length ? `${closed.length} playlist ${closed.length === 1 ? 'save' : 'saves'} ${closed.some(entry => playlistSubmissionIntent(entry)?.status === 'unconfirmed') ? 'not confirmed' : closed.some(entry => playlistSubmissionIntent(entry)?.status === 'conflicted') ? 'in conflict' : 'pending or needing review'}.` : '';
+    const closedMessage = summaryMessage + (closedDrafts.length ? ` ${closedDrafts.length} unsaved playlist ${closedDrafts.length === 1 ? 'draft' : 'drafts'}.` : '');
+    if (summary.querySelector('span').textContent !== closedMessage) summary.querySelector('span').textContent = closedMessage;
+    const aggregate = tagMutations.pending().concat(entries.filter(entry => entry.legacy).map(entry => entry.legacy), preferenceSubmission?.legacy ? [preferenceSubmission.legacy] : []);
+    for (const [field, states] of [['pending', ['queued', 'sending', 'unconfirmed', 'conflicted']], ['unconfirmed', ['unconfirmed']], ['conflicted', ['conflicted']]]) mutationMetrics[field] = aggregate.filter(entry => states.includes(entry.status)).length;
+    for (const [field, states] of [['pending', ['queued', 'sending', 'unconfirmed', 'conflicted']], ['unconfirmed', ['unconfirmed']], ['conflicted', ['conflicted']]]) playlistMutationMetrics[field] = entries.filter(entry => states.includes(playlistSubmissionIntent(entry)?.status)).length;
+}
+
+function handlePlaylistMutationEvent(event) {
+    const submission = [...playlistSubmissions.values()].find(entry => entry.intentId === event.intentId || (event.outcome === 'presented' && !entry.intentId && !entry.legacy));
+    if (!submission || submission.epoch !== tagSessionEpoch) return;
+    if (event.outcome === 'presented') submission.intentId = event.intentId;
+    if (event.outcome === 'confirmed') finishPlaylistSave(submission, tagState.selectPlaylist(submission.key), event.revision);
+    else {
+        if (event.outcome === 'conflicted') mergeConfirmedPlaylist(tagState.selectPlaylist(submission.key));
+        renderPlaylistSaveStatus();
+    }
+}
+
+function mergeConfirmedPlaylist(playlist) {
+    if (!playlist?.id || playlistDeletedIds.has(playlist.id)) return;
+    playlistCollectionGeneration++;
+    const index = playlistSummaries.findIndex(item => item.id === playlist.id);
+    const old = playlistSummaries[index];
+    if (old && old.revision > playlist.revision) return;
+    const canonical = { ...playlist, item_count: playlist.item_count ?? playlist.items.length,
+        member_ids: playlist.member_ids || playlist.items.map(item => item.id).filter(Boolean),
+        mosaic_ids: playlist.mosaic_ids || playlist.items.map(item => item.id).filter(Boolean).slice(0, 4) };
+    if (index < 0) playlistSummaries.push(canonical);
+    else playlistSummaries[index] = { ...old, ...canonical };
+    renderPlaylists();
+}
+
+function finishPlaylistSave(submission, canonical, acknowledgedRevision = canonical?.revision) {
+    if (submission.epoch !== tagSessionEpoch || !canonical?.id) return;
+    if (playlistDeletedIds.has(canonical.id)) {
+        tagMutations.fence(`playlist:${submission.key}`);
+        return;
+    }
+    if (!tagState.isAvailable(`playlist:${submission.key}`)) return;
+    tagState.acceptPlaylist(canonical);
+    mergeConfirmedPlaylist(tagState.selectPlaylist(canonical.id) || canonical);
+    const latest = tagState.selectPlaylist(canonical.id) || canonical;
+    canonical = latest;
+    const sameView = playlistEditorDraft === submission.draft && playlistEditorViewToken === submission.viewToken;
+    const sameDraft = submission.draft.generation === submission.generation;
+    submission.draft.id = canonical.id;
+    submission.draft.revision = acknowledgedRevision;
+    playlistSubmissions.delete(submission.key);
+    // Identity mapping happens once, while later edits retain their own draft.
+    submission.draft.key = canonical.id;
+    if (!sameDraft) playlistRetainedDrafts.set(canonical.id, { key: canonical.id, draft: submission.draft, baseline: JSON.stringify({ name: canonical.name, ids: canonical.items.map(item => item.id) }) });
+    if (sameView && sameDraft) {
+        playlistEditorBaseline = playlistEditorSnapshot();
+        closePlaylistEditor(true);
+    } else if (playlistEditorDraft === submission.draft) {
+        playlistEditorBaseline = JSON.stringify({ name: canonical.name, ids: canonical.items.map(item => item.id) });
+        playlistSaveMessage = sameDraft ? 'Playlist saved.' : 'Playlist saved. Newer edits remain unsaved.';
+        markPlaylistEditorDirty();
+    }
+    renderPlaylistSaveStatus();
+}
+
+function savePlaylistEditor(event) {
     event.preventDefault();
     if (!playlistEditorDraft) return;
-    playlistEditorDraft.name = document.getElementById('playlistName').value;
-    const unavailable = playlistEditorDraft.items.some(item => !item.id);
-    if (unavailable) {
-        showPlaylistEditorError('Remove unavailable videos before saving this playlist.');
-        return;
+    markPlaylistEditorDirty();
+    const draft = playlistEditorDraft;
+    const prior = playlistSubmissions.get(draft.key);
+    if (prior) {
+        if (playlistSubmissionIntent(prior)?.status !== 'rejected') return;
+        if (prior.intentId) tagMutations.resolve(prior.intentId);
+        playlistSubmissions.delete(draft.key);
     }
-    const editing = Boolean(playlistEditorDraft.id);
-    const url = editing
-        ? '/api/playlists/' + encodeURIComponent(playlistEditorDraft.id)
-        : '/api/playlists';
-    const body = editing ? {
-        name: playlistEditorDraft.name,
-        download_ids: playlistEditorDraft.items.map(item => item.id),
-        expected_revision: playlistEditorDraft.revision,
-    } : {
-        name: playlistEditorDraft.name,
-        download_ids: playlistEditorDraft.items.map(item => item.id),
-    };
-    const response = await apiFetch(url, {
-        method: editing ? 'PUT' : 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-    });
-    if (!response.ok) {
-        const data = await response.json().catch(() => ({}));
-        showPlaylistEditorError(data.error || 'The playlist could not be saved.');
-        return;
+    if (draft.items.some(item => !item.id)) { showPlaylistEditorError('Remove unavailable videos before saving this playlist.'); return; }
+    const started = performance.now();
+    showPlaylistEditorError('');
+    playlistSaveMessage = '';
+    playlistReviewVisible = false;
+    if (playlistSubmissions.size + playlistRetainedDrafts.size - (playlistRetainedDrafts.has(draft.key) ? 1 : 0) >= 128) { showPlaylistEditorError('Too many pending edits. Resolve existing playlist saves first.'); return; }
+    const kind = draft.id ? 'playlist.replace' : 'playlist.create';
+    const submission = { key: draft.key, draft, kind, generation: draft.generation, viewToken: playlistEditorViewToken,
+        epoch: tagSessionEpoch, baseline: playlistEditorBaseline, sentAt: performance.now(),
+        value: { name: draft.name, download_ids: draft.items.map(item => item.id) } };
+    playlistRetainedDrafts.delete(draft.key);
+    playlistSubmissions.set(draft.key, submission);
+    if (hasPlaylistProtocol(kind)) {
+        const result = tagMutations.submit({ kind, targetId: `playlist:${draft.key}`, value: submission.value, expectedRevision: draft.revision, viewToken: submission.viewToken });
+        if (!result.accepted) { playlistSubmissions.delete(draft.key); showPlaylistEditorError(result.message); }
+        else submission.intentId = result.intentId;
+    } else saveLegacyPlaylist(submission);
+    renderPlaylistSaveStatus();
+    playlistMutationMetrics.latestLocalFeedbackMs = performance.now() - started;
+    mutationMetrics.latestLocalFeedbackMs = playlistMutationMetrics.latestLocalFeedbackMs;
+}
+
+async function saveLegacyPlaylist(submission) {
+    submission.legacy = { status: 'sending' };
+    for (const metrics of [playlistMutationMetrics, mutationMetrics]) metrics.submissions++;
+    const alive = () => submission.epoch === tagSessionEpoch && playlistSubmissions.get(submission.key) === submission;
+    const delayed = setTimeout(() => { if (alive()) { submission.legacy.delayed = true; renderPlaylistSaveStatus(); } }, 5000);
+    const timeout = setTimeout(() => { if (alive() && submission.legacy.status === 'sending') { submission.legacy.status = 'unconfirmed'; renderPlaylistSaveStatus(); } }, 30000);
+    renderPlaylistSaveStatus();
+    try {
+        const response = await apiFetch(submission.draft.id ? `/api/playlists/${encodeURIComponent(submission.draft.id)}` : '/api/playlists', {
+            method: submission.draft.id ? 'PUT' : 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ...submission.value, ...(submission.draft.id ? { expected_revision: submission.draft.revision } : {}) }),
+        });
+        const body = await response.json().catch(() => null);
+        if (!alive()) return;
+        if ([401, 403, 404].includes(response.status)) { tagMutations.fence(`playlist:${submission.key}`); return; }
+        if (response.ok && body?.id && Number.isSafeInteger(body.revision) && Array.isArray(body.items)) {
+            tagState.acceptPlaylist(body, {}, submission.key);
+            for (const metrics of [playlistMutationMetrics, mutationMetrics]) { metrics.acknowledgements++; metrics.latestAcknowledgementMs = Math.max(0, performance.now() - submission.sentAt); }
+            finishPlaylistSave(submission, body);
+        } else {
+            if (response.status === 409 && submission.draft.id) {
+                submission.legacy.status = 'conflicted';
+                const currentResponse = await apiFetch(`/api/playlists/${encodeURIComponent(submission.draft.id)}`);
+                const current = await currentResponse.json().catch(() => null);
+                if (!alive()) return;
+                if ([401, 403, 404].includes(currentResponse.status)) { tagMutations.fence(`playlist:${submission.key}`); return; }
+                if (currentResponse.ok && current?.id === submission.draft.id) tagState.acceptPlaylist(current, {}, submission.key);
+            } else submission.legacy.status = [400, 422].includes(response.status) ? 'rejected' : 'unconfirmed';
+            for (const metrics of [playlistMutationMetrics, mutationMetrics]) metrics[submission.legacy.status === 'conflicted' ? 'conflicts' : submission.legacy.status === 'rejected' ? 'rejectedOutcomes' : 'unconfirmedOutcomes']++;
+            submission.legacy.message = body?.error || 'The playlist could not be saved. Your draft is retained.';
+            renderPlaylistSaveStatus();
+        }
+    } catch (_) { if (alive()) { submission.legacy.status = 'unconfirmed'; renderPlaylistSaveStatus(); } }
+    finally { clearTimeout(delayed); clearTimeout(timeout); }
+}
+
+function playlistRecovery(action) {
+    const submission = playlistEditorDraft && playlistSubmissions.get(playlistEditorDraft.key);
+    const intent = playlistSubmissionIntent(submission);
+    if (!intent) return;
+    if (action === 'check') return tagMutations.recover(intent.id);
+    if (action === 'replay') return tagMutations.recover(intent.id, { replay: true });
+    if (action === 'review') { playlistReviewVisible = true; renderPlaylistSaveStatus(); return; }
+    if (submission.legacy ? intent.status !== 'conflicted' || !tagState.selectPlaylist(submission.key)?.id : !submission.intentId || !tagMutations.resolve(submission.intentId)) { playlistSaveMessage = 'The original save may still complete. Check its status before using the current version.'; renderPlaylistSaveStatus(); return; }
+    const current = tagState.selectPlaylist(submission.key);
+    playlistSubmissions.delete(submission.key);
+    playlistReviewVisible = false;
+    if (current?.id) {
+        playlistEditorDraft.id = current.id;
+        playlistEditorDraft.revision = current.revision;
+        if (action === 'current') {
+            playlistEditorDraft.name = current.name;
+            playlistEditorDraft.items = current.items.map(item => ({ ...item }));
+            document.getElementById('playlistName').value = current.name;
+            playlistEditorBaseline = playlistEditorSnapshot();
+            renderPlaylistEditor();
+        }
     }
-    await response.json();
-    playlistEditorBaseline = playlistEditorSnapshot();
-    closePlaylistEditor(true);
-    await fetchPlaylists();
+    playlistSaveMessage = action === 'current' ? 'Current version loaded.' : 'Current version reviewed. Your draft remains unsaved.';
+    renderPlaylistSaveStatus();
+    if (action === 'resubmit') savePlaylistEditor({ preventDefault() {} });
+}
+
+function openPlaylistRecovery() {
+    const submission = [...playlistSubmissions.values(), ...playlistRetainedDrafts.values()].find(entry => entry.key !== playlistEditorDraft?.key);
+    if (submission) openPlaylistEditor(submission.key);
+}
+
+function fencePlaylistPresentation(key) {
+    const submission = playlistSubmissions.get(key);
+    playlistSubmissions.delete(key);
+    playlistRetainedDrafts.delete(key);
+    const id = submission?.draft.id || key;
+    playlistDeletedIds.add(id);
+    playlistCollectionGeneration++;
+    playlistSummaries = playlistSummaries.filter(item => item.id !== id);
+    if (playlistEditorDraft?.key === key) {
+        document.getElementById('playlistEditorDialog').close();
+        playlistEditorDraft = null;
+        ++playlistEditorViewToken;
+        document.getElementById('playlistName').value = '';
+        document.getElementById('playlistSelected').replaceChildren();
+        document.getElementById('playlistCurrentVersion').textContent = '';
+    }
+    renderPlaylistSaveStatus();
+    renderPlaylists();
+}
+
+function resetPlaylistSession() {
+    ++playlistEditorViewToken;
+    ++playlistCollectionGeneration;
+    playlistSubmissions.clear(); playlistRetainedDrafts.clear(); playlistDeletedIds.clear();
+    playlistEditorDraft = null; playlistSummaries = [];
+    playlistSaveMessage = ''; playlistReviewVisible = false;
+    const dialog = document.getElementById('playlistEditorDialog');
+    if (dialog.open) dialog.close();
+    document.getElementById('playlistName').value = '';
+    document.getElementById('playlistSelected').replaceChildren();
+    document.getElementById('playlistAvailable').replaceChildren();
+    document.getElementById('playlistChooserList').replaceChildren();
+    document.getElementById('playlistVideoSearch').value = '';
+    document.getElementById('playlistCurrentVersion').textContent = '';
+    playlistChooserDownloadId = null;
+    const chooser = document.getElementById('playlistChooserDialog');
+    if (chooser.open) chooser.close();
+    renderPlaylistSaveStatus();
+    renderPlaylists();
 }
 
 function openPlaylistChooser(downloadId, opener = null) {
@@ -3740,6 +4001,8 @@ function closePlaylistChooser() {
 }
 
 async function quickAddToPlaylist(playlistId) {
+    const epoch = tagSessionEpoch;
+    const chooserId = playlistChooserDownloadId;
     const response = await apiFetch(
         '/api/playlists/' + encodeURIComponent(playlistId) + '/items', {
             method: 'POST',
@@ -3747,12 +4010,18 @@ async function quickAddToPlaylist(playlistId) {
             body: JSON.stringify({ download_id: playlistChooserDownloadId }),
         },
     );
+    if (epoch !== tagSessionEpoch) return;
     if (!response.ok) {
         const data = await response.json().catch(() => ({}));
+        if (epoch !== tagSessionEpoch) return;
         showActionError(data.error || 'The video could not be added.');
         return;
     }
-    closePlaylistChooser();
+    const canonical = await response.json();
+    if (epoch !== tagSessionEpoch || playlistDeletedIds.has(playlistId)) return;
+    tagState.acceptPlaylist(canonical);
+    mergeConfirmedPlaylist(canonical);
+    if (playlistChooserDownloadId === chooserId) closePlaylistChooser();
     await fetchPlaylists();
 }
 
@@ -3763,16 +4032,20 @@ function createPlaylistFromChooser() {
 }
 
 async function deletePlaylist(id) {
+    const epoch = tagSessionEpoch;
     closeAllMenus();
     if (!window.confirm('Delete this playlist? Its videos will remain in your library.')) return;
     const response = await apiFetch('/api/playlists/' + encodeURIComponent(id), {
         method: 'DELETE',
     });
+    if (epoch !== tagSessionEpoch) return;
     if (!response.ok) {
         const data = await response.json().catch(() => ({}));
+        if (epoch !== tagSessionEpoch) return;
         showActionError(data.error || 'The playlist could not be deleted.');
         return;
     }
+    tagMutations.fence(`playlist:${id}`);
     await fetchPlaylists();
 }
 

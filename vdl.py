@@ -3696,6 +3696,15 @@ def _playlist_item(entry, position):
     return item
 
 
+def _playlist_current_actor(conn, user_id, is_admin):
+    if has_request_context():
+        actor = _tag_actor(conn)
+        if actor is None or actor['id'] != user_id:
+            abort(401)
+        return actor['id'], 'admin' in actor['roles']
+    return user_id, is_admin
+
+
 class PlaylistService:
     """Own playlist authorization, validation, repair, and transactions."""
 
@@ -3778,149 +3787,109 @@ class PlaylistService:
 
     def list_summaries(self, user_id, is_admin=False):
         with _db_lock, db() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            user_id, is_admin = _playlist_current_actor(conn, user_id, is_admin)
             rows = conn.execute(
-                "SELECT id, owner_user_id, name, revision, created_at, "
-                "content_updated_at FROM playlists WHERE owner_user_id = ? "
-                "ORDER BY content_updated_at DESC, id ASC",
-                (user_id,),
+                "SELECT id FROM playlists WHERE owner_user_id = ? "
+                "ORDER BY content_updated_at DESC, id ASC", (user_id,),
             ).fetchall()
-            summaries = []
-            for raw in rows:
-                playlist = dict(raw)
-                members = self._members(conn, playlist['id'])
-                progress = self._repair_progress(
-                    conn, playlist['id'], members,
-                    next((row['position'] for row in members
-                          if row['download_id'] == (
-                              self._progress(conn, playlist['id']) or {}
-                          ).get('download_id')), 0),
-                )
-                visible = []
-                duration = 0.0
-                for row in members:
-                    entry = dict(row)
-                    if _playlist_download_visible(entry, user_id, is_admin):
-                        visible.append(entry)
-                        known = _finite_positive_number(
-                            entry.get('duration_seconds')
-                        )
-                        if known is not None:
-                            duration += known
-                resume_position = next(
-                    (row['position'] for row in members
-                     if progress and row['download_id'] == progress['download_id']),
-                    0,
-                )
-                playlist.update({
-                    'item_count': len(members),
-                    'duration_seconds': duration or None,
-                    'mosaic_ids': [row['download_id'] for row in visible[:4]],
-                    'member_ids': [row['download_id'] for row in members],
-                    'progress': progress,
-                    'resume_position': resume_position,
-                })
-                summaries.append(playlist)
-            return summaries
+            return [self._snapshot(conn, row['id'], user_id, is_admin) for row in rows]
+
+    def _snapshot(self, conn, playlist_id, user_id, is_admin=False, *, repair=True):
+        """Read canonical editor and shelf values in the caller's transaction."""
+        playlist = self._owned(conn, playlist_id, user_id)
+        members = self._members(conn, playlist_id)
+        progress = self._progress(conn, playlist_id)
+        old_position = next((row['position'] for row in members
+                             if progress and row['download_id'] == progress['download_id']), 0)
+        if repair:
+            progress = self._repair_progress(conn, playlist_id, members, old_position)
+        resume_position = next((row['position'] for row in members
+                                if progress and row['download_id'] == progress['download_id']), 0)
+        items = []
+        for row in members:
+            entry = dict(row)
+            visible = _playlist_download_visible(entry, user_id, is_admin)
+            items.append(_playlist_item(entry if visible else None, row['position']))
+        playlist.update(items=items, progress=progress, resume_position=resume_position)
+        return _playlist_summary(playlist)
 
     def get(self, playlist_id, user_id, is_admin=False):
         with _db_lock, db() as conn:
-            playlist = self._owned(conn, playlist_id, user_id)
-            members = self._members(conn, playlist_id)
-            progress = self._progress(conn, playlist_id)
-            old_position = next(
-                (row['position'] for row in members
-                 if progress and row['download_id'] == progress['download_id']),
-                0,
+            conn.execute('BEGIN IMMEDIATE')
+            user_id, is_admin = _playlist_current_actor(conn, user_id, is_admin)
+            return self._snapshot(conn, playlist_id, user_id, is_admin)
+
+    def _create(self, conn, user_id, name, download_ids, is_admin=False):
+        name = _validated_playlist_name(name)
+        entries = self._validated_downloads(conn, download_ids, user_id, is_admin)
+        playlist_id = str(uuid.uuid4())
+        now = time.time()
+        conn.execute(
+            "INSERT INTO playlists(id, owner_user_id, name, revision, "
+            "created_at, content_updated_at) VALUES (?, ?, ?, 1, ?, ?)",
+            (playlist_id, user_id, name, now, now),
+        )
+        for position, entry in enumerate(entries):
+            conn.execute(
+                "INSERT INTO playlist_items(playlist_id, download_id, position, added_at) "
+                "VALUES (?, ?, ?, ?)", (playlist_id, entry['id'], position, now),
             )
-            progress = self._repair_progress(
-                conn, playlist_id, members, old_position
-            )
-            items = []
-            for row in members:
-                entry = dict(row)
-                visible = _playlist_download_visible(entry, user_id, is_admin)
-                items.append(_playlist_item(entry if visible else None,
-                                            row['position']))
-            playlist.update({'items': items, 'progress': progress})
-            return playlist
+        return self._snapshot(conn, playlist_id, user_id, is_admin)
 
     def create(self, user_id, name, download_id=None, is_admin=False,
                download_ids=None):
-        name = _validated_playlist_name(name)
         if download_ids is None:
             download_ids = [] if download_id is None else [download_id]
         elif download_id is not None:
             raise ValueError('Use download_id or download_ids, not both')
-        playlist_id = str(uuid.uuid4())
-        now = time.time()
         with _db_lock, db() as conn:
-            entries = self._validated_downloads(
-                conn, download_ids, user_id, is_admin
-            )
-            conn.execute(
-                "INSERT INTO playlists(id, owner_user_id, name, revision, "
-                "created_at, content_updated_at) VALUES (?, ?, ?, 1, ?, ?)",
-                (playlist_id, user_id, name, now, now),
-            )
-            for position, entry in enumerate(entries):
-                conn.execute(
-                    "INSERT INTO playlist_items(playlist_id, download_id, "
-                    "position, added_at) VALUES (?, ?, ?, ?)",
-                    (playlist_id, entry['id'], position, now),
-                )
-        event_bus.publish('change', {
-            'reason': 'playlist-create', 'playlist_id': playlist_id,
-        }, owner_user_id=user_id)
-        return self.get(playlist_id, user_id, is_admin)
+            conn.execute('BEGIN IMMEDIATE')
+            user_id, is_admin = _playlist_current_actor(conn, user_id, is_admin)
+            result = self._create(conn, user_id, name, download_ids, is_admin)
+        _publish_metadata_change('playlist')
+        return result
 
-    def replace(self, playlist_id, user_id, name, download_ids,
-                expected_revision, is_admin=False):
+    def _replace(self, conn, playlist_id, user_id, name, download_ids,
+                 expected_revision, is_admin=False):
         name = _validated_playlist_name(name)
         if (isinstance(expected_revision, bool)
                 or not isinstance(expected_revision, int)
                 or expected_revision < 1):
             raise ValueError('expected_revision must be a positive integer')
+        playlist = self._owned(conn, playlist_id, user_id)
+        if playlist['revision'] != expected_revision:
+            raise PlaylistRevisionConflict()
+        entries = self._validated_downloads(conn, download_ids, user_id, is_admin)
+        old_members = self._members(conn, playlist_id)
+        old_added = {row['download_id']: row['added_at'] for row in old_members}
+        progress = self._progress(conn, playlist_id)
+        old_position = next((row['position'] for row in old_members
+                             if progress and row['download_id'] == progress['download_id']), 0)
         now = time.time()
+        conn.execute('DELETE FROM playlist_items WHERE playlist_id = ?', (playlist_id,))
+        for position, entry in enumerate(entries):
+            conn.execute(
+                "INSERT INTO playlist_items(playlist_id, download_id, position, added_at) "
+                "VALUES (?, ?, ?, ?)",
+                (playlist_id, entry['id'], position, old_added.get(entry['id'], now)),
+            )
+        conn.execute(
+            "UPDATE playlists SET name = ?, revision = revision + 1, "
+            "content_updated_at = ? WHERE id = ?", (name, now, playlist_id),
+        )
+        self._repair_progress(conn, playlist_id, self._members(conn, playlist_id), old_position)
+        return self._snapshot(conn, playlist_id, user_id, is_admin)
+
+    def replace(self, playlist_id, user_id, name, download_ids,
+                expected_revision, is_admin=False):
         with _db_lock, db() as conn:
-            playlist = self._owned(conn, playlist_id, user_id)
-            if playlist['revision'] != expected_revision:
-                raise PlaylistRevisionConflict()
-            entries = self._validated_downloads(
-                conn, download_ids, user_id, is_admin
-            )
-            old_members = self._members(conn, playlist_id)
-            old_added = {
-                row['download_id']: row['added_at'] for row in old_members
-            }
-            progress = self._progress(conn, playlist_id)
-            old_position = next(
-                (row['position'] for row in old_members
-                 if progress and row['download_id'] == progress['download_id']),
-                0,
-            )
-            conn.execute(
-                "DELETE FROM playlist_items WHERE playlist_id = ?",
-                (playlist_id,),
-            )
-            for position, entry in enumerate(entries):
-                conn.execute(
-                    "INSERT INTO playlist_items(playlist_id, download_id, "
-                    "position, added_at) VALUES (?, ?, ?, ?)",
-                    (playlist_id, entry['id'], position,
-                     old_added.get(entry['id'], now)),
-                )
-            conn.execute(
-                "UPDATE playlists SET name = ?, revision = revision + 1, "
-                "content_updated_at = ? WHERE id = ?",
-                (name, now, playlist_id),
-            )
-            self._repair_progress(
-                conn, playlist_id, self._members(conn, playlist_id), old_position
-            )
-        event_bus.publish('change', {
-            'reason': 'playlist-edit', 'playlist_id': playlist_id,
-        }, owner_user_id=user_id)
-        return self.get(playlist_id, user_id, is_admin)
+            conn.execute('BEGIN IMMEDIATE')
+            user_id, is_admin = _playlist_current_actor(conn, user_id, is_admin)
+            result = self._replace(conn, playlist_id, user_id, name, download_ids,
+                                   expected_revision, is_admin)
+        _publish_metadata_change('playlist')
+        return result
 
     def add(self, playlist_id, user_id, download_id, is_admin=False):
         if not isinstance(download_id, str) or not download_id:
@@ -3928,6 +3897,8 @@ class PlaylistService:
         now = time.time()
         changed = False
         with _db_lock, db() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            user_id, is_admin = _playlist_current_actor(conn, user_id, is_admin)
             self._owned(conn, playlist_id, user_id)
             entry = self._validated_downloads(
                 conn, [download_id], user_id, is_admin
@@ -3967,6 +3938,8 @@ class PlaylistService:
 
     def delete(self, playlist_id, user_id):
         with _db_lock, db() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            user_id, _ = _playlist_current_actor(conn, user_id, False)
             self._owned(conn, playlist_id, user_id)
             conn.execute("DELETE FROM playlists WHERE id = ?", (playlist_id,))
         event_bus.publish('change', {
@@ -4103,6 +4076,159 @@ class PlaylistService:
                         raise PlaylistRevisionConflict('completed')
         return (detail, queue_items, snapshot_ids, playable[start_position],
                 start_position, resume_seconds)
+
+
+def _playlist_summary(playlist):
+    items = playlist['items']
+    visible = [item for item in items if item.get('id') is not None]
+    playlist.update(
+        item_count=len(items), member_ids=[item.get('id') for item in items],
+        mosaic_ids=[item['id'] for item in visible[:4]],
+        duration_seconds=sum(item.get('duration_seconds') or 0 for item in visible) or None,
+    )
+    if playlist.get('progress') and playlist['progress'].get('download_id') not in playlist['member_ids']:
+        playlist['progress'] = None
+    return playlist
+
+
+def _authorized_playlist_receipt(conn, result, actor):
+    """Revalidate cached identities without replacing the attempt's outcome."""
+    if result.get('id') is None:
+        return result
+    playlists._owned(conn, result['id'], actor['id'])
+    for position, item in enumerate(result['items']):
+        entry = _playlist_download_row(conn, item.get('id'))
+        if not _playlist_download_visible(entry, actor['id'], 'admin' in actor['roles']):
+            result['items'][position] = _playlist_item(None, item['position'])
+    return _playlist_summary(result)
+
+
+def _execute_playlist_mutation(payload, playlist_id=None):
+    """Atomically authorize, conditionally save and record a canonical receipt."""
+    creating = playlist_id is None
+    action = 'playlist.create' if creating else 'playlist.replace'
+    method = 'POST' if creating else 'PUT'
+    mutation_id = payload.get('client_mutation_id')
+    match = MUTATION_ID_PATTERN.fullmatch(mutation_id) if isinstance(mutation_id, str) else None
+    if match is None:
+        return {'error': 'Invalid mutation identifier'}, 400
+    # Bind raw submitted fields as well as ordered membership. Unknown options
+    # cannot accidentally become unbound semantic inputs in a later adapter.
+    fingerprint = hashlib.sha256(json.dumps(
+        [method, action, playlist_id, {key: value for key, value in payload.items()
+                                     if key != 'client_mutation_id'}],
+        sort_keys=True, ensure_ascii=True, separators=(',', ':'),
+    ).encode()).hexdigest()
+    with _db_lock, db() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        actor = _tag_actor(conn)
+        if actor is None:
+            return {'error': 'Authentication required'}, 401
+        is_admin = 'admin' in actor['roles']
+        try:
+            state = ({'id': None, 'name': '', 'revision': 0, 'items': [], 'progress': None,
+                      'item_count': 0, 'member_ids': [], 'mosaic_ids': [],
+                      'duration_seconds': None, 'resume_position': 0} if creating else
+                     playlists._snapshot(conn, playlist_id, actor['id'], is_admin, repair=False))
+        except PlaylistNotFound:
+            return {'error': 'Unknown playlist'}, 404
+        receipt = conn.execute(
+            'SELECT fingerprint, status, response FROM mutation_receipts '
+            'WHERE actor_id = ? AND mutation_id = ?', (actor['id'], mutation_id),
+        ).fetchone()
+        if receipt is not None:
+            if receipt['fingerprint'] != fingerprint:
+                return {'error': 'Mutation identifier already used', 'code': 'mutation_id_conflict'}, 409
+            try:
+                result = _authorized_playlist_receipt(conn, json.loads(receipt['response']), actor)
+            except PlaylistNotFound:
+                return {'error': 'Unknown playlist'}, 404
+            return result, receipt['status']
+        if conn.execute("SELECT 1 FROM rename_operations WHERE actor_id = ? AND mutation_id = ? AND phase != 'done'",
+                        (actor['id'], mutation_id)).fetchone():
+            return {'error': 'Mutation identifier already used', 'code': 'mutation_id_conflict'}, 409
+        now = time.time()
+        conn.execute('DELETE FROM mutation_receipts WHERE recorded_at < ?', (now - MUTATION_RETENTION_SECONDS,))
+        counts = conn.execute(
+            'SELECT COUNT(*) AS total, COALESCE(SUM(recorded_at > ?), 0) AS recent '
+            'FROM mutation_receipts WHERE actor_id = ?', (now - 60, actor['id']),
+        ).fetchone()
+        active = conn.execute("SELECT COUNT(*) FROM rename_operations WHERE actor_id = ? AND (phase != 'done' OR NOT EXISTS (SELECT 1 FROM mutation_receipts r WHERE r.actor_id = rename_operations.actor_id AND r.mutation_id = rename_operations.mutation_id))", (actor['id'],)).fetchone()[0]
+        if counts['total'] + active >= MUTATION_ACTOR_RECEIPT_LIMIT or counts['recent'] + active >= MUTATION_ACTOR_MINUTE_LIMIT:
+            return {'error': 'Too many mutations; wait before submitting more', 'code': 'mutation_limit'}, 429
+        error = None
+        field_errors = {}
+        status, outcome = (201 if creating else 200), 'committed'
+        expected = payload.get('expected_revision')
+        created = int(match.group(1)) / 1000
+        if created < now - MUTATION_REPLAY_SECONDS or created > now + 300:
+            error, status, outcome = 'Mutation identifier expired or clock is incorrect', 400, 'rejected'
+        elif set(payload) - {'name', 'download_ids', 'download_id', 'expected_revision', 'client_mutation_id'}:
+            error, status, outcome = 'Unsupported playlist option', 400, 'rejected'
+        elif creating and expected is not None:
+            error, status, outcome = 'Creation does not accept an expected revision', 400, 'rejected'
+        elif not creating and (isinstance(expected, bool) or not isinstance(expected, int) or expected < 1):
+            error, status, outcome = 'expected_revision must be a positive integer', 400, 'rejected'
+        elif not creating and expected != state['revision']:
+            error, status, outcome = 'Playlist state changed; review the current version', 409, 'conflicted'
+        else:
+            ids = payload.get('download_ids')
+            if ids is None and creating:
+                ids = [] if payload.get('download_id') is None else [payload['download_id']]
+            try:
+                if payload.get('download_ids') is not None and payload.get('download_id') is not None:
+                    raise ValueError('Use download_id or download_ids, not both')
+                if not creating and payload.get('download_id') is not None:
+                    raise ValueError('Use download_ids when replacing a playlist')
+                _validated_playlist_name(payload.get('name'))
+            except ValueError as invalid:
+                error, field_errors = str(invalid), {'name': str(invalid)}
+            if error is None:
+                try:
+                    state = (playlists._create(conn, actor['id'], payload.get('name'), ids, is_admin)
+                             if creating else playlists._replace(conn, playlist_id, actor['id'],
+                                 payload.get('name'), ids, expected, is_admin))
+                except ValueError as invalid:
+                    error, field_errors = str(invalid), {'download_ids': str(invalid)}
+            if error is not None:
+                status, outcome = 400, 'rejected'
+        result = dict(state, mutation={'id': mutation_id, 'domain': 'playlist',
+                                      'revision': state['revision'], 'outcome': outcome},
+                      server_time=int(now * 1000))
+        if error:
+            result.update(error=error, field_errors=field_errors)
+        conn.execute(
+            'INSERT INTO mutation_receipts(actor_id, mutation_id, target_id, fingerprint, status, response, recorded_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?)',
+            (actor['id'], mutation_id, result['id'] or 'playlist:create', fingerprint,
+             status, json.dumps(result, separators=(',', ':')), now),
+        )
+    if outcome == 'committed':
+        _publish_metadata_change('playlist')
+    return result, status
+
+
+def _execute_legacy_playlist_save(payload, playlist_id=None):
+    # Old clients retain the same wire contract and conflict type while sharing
+    # the transaction's current actor and member authorization checks.
+    with _db_lock, db() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        actor = _tag_actor(conn)
+        if actor is None:
+            return {'error': 'Authentication required'}, 401
+        is_admin = 'admin' in actor['roles']
+        if playlist_id is None:
+            ids = payload.get('download_ids')
+            if ids is None:
+                ids = [] if payload.get('download_id') is None else [payload['download_id']]
+            elif payload.get('download_id') is not None:
+                raise ValueError('Use download_id or download_ids, not both')
+            result = playlists._create(conn, actor['id'], payload.get('name'), ids, is_admin)
+        else:
+            result = playlists._replace(conn, playlist_id, actor['id'], payload.get('name'),
+                                        payload.get('download_ids'), payload.get('expected_revision'), is_admin)
+    _publish_metadata_change('playlist')
+    return result, 201 if playlist_id is None else 200
 
 
 playlists = PlaylistService()
@@ -7746,18 +7872,21 @@ def playlist_collection():
     is_admin = 'admin' in g.current_user['roles']
     if request.method == 'GET':
         return jsonify(playlists.list_summaries(user_id, is_admin))
-    payload = request.get_json(silent=True)
-    if not isinstance(payload, dict):
-        return jsonify({'error': 'A JSON object is required'}), 400
+    payload, invalid = _read_json_body(2 * 1024 * 1024)
+    if invalid is not None:
+        return invalid
+    if 'client_mutation_id' in payload:
+        result, status = _execute_playlist_mutation(payload)
+        response = jsonify(result)
+        response.status_code = status
+        response.headers['Cache-Control'] = 'no-store'
+        return response
     try:
-        result = playlists.create(
-            user_id, payload.get('name'), payload.get('download_id'), is_admin,
-            payload.get('download_ids'),
-        )
+        result, status = _execute_legacy_playlist_save(payload)
     except (ValueError, PlaylistNotFound,
             PlaylistRevisionConflict) as exc:
         return _playlist_error_response(exc)
-    return jsonify(result), 201
+    return jsonify(result), status
 
 
 @app.route('/api/playlists/<playlist_id>',
@@ -7771,18 +7900,17 @@ def playlist_resource(playlist_id):
         if request.method == 'DELETE':
             playlists.delete(playlist_id, user_id)
             return '', 204
-        payload = request.get_json(silent=True)
-        if not isinstance(payload, dict):
-            return jsonify({'error': 'A JSON object is required'}), 400
-        result = playlists.replace(
-            playlist_id,
-            user_id,
-            payload.get('name'),
-            payload.get('download_ids'),
-            payload.get('expected_revision'),
-            is_admin,
-        )
-        return jsonify(result)
+        payload, invalid = _read_json_body(2 * 1024 * 1024)
+        if invalid is not None:
+            return invalid
+        if 'client_mutation_id' in payload:
+            result, status = _execute_playlist_mutation(payload, playlist_id)
+            response = jsonify(result)
+            response.status_code = status
+            response.headers['Cache-Control'] = 'no-store'
+            return response
+        result, status = _execute_legacy_playlist_save(payload, playlist_id)
+        return jsonify(result), status
     except (ValueError, PlaylistNotFound,
             PlaylistRevisionConflict) as exc:
         return _playlist_error_response(exc)
@@ -8498,7 +8626,7 @@ def record_download_view(download_id):
 @app.route('/api/client-capabilities', methods=['GET'])
 def client_capabilities():
     response = jsonify({
-        'mutation_protocol': 1, 'actions': ['tag.add', 'tag.remove', 'favorite.set', 'rename.set', 'preference.set'],
+        'mutation_protocol': 1, 'actions': ['tag.add', 'tag.remove', 'favorite.set', 'rename.set', 'preference.set', 'playlist.create', 'playlist.replace'],
         'tag_identity_version': TAG_IDENTITY_VERSION,
         'server_time': int(time.time() * 1000),
     })
@@ -8550,7 +8678,18 @@ def mutation_receipt(mutation_id):
             if receipt is not None:
                 result = json.loads(receipt['response'])
                 preference_receipt = result.get('mutation', {}).get('domain') == 'preferences' and receipt['target_id'] == 'installation'
-                if not preference_receipt and _tag_visible_row(conn, receipt['target_id'], actor) is None:
+                playlist_receipt = result.get('mutation', {}).get('domain') == 'playlist'
+                if playlist_receipt:
+                    try:
+                        result = _authorized_playlist_receipt(conn, result, actor)
+                    except PlaylistNotFound:
+                        match = MUTATION_ID_PATTERN.fullmatch(mutation_id)
+                        final = bool(match and int(match.group(1)) / 1000 < time.time() - MUTATION_REPLAY_SECONDS)
+                        response = jsonify({'error': 'Mutation unavailable', 'final': final})
+                        response.status_code = 404
+                        response.headers['Cache-Control'] = 'no-store'
+                        return response
+                if not preference_receipt and not playlist_receipt and _tag_visible_row(conn, receipt['target_id'], actor) is None:
                     match = MUTATION_ID_PATTERN.fullmatch(mutation_id)
                     final = bool(match and int(match.group(1)) / 1000 < time.time() - MUTATION_REPLAY_SECONDS)
                     return jsonify({'error': 'Mutation unavailable', 'final': final}), 404

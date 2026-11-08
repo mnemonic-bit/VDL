@@ -1,6 +1,6 @@
 # Architecture: immediate feedback for server-backed interactions
 
-**Status:** Foundation, tag protocol, favorite adapter, rename recovery, and preference saves implemented; additional adapters remain proposed.\
+**Status:** Foundation, tags, favorites, rename, preferences, and playlist editor saves implemented; additional adapters remain proposed.\
 **Date:** 2026-11-08\
 **Requirements:** [Feature 0051](../FEATURES/feature-0051-immediate-feedback-for-server-backed-interactions.md)
 
@@ -19,7 +19,8 @@ detailed requirements. If implementation requires changing a requirement, update
 the feature explicitly rather than silently contradicting it here.
 
 The implementation adds the shared modules, tag protocol, and independent
-`favorite.set`, `rename.set`, and `preference.set` adapters described below. Other actions still use handlers and collection snapshots in
+`favorite.set`, `rename.set`, `preference.set`, `playlist.create`, and
+`playlist.replace` adapters described below. Other actions still use handlers and collection snapshots in
 `static/app.js`, server routes and persistence in `vdl.py`, and SSE hints that
 trigger collection reads. The [rollout inventory](feature-0051-rollout.md) records
 which adapters remain staged. Existing
@@ -57,7 +58,7 @@ reconciliation may still use the existing batching delays.
 
 ## Module responsibilities and proposed placement
 
-The client modules below host tags, favorites, rename, and preferences. Additional action adapters
+The client modules below host tags, favorites, rename, preferences, and playlist editor saves. Additional action adapters
 remain staged. The client remains raw browser JavaScript;
 new scripts expose factory functions through one `window.VDL` namespace and load
 in dependency order before `app.js`. No bundler or runtime package is required.
@@ -346,6 +347,33 @@ does not generate a new rotation or download command. Startup restores
 process-local configuration while retaining the debug reloader's timer-owner
 restriction. The [preference effect audit](../FEATURES/feature-0054-immediate-feedback-for-preference-saves.md#preference-effect-audit)
 records each boundary.
+
+### Playlist transactions and editor recovery
+
+The `playlist.create` and `playlist.replace` descriptors use the existing
+integer playlist revision. They retain one unresolved whole-list submission per
+playlist rather than queuing later editor drafts. Creation uses an in-memory
+editor key until a canonical acknowledgement supplies the server identity.
+The editor owns draft generations and view tokens; the shared store owns
+confirmed playlist snapshots and status-only intents. Confirmed playback and
+rotation ownership do not follow the pending draft.
+
+The serialized database transaction rechecks the current actor/session,
+playlist ownership, and member visibility/playability. It binds ordered
+membership and submitted options to the shared actor-scoped receipt namespace,
+then commits the canonical playlist and receipt together. Matching receipt
+replay precedes the original expected-revision check. Authorized recovery
+retains the original outcome while redacting member details that are no longer
+visible. Existing quick-add and removal writers retain the same integer
+revision boundary; this adapter does not advertise their receipt support.
+
+Canonical responses merge the affected playlist without a collection refresh.
+Collection generations and deletion fences reject older reads and callbacks.
+Conflicts retain the draft and expose the current authorized ordered list for
+explicit review. Unknown outcomes retain their frozen attempt and block another
+save in that domain until receipt or finality rules establish safety. Closing
+the editor leaves a compact recovery summary. Authentication reset clears the
+editor, recovery state, and prior callbacks.
 
 ## Bootstrap, compatibility, and deployment
 
