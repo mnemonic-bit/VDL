@@ -36,26 +36,117 @@ objective is complete. Existing permission checks and specialized sequencing
 remain in force. They need their own behavior and regression evidence before
 adopting automatic recovery.
 
-| Controls / production entry points in `static/app.js` | Existing mechanism | Required migration / recovery boundary |
-| --- | --- | --- |
-| Favorite: `toggleFavorite` | Explicit desired boolean; later collection reconciliation | Independent favorite revision, pending star projection, FIFO intents, canonical acknowledgement and receipts. Preserve card order. |
-| Rename: `renameStart`, `renameCommit`, `renameCancel` | Separate draft and disabled submit controls; server owns final path | Local editor transitions and requested display name. Durable filesystem journal and crash recovery must precede replay. |
-| Preferences: `savePreferences` | Captured form submission; effects apply after acknowledgement; local theme preview | Saving presentation, newer draft generations, duplicate guards and canonical acknowledgement. Sensitive effects wait for confirmation. |
-| Playlist create/replace: `savePlaylistEditor` | Local draft, existing `expected_revision` on replace, server conflict response | Saving state, duplicate guards, retained newer drafts and explicit conflict recovery. Preserve the existing revision type. |
-| Playlist add/delete: `quickAddToPlaylist`, `deletePlaylist` | Server response, deletion confirmation, playlist refresh | Pending initiating controls and receipt-safe recovery before retries. |
-| Pause/unpause/stop/retry/resume: download controls and attempt-history actions | Worker status remains server-owned; collection reconciliation | Request feedback is separate from worker transition. Durable job acceptance and crash recovery are required before replay. |
-| New download: `submitDownload` | `downloadSubmitting`, probe generation and dialog-session guards | Retain existing immediate submission state. Lost acceptance needs a durable job identity before replay. |
-| Upload: `registerDroppedVideo`, `transferDroppedVideo`, `stopDroppedUpload` | Local transfer row with preallocated server ID, byte progress, registration acknowledgement and cancellation | Preserve transfer and worker semantics. Do not manufacture playable files or equate abort with server cancellation. |
-| Entry removal: `deleteDownload` | Server remove request and collection refresh | Retain marked pending row until acknowledgement; prevent duplicate submission and fence authoritative deletion. Filesystem deletion needs operation-specific recovery. |
-| Clear attempts/library: `clearHistory`, `clearLibrary` | Preview counts and explicit confirmation, then server request | Pending confirmation surface and duplicate guard; no claim of deletion before acknowledgement. |
-| Visibility: `changeDownloadVisibility` | Explicit desired visibility; server permission checks | Display pending request beside confirmed security state. A pending grant must never enable authority. |
-| Pairing creation/invalidation: `createExtensionPairing`, `invalidateExtensionPairing` | Server response supplies or invalidates credential; current UI status | Pending controls and session-safe callbacks. Never persist recovery payloads containing credentials in browser storage. |
-| Connection revocation: `revokeExtensionConnection` | Confirmation, then server response and connection refresh | Pending state beside confirmed connection; no revoked announcement until acknowledgement. |
-| User creation/update/suspension/removal: `addUser`, `updateUser`, `setUserSuspended`, removal-dialog close handler | Local edit draft, server authorization and delete confirmation | Pending controls, duplicate guards, draft/epoch safety; pending role changes cannot authorize new actions. |
-| Duplicate-index refresh button | Disabled initiating button, server acceptance, background status | Keep acceptance separate from indexing completion; no automatic replay of an unknown job request. |
-| Login/logout forms | Normal browser form navigation and server session guards | Logout clears the client authentication epoch and private drafts; old callbacks cannot revive them. |
+Each remaining row now has a proposed feature spec. These links allocate work;
+they do not mark any adapter implemented. Features 0052–0067 inherit Feature
+0051 and the shared requirements below.
+
+| Controls / production entry points in `static/app.js` | Existing mechanism | Required migration / recovery boundary | Feature spec |
+| --- | --- | --- | --- |
+| Favorite: `toggleFavorite` | Explicit desired boolean; later collection reconciliation | Independent favorite revision, pending star projection, FIFO intents, canonical acknowledgement and receipts. Preserve card order. | [0052: Favorites](../FEATURES/feature-0052-immediate-feedback-for-favorites.md) |
+| Rename: `renameStart`, `renameCommit`, `renameCancel` | Separate draft and disabled submit controls; server owns final path | Local editor transitions and requested display name. Durable filesystem journal and crash recovery must precede replay. | [0053: Rename](../FEATURES/feature-0053-immediate-feedback-and-safe-recovery-for-rename.md) |
+| Preferences: `savePreferences` | Captured form submission; effects apply after acknowledgement; local theme preview | Saving presentation, newer draft generations, duplicate guards and canonical acknowledgement. Sensitive effects wait for confirmation. | [0054: Preferences](../FEATURES/feature-0054-immediate-feedback-for-preference-saves.md) |
+| Playlist create/replace: `savePlaylistEditor` | Local draft, existing `expected_revision` on replace, server conflict response | Saving state, duplicate guards, retained newer drafts and explicit conflict recovery. Preserve the existing revision type. | [0055: Playlist editor](../FEATURES/feature-0055-immediate-feedback-for-playlist-editor-saves.md) |
+| Playlist add/delete: `quickAddToPlaylist`, `deletePlaylist` | Server response, deletion confirmation, playlist refresh | Pending initiating controls and receipt-safe recovery before retries. | [0056: Playlist add/delete](../FEATURES/feature-0056-immediate-feedback-for-playlist-add-and-delete.md) |
+| Pause/unpause/stop/retry/resume: download controls and attempt-history actions | Worker status remains server-owned; collection reconciliation | Request feedback is separate from worker transition. Durable job acceptance and crash recovery are required before replay. | [0057: Download commands](../FEATURES/feature-0057-immediate-feedback-and-durable-download-commands.md) |
+| New download: `submitDownload` | `downloadSubmitting`, probe generation and dialog-session guards | Retain existing immediate submission state. Lost acceptance needs a durable job identity before replay. | [0058: New downloads](../FEATURES/feature-0058-durable-acceptance-for-new-downloads.md) |
+| Upload: `registerDroppedVideo`, `transferDroppedVideo`, `stopDroppedUpload` | Local transfer row with preallocated server ID, byte progress, registration acknowledgement and cancellation | Preserve transfer and worker semantics. Do not manufacture playable files or equate abort with server cancellation. | [0059: Uploads](../FEATURES/feature-0059-immediate-feedback-and-recovery-for-uploads.md) |
+| Entry removal: `deleteDownload` | Server remove request and collection refresh | Retain marked pending row until acknowledgement; prevent duplicate submission and fence authoritative deletion. Filesystem deletion needs operation-specific recovery. | [0060: Entry removal](../FEATURES/feature-0060-immediate-feedback-and-safe-entry-removal.md) |
+| Clear attempts/library: `clearHistory`, `clearLibrary` | Preview counts and explicit confirmation, then server request | Pending confirmation surface and duplicate guard; no claim of deletion before acknowledgement. | [0061: Bulk clear](../FEATURES/feature-0061-immediate-feedback-for-bulk-clear-actions.md) |
+| Visibility: `changeDownloadVisibility` | Explicit desired visibility; server permission checks | Display pending request beside confirmed security state. A pending grant must never enable authority. | [0062: Visibility](../FEATURES/feature-0062-immediate-feedback-for-visibility-changes.md) |
+| Pairing creation/invalidation: `createExtensionPairing`, `invalidateExtensionPairing` | Server response supplies or invalidates credential; current UI status | Pending controls and session-safe callbacks. Never persist recovery payloads containing credentials in browser storage. | [0063: Pairing](../FEATURES/feature-0063-immediate-feedback-for-extension-pairing.md) |
+| Connection revocation: `revokeExtensionConnection` | Confirmation, then server response and connection refresh | Pending state beside confirmed connection; no revoked announcement until acknowledgement. | [0064: Connection revocation](../FEATURES/feature-0064-immediate-feedback-for-connection-revocation.md) |
+| User creation/update/suspension/removal: `addUser`, `updateUser`, `setUserSuspended`, removal-dialog close handler | Local edit draft, server authorization and delete confirmation | Pending controls, duplicate guards, draft/epoch safety; pending role changes cannot authorize new actions. | [0065: User administration](../FEATURES/feature-0065-immediate-feedback-for-user-administration.md) |
+| Duplicate-index refresh button | Disabled initiating button, server acceptance, background status | Keep acceptance separate from indexing completion; no automatic replay of an unknown job request. | [0066: Duplicate-index refresh](../FEATURES/feature-0066-immediate-feedback-for-duplicate-index-refresh.md) |
+| Login/logout forms | Normal browser form navigation and server session guards | Logout clears the client authentication epoch and private drafts; old callbacks cannot revive them. | [0067: Authentication lifecycle](../FEATURES/feature-0067-authentication-epoch-and-form-lifecycle.md) |
+
+## Shared requirements for the remaining specs
+
+The linked specs define proposed behavior and completion criteria, not observed
+implementation. Feature 0051 remains the source for shared lifecycle, wire,
+security, quota, and replay-window requirements; the
+[architecture](immediate-feedback-for-server-backed-interactions.md) owns module
+responsibilities. Each adapter must declare its action names, affected views,
+conflict boundary, permissions, acknowledgement decoder, and recovery policy
+before implementation. The shared contract applies to every linked spec:
+
+- Render local feedback before awaiting transport or reconciliation, within
+  the next available frame; use the parent's 50 ms budget in an idle browser.
+  Confirm supported results from canonical responses with SSE disconnected.
+  Background SSE/reconnect/focus reads remain reconciliation, without polling.
+- Keep confirmed state, pending intent, and drafts separate. Preserve stable
+  identities, newer draft generations, view tokens, focus, and collection order.
+  Reject stale revisions and obsolete membership generations. Never roll back
+  an entire object or collection to undo one failed request.
+- Use the existing store/coordinator seam and trusted descriptors for discrete
+  adopted actions. Keep the frontend raw JavaScript with no build step. New
+  domains use decimal-string revisions; existing playlist revisions keep their
+  existing type. Do not invent revisions for unsupported contracts.
+- Treat lost responses, malformed success, and generic server errors as
+  potentially unknown. After five seconds replace spinner-only waiting with
+  explanatory text. Definite rejection, conflict, unknown outcome, accepted
+  work, and completed work remain distinct. Provide recovery status when the
+  originating surface closes; dismissing it cannot cancel transmitted work.
+- Preserve the parent's bounded queue and receipt limits. Receipt lookup is
+  actor-scoped and current-authorized. Replay, where supported, is deliberate
+  and uses the same frozen attempt; none of these specs enables automatic
+  mutation replay. Missing receipts and matching reads alone do not prove an
+  attempt's outcome. Follow the parent's domain-release/finality rules.
+- Add no persistent browser write queue. Clear private state on auth epoch
+  changes; known deletion/access loss fences older callbacks. Recheck current
+  authorization at execution and recovery. Pending security changes never
+  confer authority. Retain existing request-security and output-escaping rules.
+- Use existing icons, theme tokens, reduced-motion support, keyboard and touch
+  controls, and readable status/error text. Announce meaningful changes once;
+  do not rely on color, hover, or animation alone. Keep unrelated work usable.
+- Record bounded aggregate local-feedback and acknowledgement timings, outcome
+  counts, and reconciliation reads through the shared diagnostic seam. Include
+  no user content, credentials, raw paths, or private resource identifiers.
+
+Pending presentation may be delivered before a recovery protocol, as each spec
+permits. That is partial delivery, not completion of a spec that requires
+durable recovery. Advertise an action capability only after every writer,
+serializer, authorization path, receipt/journal, and recovery route meets it.
+Do not apply GET contention recovery to mutations. Database receipts do not
+establish atomicity for filesystem effects or worker dispatch.
+
+Implementation verification for **each** spec requires deterministic tests of
+the production module interface and actual server routes where changed, plus
+controlled browser request gates rather than sleeps. Cover held responses,
+SSE-free confirmation, stale reads and callbacks, duplicate submission, definite
+rejection, conflict where applicable, unknown outcome, access loss, and account
+switching. For receipt/job/journal adoption also inject response loss after
+commit, simultaneous replay, fingerprint mismatch, expiry, and restart at each
+side-effect boundary. Run `./tests/run-all.sh --unit` and record at least **90%
+`vdl.py` line coverage**, using Python 3.12 when close to the threshold, relevant
+production-module Node tests, and Chromium/Firefox browser regressions. A passing
+suite without its coverage result is insufficient. These are future
+implementation gates, not claims that the proposed adapters have passed them.
+
+## Delivery dependencies
+
+Numbering follows the inventory, not required implementation order. Extend
+authentication fencing (0067) alongside every adapter, including specialized
+callbacks. Favorites (0052) exercise an independent scalar domain; preference
+and playlist saves (0054–0056) then exercise drafts and existing conflicts.
+Playlist editor and quick-add/delete share one revision boundary and must be
+compatible even when delivered separately.
+
+Download commands and new submissions (0057–0058) need a consistent durable
+acceptance/worker-ownership seam. Uploads (0059) retain their transfer sequence.
+Rename and entry removal (0053, 0060) require filesystem recovery before replay;
+bulk Library clear (0061) builds on safe per-target removal and a fixed accepted
+scope. Security changes (0062–0065) require conservative presentation and
+current authorization throughout. Duplicate indexing (0066) retains its job
+mechanism without enabling replay. No later spec is implicitly completed by
+shipping a dependency.
 
 ## Specialized sequences retained
+
+These six rows are retained mechanisms, not additional human-edit adapters.
+Their preservation is required regression coverage for the specs above,
+particularly authentication lifecycle (0067), upload/download work (0057–0059),
+playlist edits (0055–0056), and companion security controls (0063–0064). Do not
+mark the wider rollout complete without that evidence.
 
 | Mutation | Existing domain-specific mechanism | Reason to retain it |
 | --- | --- | --- |
