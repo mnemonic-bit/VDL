@@ -24,6 +24,8 @@ import time
 import subprocess
 import mimetypes
 import copy
+import ctypes
+import errno
 import secrets
 import signal
 import stat
@@ -478,6 +480,8 @@ BROWSER_VIDEO_EXTENSIONS = {
 # connection cause "database is locked" errors. We open a fresh connection
 # per operation and guard writes with this lock.
 _db_lock = threading.Lock()
+# File operations take this before database serialization; aliases share it.
+_file_operation_lock = threading.RLock()
 _rotation_lock = threading.RLock()
 _rotation_timer = None
 _rotation_timer_db = None
@@ -816,6 +820,7 @@ def init_db():
             ("favorite", "ALTER TABLE downloads ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0"),
             ("favorite_revision", "ALTER TABLE downloads ADD COLUMN favorite_revision INTEGER NOT NULL DEFAULT 0"),
             ("tags_revision", "ALTER TABLE downloads ADD COLUMN tags_revision INTEGER NOT NULL DEFAULT 0"),
+            ("rename_revision", "ALTER TABLE downloads ADD COLUMN rename_revision INTEGER NOT NULL DEFAULT 0"),
             # A view is an explicit preview activation. Keeping the counter
             # independent of media requests avoids counting range fetches,
             # downloads, and generated hover previews as watches.
@@ -849,6 +854,29 @@ def init_db():
         # Triggers include legacy clients, imports and cleanup writers, so each
         # metadata revision stays independent of progress and other domains.
         conn.executescript("""
+            CREATE TRIGGER IF NOT EXISTS download_rename_revision
+            AFTER UPDATE OF filename, display_filename ON downloads
+            WHEN NEW.filename IS NOT OLD.filename OR NEW.display_filename IS NOT OLD.display_filename BEGIN
+                UPDATE downloads SET rename_revision = OLD.rename_revision + 1
+                WHERE id = NEW.id;
+            END;
+            CREATE TABLE IF NOT EXISTS rename_operations (
+                actor_id INTEGER NOT NULL,
+                mutation_id TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                actor_session_version INTEGER NOT NULL,
+                expected_revision TEXT NOT NULL,
+                source TEXT NOT NULL,
+                destination TEXT NOT NULL,
+                anchor TEXT NOT NULL,
+                identity TEXT NOT NULL,
+                display_name TEXT,
+                phase TEXT NOT NULL,
+                recorded_at REAL NOT NULL,
+                PRIMARY KEY(actor_id, mutation_id)
+            );
+            CREATE INDEX IF NOT EXISTS rename_operations_target ON rename_operations(target_id, phase);
             CREATE TRIGGER IF NOT EXISTS download_favorite_revision
             AFTER UPDATE OF favorite ON downloads WHEN NEW.favorite != OLD.favorite BEGIN
                 UPDATE downloads SET favorite_revision = OLD.favorite_revision + 1
@@ -1009,6 +1037,7 @@ def init_db():
             "UPDATE downloads SET status = 'interrupted', progress = 'Interrupted' "
             "WHERE status IN ('starting', 'downloading', 'paused')"
         )
+    _recover_rename_operations()
     # The debug reloader's parent must not renew the shared deck alongside
     # its serving child. Ordinary WSGI imports still own their deadline timer.
     if (__name__ != '__main__'
@@ -1276,6 +1305,7 @@ def db_get_download(download_id):
             return None
         result = dict(row)
         result.update(_favorite_snapshot(conn, download_id, row))
+        result.update(_rename_snapshot(conn, download_id, row))
         result["quality"] = classify_video_quality(result["resolution"])
         result.update(_tag_snapshot(conn, download_id, row))
         return result
@@ -1422,7 +1452,7 @@ def _tag_actor(conn):
 
 def _tag_visible_row(conn, download_id, actor):
     row = conn.execute(
-        "SELECT id, visibility, owner_user_id, tags_revision, favorite, favorite_revision "
+        "SELECT * "
         "FROM downloads WHERE id = ?", (download_id,),
     ).fetchone()
     if row is not None and (row['visibility'] == 'public'
@@ -1568,6 +1598,9 @@ def _execute_metadata_mutation(download_id, payload, method, domain):
                 if is_tag:
                     result['available_tags'] = _tag_vocabulary(conn, actor)
                 return result, receipt['status']
+            if conn.execute('SELECT 1 FROM rename_operations WHERE actor_id = ? AND mutation_id = ? AND phase != ?',
+                            (actor['id'], mutation_id, 'done')).fetchone():
+                return {'error': 'Mutation identifier already used', 'code': 'mutation_id_conflict'}, 409
             now = time.time()
             created = int(match.group(1)) / 1000
             conn.execute('DELETE FROM mutation_receipts WHERE recorded_at < ?',
@@ -1577,8 +1610,9 @@ def _execute_metadata_mutation(download_id, payload, method, domain):
                 'COALESCE(SUM(recorded_at > ?), 0) AS recent FROM mutation_receipts '
                 'WHERE actor_id = ?', (now - 60, actor['id']),
             ).fetchone()
-            if (counts['total'] >= MUTATION_ACTOR_RECEIPT_LIMIT
-                    or counts['recent'] >= MUTATION_ACTOR_MINUTE_LIMIT):
+            active = conn.execute("SELECT COUNT(*) FROM rename_operations WHERE actor_id = ? AND (phase != 'done' OR NOT EXISTS (SELECT 1 FROM mutation_receipts r WHERE r.actor_id = rename_operations.actor_id AND r.mutation_id = rename_operations.mutation_id))", (actor['id'],)).fetchone()[0]
+            if (counts['total'] + active >= MUTATION_ACTOR_RECEIPT_LIMIT
+                    or counts['recent'] + active >= MUTATION_ACTOR_MINUTE_LIMIT):
                 return {'error': 'Too many mutations; wait before submitting more',
                         'code': 'mutation_limit'}, 429
             status, outcome = 200, 'committed'
@@ -1619,6 +1653,511 @@ def _execute_metadata_mutation(download_id, payload, method, domain):
         else:
             _publish_metadata_change(domain)
     return result, status
+
+
+def _rename_snapshot(conn, download_id, row=None):
+    if row is None:
+        row = conn.execute('SELECT filename, display_filename, rename_revision FROM downloads WHERE id = ?', (download_id,)).fetchone()
+    if row is None:
+        return None
+    return {'id': download_id, 'filename': row['filename'],
+            'display_filename': row['display_filename'],
+            'rename_revision': str(row['rename_revision'])}
+
+
+def _rename_checkpoint(phase, operation):
+    """Crash-injection seam; callers have already persisted each boundary."""
+
+
+def _rename_identity(path):
+    # An anchor pins this inode across moves; a hash also detects changed bytes.
+    with open(path, 'rb') as media:
+        before = os.fstat(media.fileno())
+        if not stat.S_ISREG(before.st_mode) or os.path.islink(path):
+            raise OSError('Unsupported file identity')
+        digest = hashlib.file_digest(media, 'sha256').hexdigest()
+        after = os.fstat(media.fileno())
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+        raise OSError('File changed during rename')
+    return {'device': before.st_dev, 'inode': before.st_ino,
+            'size': before.st_size, 'mtime': before.st_mtime_ns,
+            'ctime': before.st_ctime_ns, 'digest': digest}
+
+
+def _rename_matches(path, identity, *, pristine=False):
+    try:
+        current = _rename_identity(path)
+    except OSError:
+        return False
+    keys = ('device', 'inode', 'size', 'mtime', 'digest')
+    if pristine:
+        keys += ('ctime',)
+    return all(current[key] == identity[key] for key in keys)
+
+
+def _rename_noreplace(source, destination):
+    # Source retirement must be atomic: checking then unlinking source can
+    # delete an unrelated file installed between those two operations.
+    if os.name == 'nt':
+        os.rename(source, destination)
+        return
+    library = ctypes.CDLL(None, use_errno=True)
+    rename = getattr(library, 'renameat2', None)
+    if rename is None:
+        raise OSError(errno.ENOTSUP, 'Safe source retirement unavailable')
+    rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    rename.restype = ctypes.c_int
+    if rename(-100, os.fsencode(source), -100, os.fsencode(destination), 1) != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code))
+
+
+def _rename_sync(directory):
+    fd = os.open(directory, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _rename_phase(operation, phase):
+    with _db_lock, db() as conn:
+        conn.execute('UPDATE rename_operations SET phase = ? WHERE actor_id = ? AND mutation_id = ?',
+                     (phase, operation['actor_id'], operation['mutation_id']))
+    operation['phase'] = phase
+    _rename_checkpoint(phase, operation)
+
+
+def _rename_authorized(conn, operation, request_actor):
+    actor = (_tag_actor(conn) if request_actor else
+             _db_user(conn, 'id = ?', (operation['actor_id'],)))
+    if (actor is None or actor['suspended'] or actor['password_hash'] is None
+            or actor['session_version'] != operation['actor_session_version']):
+        return None, None, 401
+    row = _tag_visible_row(conn, operation['target_id'], actor)
+    return actor, row, 200 if row is not None else 404
+
+
+def _rename_unresolved():
+    # Recovery paths and filesystem exception text are intentionally private.
+    return {'error': 'Rename not confirmed. File recovery requires intervention.',
+            'code': 'rename_recovery_required'}, 503
+
+
+def _assert_no_pending_rename(entry, exclude=None):
+    with db() as conn:
+        operations = conn.execute('SELECT * FROM rename_operations').fetchall()
+    path = entry.get('filename')
+    real = os.path.realpath(path) if path else None
+    for operation in operations:
+        if exclude == (operation['actor_id'], operation['mutation_id']):
+            continue
+        identity = json.loads(operation['identity'])
+        same_file = False
+        if path:
+            try:
+                info = os.stat(path)
+                same_file = (info.st_dev, info.st_ino) == (identity.get('device'), identity.get('inode'))
+            except OSError:
+                pass
+        if (entry['id'] == operation['target_id'] or same_file or
+                real in (operation['source'], operation['destination'])):
+            raise OSError('Rename recovery requires intervention before another file operation')
+
+
+def _rename_aliases_authorized(conn, operation, actor):
+    if operation['display_name'] is not None:
+        return True
+    aliases = conn.execute('SELECT id, filename, status FROM downloads WHERE filename IS NOT NULL').fetchall()
+    return all(alias['status'] not in ('starting', 'downloading', 'paused')
+               and alias['id'] not in _live_worker_ids
+               and _tag_visible_row(conn, alias['id'], actor) is not None
+               for alias in aliases if os.path.abspath(alias['filename']) == operation['source'])
+
+
+def _retire_rename_source(operation):
+    source, anchor = operation['source'], operation['anchor']
+    directory = os.path.dirname(source)
+    identity = json.loads(operation['identity'])
+    retired = anchor + '.retired'
+    if os.path.lexists(retired) and not _rename_matches(retired, identity):
+        if not os.path.lexists(source):
+            _rename_noreplace(retired, source)
+            _rename_sync(directory)
+        return False
+    if os.path.lexists(source) and _rename_matches(source, identity):
+        if os.path.lexists(retired):
+            os.unlink(retired)
+            _rename_sync(directory)
+        _rename_noreplace(source, retired)
+        _rename_sync(directory)
+        _rename_checkpoint('source_retired', operation)
+        if not _rename_matches(retired, identity):
+            if not os.path.lexists(source):
+                _rename_noreplace(retired, source)
+                _rename_sync(directory)
+            return False
+    # A replacement at the old name belongs to somebody else. The pinned
+    # inode at destination remains the admitted file identity.
+    return True
+
+
+class _RenameRecoveryRequired(OSError):
+    pass
+
+
+def _rename_done_superseded(operation, entry):
+    if entry is None:
+        return True
+    path = os.path.abspath(entry['filename']) if entry['filename'] else None
+    if path not in (operation['source'], operation['destination']):
+        return True
+    published = json.loads(operation['identity']).get('published_revisions', {})
+    revision = published.get(entry['id'])
+    return revision is not None and str(entry['rename_revision']) != revision
+
+
+def _finish_rename_cleanup(operation):
+    identity = json.loads(operation['identity'])
+    with db() as conn:
+        current = conn.execute('SELECT id, filename, rename_revision FROM downloads WHERE id = ?', (operation['target_id'],)).fetchone()
+    superseded = _rename_done_superseded(operation, current)
+    if not superseded and operation['display_name'] is None and not _rename_matches(operation['destination'], identity):
+        _restore_rename_source(operation)
+        raise _RenameRecoveryRequired('File recovery requires intervention')
+    if not superseded and operation['display_name'] is None and operation['source'] != operation['destination']:
+        if not _retire_rename_source(operation):
+            raise _RenameRecoveryRequired('File recovery requires intervention')
+    retired = operation['anchor'] + '.retired'
+    if os.path.lexists(retired) and _rename_matches(retired, identity):
+        os.unlink(retired)
+        _rename_sync(os.path.dirname(operation['source']))
+    if os.path.lexists(operation['anchor']) and _rename_matches(operation['anchor'], identity):
+        os.unlink(operation['anchor'])
+        _rename_sync(os.path.dirname(operation['source']))
+    with _db_lock, db() as conn:
+        conn.execute("DELETE FROM rename_operations WHERE actor_id = ? AND mutation_id = ? AND phase = 'done'",
+                     (operation['actor_id'], operation['mutation_id']))
+
+
+class _RenameAuthorizationLost(Exception):
+    def __init__(self, status):
+        self.status = status
+
+
+def _restore_rename_source(operation):
+    # Compensation repairs the already-confirmed reference without granting a
+    # revoked actor a new rename, and never overwrites a replacement pathname.
+    if operation['display_name'] is not None or operation['source'] == operation['destination']:
+        return
+    identity = json.loads(operation['identity'])
+    try:
+        if not os.path.lexists(operation['source']) and _rename_matches(operation['anchor'], identity):
+            os.link(operation['anchor'], operation['source'], follow_symlinks=False)
+            _rename_sync(os.path.dirname(operation['source']))
+    except OSError:
+        app.logger.warning('rename recovery outcome=intervention-required')
+
+
+def _recover_rename_operation(operation, request_actor=False):
+    """Resume the admitted operation, never a newly inferred rename."""
+    if operation['phase'] == 'done':
+        with _db_lock, db() as conn:
+            actor, row, status = _rename_authorized(conn, operation, request_actor)
+            if status != 200:
+                return {'error': 'Authentication required' if status == 401 else 'Unknown download id'}, status
+            receipt = conn.execute('SELECT response, status FROM mutation_receipts WHERE actor_id = ? AND mutation_id = ?',
+                                   (operation['actor_id'], operation['mutation_id'])).fetchone()
+        try:
+            _finish_rename_cleanup(operation)
+        except _RenameRecoveryRequired:
+            return _rename_unresolved()
+        except OSError:
+            app.logger.warning('rename recovery outcome=cleanup-required')
+        return (json.loads(receipt['response']), receipt['status']) if receipt else _rename_unresolved()
+    with _db_lock, db() as conn:
+        actor, row, status = _rename_authorized(conn, operation, request_actor)
+        denied = status != 200
+        invalid = not denied and (str(row['rename_revision']) != operation['expected_revision']
+                                  or row['status'] != 'finished'
+                                  or not _rename_aliases_authorized(conn, operation, actor))
+    if denied:
+        _restore_rename_source(operation)
+        return {'error': 'Authentication required' if status == 401 else 'Unknown download id'}, status
+    if invalid:
+        _restore_rename_source(operation)
+        return _rename_unresolved()
+    source, destination, anchor = (operation[key] for key in ('source', 'destination', 'anchor'))
+    identity = json.loads(operation['identity'])
+    directory = os.path.dirname(source)
+    try:
+        if operation['display_name'] is None and source != destination:
+            if not os.path.lexists(anchor):
+                if operation['phase'] != 'prepared' or not _rename_matches(source, identity, pristine=True):
+                    return _rename_unresolved()
+                os.link(source, anchor, follow_symlinks=False)
+                _rename_sync(directory)
+                _rename_checkpoint('anchor_created', operation)
+            if not _rename_matches(anchor, identity):
+                return _rename_unresolved()
+            if operation['phase'] == 'prepared':
+                _rename_phase(operation, 'anchored')
+            if not os.path.lexists(destination):
+                # An exclusive hardlink makes destination creation no-clobber,
+                # including a file created externally after collision checking.
+                os.link(anchor, destination, follow_symlinks=False)
+                _rename_sync(directory)
+                _rename_checkpoint('destination_created', operation)
+            if not _rename_matches(destination, identity):
+                if not os.path.lexists(source):
+                    os.link(anchor, source, follow_symlinks=False)
+                    _rename_sync(directory)
+                return _rename_unresolved()
+            if operation['phase'] in ('prepared', 'anchored'):
+                _rename_phase(operation, 'linked')
+            if not _retire_rename_source(operation):
+                return _rename_unresolved()
+            _rename_checkpoint('source_removed', operation)
+            _rename_phase(operation, 'moved')
+        else:
+            if not _rename_matches(source, identity, pristine=True):
+                return _rename_unresolved()
+        if operation['display_name'] is None and source != destination:
+            if not _rename_matches(anchor, identity) or not _rename_matches(destination, identity):
+                _restore_rename_source(operation)
+                return _rename_unresolved()
+        with _db_lock, db() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            actor, row, status = _rename_authorized(conn, operation, request_actor)
+            if status != 200:
+                raise _RenameAuthorizationLost(status)
+            if str(row['rename_revision']) != operation['expected_revision']:
+                raise _RenameRecoveryRequired('Editable state changed during recovery')
+            if not _rename_aliases_authorized(conn, operation, actor):
+                raise _RenameRecoveryRequired('File authorization changed during recovery')
+            before = _rename_snapshot(conn, row['id'], row)
+            affected_ids = [row['id']]
+            if operation['display_name'] is not None:
+                conn.execute('UPDATE downloads SET display_filename = ? WHERE id = ?',
+                             (operation['display_name'], row['id']))
+            elif source != destination:
+                # Multiple rows may name the very same directory entry. Keep
+                # each reference valid; separate hardlink aliases stay put.
+                aliases = conn.execute('SELECT id, filename FROM downloads WHERE filename IS NOT NULL').fetchall()
+                for alias in aliases:
+                    if os.path.abspath(alias['filename']) == source:
+                        conn.execute('UPDATE downloads SET filename = ? WHERE id = ?', (destination, alias['id']))
+                        affected_ids.append(alias['id'])
+            state = _rename_snapshot(conn, row['id'])
+            changed = before != state
+            result = dict(state, changed=changed, server_time=int(time.time() * 1000),
+                          mutation={'id': operation['mutation_id'], 'domain': 'rename',
+                                    'outcome': 'committed', 'revision': state['rename_revision']})
+            conn.execute('INSERT INTO mutation_receipts(actor_id, mutation_id, target_id, fingerprint, status, response, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                         (operation['actor_id'], operation['mutation_id'], row['id'], operation['fingerprint'], 200, json.dumps(result), time.time()))
+            identity['published_revisions'] = {target_id: str(conn.execute('SELECT rename_revision FROM downloads WHERE id = ?', (target_id,)).fetchone()[0]) for target_id in set(affected_ids)}
+            operation['identity'] = json.dumps(identity)
+            conn.execute("UPDATE rename_operations SET phase = 'done', identity = ? WHERE actor_id = ? AND mutation_id = ?",
+                         (operation['identity'], operation['actor_id'], operation['mutation_id']))
+        _rename_checkpoint('committed', operation)
+        try:
+            _finish_rename_cleanup(operation)
+        except _RenameRecoveryRequired:
+            return _rename_unresolved()
+        except OSError:
+            app.logger.warning('rename recovery outcome=cleanup-required')
+        _rename_checkpoint('cleaned', operation)
+        if changed:
+            _publish_metadata_change('rename')
+        return result, 200
+    except _RenameAuthorizationLost as denied:
+        _restore_rename_source(operation)
+        return {'error': 'Authentication required' if denied.status == 401 else 'Unknown download id'}, denied.status
+    except OSError:
+        _restore_rename_source(operation)
+        return _rename_unresolved()
+
+
+def _recover_rename_operations():
+    with _file_operation_lock:
+        with db() as conn:
+            operations = [dict(row) for row in conn.execute('SELECT * FROM rename_operations')]
+        for operation in operations:
+            if operation['phase'] == 'done':
+                try:
+                    _finish_rename_cleanup(operation)
+                except OSError:
+                    app.logger.warning('rename recovery outcome=cleanup-required')
+            else:
+                _recover_rename_operation(operation)
+
+
+def _record_rename_rejection(conn, actor, row, mutation_id, fingerprint, error, status, outcome='rejected'):
+    state = _rename_snapshot(conn, row['id'], row)
+    result = dict(state, error=error, changed=False, server_time=int(time.time() * 1000),
+                  mutation={'id': mutation_id, 'domain': 'rename', 'outcome': outcome, 'revision': state['rename_revision']})
+    conn.execute('INSERT INTO mutation_receipts(actor_id, mutation_id, target_id, fingerprint, status, response, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                 (actor['id'], mutation_id, row['id'], fingerprint, status, json.dumps(result), time.time()))
+    return result, status
+
+
+def _rename_rejection(download_id, mutation_id, fingerprint, error, status, outcome='rejected'):
+    with _db_lock, db() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        actor = _tag_actor(conn)
+        row = _tag_visible_row(conn, download_id, actor) if actor else None
+        if actor is None or row is None:
+            return {'error': 'Authentication required' if actor is None else 'Unknown download id'}, 401 if actor is None else 404
+        receipt = conn.execute('SELECT fingerprint, response, status FROM mutation_receipts WHERE actor_id = ? AND mutation_id = ?', (actor['id'], mutation_id)).fetchone()
+        if receipt is not None:
+            if receipt['fingerprint'] != fingerprint:
+                return {'error': 'Mutation identifier already used', 'code': 'mutation_id_conflict'}, 409
+            return json.loads(receipt['response']), receipt['status']
+        if conn.execute('SELECT 1 FROM rename_operations WHERE actor_id = ? AND mutation_id = ?', (actor['id'], mutation_id)).fetchone():
+            return {'error': 'Mutation identifier already used', 'code': 'mutation_id_conflict'}, 409
+        now = time.time()
+        counts = conn.execute('SELECT COUNT(*) AS total, COALESCE(SUM(recorded_at > ?), 0) AS recent FROM mutation_receipts WHERE actor_id = ?', (now - 60, actor['id'])).fetchone()
+        active = conn.execute("SELECT COUNT(*) FROM rename_operations WHERE actor_id = ? AND (phase != 'done' OR NOT EXISTS (SELECT 1 FROM mutation_receipts r WHERE r.actor_id = rename_operations.actor_id AND r.mutation_id = rename_operations.mutation_id))", (actor['id'],)).fetchone()[0]
+        if counts['total'] + active >= MUTATION_ACTOR_RECEIPT_LIMIT or counts['recent'] + active >= MUTATION_ACTOR_MINUTE_LIMIT:
+            return {'error': 'Too many mutations; wait before submitting more', 'code': 'mutation_limit'}, 429
+        return _record_rename_rejection(conn, actor, row, mutation_id, fingerprint, error, status, outcome)
+
+
+def _execute_rename_mutation(download_id, payload):
+    protocol = 'client_mutation_id' in payload or 'expected_revision' in payload
+    with _file_operation_lock:
+        # Authorization and journal/receipt replay precede inspecting old paths:
+        # a completed move necessarily made that old source disappear.
+        with _db_lock, db() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            actor = _tag_actor(conn)
+            if actor is None:
+                return {'error': 'Authentication required'}, 401
+            row = _tag_visible_row(conn, download_id, actor)
+            if row is None:
+                return {'error': 'Unknown download id'}, 404
+            row = dict(row)
+            state = _rename_snapshot(conn, download_id, row)
+            expected = payload.get('expected_revision') if protocol else state['rename_revision']
+            mutation_id = payload.get('client_mutation_id') if protocol else str(int(time.time() * 1000)) + '-' + secrets.token_hex(16)
+            match = MUTATION_ID_PATTERN.fullmatch(mutation_id) if isinstance(mutation_id, str) else None
+            if match is None:
+                return {'error': 'Invalid mutation identifier'}, 400
+            fingerprint = hashlib.sha256(json.dumps(['POST', 'rename.set', download_id, payload.get('filename'), expected],
+                                                    ensure_ascii=True, separators=(',', ':'), sort_keys=True).encode()).hexdigest()
+            receipt = conn.execute('SELECT fingerprint, status, response FROM mutation_receipts WHERE actor_id = ? AND mutation_id = ?', (actor['id'], mutation_id)).fetchone()
+            operation = conn.execute('SELECT * FROM rename_operations WHERE actor_id = ? AND mutation_id = ?', (actor['id'], mutation_id)).fetchone()
+            if receipt is not None or operation is not None:
+                recorded = receipt if receipt is not None else operation
+                if recorded['fingerprint'] != fingerprint:
+                    return {'error': 'Mutation identifier already used', 'code': 'mutation_id_conflict'}, 409
+                if receipt is not None:
+                    result, status = json.loads(receipt['response']), receipt['status']
+                else:
+                    result = status = None
+                operation = dict(operation) if operation is not None else None
+            else:
+                operation = None
+                now = time.time()
+                conn.execute('DELETE FROM mutation_receipts WHERE recorded_at < ?', (now - MUTATION_RETENTION_SECONDS,))
+                counts = conn.execute('SELECT COUNT(*) AS total, COALESCE(SUM(recorded_at > ?), 0) AS recent FROM mutation_receipts WHERE actor_id = ?', (now - 60, actor['id'])).fetchone()
+                active = conn.execute("SELECT COUNT(*) FROM rename_operations WHERE actor_id = ? AND (phase != 'done' OR NOT EXISTS (SELECT 1 FROM mutation_receipts r WHERE r.actor_id = rename_operations.actor_id AND r.mutation_id = rename_operations.mutation_id))", (actor['id'],)).fetchone()[0]
+                if counts['total'] + active >= MUTATION_ACTOR_RECEIPT_LIMIT or counts['recent'] + active >= MUTATION_ACTOR_MINUTE_LIMIT:
+                    return {'error': 'Too many mutations; wait before submitting more', 'code': 'mutation_limit'}, 429
+                error, status, outcome = None, 200, 'committed'
+                value = payload.get('filename')
+                if int(match.group(1)) / 1000 < now - MUTATION_REPLAY_SECONDS or int(match.group(1)) / 1000 > now + 300:
+                    error, status = 'Mutation identifier expired or clock is incorrect', 400
+                elif not isinstance(expected, str) or not re.fullmatch(r'0|[1-9][0-9]{0,18}', expected):
+                    error, status = 'Expected revision must be a decimal string', 400
+                elif not isinstance(value, str) or not value.strip():
+                    error, status = 'Filename must not be empty', 400
+                elif any(char in value for char in ('/', '\\', '\x00')) or value.strip() in ('.', '..'):
+                    error, status = 'Filename must not contain path separators', 400
+                elif row['status'] != 'finished':
+                    error, status = 'Only finished downloads can be renamed', 409
+                elif expected != state['rename_revision']:
+                    error, status, outcome = 'Editable state changed; review the current state', 409, 'conflicted'
+                if error is not None:
+                    if outcome != 'conflicted':
+                        outcome = 'rejected'
+                    result = dict(state, error=error, changed=False, server_time=int(now * 1000),
+                                  mutation={'id': mutation_id, 'domain': 'rename', 'outcome': outcome, 'revision': state['rename_revision']})
+                    conn.execute('INSERT INTO mutation_receipts(actor_id, mutation_id, target_id, fingerprint, status, response, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                                 (actor['id'], mutation_id, download_id, fingerprint, status, json.dumps(result), now))
+                else:
+                    result = status = None
+        if result is not None and operation is not None and operation['phase'] == 'done':
+            try:
+                _finish_rename_cleanup(operation)
+            except _RenameRecoveryRequired:
+                return _rename_unresolved()
+            except OSError:
+                app.logger.warning('rename recovery outcome=cleanup-required')
+        if result is None and operation is None:
+            try:
+                _assert_no_pending_rename(row)
+                old_path = row.get('filename')
+                if not old_path or not _is_allowed_download_path(old_path):
+                    return _rename_rejection(download_id, mutation_id, fingerprint, 'Original file is missing on disk', 410)
+                source = os.path.abspath(old_path)
+                if os.path.realpath(source) != source:
+                    return _rename_rejection(download_id, mutation_id, fingerprint, 'File location does not support safe rename', 409)
+                identity = _rename_identity(source)
+                old_ext = os.path.splitext(source)[1]
+                base = os.path.splitext(payload['filename'].strip())[0]
+                if not base:
+                    return _rename_rejection(download_id, mutation_id, fingerprint, 'Filename must not be empty', 400)
+                final_name = base + old_ext
+                if len(os.fsencode(final_name)) > 255:
+                    return _rename_rejection(download_id, mutation_id, fingerprint, 'Filename is too long', 400)
+                display_name = final_name if row.get('display_filename') else None
+                destination = source if display_name is not None else os.path.join(os.path.dirname(source), final_name)
+                if destination != source and os.path.lexists(destination):
+                    return _rename_rejection(download_id, mutation_id, fingerprint, 'A file with that name already exists', 409)
+                operation = dict(actor_id=actor['id'], mutation_id=mutation_id, target_id=download_id,
+                                 fingerprint=fingerprint, actor_session_version=actor['session_version'],
+                                 expected_revision=expected, source=source, destination=destination,
+                                 anchor=os.path.join(os.path.dirname(source), '.vdl-rename-' + secrets.token_hex(16) + '.source'),
+                                 identity=json.dumps(identity), display_name=display_name, phase='prepared', recorded_at=time.time())
+                with _db_lock, db() as conn:
+                    conn.execute('BEGIN IMMEDIATE')
+                    current = _tag_actor(conn)
+                    current_row = _tag_visible_row(conn, download_id, current) if current else None
+                    if current is None:
+                        return {'error': 'Authentication required'}, 401
+                    if current_row is None:
+                        return {'error': 'Unknown download id'}, 404
+                    # Hashing is deliberately outside SQLite serialization;
+                    # admission must therefore recheck namespace, budget, clock.
+                    if (conn.execute('SELECT 1 FROM mutation_receipts WHERE actor_id = ? AND mutation_id = ?', (current['id'], mutation_id)).fetchone()
+                            or conn.execute('SELECT 1 FROM rename_operations WHERE actor_id = ? AND mutation_id = ?', (current['id'], mutation_id)).fetchone()):
+                        return {'error': 'Mutation identifier already used', 'code': 'mutation_id_conflict'}, 409
+                    admitted_now = time.time()
+                    counts = conn.execute('SELECT COUNT(*) AS total, COALESCE(SUM(recorded_at > ?), 0) AS recent FROM mutation_receipts WHERE actor_id = ?', (admitted_now - 60, current['id'])).fetchone()
+                    active = conn.execute("SELECT COUNT(*) FROM rename_operations WHERE actor_id = ? AND (phase != 'done' OR NOT EXISTS (SELECT 1 FROM mutation_receipts r WHERE r.actor_id = rename_operations.actor_id AND r.mutation_id = rename_operations.mutation_id))", (current['id'],)).fetchone()[0]
+                    if counts['total'] + active >= MUTATION_ACTOR_RECEIPT_LIMIT or counts['recent'] + active >= MUTATION_ACTOR_MINUTE_LIMIT:
+                        return {'error': 'Too many mutations; wait before submitting more', 'code': 'mutation_limit'}, 429
+                    created = int(match.group(1)) / 1000
+                    if created < admitted_now - MUTATION_REPLAY_SECONDS or created > admitted_now + 300:
+                        return _record_rename_rejection(conn, current, current_row, mutation_id, fingerprint, 'Mutation identifier expired or clock is incorrect', 400)
+                    if str(current_row['rename_revision']) != expected:
+                        return _record_rename_rejection(conn, current, current_row, mutation_id, fingerprint, 'Editable state changed; review the current state', 409, 'conflicted')
+                    if not _rename_aliases_authorized(conn, operation, current):
+                        return _record_rename_rejection(conn, current, current_row, mutation_id, fingerprint, 'File location does not support safe rename', 409)
+                    conn.execute('INSERT INTO rename_operations(' + ','.join(operation) + ') VALUES (' + ','.join('?' for _ in operation) + ')', tuple(operation.values()))
+                _rename_checkpoint('prepared', operation)
+            except FileNotFoundError:
+                return _rename_rejection(download_id, mutation_id, fingerprint, 'Original file is missing on disk', 410)
+            except OSError:
+                return _rename_unresolved()
+        if result is None:
+            result, status = _recover_rename_operation(operation, request_actor=True)
+        if not protocol and status == 200:
+            return {'message': 'Renamed' if result['changed'] else 'Unchanged', 'id': download_id,
+                    'filename': result['display_filename'] or os.path.basename(result['filename'])}, status
+        return result, status
 
 
 def _validated_tag_name(value):
@@ -1759,6 +2298,12 @@ def delete_download_artifacts(entry, fallback_dir=None):
         except OSError:
             pass
 
+    if filename:
+        with db() as conn:
+            references = conn.execute('SELECT id, filename FROM downloads WHERE id != ? AND filename IS NOT NULL', (entry['id'],)).fetchall()
+        if any(os.path.abspath(reference['filename']) == os.path.abspath(filename)
+               and reference['id'] not in entry.get('_removing_ids', ()) for reference in references):
+            candidates.discard(filename)
     removed = 0
     for path in candidates:
         try:
@@ -1834,62 +2379,60 @@ def _db_remove_download_from_playlists(conn, download_id):
 
 
 def db_remove_download_if_inactive(download_id, fallback_dir=None):
-    """Atomically remove a non-active, fully stopped download row."""
-    assets = _get_asset_queue()
-    with assets.publication_lock, _worker_condition, _db_lock, db() as conn:
-        row = conn.execute(
-            "SELECT * FROM downloads WHERE id = ?", (download_id,)
-        ).fetchone()
-        entry = dict(row) if row else None
-        worker_is_live = download_id in _live_worker_ids
-        if (entry is None
-                or entry['status'] in ('starting', 'downloading', 'paused')
-                or worker_is_live):
-            return entry, False
-        # Keep the row as a retry handle if filesystem cleanup fails. Holding
-        # the state lock also prevents Resume from claiming the same partial
-        # files while they are being removed.
-        assets.invalidate([download_id], conn=conn)
-        delete_download_artifacts(entry, fallback_dir)
-        _db_remove_download_from_playlists(conn, download_id)
-        cur = conn.execute(
-            "DELETE FROM downloads WHERE id = ? "
-            "AND status NOT IN ('starting', 'downloading', 'paused')",
-            (download_id,),
-        )
-        removed = cur.rowcount == 1
-    if removed:
-        event_bus.publish('change', {'reason': 'delete', 'id': download_id})
-    return entry, removed
+    """Keep file ownership stable while allowing unrelated database writes."""
+    with _file_operation_lock:
+        assets = _get_asset_queue()
+        with assets.publication_lock, _worker_condition:
+            with db() as conn:
+                row = conn.execute('SELECT * FROM downloads WHERE id = ?', (download_id,)).fetchone()
+            entry = dict(row) if row else None
+            if (entry is None or entry['status'] in ('starting', 'downloading', 'paused')
+                    or download_id in _live_worker_ids):
+                return entry, False
+            _assert_no_pending_rename(entry)
+            with _db_lock, db() as conn:
+                assets.invalidate([download_id], conn=conn)
+            delete_download_artifacts(entry, fallback_dir)
+            with _db_lock, db() as conn:
+                current = conn.execute('SELECT status, filename FROM downloads WHERE id = ?', (download_id,)).fetchone()
+                if current is None or current['status'] in ('starting', 'downloading', 'paused') or current['filename'] != entry['filename']:
+                    return entry, False
+                _db_remove_download_from_playlists(conn, download_id)
+                removed = conn.execute('DELETE FROM downloads WHERE id = ?', (download_id,)).rowcount == 1
+        if removed:
+            event_bus.publish('change', {'reason': 'delete', 'id': download_id})
+        return entry, removed
 
 
 def db_clear_library():
-    placeholders = ",".join("?" * len(HISTORY_STATUSES))
-    fallback_dir = db_get_preferences().get("download_dir", ".")
-    assets = _get_asset_queue()
-    with assets.publication_lock, _db_lock, db() as conn:
-        entries = [
-            dict(r) for r in conn.execute(
-                f"SELECT id, filename, output_dir FROM downloads WHERE status IN ({placeholders})",
-                HISTORY_STATUSES,
-            ).fetchall()
-        ]
-        assets.invalidate([entry['id'] for entry in entries], conn=conn)
-        # If any file cannot be removed, retain all rows so the user can retry
-        # instead of losing the only record of the remaining artifacts.
-        files_deleted = sum(
-            delete_download_artifacts(entry, fallback_dir) for entry in entries
-        )
-        for entry in entries:
-            _db_remove_download_from_playlists(conn, entry['id'])
-        cur = conn.execute(
-            f"DELETE FROM downloads WHERE status IN ({placeholders})",
-            HISTORY_STATUSES,
-        )
-        rows = cur.rowcount
-    if rows:
-        event_bus.publish('change', {'reason': 'clear', 'count': rows})
-    return rows, files_deleted
+    with _file_operation_lock:
+        placeholders = ','.join('?' for _ in HISTORY_STATUSES)
+        fallback_dir = db_get_preferences().get('download_dir', '.')
+        assets = _get_asset_queue()
+        with assets.publication_lock, _worker_condition:
+            with db() as conn:
+                entries = [dict(row) for row in conn.execute(
+                    f'SELECT * FROM downloads WHERE status IN ({placeholders})', HISTORY_STATUSES)]
+            for entry in entries:
+                _assert_no_pending_rename(entry)
+            with _db_lock, db() as conn:
+                assets.invalidate([entry['id'] for entry in entries], conn=conn)
+            # A failed cleanup retains the rows, as before. The accepted set is
+            # fixed so a newly finished download cannot be removed unexamined.
+            removing_ids = {entry['id'] for entry in entries}
+            for entry in entries:
+                entry['_removing_ids'] = removing_ids
+            files_deleted = sum(delete_download_artifacts(entry, fallback_dir) for entry in entries)
+            rows = 0
+            with _db_lock, db() as conn:
+                for entry in entries:
+                    current = conn.execute('SELECT status, filename FROM downloads WHERE id = ?', (entry['id'],)).fetchone()
+                    if current is not None and current['status'] in HISTORY_STATUSES and current['filename'] == entry['filename']:
+                        _db_remove_download_from_playlists(conn, entry['id'])
+                        rows += conn.execute('DELETE FROM downloads WHERE id = ?', (entry['id'],)).rowcount
+        if rows:
+            event_bus.publish('change', {'reason': 'clear', 'count': rows})
+        return rows, files_deleted
 
 
 def db_list_downloads(user_id=None, is_admin=False, statuses=None):
@@ -1914,7 +2457,7 @@ def db_list_downloads(user_id=None, is_admin=False, statuses=None):
             "filename, display_filename, resolution, filesize, speed, eta, title, finished_at, "
             "duration_seconds, media_metadata_probed, "
             "formats, requested_format, downloaded_bytes, total_bytes, favorite, "
-            "view_count, tags_revision, favorite_revision, "
+            "view_count, tags_revision, favorite_revision, rename_revision, "
             "source_type, owner_user_id, visibility, browser_authenticated, "
             "(downloads.ingest_source_path IS NOT NULL) AS mounted_import, "
             "COALESCE(users.username, downloads.owner_username) "
@@ -1940,6 +2483,7 @@ def db_list_downloads(user_id=None, is_admin=False, statuses=None):
                 {"key": row["normalized_name"], "name": row["name"]}
             )
         for download in downloads:
+            download["rename_revision"] = str(download["rename_revision"])
             download.update(_serialize_favorite_state(
                 download['id'], download['favorite'], download['favorite_revision'],
             ))
@@ -6910,70 +7454,14 @@ def unpause_download(download_id):
 
 @app.route('/api/rename/<download_id>', methods=['POST'])
 def rename_download(download_id):
-    """Rename the file for a finished download. Body: {"filename": "new"}.
-
-    The user only edits the basename -- the file stays in its original
-    directory (so playback and the path-traversal guard keep working). The
-    extension is preserved automatically: if the user typed a basename
-    without (or with a different) extension we re-append the original one.
-    """
-    entry = _visible_download(download_id)
-    if entry is None:
-        return jsonify({"error": "Unknown download id"}), 404
-    if entry.get('status') != 'finished':
-        return jsonify({"error": "Only finished downloads can be renamed"}), 409
-    old_path = entry.get('filename')
-    if (not old_path or not os.path.isfile(old_path)
-            or not _is_allowed_download_path(old_path)):
-        return jsonify({"error": "Original file is missing on disk"}), 410
-
-    payload = request.get_json(silent=True) or {}
-    new_name = (payload.get('filename') or '').strip()
-    if not new_name:
-        return jsonify({"error": "Filename must not be empty"}), 400
-    # Reject anything that tries to escape the current directory or smuggle
-    # control bytes. We accept only a bare basename.
-    if ('/' in new_name or '\\' in new_name or '\x00' in new_name
-            or new_name in ('.', '..')):
-        return jsonify({"error": "Filename must not contain path separators"}), 400
-
-    directory = os.path.dirname(old_path) or '.'
-    _, old_ext = os.path.splitext(old_path)
-    # Preserve the original extension. If the user typed their own (matching
-    # or different) we still force the original one back -- the file's
-    # bytes haven't changed, so the extension shouldn't either.
-    new_base, _typed_ext = os.path.splitext(new_name)
-    if not new_base:
-        return jsonify({"error": "Filename must not be empty"}), 400
-    final_name = new_base + old_ext
-    new_path = os.path.join(directory, final_name)
-
-    if entry.get('display_filename'):
-        if len(os.fsencode(final_name)) > 255:
-            return jsonify({"error": "Filename is too long"}), 400
-        if final_name == entry['display_filename']:
-            return jsonify({"message": "Unchanged", "id": download_id,
-                            "filename": final_name})
-        db_update_download(download_id, display_filename=final_name)
-        return jsonify({"message": "Renamed", "id": download_id,
-                        "filename": final_name})
-
-    # No-op if the user submitted the same name.
-    if os.path.realpath(new_path) == os.path.realpath(old_path):
-        return jsonify({"message": "Unchanged", "id": download_id,
-                        "filename": os.path.basename(old_path)})
-
-    if os.path.exists(new_path):
-        return jsonify({"error": "A file with that name already exists"}), 409
-
-    try:
-        os.rename(old_path, new_path)
-    except OSError as exc:
-        return jsonify({"error": f"Rename failed: {exc}"}), 500
-
-    db_update_download(download_id, filename=new_path)
-    return jsonify({"message": "Renamed", "id": download_id,
-                    "filename": os.path.basename(new_path)})
+    payload, error = _read_json_body(4096)
+    if error is not None:
+        return error
+    result, status = _execute_rename_mutation(download_id, payload)
+    response = jsonify(result)
+    response.status_code = status
+    response.headers['Cache-Control'] = 'no-store'
+    return response
 
 
 @app.route('/api/remove/<download_id>', methods=['POST'])
@@ -7129,27 +7617,31 @@ def retry_download(download_id):
         return jsonify({'error': 'Send this source again to start a new attempt'}), 409
     assets = _get_asset_queue()
     try:
-        with assets.publication_lock, _worker_condition, _db_lock, db() as conn:
-            current = conn.execute(
-                'SELECT * FROM downloads WHERE id = ?', (download_id,),
-            ).fetchone()
+        with _file_operation_lock, assets.publication_lock, _worker_condition:
+            with db() as conn:
+                current = conn.execute('SELECT * FROM downloads WHERE id = ?', (download_id,)).fetchone()
             if (current is None or current['status'] not in TERMINAL_STATUSES
                     or download_id in _live_worker_ids):
                 return jsonify({'error': 'Wait until the current worker has stopped'}), 409
-            assets.invalidate([download_id], conn=conn)
-            delete_download_artifacts(
-                dict(current), db_get_preferences().get('download_dir', '.'),
-            )
-            conn.execute(
-                "UPDATE downloads SET status = 'starting', progress = '0%', "
-                "filename = NULL, finished_at = NULL, downloaded_bytes = 0, "
-                "total_bytes = NULL, filesize = NULL, speed = 0, eta = NULL "
-                "WHERE id = ?", (download_id,),
-            )
-            # The replacement will get a new source identity on publication.
-            conn.execute('DELETE FROM asset_invalidations WHERE download_id=?',
-                         (download_id,))
-            download_history.record(conn, download_id, new=True)
+            current = dict(current)
+            _assert_no_pending_rename(current)
+            with _db_lock, db() as conn:
+                assets.invalidate([download_id], conn=conn)
+            delete_download_artifacts(current, db_get_preferences().get('download_dir', '.'))
+            with _db_lock, db() as conn:
+                latest = conn.execute('SELECT * FROM downloads WHERE id = ?', (download_id,)).fetchone()
+                if (latest is None or latest['status'] not in TERMINAL_STATUSES
+                        or latest['filename'] != current['filename']):
+                    return jsonify({'error': 'Download changed; review its current state'}), 409
+                conn.execute(
+                    "UPDATE downloads SET status = 'starting', progress = '0%', "
+                    "filename = NULL, finished_at = NULL, downloaded_bytes = 0, "
+                    "total_bytes = NULL, filesize = NULL, speed = 0, eta = NULL "
+                    "WHERE id = ?", (download_id,),
+                )
+                # The replacement gets a new source identity on publication.
+                conn.execute('DELETE FROM asset_invalidations WHERE download_id=?', (download_id,))
+                download_history.record(conn, download_id, new=True)
     except OSError as exc:
         return jsonify({'error': f'Cleanup failed: {exc}'}), 500
     event_bus.publish('change', {'reason': 'retry', 'id': download_id})
@@ -7953,7 +8445,7 @@ def record_download_view(download_id):
 @app.route('/api/client-capabilities', methods=['GET'])
 def client_capabilities():
     response = jsonify({
-        'mutation_protocol': 1, 'actions': ['tag.add', 'tag.remove', 'favorite.set'],
+        'mutation_protocol': 1, 'actions': ['tag.add', 'tag.remove', 'favorite.set', 'rename.set'],
         'tag_identity_version': TAG_IDENTITY_VERSION,
         'server_time': int(time.time() * 1000),
     })
@@ -7973,7 +8465,8 @@ def editable_download_state(download_id):
             return jsonify({'error': 'Unknown download id'}), 404
         result = _tag_snapshot(conn, download_id, row)
         result.update(_favorite_snapshot(conn, download_id, row))
-        result['permissions'] = {'tags': True, 'favorite': True}
+        result.update(_rename_snapshot(conn, download_id, row))
+        result['permissions'] = {'tags': True, 'favorite': True, 'rename': row['status'] == 'finished'}
     response = jsonify(result)
     response.headers['Cache-Control'] = 'no-store'
     return response
@@ -7981,34 +8474,43 @@ def editable_download_state(download_id):
 
 @app.route('/api/mutations/<mutation_id>', methods=['GET'])
 def mutation_receipt(mutation_id):
-    # Serializing recovery behind admitted writes makes expired absence final.
-    with _db_lock, db() as conn:
-        conn.execute('BEGIN IMMEDIATE')
-        actor = _tag_actor(conn)
-        if actor is None:
-            return jsonify({'error': 'Authentication required'}), 401
-        receipt = conn.execute(
-            'SELECT target_id, status, response FROM mutation_receipts '
-            'WHERE actor_id = ? AND mutation_id = ?', (actor['id'], mutation_id),
-        ).fetchone()
-        if receipt is not None:
-            if _tag_visible_row(conn, receipt['target_id'], actor) is None:
+    with _file_operation_lock:
+        with db() as lookup:
+            pending = lookup.execute("SELECT * FROM rename_operations WHERE actor_id = ? AND mutation_id = ?",
+                                     (session.get('user_id'), mutation_id)).fetchone()
+        if pending is not None:
+            result, status = _recover_rename_operation(dict(pending), request_actor=True)
+            response = jsonify(result)
+            response.status_code = status
+            response.headers['Cache-Control'] = 'no-store'
+            return response
+        # Serializing recovery behind admitted writes makes expired absence final.
+        with _db_lock, db() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            actor = _tag_actor(conn)
+            if actor is None:
+                return jsonify({'error': 'Authentication required'}), 401
+            receipt = conn.execute(
+                'SELECT target_id, status, response FROM mutation_receipts '
+                'WHERE actor_id = ? AND mutation_id = ?', (actor['id'], mutation_id),
+            ).fetchone()
+            if receipt is not None:
+                if _tag_visible_row(conn, receipt['target_id'], actor) is None:
+                    match = MUTATION_ID_PATTERN.fullmatch(mutation_id)
+                    final = bool(match and int(match.group(1)) / 1000 < time.time() - MUTATION_REPLAY_SECONDS)
+                    return jsonify({'error': 'Mutation unavailable', 'final': final}), 404
+                result = json.loads(receipt['response'])
+                if result.get('mutation', {}).get('domain') == 'tags':
+                    result['available_tags'] = _tag_vocabulary(conn, actor)
+                response = jsonify(result)
+                response.status_code = receipt['status']
+            else:
                 match = MUTATION_ID_PATTERN.fullmatch(mutation_id)
                 final = bool(match and int(match.group(1)) / 1000 < time.time() - MUTATION_REPLAY_SECONDS)
-                return jsonify({'error': 'Mutation unavailable', 'final': final}), 404
-            result = json.loads(receipt['response'])
-            if result.get('mutation', {}).get('domain') == 'tags':
-                result['available_tags'] = _tag_vocabulary(conn, actor)
-            response = jsonify(result)
-            response.status_code = receipt['status']
-        else:
-            match = MUTATION_ID_PATTERN.fullmatch(mutation_id)
-            final = bool(match and int(match.group(1)) / 1000 < time.time() - MUTATION_REPLAY_SECONDS)
-            response = jsonify({'error': 'Mutation unavailable', 'final': final})
-            response.status_code = 404
-    response.headers['Cache-Control'] = 'no-store'
-    return response
-
+                response = jsonify({'error': 'Mutation unavailable', 'final': final})
+                response.status_code = 404
+        response.headers['Cache-Control'] = 'no-store'
+        return response
 
 @app.route('/api/tags/<download_id>', methods=['POST', 'DELETE'])
 def download_tags(download_id):
@@ -8124,50 +8626,67 @@ def _is_allowed_download_path(path, allowed_bases=None):
         return False
 
 
+def _rename_playback_path(entry):
+    path = os.path.abspath(entry['filename']) if entry.get('filename') else None
+    with db() as conn:
+        operations = conn.execute('SELECT * FROM rename_operations WHERE target_id = ? OR source = ? OR destination = ? ORDER BY recorded_at',
+                                  (entry['id'], path, path)).fetchall()
+    for operation in operations:
+        if operation['phase'] == 'done' and _rename_done_superseded(operation, entry):
+            continue
+        identity = json.loads(operation['identity'])
+        if _rename_matches(operation['anchor'], identity):
+            return operation['anchor']
+        if operation['phase'] == 'prepared' and _rename_matches(operation['source'], identity, pristine=True):
+            return operation['source']
+        return None
+    return entry.get('filename')
+
+
 @app.route('/api/file/<download_id>', methods=['GET'])
 def stream_file(download_id):
     """Serve a finished download for playback or browser download."""
-    entry = _visible_download(download_id)
-    if entry is None or entry.get('status') != 'finished':
-        abort(404)
-    path = entry.get('filename')
-    if not path or not os.path.isfile(path):
-        abort(404)
-    real = os.path.realpath(path)
-    if not _is_allowed_download_path(real):
-        abort(403)
-    # Resolve MIME type for the browser's <video> element. mimetypes.guess_type
-    # relies on the OS MIME database, which may lack entries for .webm or .mkv
-    # on minimal systems (e.g. Docker, some Linux distros). The hardcoded map
-    # below covers every container yt-dlp can produce; the OS lookup is the
-    # fallback for anything exotic.
-    _MIME_MAP = {
-        '.mp4':  'video/mp4',
-        '.m4v':  'video/mp4',
-        '.webm': 'video/webm',
-        '.mkv':  'video/x-matroska',
-        '.ogg':  'video/ogg',
-        '.ogv':  'video/ogg',
-        '.mov':  'video/quicktime',
-        '.avi':  'video/x-msvideo',
-        '.m4a':  'audio/mp4',
-        '.mp3':  'audio/mpeg',
-        '.opus': 'audio/ogg; codecs=opus',
-        '.flac': 'audio/flac',
-        '.wav':  'audio/wav',
-    }
-    ext = os.path.splitext(real)[1].lower()
-    mimetype = _MIME_MAP.get(ext) or mimetypes.guess_type(real)[0] or 'application/octet-stream'
-    as_attachment = request.args.get('download') == '1'
-    return send_file(
-        real,
-        mimetype=mimetype,
-        conditional=True,
-        as_attachment=as_attachment,
-        download_name=(entry.get('display_filename') or os.path.basename(real))
-        if as_attachment else None,
-    )
-
+    with _file_operation_lock:
+        entry = _visible_download(download_id)
+        if entry is None or entry.get('status') != 'finished':
+            abort(404)
+        path = _rename_playback_path(entry)
+        if not path or not os.path.isfile(path):
+            abort(404)
+        real = os.path.realpath(path)
+        if not _is_allowed_download_path(real):
+            abort(403)
+        # Resolve MIME type for the browser's <video> element. mimetypes.guess_type
+        # relies on the OS MIME database, which may lack entries for .webm or .mkv
+        # on minimal systems (e.g. Docker, some Linux distros). The hardcoded map
+        # below covers every container yt-dlp can produce; the OS lookup is the
+        # fallback for anything exotic.
+        _MIME_MAP = {
+            '.mp4':  'video/mp4',
+            '.m4v':  'video/mp4',
+            '.webm': 'video/webm',
+            '.mkv':  'video/x-matroska',
+            '.ogg':  'video/ogg',
+            '.ogv':  'video/ogg',
+            '.mov':  'video/quicktime',
+            '.avi':  'video/x-msvideo',
+            '.m4a':  'audio/mp4',
+            '.mp3':  'audio/mpeg',
+            '.opus': 'audio/ogg; codecs=opus',
+            '.flac': 'audio/flac',
+            '.wav':  'audio/wav',
+        }
+        ext = os.path.splitext(entry.get('filename') or real)[1].lower()
+        mimetype = _MIME_MAP.get(ext) or mimetypes.guess_type(real)[0] or 'application/octet-stream'
+        as_attachment = request.args.get('download') == '1'
+        return send_file(
+            real,
+            mimetype=mimetype,
+            conditional=True,
+            as_attachment=as_attachment,
+            download_name=(entry.get('display_filename') or os.path.basename(entry.get('filename') or real))
+            if as_attachment else None,
+        )
 
 def _asset_eligible(entry):
     filename = entry.get('filename')

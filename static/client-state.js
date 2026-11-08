@@ -40,6 +40,7 @@
             if (!snapshot || snapshot.id == null || (context.epoch !== undefined && context.epoch !== epoch)) return false;
             if (snapshot.tags_revision !== undefined && (!revision(snapshot.tags_revision) || !Array.isArray(snapshot.tags) || !Array.isArray(snapshot.tag_items) || snapshot.tags.length !== snapshot.tag_items.length || snapshot.tag_items.some((tag, index) => !tag || typeof tag.key !== 'string' || typeof tag.name !== 'string' || tag.name !== snapshot.tags[index]) || new Set(snapshot.tag_items.map(tag => tag.key)).size !== snapshot.tag_items.length)) return false;
             if (snapshot.favorite_revision !== undefined && (!revision(snapshot.favorite_revision) || typeof snapshot.favorite !== 'boolean')) return false;
+            if (snapshot.rename_revision !== undefined && (!revision(snapshot.rename_revision) || !(snapshot.filename === null || typeof snapshot.filename === 'string') || !(snapshot.display_filename == null || typeof snapshot.display_filename === 'string'))) return false;
             const id = String(snapshot.id);
             const fence = fences.get(id);
             if (fence !== undefined) {
@@ -67,6 +68,13 @@
                     return false;
                 }
             }
+            if (old && revision(old.rename_revision)) {
+                if (!revision(snapshot.rename_revision) || BigInt(snapshot.rename_revision) < BigInt(old.rename_revision)) {
+                    for (const field of ['filename', 'display_filename', 'rename_revision']) next[field] = old[field];
+                } else if (snapshot.rename_revision === old.rename_revision && (snapshot.filename !== old.filename || snapshot.display_filename !== old.display_filename)) {
+                    return false;
+                }
+            }
             downloads.set(id, next);
             notify(id);
             return true;
@@ -77,12 +85,19 @@
             if (!download || fences.has(id)) return null;
             let favorite = Boolean(download.favorite);
             const favoriteIntents = [];
+            const renameIntents = [];
+            let requestedFilename = null;
             const chips = new Map();
             for (const tag of download.tag_items || (download.tags || []).map(name => VDL.tagIdentity.normalize(name))) {
                 chips.set(tag.key, { ...tag, status: 'confirmed', intentId: null, operation: null, effective: true });
             }
             for (const intent of intents.values()) {
                 if (intent.targetId !== id) continue;
+                if (intent.kind === 'rename.set') {
+                    renameIntents.push(copy(intent));
+                    if (!['rejected', 'conflicted'].includes(intent.status)) requestedFilename = intent.value;
+                    continue;
+                }
                 if (intent.kind === 'favorite.set') {
                     favoriteIntents.push(copy(intent));
                     if (!['rejected', 'conflicted'].includes(intent.status)) favorite = intent.value;
@@ -107,7 +122,7 @@
                 rows.sort((a, b) => a.name.localeCompare(b.name));
             }
             const effective = rows.filter(tag => tag.effective).map(tag => ({ key: tag.key, name: tag.name }));
-            return freeze(copy({ ...download, favorite, favorite_intents: favoriteIntents, tags: effective.map(tag => tag.name), tag_items: effective, tag_chips: rows }));
+            return freeze(copy({ ...download, requested_filename: requestedFilename, rename_intents: renameIntents, favorite, favorite_intents: favoriteIntents, tags: effective.map(tag => tag.name), tag_items: effective, tag_chips: rows }));
         }
         function fence(id) {
             id = String(id);

@@ -2186,3 +2186,18 @@ body.history-open .create-playlist-button { display: none; }
 .favorite-control-inline .favorite-feedback { position: static; }
 .favorite-feedback[hidden] { display: none; }
 .favorite-feedback button { margin: 2px 3px; font: inherit; }
+
+/* A separate feedback row keeps the editable field stable as recovery changes. */
+.rename-wrap { flex-direction: column; min-width: 0; }
+.rename-editor-row { display: flex; align-items: stretch; min-width: 0; }
+.rename-wrap-block .rename-editor-row { width: 100%; }
+.rename-wrap-block .rename-input { flex: 1 1 auto; }
+.rename-feedback { display: block; color: var(--fg); font-size: 0.8rem; overflow-wrap: anywhere; padding-top: 4px; }
+.rename-feedback[hidden] { display: none; }
+.rename-feedback button { margin: 3px; font: inherit; min-height: 28px; color: var(--fg); background: var(--surface-2); border: 1px solid var(--border); border-radius: 3px; }
+.rename-requested { font-family: ui-monospace, Menlo, Consolas, monospace; }
+.rename-btn:disabled { cursor: default; opacity: 0.55; }
+
+.rename-surface-status { display: block; font-size: 0.78rem; font-weight: normal; color: var(--muted); overflow-wrap: anywhere; white-space: normal; }
+
+.rename-surface-status[hidden] { display: none; }

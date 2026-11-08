@@ -1,7 +1,7 @@
 # Immediate feedback for server-backed interactions
 
 **Source:** User-requested design specification\
-**Status:** Foundation, tags, and Feature 0052 favorites implemented; remaining actions staged\
+**Status:** Foundation, tags, Feature 0052 favorites, and Feature 0053 rename implemented; remaining actions staged\
 **Last refined:** 2026-11-08\
 **Architecture:** [Module responsibilities and implementation design](../ARCHITECTURE/immediate-feedback-for-server-backed-interactions.md)\
 **Extends:** [Feature 0001, Tags](feature-0001-add-tags-to-entries.md)\

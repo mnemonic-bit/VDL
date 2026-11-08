@@ -1,6 +1,6 @@
 # Architecture: immediate feedback for server-backed interactions
 
-**Status:** Foundation, tag protocol, and favorite adapter implemented; additional adapters remain proposed.\
+**Status:** Foundation, tag protocol, favorite adapter, and rename recovery implemented; additional adapters remain proposed.\
 **Date:** 2026-11-08\
 **Requirements:** [Feature 0051](../FEATURES/feature-0051-immediate-feedback-for-server-backed-interactions.md)
 
@@ -19,7 +19,7 @@ detailed requirements. If implementation requires changing a requirement, update
 the feature explicitly rather than silently contradicting it here.
 
 The implementation adds the shared modules, tag protocol, and independent
-`favorite.set` adapter described below. Other actions still use handlers and collection snapshots in
+`favorite.set` and `rename.set` adapters described below. Other actions still use handlers and collection snapshots in
 `static/app.js`, server routes and persistence in `vdl.py`, and SSE hints that
 trigger collection reads. The [rollout inventory](feature-0051-rollout.md) records
 which adapters remain staged. Existing
@@ -297,6 +297,28 @@ Read adapters return values and revisions from one explicit read transaction.
 The ordinary `db()` helper's connection lifecycle alone is not a declaration
 that several SELECTs share the necessary read snapshot; the implementation must
 establish and test it. Preserve connection-per-call/thread conventions.
+
+### Rename filesystem recovery
+
+The `rename.set` adapter uses an independent persistent rename revision and a
+filesystem journal in `vdl.py`. Unlike the tag/favorite transaction executor,
+it commits durable preparation before filesystem effects and publishes the
+canonical identity together with its final receipt afterward. The journal
+binds the actor and frozen request fingerprint to source identity, destination,
+and recovery phase. A synchronized hardlink anchor pins the intended file;
+exclusive destination creation prevents collision overwrite. Source retirement
+uses an exclusive move to a journal-owned path before checking identity, so a
+replacement at the old name is never blindly unlinked. Restart and
+authorized receipt recovery resume the original operation. Ambiguous identity
+requires intervention and retains the operation rather than claiming success.
+
+A file-operation lock serializes rename with removal, including aliases.
+Filesystem work runs outside the SQLite write lock. Database phases recheck
+current authorization and expected identity before publication. Active journal
+admissions survive terminal receipt cleanup. The public recovery response
+contains canonical editable state or a generic unresolved status, never raw
+journal paths. The UI projects requested display text while retaining confirmed
+file identity; only a canonical acknowledgement changes that identity.
 
 ## Bootstrap, compatibility, and deployment
 

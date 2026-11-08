@@ -1327,6 +1327,12 @@ const tagMutationMetrics = {
 };
 VDL.tagMutationMetrics = () => Object.freeze({ ...tagMutationMetrics });
 // Favorite presentation shares the coordinator, but never the tag conflict domain.
+const renameDrafts = new Map();
+const renameEditPositions = new Map();
+const compatibilityRenames = new Map();
+let renameViewSequence = 0;
+const renameMutationMetrics = { ...tagMutationMetrics };
+VDL.renameMutationMetrics = () => Object.freeze({ ...renameMutationMetrics });
 const favoriteEditPositions = new Map();
 const compatibilityFavorites = new Map();
 const favoriteNotices = new Map();
@@ -1349,7 +1355,7 @@ const tagMutations = VDL.createMutations({
         return { status: response.status, body: await response.json().catch(() => null) };
     },
     onEvent: event => {
-        const domainMetrics = event.action === 'favorite.set' ? favoriteMutationMetrics : tagMutationMetrics;
+        const domainMetrics = event.action === 'rename.set' ? renameMutationMetrics : event.action === 'favorite.set' ? favoriteMutationMetrics : tagMutationMetrics;
         for (const metrics of [domainMetrics, mutationMetrics]) {
             if (event.outcome === 'presented') metrics.submissions++;
             if (event.outcome === 'confirmed') {
@@ -1363,6 +1369,20 @@ const tagMutations = VDL.createMutations({
         mutationMetrics.pending = event.pending;
         mutationMetrics.unconfirmed = event.unconfirmed;
         mutationMetrics.conflicted = event.conflicted;
+        if (event.action === 'rename.set') {
+            const intent = tagMutations.status(event.intentId);
+            const draft = intent && renameDrafts.get(intent.targetId);
+            if (event.outcome === 'confirmed' && draft?.submittedIntentId === event.intentId) {
+                if (draft.generation === draft.submittedGeneration && draft.viewToken === draft.submittedViewToken) renameDrafts.delete(intent.targetId);
+                else delete draft.submittedIntentId;
+            }
+            const messages = {
+                presented: 'Renaming…', confirmed: 'Renamed.', rejected: 'Could not rename. The requested name is retained.',
+                conflicted: 'Name changed elsewhere. Review the current name before retrying.',
+                unconfirmed: 'Rename not confirmed. Check its status before replaying.',
+            };
+            if (messages[event.outcome]) announceTagStatus(messages[event.outcome]);
+        }
         if (event.action === 'favorite.set') {
             const messages = {
                 presented: 'Saving favorite', confirmed: 'Favorite saved.',
@@ -1389,6 +1409,10 @@ function resetTagSession() {
     submittedTagIntents.clear();
     recoveredTagIntents.clear();
     checkingTagAvailability.clear();
+    for (const id of compatibilityRenames.keys()) clearCompatibilityRename(id);
+    renameDrafts.clear();
+    renameEditPositions.clear();
+    renameViewSequence++;
     favoriteEditPositions.clear();
     compatibilityFavorites.clear();
     favoriteNotices.clear();
@@ -1415,10 +1439,12 @@ function updateTagMutationSummary() {
         recoveredTagIntents.delete(intentId);
     }
     const allIntents = tagMutations.pending();
-    const intents = allIntents.filter(intent => intent.kind !== 'favorite.set');
+    const intents = allIntents.filter(intent => intent.kind.startsWith('tag.'));
     const favoriteIntents = allIntents.filter(intent => intent.kind === 'favorite.set');
     updateFavoriteMutationSummary(favoriteIntents);
-    for (const [metrics, entries] of [[favoriteMutationMetrics, favoriteIntents], [mutationMetrics, allIntents]]) {
+    const renameIntents = allIntents.filter(intent => intent.kind === 'rename.set');
+    updateRenameMutationSummary(renameIntents.concat([...compatibilityRenames.values()]));
+    for (const [metrics, entries] of [[renameMutationMetrics, renameIntents.concat([...compatibilityRenames.values()])], [favoriteMutationMetrics, favoriteIntents], [mutationMetrics, allIntents]]) {
         metrics.pending = entries.filter(intent => ['queued', 'sending', 'unconfirmed', 'conflicted'].includes(intent.status)).length;
         metrics.unconfirmed = entries.filter(intent => intent.status === 'unconfirmed').length;
         metrics.conflicted = entries.filter(intent => intent.status === 'conflicted').length;
@@ -1448,7 +1474,8 @@ function updateTagMutationSummary() {
 function projectTagEntry(info) {
     const projected = tagState.selectDownload(String(info.id));
     if (!projected) return info;
-    return { ...info, tags: projected.tags, tag_items: projected.tag_items,
+    return { ...info, filename: projected.filename, display_filename: projected.display_filename,
+        rename_revision: projected.rename_revision, requested_filename: ['sending', 'unconfirmed'].includes(compatibilityRenames.get(String(info.id))?.status) ? compatibilityRenames.get(String(info.id)).value : projected.requested_filename, rename_intents: projected.rename_intents, tags: projected.tags, tag_items: projected.tag_items,
         tags_revision: projected.tags_revision, tag_chips: projected.tag_chips,
         favorite: projected.favorite, favorite_revision: projected.favorite_revision, favorite_intents: projected.favorite_intents };
 }
@@ -1480,6 +1507,9 @@ tagState.subscribe(ids => {
             collectionSnapshots[key] = collectionSnapshots[key].filter(info => String(info.id) !== String(id));
         }
         allLibraryEntries = allLibraryEntries.filter(info => String(info.id) !== String(id));
+        clearCompatibilityRename(String(id));
+        renameDrafts.delete(String(id));
+        renameEditPositions.delete(String(id));
         favoriteEditPositions.delete(String(id));
         compatibilityFavorites.delete(String(id));
         favoriteNotices.delete(String(id));
@@ -1492,20 +1522,24 @@ tagState.subscribe(ids => {
     tagRenderScheduled = true;
     queueMicrotask(() => {
         tagRenderScheduled = false;
+        releaseSettledRenameInteractions();
         releaseSettledFavoriteInteractions();
         renderDownloadCollections();
+        refreshRenamePresentations();
         const statuses = ids.flatMap(id => tagState.selectDownload(id)?.tag_chips || [])
             .filter(chip => chip.status !== 'confirmed')
             .map(chip => chip.message || `${chip.operation === 'tag.remove' ? 'Removing' : 'Saving'} tag ${chip.name}`);
         const delayedFavorites = ids.flatMap(id => tagState.selectDownload(id)?.favorite_intents || [])
             .filter(intent => intent.delayed && intent.status === 'sending')
             .map(intent => intent.message);
-        if (statuses.length || delayedFavorites.length) announceTagStatus([...statuses, ...delayedFavorites].join('. '));
+        const delayedRenames = ids.flatMap(id => tagState.selectDownload(id)?.rename_intents || [])
+            .filter(intent => intent.delayed && intent.status === 'sending').map(intent => intent.message);
+        if (statuses.length || delayedFavorites.length || delayedRenames.length) announceTagStatus([...statuses, ...delayedFavorites, ...delayedRenames].join('. '));
     });
 });
 
 window.addEventListener('beforeunload', event => {
-    if (!tagMutations.hasPending() && ![...tagDrafts.values()].some(value => value.trim())) return;
+    if (!tagMutations.hasPending() && ![...tagDrafts.values()].some(value => value.trim()) && !renameDrafts.size && !compatibilityRenames.size) return;
     event.preventDefault();
     event.returnValue = '';
 });
@@ -2189,119 +2223,322 @@ function stopDownload(id) {
         .catch(() => fetchHistory());
 }
 
-const renameDrafts = new Map();
+function hasRenameProtocol() {
+    return tagCapabilities?.mutation_protocol === 1 && tagCapabilities.actions?.includes('rename.set');
+}
+
+function renamePresentationText(id) {
+    const intent = renameIntent(id);
+    if (!intent) return '';
+    const message = intent.status === 'unconfirmed' ? 'Rename not confirmed' : ['rejected', 'conflicted'].includes(intent.status) ? 'Rename needs attention' : 'Renaming…';
+    return `${intent.value} · ${message}`;
+}
+
+function renameSurfaceStatus(info) {
+    const text = renamePresentationText(info.id);
+    return `<span class="rename-surface-status" data-rename-presentation="${escapeAttr(String(info.id))}"${text ? '' : ' hidden'}>${escapeHtml(text)}</span>`;
+}
+
+function refreshRenamePresentations() {
+    for (const node of document.querySelectorAll('[data-rename-presentation]')) {
+        const text = renamePresentationText(node.dataset.renamePresentation);
+        node.hidden = !text;
+        node.textContent = text;
+    }
+    for (const node of document.querySelectorAll('[data-rename-filename]')) {
+        const model = tagState.selectDownload(node.dataset.renameFilename);
+        if (model) node.textContent = displayFilename(projectTagEntry(model));
+    }
+    if (typeof endlessPlayback !== 'undefined' && endlessPlayback.currentDownloadId) {
+        const title = document.getElementById('playerTitle');
+        if (title) {
+            title.textContent = currentPlayerDisplayTitle();
+        }
+    }
+}
+
+function currentPlayerDisplayTitle() {
+    const item = endlessPlayback.currentItem;
+    const id = endlessPlayback.currentDownloadId;
+    const model = id ? tagState.selectDownload(id) : null;
+    const title = item?.filenameTitle && model?.filename
+        ? displayFilename({ ...model, requested_filename: null })
+        : item?.title || 'Video playback';
+    const pending = id ? renamePresentationText(id) : '';
+    return `${title}${pending ? ` · ${pending}` : ''}`;
+}
+
+function renameIntent(id) {
+    return tagState.selectDownload(String(id))?.rename_intents[0] || compatibilityRenames.get(String(id)) || null;
+}
+
+function pinRenameInteraction(id) {
+    if (!renameEditPositions.has(id)) renameEditPositions.set(id, historyPageItems.findIndex(info => String(info.id) === id));
+}
+
+function releaseSettledRenameInteractions() {
+    let released = false;
+    for (const id of renameEditPositions.keys()) {
+        if (!renameDrafts.has(id) && !renameIntent(id)) { renameEditPositions.delete(id); released = true; }
+    }
+    if (released && !renameEditPositions.size) resumeDeferredHistoryFetch();
+}
+
+function updateRenameMutationSummary(intents) {
+    for (const id of ['renameMutationSummary', 'currentRenameMutationSummary']) {
+        const summary = document.getElementById(id);
+        if (!summary) continue;
+        summary.hidden = !intents.length;
+        summary.textContent = intents.length ? `${intents.length} ${intents.length === 1 ? 'rename' : 'renames'} ${intents.some(intent => intent.status === 'unconfirmed') ? 'not confirmed' : 'pending or needing attention'}. Open the entry’s file name for details.` : '';
+    }
+}
 
 function renderRenameControl(id, basename, fullWidth = false) {
-    if (renameDrafts.has(id)) {
-        const draft = renameDrafts.get(id);
-        const widthStyle = draft.width && !fullWidth ? `style="width:${draft.width}px"` : '';
-        const widthClass = fullWidth ? ' rename-wrap-block' : '';
-        return `<span class="rename-wrap${widthClass}" data-rename-id="${id}" data-mode="edit">
-                    <input class="rename-input" type="text" ${widthStyle} value="${escapeAttr(draft.value)}" data-orig="${escapeAttr(basename)}" oninput="renameOnInput('${id}', this.value)" />
-                    <button class="rename-btn confirm" type="button" title="Save" aria-label="Save" onclick="renameCommit('${id}')">
-                        <svg class="icon"><use href="#i-check"/></svg>
-                    </button>
-                    <button class="rename-btn cancel" type="button" title="Cancel" aria-label="Cancel" onclick="renameCancel('${id}')">
-                        <svg class="icon"><use href="#i-x"/></svg>
-                    </button>
-                </span>`;
-    }
+    id = String(id);
+    const draft = renameDrafts.get(id);
+    const intent = renameIntent(id);
+    const busy = intent && ['queued', 'sending', 'unconfirmed'].includes(intent.status);
     const widthClass = fullWidth ? ' rename-wrap-block' : '';
-    return `<span class="rename-wrap${widthClass}" data-rename-id="${id}" data-mode="display">
-                <span class="rename-display" data-orig="${escapeAttr(basename)}">${escapeHtml(basename)}</span>
-                <button class="rename-btn" type="button" title="Edit name" aria-label="Edit name" onclick="renameStart('${id}')">
-                    <svg class="icon"><use href="#i-pencil"/></svg>
-                </button>
-            </span>`;
+    const widthStyle = draft?.width && !fullWidth ? `style="width:${draft.width}px"` : '';
+    const action = (name, text) => `<button type="button" data-rename-recovery="${name}" data-intent-id="${escapeAttr(intent.id)}">${text}</button>`;
+    let recovery = '';
+    if (intent?.legacy && intent.status === 'unconfirmed') recovery = action('check', 'Check current name');
+    else if (intent?.status === 'unconfirmed') recovery = action('check', 'Check rename') + action('recover', 'Replay') + action('dismiss', 'Use current name');
+    else if (intent && ['rejected', 'conflicted'].includes(intent.status)) recovery = action('edit', 'Correct name') + action('retry', 'Retry') + action('dismiss', 'Dismiss');
+    const message = intent ? (['queued', 'sending'].includes(intent.status) && !intent.delayed ? 'Renaming…' : intent.message) : draft?.error || '';
+    const feedback = `<span class="rename-feedback" data-rename-state="${escapeAttr(intent?.status || (message ? 'rejected' : 'confirmed'))}"${message ? '' : ' hidden'}>${intent ? `<span class="rename-requested">${escapeHtml(intent.value)}</span> ` : ''}<span>${escapeHtml(message)}</span>${recovery}</span>`;
+    const editor = draft
+        ? `<input class="rename-input" type="text" aria-label="File name" ${widthStyle} value="${escapeAttr(draft.value)}" data-orig="${escapeAttr(basename)}" oninput="renameOnInput('${id}', this.value)" />
+            <button class="rename-btn confirm" type="button" title="Save" aria-label="Save" onclick="renameCommit('${id}')"${busy ? ' disabled' : ''}><svg class="icon"><use href="#i-check"/></svg></button>
+            <button class="rename-btn cancel" type="button" title="Cancel" aria-label="Cancel" onclick="renameCancel('${id}')"><svg class="icon"><use href="#i-x"/></svg></button>`
+        : `<span class="rename-display" data-orig="${escapeAttr(basename)}">${escapeHtml(basename)}</span>
+            <button class="rename-btn" type="button" title="Edit name" aria-label="Edit name" onclick="renameStart('${id}')"><svg class="icon"><use href="#i-pencil"/></svg></button>`;
+    return `<span class="rename-wrap${widthClass}" data-rename-id="${escapeAttr(id)}" data-mode="${draft ? 'edit' : 'display'}"><span class="rename-editor-row">${editor}</span>${feedback}</span>`;
 }
 
 function renameOnInput(id, value) {
-    const cur = renameDrafts.get(id);
-    if (!cur) return;
-    cur.value = value;
+    const draft = renameDrafts.get(String(id));
+    if (!draft) return;
+    draft.value = value;
+    draft.generation++;
+    draft.error = '';
 }
 
 function bindRenameInputs() {
-    document.querySelectorAll('.rename-wrap[data-mode="edit"] .rename-input').forEach((input) => {
+    document.querySelectorAll('.rename-wrap[data-mode="edit"] .rename-input').forEach(input => {
         if (input.dataset.bound === '1') return;
         input.dataset.bound = '1';
-        const wrap = input.closest('.rename-wrap');
-        const id = wrap && wrap.dataset.renameId;
+        const id = input.closest('.rename-wrap')?.dataset.renameId;
         if (!id) return;
-        input.addEventListener('keydown', (ev) => {
-            if (ev.key === 'Enter') { ev.preventDefault(); renameCommit(id); }
-            else if (ev.key === 'Escape') { ev.preventDefault(); renameCancel(id); }
+        input.addEventListener('keydown', event => {
+            if (event.key === 'Enter') { event.preventDefault(); renameCommit(id); }
+            else if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); renameCancel(id); }
         });
     });
 }
 
 function renameStart(id) {
-    const wrap = document.querySelector(`.rename-wrap[data-rename-id="${id}"]`);
-    if (!wrap) return;
-    const disp = wrap.querySelector('.rename-display');
-    const orig = disp ? disp.dataset.orig : '';
-    const dispRect = disp ? disp.getBoundingClientRect() : null;
-    const width = dispRect ? Math.round(dispRect.width) : 0;
-    renameDrafts.set(id, { value: orig, width });
-    fetchHistory().then(() => {
-        const input = document.querySelector(`.rename-wrap[data-rename-id="${id}"] .rename-input`);
-        if (!input) return;
-        input.focus();
-        const dot = orig.lastIndexOf('.');
-        if (dot > 0) input.setSelectionRange(0, dot);
-        else input.select();
-    });
+    id = String(id);
+    const model = tagState.selectDownload(id);
+    if (!model) return;
+    const wrap = document.querySelector(`.rename-wrap[data-rename-id="${CSS.escape(id)}"]`);
+    const width = Math.round(wrap?.querySelector('.rename-display')?.getBoundingClientRect().width || 0);
+    const orig = renameIntent(id)?.value || displayFilename(model);
+    pinRenameInteraction(id);
+    renameDrafts.set(id, { value: orig, width, generation: 0, viewToken: ++renameViewSequence });
+    renderDownloadCollections();
+    const input = document.querySelector(`.rename-wrap[data-rename-id="${CSS.escape(id)}"] .rename-input`);
+    if (!input) return;
+    input.focus();
+    const dot = orig.lastIndexOf('.');
+    input.setSelectionRange(0, dot > 0 ? dot : orig.length);
 }
 
 function renameCancel(id) {
+    id = String(id);
     renameDrafts.delete(id);
-    fetchHistory();
+    releaseSettledRenameInteractions();
+    renderDownloadCollections();
 }
 
 function renameCommit(id) {
-    const keepInfoOpen = openInfoId === String(id);
-    const wrap = document.querySelector(`.rename-wrap[data-rename-id="${id}"]`);
-    if (!wrap) { renameDrafts.delete(id); return; }
-    const input = wrap.querySelector('.rename-input');
-    if (!input) { renameDrafts.delete(id); return; }
+    const startedAt = performance.now();
+    id = String(id);
     const draft = renameDrafts.get(id);
-    const newName = ((input.value !== undefined ? input.value
-        : (draft && draft.value) || '') || '').trim();
-    const orig = input.dataset.orig || '';
-    if (!newName || newName === orig) {
-        renameDrafts.delete(id);
-        fetchHistory();
+    if (!draft) return;
+    const existing = renameIntent(id);
+    if (existing && ['queued', 'sending', 'unconfirmed'].includes(existing.status)) {
+        announceTagStatus(existing.status === 'unconfirmed' ? 'Rename not confirmed. Check its status before submitting another name.' : 'Renaming… Your newer draft is retained.');
         return;
     }
-    input.disabled = true;
-    wrap.querySelectorAll('button').forEach(b => b.disabled = true);
+    const value = draft.value.trim();
+    if (!value || /[/\\\x00]/.test(value) || ['.', '..'].includes(value)) {
+        draft.error = 'Enter a filename without path separators.';
+        announceTagStatus(draft.error);
+        renderDownloadCollections();
+        return;
+    }
+    if (!hasRenameProtocol()) {
+        startCompatibilityRename(id, value, draft);
+        return;
+    }
+    if (existing && ['rejected', 'conflicted'].includes(existing.status)) {
+        if (existing.legacy) clearCompatibilityRename(id);
+        else tagMutations.resolve(existing.id);
+    }
+    const result = tagMutations.submit({ kind: 'rename.set', targetId: id, value, viewToken: draft.viewToken });
+    if (!result.accepted) {
+        draft.error = result.message;
+        announceTagStatus(result.message);
+    } else if (result.intentId) {
+        draft.submittedGeneration = draft.generation;
+        draft.submittedViewToken = draft.viewToken;
+        draft.submittedIntentId = result.intentId;
+        submittedTagIntents.add(result.intentId);
+        pinRenameInteraction(id);
+    } else renameDrafts.delete(id);
+    renderDownloadCollections();
+    refreshRenamePresentations();
+    renameMutationMetrics.latestLocalFeedbackMs = performance.now() - startedAt;
+    mutationMetrics.latestLocalFeedbackMs = renameMutationMetrics.latestLocalFeedbackMs;
+}
+
+function clearCompatibilityRename(id) {
+    compatibilityRenames.get(id)?.timers?.forEach(clearTimeout);
+    compatibilityRenames.delete(id);
+}
+
+async function checkCompatibilityRename(intent) {
+    const epoch = tagSessionEpoch;
+    const context = tagState.capture();
+    try {
+        const response = await apiFetch(`/api/downloads/${encodeURIComponent(intent.targetId)}/editable-state`);
+        if (epoch !== tagSessionEpoch || compatibilityRenames.get(intent.targetId) !== intent) return false;
+        if ([403, 404].includes(response.status)) { tagMutations.fence(intent.targetId); return false; }
+        const body = await response.json();
+        if (epoch !== tagSessionEpoch || compatibilityRenames.get(intent.targetId) !== intent) return false;
+        renameMutationMetrics.reconciliationReads++;
+        mutationMetrics.reconciliationReads++;
+        if (response.ok && String(body?.id) === intent.targetId && typeof body.filename === 'string') return tagState.acceptDownload(body, context);
+    } catch (_) { /* A current name cannot prove a lost legacy request's outcome. */ }
+    return false;
+}
+
+function startCompatibilityRename(id, value, draft) {
+    const existing = compatibilityRenames.get(id);
+    if (existing && existing.status !== 'rejected') return;
+    const epoch = tagSessionEpoch;
+    const intent = { id: `legacy-rename-${++renameViewSequence}`, targetId: id, kind: 'rename.set', value, status: 'sending', legacy: true };
+    compatibilityRenames.set(id, intent);
+    pinRenameInteraction(id);
+    const generation = draft.generation;
+    const viewToken = draft.viewToken;
+    const startedAt = performance.now();
+    renameMutationMetrics.submissions++;
+    mutationMetrics.submissions++;
+    renderDownloadCollections();
+    refreshRenamePresentations();
+    renameMutationMetrics.latestLocalFeedbackMs = performance.now() - startedAt;
+    mutationMetrics.latestLocalFeedbackMs = renameMutationMetrics.latestLocalFeedbackMs;
+    announceTagStatus('Renaming…');
+    const timer = setTimeout(() => {
+        if (epoch !== tagSessionEpoch || compatibilityRenames.get(id) !== intent || intent.status !== 'sending') return;
+        intent.delayed = true;
+        intent.message = 'Still waiting for rename confirmation.';
+        renderDownloadCollections();
+        announceTagStatus(intent.message);
+    }, 5000);
+    const timeoutTimer = setTimeout(() => {
+        if (epoch !== tagSessionEpoch || compatibilityRenames.get(id) !== intent || intent.status !== 'sending') return;
+        intent.status = 'unconfirmed';
+        intent.message = 'Rename not confirmed. This server cannot safely replay it. Checking the current name does not prove completion.';
+        renderDownloadCollections();
+        announceTagStatus(intent.message);
+    }, 30000);
+    intent.timers = [timer, timeoutTimer];
     apiFetch('/api/rename/' + encodeURIComponent(id), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ filename: newName }),
-    }).then(async (r) => {
-        if (!r.ok) {
-            const data = await r.json().catch(() => ({}));
-            alert('Rename failed: ' + (data.error || r.statusText));
-            input.disabled = false;
-            wrap.querySelectorAll('button').forEach(b => b.disabled = false);
-            return;
-        }
-        renameDrafts.delete(id);
-        fetchHistory().then(() => {
-            // The rename response and its SSE signal can reconcile in either
-            // order. Preserve the dialog the user was actively editing.
-            if (keepInfoOpen) {
-                openInfoId = String(id);
-                positionHistoryInfo(openInfoId);
-            }
-        });
-    }).catch((err) => {
-        alert('Rename failed: ' + err);
-        input.disabled = false;
-        wrap.querySelectorAll('button').forEach(b => b.disabled = false);
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filename: value }),
+    }).then(async response => {
+        const body = await response.json().catch(() => null);
+        if (epoch !== tagSessionEpoch || compatibilityRenames.get(id) !== intent) return;
+        if ([403, 404].includes(response.status)) { tagMutations.fence(id); return; }
+        if (response.ok && body?.id === id && typeof body.filename === 'string') {
+            const checked = await checkCompatibilityRename(intent);
+            if (epoch !== tagSessionEpoch || compatibilityRenames.get(id) !== intent) return;
+            if (!checked) await fetchHistory();
+            if (epoch !== tagSessionEpoch || compatibilityRenames.get(id) !== intent) return;
+            clearCompatibilityRename(id);
+            const currentDraft = renameDrafts.get(id);
+            if (currentDraft === draft && draft.generation === generation && draft.viewToken === viewToken && draft.value.trim() === value) renameDrafts.delete(id);
+            renameMutationMetrics.acknowledgements++;
+            mutationMetrics.acknowledgements++;
+            renameMutationMetrics.latestAcknowledgementMs = performance.now() - startedAt;
+            mutationMetrics.latestAcknowledgementMs = renameMutationMetrics.latestAcknowledgementMs;
+            announceTagStatus('Renamed.');
+        } else if ([400, 409, 410, 413, 422].includes(response.status)) {
+            intent.status = 'rejected';
+            intent.message = 'Could not rename. Correct the name or try again.';
+            renameMutationMetrics.rejectedOutcomes++;
+            mutationMetrics.rejectedOutcomes++;
+            announceTagStatus(intent.message);
+        } else throw new Error('Rename not confirmed');
+    }).catch(() => {
+        if (epoch !== tagSessionEpoch || compatibilityRenames.get(id) !== intent) return;
+        intent.status = 'unconfirmed';
+        intent.message = 'Rename not confirmed. This server cannot safely replay it. Checking the current name does not prove completion.';
+        renameMutationMetrics.unconfirmedOutcomes++;
+        mutationMetrics.unconfirmedOutcomes++;
+        announceTagStatus(intent.message);
+    }).finally(() => {
+        clearTimeout(timer);
+        clearTimeout(timeoutTimer);
+        if (epoch !== tagSessionEpoch) return;
+        releaseSettledRenameInteractions();
+        renderDownloadCollections();
+        refreshRenamePresentations();
     });
 }
+
+document.addEventListener('click', event => {
+    const button = event.target.closest('[data-rename-recovery]');
+    if (!button) return;
+    const intentId = button.dataset.intentId;
+    const intent = tagMutations.status(intentId) || [...compatibilityRenames.values()].find(entry => entry.id === intentId);
+    if (!intent) return;
+    const action = button.dataset.renameRecovery;
+    if (intent.legacy) {
+        if (action === 'check') checkCompatibilityRename(intent);
+        else if (intent.status === 'rejected') {
+            clearCompatibilityRename(intent.targetId);
+            if (action === 'retry') { const draft = renameDrafts.get(intent.targetId); if (draft) startCompatibilityRename(intent.targetId, intent.value, draft); }
+            else if (action === 'edit' && !renameDrafts.has(intent.targetId)) renameStart(intent.targetId);
+        }
+        renderDownloadCollections();
+        return;
+    }
+    if (action === 'check') tagMutations.recover(intentId);
+    else if (action === 'recover') tagMutations.recover(intentId, { replay: true });
+    else if (action === 'retry') tagMutations.retry(intentId);
+    else if (action === 'edit') {
+        const draft = renameDrafts.get(intent.targetId);
+        if (draft && draft.value.trim() && draft.value !== intent.value) {
+            announceTagStatus('Finish or clear your newer name before restoring the failed name.');
+            return;
+        }
+        tagMutations.resolve(intentId);
+        renameStart(intent.targetId);
+        const restored = renameDrafts.get(intent.targetId);
+        if (restored) {
+            restored.value = intent.value;
+            restored.generation++;
+            const input = document.querySelector(`.rename-wrap[data-rename-id="${CSS.escape(intent.targetId)}"] .rename-input`);
+            if (input) input.value = intent.value;
+        }
+        renderDownloadCollections();
+    } else if (!tagMutations.resolve(intentId)) announceTagStatus('The original rename may still complete. Check its status before using the current name.');
+    releaseSettledRenameInteractions();
+    renderDownloadCollections();
+});
 
 function pauseDownload(id) {
     closeAllMenus();
@@ -2350,6 +2587,7 @@ function deleteDownload(id) {
     }
     apiAction('/api/remove/' + encodeURIComponent(id), { method: 'POST' })
         .then(() => {
+            tagMutations.fence(String(id));
             droppedUploads.delete(String(id));
             collectionSnapshots.current = collectionSnapshots.current.filter(info => String(info.id) !== String(id));
             renderDroppedUploads();
@@ -2701,6 +2939,8 @@ function closeHistoryInfo() {
     document.querySelectorAll('[data-info-action]').forEach(button => {
         button.setAttribute('aria-expanded', 'false');
     });
+    const draft = renameDrafts.get(String(openInfoId));
+    if (draft) draft.viewToken = ++renameViewSequence;
     openInfoId = null;
 }
 
@@ -2991,8 +3231,11 @@ document.addEventListener('click', (ev) => {
                 break;
         }
     }
-    if (ev.target.closest('.history-info-popover')) return;
-    if (ev.target.closest('.kebab-menu') || ev.target.closest('.kebab-btn')) return;
+    // Local editor transitions may replace the clicked button synchronously.
+    // The event path retains its original surface after that node detaches.
+    const originalPath = ev.composedPath();
+    if (originalPath.some(node => node instanceof Element && node.matches('.history-info-popover'))) return;
+    if (originalPath.some(node => node instanceof Element && node.matches('.kebab-menu, .kebab-btn'))) return;
     closeHistoryInfo();
     closeAllMenus();
 });
@@ -3049,7 +3292,7 @@ function formatBytes(n) {
 }
 
 function displayFilename(info) {
-    const name = info.display_filename || info.filename || '';
+    const name = info.requested_filename || info.display_filename || info.filename || '';
     return String(name).split('/').pop().split('\\').pop();
 }
 
@@ -3290,13 +3533,13 @@ function renderPlaylistEditor() {
         && (!query || tagSearchKey(libraryTitle(info)).includes(query))
     ));
     document.getElementById('playlistAvailable').innerHTML = available.length
-        ? available.map(info => `<button type="button" class="playlist-picker-row" onclick="playlistEditorAdd('${escapeAttr(info.id)}')">${assetImage(info.id)}<span>${escapeHtml(libraryTitle(info))}</span><svg aria-hidden="true"><use href="#i-plus"/></svg></button>`).join('')
+        ? available.map(info => `<button type="button" class="playlist-picker-row" onclick="playlistEditorAdd('${escapeAttr(info.id)}')">${assetImage(info.id)}<span>${escapeHtml(libraryTitle(info))}${renameSurfaceStatus(info)}</span><svg aria-hidden="true"><use href="#i-plus"/></svg></button>`).join('')
         : '<p>No available videos match.</p>';
     document.getElementById('playlistSelected').innerHTML = playlistEditorDraft.items.length
         ? playlistEditorDraft.items.map((item, index) => `<div class="playlist-selected-row${item.unavailable ? ' is-unavailable' : ''}" draggable="${!item.unavailable}" data-playlist-index="${index}">
             <span class="playlist-drag-handle" aria-hidden="true">⋮⋮</span>
             ${item.id ? assetImage(item.id) : '<span class="playlist-unavailable-thumb"><svg><use href="#i-camera"/></svg></span>'}
-            <span class="playlist-selected-title"><span>${index + 1}</span>${escapeHtml(item.title || 'Unavailable video')}</span>
+            <span class="playlist-selected-title"><span>${index + 1}</span>${escapeHtml(item.title || 'Unavailable video')}${item.id ? renameSurfaceStatus(tagState.selectDownload(item.id) || item) : ''}</span>
             <span class="playlist-order-actions">
                 <button type="button" onclick="playlistEditorMove(${index}, -1)" ${index === 0 ? 'disabled' : ''} aria-label="Move ${escapeAttr(item.title || 'video')} up">↑</button>
                 <button type="button" onclick="playlistEditorMove(${index}, 1)" ${index === playlistEditorDraft.items.length - 1 ? 'disabled' : ''} aria-label="Move ${escapeAttr(item.title || 'video')} down">↓</button>
@@ -3587,7 +3830,7 @@ function renderHistoryCard(info) {
     }
 
     let fileControl = '';
-    if (info.filename) {
+    if (info.filename || renameIntent(id) || renameDrafts.has(id)) {
         const base = displayFilename(info);
         fileControl = `
                             <div class="history-info-section history-file-section">
@@ -3666,7 +3909,7 @@ function renderHistoryCard(info) {
                 <article class="history-card" id="history-item-${escapeAttr(id)}" data-row-id="${escapeAttr(id)}">
                     ${preview}
                     <div class="history-card-caption">
-                        <div class="history-card-title" title="${escapeAttr(displayTitle)}">${escapeHtml(displayTitle)}</div>
+                        <div class="history-card-title" title="${escapeAttr(displayTitle)}">${escapeHtml(displayTitle)}${renameSurfaceStatus(info)}</div>
                         <div class="menu-wrap">
                             <button class="kebab-btn" onclick="toggleMenu('${id}', event)" aria-label="More actions"><svg class="icon"><use href="#i-kebab"/></svg></button>
                             <div id="menu-${escapeAttr(id)}" class="kebab-menu">${menuItems.join('')}</div>
@@ -3807,7 +4050,7 @@ function renderItem(info, inHistoryView = false) {
                         </div>`;
         }
         const meta = [];
-        if (info.filename) {
+        if (info.filename || renameIntent(id) || renameDrafts.has(id)) {
             const base = displayFilename(info);
             if (isFinished) {
                 meta.push(`<div class="file-meta-row"><strong>File:</strong>${renderRenameControl(id, base)}</div>`);
@@ -3865,7 +4108,7 @@ function renderItem(info, inHistoryView = false) {
         ? '<span class="firefox-session-label">Firefox session</span>'
         : '';
     const titleRow = displayTitle
-        ? `<div class="item-title" title="${escapeAttr(displayTitle)}">${escapeHtml(displayTitle)}${authenticatedLabel}</div>`
+        ? `<div class="item-title" title="${escapeAttr(displayTitle)}">${escapeHtml(displayTitle)}${authenticatedLabel}${renameSurfaceStatus(info)}</div>`
         : '';
     const tagRow = renderTagControl(info);
 
@@ -4272,6 +4515,7 @@ function duplicateSourceLabel(info) {
 }
 
 function renderDuplicateMember(info) {
+    info = projectTagEntry(info);
     const id = String(info.id);
     const name = displayFilename(info);
     const title = info.title || name.replace(/\.[^.]+$/, '') || 'Untitled download';
@@ -4282,7 +4526,7 @@ function renderDuplicateMember(info) {
                 ${assetImage(id, 'loading="lazy"')}
                 <div class="duplicate-member-detail">
                     <div class="duplicate-member-title">${escapeHtml(title)}</div>
-                    <div class="duplicate-member-filename">${escapeHtml(name)}</div>
+                    <div class="duplicate-member-filename"><span data-rename-filename="${escapeAttr(id)}">${escapeHtml(name)}</span>${renameSurfaceStatus(info)}</div>
                     <div class="duplicate-member-meta">${details}</div>
                     ${tags.length ? `<div class="tag-row">${tags.map(tag => tagChipHtml(tag, false)).join('')}</div>` : ''}
                     <a class="duplicate-history-link" href="#history-item-${escapeAttr(id)}" data-duplicate-history-link="${escapeAttr(id)}">View in Library</a>
@@ -4581,7 +4825,7 @@ function checkMissingTagTargets(previous, next) {
         const id = String(entry.id);
         if (present.has(id)) continue;
         const model = tagState.selectDownload(id);
-        if (!model?.tag_chips.some(chip => chip.status !== 'confirmed') && !model?.favorite_intents.length && !editingTagIds.has(id)) continue;
+        if (!model?.tag_chips.some(chip => chip.status !== 'confirmed') && !model?.favorite_intents.length && !model?.rename_intents.length && !compatibilityRenames.has(id) && !renameDrafts.has(id) && !editingTagIds.has(id)) continue;
         checkTagAvailability(id);
     }
 }
@@ -4601,6 +4845,7 @@ function fetchDownloadCollection(key) {
         const authEpoch = tagSessionEpoch;
         const tagContext = tagState.capture();
         tagMutationMetrics.reconciliationReads++;
+        renameMutationMetrics.reconciliationReads++;
         favoriteMutationMetrics.reconciliationReads++;
         mutationMetrics.reconciliationReads++;
         try {
@@ -4612,14 +4857,14 @@ function fetchDownloadCollection(key) {
             if (key === 'library') {
                 const changed = libraryOrder.kind !== snapshot.order.kind
                     || libraryOrder.generation_id !== snapshot.order.generation_id;
-                if (changed && (historyRefreshBlocked() || renameDrafts.size || editingTagIds.size || favoriteEditPositions.size)) {
+                if (changed && (historyRefreshBlocked() || renameDrafts.size || renameEditPositions.size || editingTagIds.size || favoriteEditPositions.size)) {
                     historyFetchDeferred = true;
                     return;
                 }
                 const complete = snapshot.order.kind === 'rotation'
                     ? await readCollection('/api/library-catalog') : data;
                 if (authEpoch !== tagSessionEpoch || requestEpoch !== libraryRequestEpoch) return;
-                if (changed && (historyRefreshBlocked() || renameDrafts.size || editingTagIds.size || favoriteEditPositions.size)) {
+                if (changed && (historyRefreshBlocked() || renameDrafts.size || renameEditPositions.size || editingTagIds.size || favoriteEditPositions.size)) {
                     historyFetchDeferred = true;
                     return;
                 }
@@ -4703,8 +4948,8 @@ function renderDownloadCollections({ sortFavorites = false } = {}) {
     }
     historyOrderIds = historyEntries.map(info => String(info.id));
     refreshAvailableTags(historyEntries);
-    const done = historyEntries.filter(info => matchesSearchFilter(info) || editingTagIds.has(String(info.id)) || favoriteEditPositions.has(String(info.id)));
-    for (const [id, position] of new Map([...tagEditPositions, ...favoriteEditPositions])) {
+    const done = historyEntries.filter(info => matchesSearchFilter(info) || editingTagIds.has(String(info.id)) || renameEditPositions.has(String(info.id)) || favoriteEditPositions.has(String(info.id)));
+    for (const [id, position] of new Map([...tagEditPositions, ...renameEditPositions, ...favoriteEditPositions])) {
         const index = done.findIndex(info => String(info.id) === id);
         if (index < 0 || position < 0) continue;
         const [entry] = done.splice(index, 1);
@@ -5001,7 +5246,7 @@ function syncPlayerControls() {
     repeat.setAttribute('aria-pressed', String(playerRepeatCurrent));
     repeat.disabled = play.disabled || (playerNavigationBusy() && !playerPreparation?.fade)
         || !endlessPlayback.currentItem;
-    playerControl('playerTitle').textContent = endlessPlayback.currentItem?.title || 'Video playback';
+    playerControl('playerTitle').textContent = currentPlayerDisplayTitle();
     const mode = playerControl('playerModeLabel');
     mode.textContent = endlessPlayback.active ? ({ sequential: 'Play All', shuffle: 'Shuffle',
         shuffle_clips: 'Shuffle Clips', playlist: 'Playlist' })[endlessPlayback.mode] || '' : '';
@@ -6774,7 +7019,7 @@ function playVideo(id, label, ext) {
         fullscreen: startVideosFullscreen,
         requestFullscreen: false,
     });
-    loadPlaybackItem({ id, title: label, extension: ext });
+    loadPlaybackItem({ id, title: label, extension: ext, filenameTitle: true });
     if (startVideosFullscreen) requestPlayerFullscreen({ launch: true });
 }
 

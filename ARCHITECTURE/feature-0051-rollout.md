@@ -2,7 +2,8 @@
 
 This inventory separates the initial tag delivery from the remaining app-wide
 migration in [Feature 0051](../FEATURES/feature-0051-immediate-feedback-for-server-backed-interactions.md).
-The shared coordinator registers `tag.add`, `tag.remove`, and `favorite.set`.
+The shared coordinator registers `tag.add`, `tag.remove`, `favorite.set`, and
+`rename.set`.
 An existing API call does not gain receipt recovery merely because the new
 scripts are loaded. Mutating requests are never retried by `apiFetch`'s GET
 contention recovery.
@@ -48,6 +49,26 @@ reset and target unavailability fence pending favorites and old callbacks.
 `VDL.favoriteMutationMetrics()` and `VDL.mutationMetrics()` expose bounded
 in-memory aggregates without content or resource identifiers.
 
+[Feature 0053: Rename](../FEATURES/feature-0053-immediate-feedback-and-safe-recovery-for-rename.md)
+adds the independent rename domain. Editor transitions are local; submitted
+names project immediately with pending feedback while the confirmed file path
+remains authoritative for playback. Draft generations and view tokens protect
+newer typing and reopened Info surfaces. Only canonical acknowledgements change
+the confirmed identity, without requiring SSE or a collection refresh.
+
+The persistent `rename_revision` is serialized as a decimal string and includes
+legacy identity writers through a database trigger. Physical renames first
+persist an actor-bound filesystem journal and pin the intended file with a
+durable hardlink anchor. Exclusive destination creation avoids overwriting a
+collision. Exclusive source retirement preserves unrelated replacements at the
+old name. Restart and authorized recovery resume the recorded operation;
+ambiguous identity retains an unresolved operation requiring intervention.
+Canonical publication and the terminal receipt share a database transaction.
+Rename and removal serialize file ownership without holding the SQLite write
+lock across filesystem effects. Recovery uses the same frozen attempt, with
+current authorization, shared quotas and expiry, and no automatic replay.
+`VDL.renameMutationMetrics()` exposes bounded in-memory aggregate diagnostics.
+
 ## Remaining action adapters
 
 The rows below are explicit migration work, not claims that the app-wide
@@ -56,12 +77,11 @@ remain in force. They need their own behavior and regression evidence before
 adopting automatic recovery.
 
 Each remaining row now has a proposed feature spec. These links allocate work;
-they do not mark any remaining adapter implemented. Features 0053–0067 inherit Feature
+they do not mark any remaining adapter implemented. Features 0054–0067 inherit Feature
 0051 and the shared requirements below.
 
 | Controls / production entry points in `static/app.js` | Existing mechanism | Required migration / recovery boundary | Feature spec |
 | --- | --- | --- | --- |
-| Rename: `renameStart`, `renameCommit`, `renameCancel` | Separate draft and disabled submit controls; server owns final path | Local editor transitions and requested display name. Durable filesystem journal and crash recovery must precede replay. | [0053: Rename](../FEATURES/feature-0053-immediate-feedback-and-safe-recovery-for-rename.md) |
 | Preferences: `savePreferences` | Captured form submission; effects apply after acknowledgement; local theme preview | Saving presentation, newer draft generations, duplicate guards and canonical acknowledgement. Sensitive effects wait for confirmation. | [0054: Preferences](../FEATURES/feature-0054-immediate-feedback-for-preference-saves.md) |
 | Playlist create/replace: `savePlaylistEditor` | Local draft, existing `expected_revision` on replace, server conflict response | Saving state, duplicate guards, retained newer drafts and explicit conflict recovery. Preserve the existing revision type. | [0055: Playlist editor](../FEATURES/feature-0055-immediate-feedback-for-playlist-editor-saves.md) |
 | Playlist add/delete: `quickAddToPlaylist`, `deletePlaylist` | Server response, deletion confirmation, playlist refresh | Pending initiating controls and receipt-safe recovery before retries. | [0056: Playlist add/delete](../FEATURES/feature-0056-immediate-feedback-for-playlist-add-and-delete.md) |
@@ -178,15 +198,15 @@ mark the wider rollout complete without that evidence.
 ## Verification commands
 
 Run the Python coverage gate with Python 3.12, the production-module Node tests,
-and real browser tag and favorite interactions. Browser runs use controlled
+and real browser tag, favorite, and rename interactions. Browser runs use controlled
 request gates to exercise pending presentation and canonical confirmation with
 SSE unavailable.
 
 ```bash
 VDL_PYTHON=/path/to/python3.12 ./tests/run-all.sh --unit
 node --test tests/*.test.cjs
-VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py tags.spec.cjs immediate-feedback.spec.cjs favorites-feedback.spec.cjs
-VDL_TEST_BROWSER=firefox VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py tags.spec.cjs immediate-feedback.spec.cjs favorites-feedback.spec.cjs
+VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py tags.spec.cjs immediate-feedback.spec.cjs favorites-feedback.spec.cjs rename-feedback.spec.cjs
+VDL_TEST_BROWSER=firefox VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py tags.spec.cjs immediate-feedback.spec.cjs favorites-feedback.spec.cjs rename-feedback.spec.cjs
 ```
 
 Verified on 2026-11-08 for version `0.54.0`:
@@ -228,3 +248,37 @@ Feature 0052 verified on 2026-11-08 for version `0.55.0`:
 
 Favorites inherit authentication fencing for their adopted callbacks. This
 does not complete Feature 0067 or any other remaining adapter.
+
+Feature 0053 verified on 2026-11-08 for version `0.56.0`:
+
+- Python 3.12 unit gate: **586 tests, 9 skipped**; `vdl.py` line coverage
+  **92.7%** (6361/6865 executable lines; enforced minimum 90%). The 28 rename
+  protocol tests cover restart at every journal/filesystem boundary, live
+  source/destination replacement, no-clobber retirement, alias ownership,
+  removal/retry races, current authorization, admission namespace/clock/quota
+  rechecks, expiry, response loss, and completed-journal identity supersession.
+- Node: **86 tests passed**, including 18 rename production-interface checks
+  for immediate projection, canonical identity, independent domains, stale
+  reads/receipts, frozen replay, unknown finality, and authentication/deletion
+  fences. Null-file rejection and receipt-denial cases remain distinguishable
+  from malformed success and missing receipts.
+- Chromium and Firefox with Python 3.12: **19 rename browser checks passed in
+  each browser**. Controlled gates verify feedback below 50 ms, confirmation
+  without SSE or collection reads, collision and conflict recovery, newer
+  drafts, mouse/keyboard controls, both themes, reduced motion, close/reopen,
+  lost-response replay, access loss, and account switching. Playback retains
+  its video node, source, and fullscreen state while the title follows pending
+  and canonical names. Legacy fallback never claims receipt support or treats
+  matching reads as proof of an unknown attempt.
+- Chromium regressions: **172 distinct scenarios passed** across the rename,
+  history actions, worker recovery, tag/favorite, immediate feedback, rotation,
+  live update/contention, playlist, playback, upload, attempt-history,
+  authentication, and extension settings suites. The final affected-suite run
+  passed **50 checks**: 19 rename, 25 history actions, and 6 worker recovery.
+
+Rename's filesystem recovery requires hardlinks, durable directory sync, and
+exclusive source retirement. Unsupported or ambiguous filesystem state retains
+an explicit intervention requirement. Completed cleanup journals cannot replace
+newer canonical file identities. Rename delivery does not complete Features
+0054–0067; authentication fencing and removal/retry serialization here cover
+the rename integration boundary only.

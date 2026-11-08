@@ -87,13 +87,13 @@ class SchemaMigrationTest(unittest.TestCase):
                     "visibility", "browser_authenticated",
                     "extension_request_id",
                     "duration_seconds", "media_metadata_probed",
-                    "display_filename", "ingest_source_path", "tags_revision",
+                    "display_filename", "ingest_source_path", "tags_revision", "rename_revision",
                 })
                 self.assertTrue({
                     "tags", "download_tags", "app_config", "roles", "users",
                     "user_roles", "ingest_receipts", "media_hashes",
                     "extension_tokens", "playlists", "playlist_items",
-                    "playlist_progress",
+                    "playlist_progress", "rename_operations",
                 }.issubset(tables))
                 self.assertIn("write_sequence", playlist_progress_columns)
                 self.assertIn("name", user_columns)
@@ -111,6 +111,7 @@ class SchemaMigrationTest(unittest.TestCase):
                 )
                 self.assertIs(vdl.db_get_download("legacy1")["favorite"], False)
                 self.assertEqual(vdl.db_get_download("legacy1")["favorite_revision"], "0")
+                self.assertEqual(vdl.db_get_download("legacy1")["rename_revision"], "0")
                 self.assertEqual(vdl.db_get_download("legacy1")["view_count"], 0)
                 self.assertEqual(
                     vdl.db_get_download("legacy1")["source_type"],

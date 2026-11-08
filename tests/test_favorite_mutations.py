@@ -48,7 +48,9 @@ class FavoriteMutationProtocolTest(AppCase):
         self.finished_file('favoriteproto')
         entry = self.client.get('/api/library').json[0]
         self.assertEqual((entry['favorite'], entry['favorite_revision']), (True, '1'))
-        self.assertEqual(self.state().json['permissions'], {'tags': True, 'favorite': True})
+        self.assertEqual(self.state().json['permissions'], {
+            'tags': True, 'favorite': True, 'rename': True,
+        })
 
     def test_legacy_helper_raw_writer_noops_and_restart(self):
         for writer in (lambda: self.mutate({'favorite': True}),

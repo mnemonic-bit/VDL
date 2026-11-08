@@ -8,6 +8,7 @@
     const actions = Object.freeze({
         'tag.add': Object.freeze({ domain: 'tags', revision: 'tags_revision', noun: 'tags', method: 'POST', route: 'tags', field: 'tag' }),
         'tag.remove': Object.freeze({ domain: 'tags', revision: 'tags_revision', noun: 'tags', method: 'DELETE', route: 'tags', field: 'tag' }),
+        'rename.set': Object.freeze({ domain: 'rename', revision: 'rename_revision', noun: 'rename', method: 'POST', route: 'rename', field: 'filename' }),
         'favorite.set': Object.freeze({ domain: 'favorite', revision: 'favorite_revision', noun: 'favorite', method: 'POST', route: 'favorite', field: 'favorite' }),
     });
     const descriptor = intent => actions[intent.kind];
@@ -38,7 +39,7 @@
         }
         setCapabilities(options.capabilities || null);
         function supported(kind) {
-            return !!actions[kind] && capabilities?.mutation_protocol === 1 && (kind === 'favorite.set' || capabilities.tag_identity_version === VDL.tagIdentity.version) && capabilities.actions?.includes(kind);
+            return !!actions[kind] && capabilities?.mutation_protocol === 1 && (!kind.startsWith('tag.') || capabilities.tag_identity_version === VDL.tagIdentity.version) && capabilities.actions?.includes(kind);
         }
         function emit(action, outcome, intent, startedAt) {
             if (!options.onEvent) return;
@@ -97,13 +98,14 @@
                 if (options.onAuthLoss) options.onAuthLoss();
                 return false;
             }
-            if (reply.status === 403 || (!receipt && reply.status === 404 && reply.body?.error === 'Unknown download id')) {
+            if (reply.status === 403 || (reply.status === 404 && reply.body?.error === 'Unknown download id')) {
                 fence(intent.targetId);
                 return false;
             }
             return true;
         }
         function snapshot(body, intent) {
+            if (intent.kind === 'rename.set') return { id: intent.targetId, filename: body.filename, display_filename: body.display_filename, rename_revision: body.rename_revision };
             if (intent.kind === 'favorite.set') return { id: intent.targetId, favorite: body.favorite, favorite_revision: body.mutation?.revision ?? body.favorite_revision };
             return {
                 id: intent.targetId, tags: body.tags, tag_items: body.tag_items,
@@ -118,6 +120,14 @@
         }
         function validResult(body, intent, committed) {
             const mutation = body?.mutation;
+            if (intent.kind === 'rename.set') {
+                return !!mutation && mutation.id === intent.attempt.body.client_mutation_id
+                    && mutation.domain === 'rename' && String(body.id) === intent.targetId
+                    && validRevision(mutation.revision) && body.rename_revision === mutation.revision
+                    && (committed ? typeof body.filename === 'string' && !!body.filename : body.filename === null || typeof body.filename === 'string')
+                    && (body.display_filename === null || typeof body.display_filename === 'string')
+                    && (committed ? mutation.outcome === 'committed' : ['rejected', 'conflicted'].includes(mutation.outcome));
+            }
             if (intent.kind === 'favorite.set') {
                 return !!mutation && mutation.id === intent.attempt.body.client_mutation_id
                     && mutation.domain === 'favorite' && String(body.id) === intent.targetId
@@ -137,6 +147,11 @@
             if (!reply || typeof reply.status !== 'number') { markUnknown(intent); return; }
             if (!authorizedReply(reply, intent)) return;
             const body = reply.body;
+            if (intent.kind === 'rename.set' && reply.status === 503 && body?.code === 'rename_recovery_required') {
+                markUnknown(intent);
+                update(intent, { message: 'Rename not confirmed. File recovery needs intervention. Check again after the file state is repaired.' });
+                return;
+            }
             if (reply.status >= 200 && reply.status < 300 && validResult(body, intent, true)) {
                 const before = state.writer.confirmed(intent.targetId);
                 const newerRemote = before && BigInt(before[descriptor(intent).revision]) > BigInt(body.mutation.revision);
@@ -167,7 +182,7 @@
                 const status = body.mutation.outcome;
                 state.writer.transaction(() => {
                     state.acceptDownload(snapshot(body, intent));
-                    update(intent, { status, message: status === 'conflicted' ? `${descriptor(intent).noun} changed elsewhere. Check the current state, then retry or dismiss.` : `Could not save ${descriptor(intent).noun}. Retry or dismiss it.` });
+                    update(intent, { status, message: status === 'conflicted' ? `${descriptor(intent).noun} changed elsewhere. Check the current state, then retry or dismiss.` : intent.kind === 'rename.set' ? `Could not rename. ${typeof body.error === 'string' ? body.error : 'Correct the name or retry.'}` : `Could not save ${descriptor(intent).noun}. Retry or dismiss it.` });
                 });
                 emit(intent.kind, status, intent, intent.sentAt);
                 if (status === 'rejected') {
@@ -180,7 +195,7 @@
         }
         function markUnknown(intent) {
             clearTimers(intent);
-            update(intent, { status: 'unconfirmed', message: 'Save not confirmed. Check its status before retrying.', delayed: true });
+            update(intent, { status: 'unconfirmed', message: intent.kind === 'rename.set' ? 'Rename not confirmed. Check its status before replaying.' : 'Save not confirmed. Check its status before retrying.', delayed: true });
             emit(intent.kind, 'unconfirmed', intent, intent.sentAt);
         }
         async function transmit(intent, capturedEpoch) {
@@ -244,7 +259,7 @@
             if (capturedEpoch !== epoch || !intents.has(intent.id) || !state.isAvailable(intent.targetId)) return false;
             if (!authorizedReply(reply, intent)) return false;
             const body = reply.body;
-            if (reply.status !== 200 || !body || String(body.id) !== intent.targetId || !validRevision(body[descriptor(intent).revision]) || (intent.kind === 'favorite.set' ? typeof body.favorite !== 'boolean' : !canonical(body))) return false;
+            if (reply.status !== 200 || !body || String(body.id) !== intent.targetId || !validRevision(body[descriptor(intent).revision]) || (intent.kind === 'favorite.set' ? typeof body.favorite !== 'boolean' : intent.kind === 'rename.set' ? !(body.filename === null || typeof body.filename === 'string') || !(body.display_filename === null || typeof body.display_filename === 'string') : !canonical(body))) return false;
             state.acceptDownload(body);
             return true;
         }
@@ -255,16 +270,26 @@
             const targetId = String(input.targetId);
             const model = state.selectDownload(targetId);
             if (!model || model.permissions?.[actions[input.kind].domain] === false) return { accepted: false, reason: 'unavailable', message: 'This entry is unavailable.' };
-            if (!validRevision(model[actions[input.kind].revision]) || (input.kind !== 'favorite.set' && model.tag_identity_version !== VDL.tagIdentity.version)) return { accepted: false, reason: 'unsupported', message: `Refresh this page before saving ${actions[input.kind].noun}.` };
+            if (input.kind === 'rename.set' && (typeof model.filename !== 'string' || !model.filename || (model.status !== undefined && model.status !== 'finished'))) return { accepted: false, reason: 'unavailable', message: 'Only finished files can be renamed.' };
+            if (!validRevision(model[actions[input.kind].revision]) || (input.kind.startsWith('tag.') && model.tag_identity_version !== VDL.tagIdentity.version)) return { accepted: false, reason: 'unsupported', message: `Refresh this page before saving ${actions[input.kind].noun}.` };
             let tag;
             try {
                 if (input.kind === 'favorite.set' && typeof input.value !== 'boolean') throw new Error('Favorite must be true or false.');
-                tag = input.kind === 'favorite.set' ? { key: 'favorite', name: input.value } : VDL.tagIdentity.normalize(input.value);
+                if (input.kind === 'rename.set') {
+                    if (typeof input.value !== 'string' || !input.value.trim() || /[/\\\x00]/.test(input.value) || ['.', '..'].includes(input.value.trim())) throw new Error('Enter a filename without path separators.');
+                    tag = { key: 'rename', name: input.value.trim() };
+                } else tag = input.kind === 'favorite.set' ? { key: 'favorite', name: input.value } : VDL.tagIdentity.normalize(input.value);
             }
             catch (error) { return { accepted: false, reason: 'validation', message: error.message }; }
             const domainKey = queueKey({ kind: input.kind, targetId });
             const queue = queues.get(domainKey) || [];
-            if (Array.from(intents.values()).some(intent => input.kind !== 'favorite.set' && intent.targetId === targetId && descriptor(intent).domain === actions[input.kind].domain && intent.key === tag.key && intent.status === 'rejected')) return { accepted: false, reason: 'unresolved', message: 'Retry or dismiss the existing failed tag first.' };
+            if (input.kind === 'rename.set') {
+                const existing = Array.from(intents.values()).find(intent => intent.targetId === targetId && intent.kind === 'rename.set');
+                if (existing) return existing.value === tag.name && !['rejected', 'conflicted'].includes(existing.status)
+                    ? { accepted: true, intentId: existing.id, duplicate: true }
+                    : { accepted: false, reason: 'unresolved', message: 'Resolve the current rename before submitting another name.' };
+            }
+            if (Array.from(intents.values()).some(intent => input.kind.startsWith('tag.') && intent.targetId === targetId && descriptor(intent).domain === actions[input.kind].domain && intent.key === tag.key && intent.status === 'rejected')) return { accepted: false, reason: 'unresolved', message: 'Retry or dismiss the existing failed tag first.' };
             for (let index = queue.length - 1; index >= 0; index--) {
                 const other = intents.get(queue[index]);
                 if (other.key === tag.key) {
@@ -272,7 +297,7 @@
                     break;
                 }
             }
-            const satisfied = input.kind === 'favorite.set' ? model.favorite === input.value : (input.kind === 'tag.add') === model.tag_items.some(item => item.key === tag.key);
+            const satisfied = input.kind === 'rename.set' ? tag.name === String(model.display_filename || model.filename || '').split('/').pop().split('\\').pop() : input.kind === 'favorite.set' ? model.favorite === input.value : (input.kind === 'tag.add') === model.tag_items.some(item => item.key === tag.key);
             if (satisfied) return { accepted: true, intentId: null, settled: true };
             const unresolved = Array.from(intents.values()).filter(intent => intent.status !== 'confirmed' && intent.status !== 'resolved');
             if (unresolved.filter(intent => queueKey(intent) === domainKey).length >= 32 || unresolved.length >= 128) return { accepted: false, reason: 'limit', message: 'Too many pending edits. Resolve existing edits before adding more.' };
@@ -306,7 +331,7 @@
                     if (!recoveryOptions.automatic && !recoveryOptions.replay) await checkState(intent, capturedEpoch);
                     if (capturedEpoch !== epoch || intent.attempt !== attempt || !intents.has(id) || !state.isAvailable(intent.targetId)) return false;
                     const current = state.writer.confirmed(intent.targetId);
-                    if (current && BigInt(current[descriptor(intent).revision]) > BigInt(intent.attempt.body.expected_revision)) intent.safeToResolve = true;
+                    if (intent.kind !== 'rename.set' && current && BigInt(current[descriptor(intent).revision]) > BigInt(intent.attempt.body.expected_revision)) intent.safeToResolve = true;
                     if (recoveryOptions.replay && !reply.body?.final && now() + timeOffset - Number(intent.attempt.body.client_mutation_id.split('-')[0]) <= 86400000) {
                         update(intent, { status: 'sending', message: 'Checking the original save…', delayed: false });
                         armWait(intent);
@@ -324,7 +349,7 @@
             if (!intent || intent.status === 'sending') return false;
             if (intent.status === 'unconfirmed') {
                 const current = state.writer.confirmed(intent.targetId);
-                if (!intent.safeToResolve && !(current && BigInt(current[descriptor(intent).revision]) > BigInt(intent.attempt.body.expected_revision))) return false;
+                if (!intent.safeToResolve && !(intent.kind !== 'rename.set' && current && BigInt(current[descriptor(intent).revision]) > BigInt(intent.attempt.body.expected_revision))) return false;
             }
             release(intent);
             state.writer.remove(id);
@@ -361,7 +386,13 @@
                 update(intent, { message: `Checking current ${descriptor(intent).noun} before retrying…` });
                 checkState(intent, capturedEpoch).then(checked => {
                     intent.checking = false;
-                    if (checked && capturedEpoch === epoch && intents.has(id)) enqueue();
+                    if (checked && capturedEpoch === epoch && intents.has(id)) {
+                        const current = state.writer.confirmed(intent.targetId);
+                        if (intent.kind === 'rename.set' && (!current?.filename || current.permissions?.rename === false || (current.status !== undefined && current.status !== 'finished'))) {
+                            release(intent);
+                            update(intent, { status: 'rejected', message: 'Only finished files can be renamed. The requested name is retained.' });
+                        } else enqueue();
+                    }
                 }).catch(() => {
                     intent.checking = false;
                     if (capturedEpoch === epoch && intents.has(id)) update(intent, { message: `Could not check current ${descriptor(intent).noun}. Try checking again.` });

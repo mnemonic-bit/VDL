@@ -1,7 +1,7 @@
 # Immediate feedback and safe recovery for rename
 
 **Source:** Remaining Feature 0051 rollout item\
-**Status:** Proposed; not implemented\
+**Status:** Implemented in 0.56.0\
 **Last refined:** 2026-11-08\
 **Extends:** [Feature 0051](feature-0051-immediate-feedback-for-server-backed-interactions.md)\
 **Rollout:** [Shared requirements and inventory](../ARCHITECTURE/feature-0051-rollout.md#shared-requirements-for-the-remaining-specs)
@@ -65,6 +65,50 @@ operation ID with server-owned recovery status. Receipt lookup and deliberate
 same-attempt replay resume or report that operation rather than moving a file
 again. Recheck current authorization; expose no raw recovery paths to the UI.
 Deletion, access loss, and auth epochs fence stale acknowledgements.
+
+## Adapter contract
+
+The trusted action is `rename.set`, with a requested basename and an independent
+`(entry ID, rename)` conflict domain. Existing visibility and finished-file
+requirements remain authoritative. The UI projects only presentation text;
+confirmed `filename` and `display_filename` remain the source of file identity.
+Tags and favorites use their own independent queues.
+
+`POST /api/rename/<id>` retains the legacy `{filename: string}` request and
+basename response. Adopted requests add `client_mutation_id` and decimal-string
+`expected_revision`. Their canonical responses carry `id`, the stored
+`filename`, nullable `display_filename`, decimal-string `rename_revision`, and
+`mutation: {id, domain: "rename", outcome, revision}`. Collection and targeted
+editable-state serializers expose the same versioned identity. A legacy write
+also advances the rename revision when either identity field changes.
+
+Filesystem work uses a durable journal distinct from the transaction-only tag
+and favorite executor. Before changing the source or destination, it records
+the actor, request fingerprint, source identity, destination, and phase. A
+durable hardlink anchor pins the intended file; destination creation cannot
+overwrite another file. Exclusive source retirement verifies the removed
+directory entry before cleanup, preserving an unrelated replacement at the old
+name. Journal phases and directory synchronization allow
+restart recovery before and after each filesystem boundary. Canonical database
+publication and the final receipt share a transaction. A separate file-operation
+lock serializes rename and removal, including aliases, without holding the
+SQLite write lock across filesystem work. Ambiguous identity remains an
+unresolved operation requiring intervention rather than an invented success.
+
+Startup recovery and authorized receipt lookup/replay resume or report the
+original journaled operation. Current authorization is rechecked at execution
+and recovery; active journals retain their admission records regardless of the
+ordinary terminal-receipt expiry. Recovery status exposes no raw journal paths.
+The shared coordinator never automatically replays a mutation. Deliberate replay
+uses the original frozen payload and mutation ID; conflict retry is a new
+attempt after an authorized current-state read.
+
+Physical recovery requires filesystem hardlinks, durable directory
+synchronization, and exclusive atomic source retirement. The Linux native and
+container path uses `renameat2(RENAME_NOREPLACE)`. If those facilities are
+unavailable, the server retains an explicit unresolved operation rather than
+falling back to an unsafe move. Display-only renames retain their existing
+stored media path.
 
 ## Acceptance criteria
 

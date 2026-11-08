@@ -44,10 +44,15 @@ def test_reset():
     for row in vdl.db_list_downloads():
         if row["status"] in ("starting", "downloading", "paused"):
             vdl.request_cancel(row["id"])
-    with vdl._db_lock, vdl.db() as connection:
+    with vdl._file_operation_lock, vdl._db_lock, vdl.db() as connection:
         connection.execute("DELETE FROM playlists")
         connection.execute("DELETE FROM downloads")
         connection.execute("DELETE FROM download_attempts")
+        # A reset represents a new isolated database, including identities and
+        # recovery records that production deliberately retains after deletion.
+        connection.execute("DELETE FROM retired_download_ids")
+        connection.execute("DELETE FROM mutation_receipts")
+        connection.execute("DELETE FROM rename_operations")
         connection.execute("DELETE FROM preferences")
     with vdl._cancel_lock:
         vdl._cancel_flags.clear()
