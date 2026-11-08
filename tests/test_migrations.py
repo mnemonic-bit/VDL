@@ -87,7 +87,7 @@ class SchemaMigrationTest(unittest.TestCase):
                     "visibility", "browser_authenticated",
                     "extension_request_id",
                     "duration_seconds", "media_metadata_probed",
-                    "display_filename", "ingest_source_path",
+                    "display_filename", "ingest_source_path", "tags_revision",
                 })
                 self.assertTrue({
                     "tags", "download_tags", "app_config", "roles", "users",

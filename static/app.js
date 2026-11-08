@@ -21,6 +21,7 @@ const collectionSnapshots = { library: [], current: [] };
 let libraryOrder = { kind: 'library', generation_id: null, created_at: null, expires_at: null };
 let libraryRequestEpoch = 0;
 let allLibraryEntries = [];
+let tagSessionEpoch = 0;
 
 function invalidateLibraryOrder() {
     // A hint or save supersedes reads that started before the new server state.
@@ -124,6 +125,29 @@ function patchRenderedNode(node, before, after) {
         } else {
             node.setAttribute(attr.name, attr.value);
         }
+    }
+    if (after.classList.contains('tag-token-input')) {
+        // Tag identity retains both chip and input nodes as queued chips settle.
+        const key = child => child.nodeType === Node.ELEMENT_NODE
+            ? child.matches('.tag-entry-input') ? 'input' : child.dataset.tagKey
+            : null;
+        const oldByKey = new Map([...before.children].map(child => [key(child), child]));
+        const liveByKey = new Map([...node.children].map(child => [key(child), child]));
+        const nextKeys = new Set([...after.children].map(key));
+        for (const child of [...node.childNodes]) {
+            if (!key(child) || !nextKeys.has(key(child))) child.remove();
+        }
+        [...after.children].forEach((next, index) => {
+            const identity = key(next);
+            let live = liveByKey.get(identity);
+            const previous = oldByKey.get(identity);
+            if (live && previous) patchRenderedNode(live, previous, next);
+            else live = next.cloneNode(true);
+            if (node.children[index] !== live) node.insertBefore(live, node.children[index] || null);
+            liveByKey.delete(identity);
+        });
+        for (const live of liveByKey.values()) live.remove();
+        return;
     }
     const oldChildren = [...before.childNodes];
     const newChildren = [...after.childNodes];
@@ -481,12 +505,16 @@ function hideServerStatus(source = 'events') {
 }
 
 async function apiFetch(url, options) {
+    const authEpoch = tagSessionEpoch;
     const safeRead = (options?.method || 'GET').toUpperCase() === 'GET';
     try {
         for (let retry = 0; ; retry++) {
+            if (authEpoch !== tagSessionEpoch) throw new DOMException('Session changed', 'AbortError');
             options?.signal?.throwIfAborted();
             const res = await fetch(url, options);
+            if (authEpoch !== tagSessionEpoch) throw new DOMException('Session changed', 'AbortError');
             if (res.status === 401) {
+                resetTagSession();
                 resetPlayerListening();
                 window.location.assign('/login');
                 throw Object.assign(new Error('Your session has ended. Sign in again.'), { retryable: false, status: 401 });
@@ -978,14 +1006,21 @@ function fetchLibraryStorage() {
 
 const storageAccountChannel = typeof BroadcastChannel === 'function'
     ? new BroadcastChannel('vdl-account') : null;
-if (storageAccountChannel) storageAccountChannel.onmessage = clearLibraryStorage;
+if (storageAccountChannel) storageAccountChannel.onmessage = () => {
+    clearLibraryStorage();
+    resetTagSession();
+};
 document.querySelector('form.logout-form')?.addEventListener('submit', () => {
     clearLibraryStorage();
     storageAccountChannel?.postMessage('signed-out');
 });
 window.addEventListener('pagehide', clearLibraryStorage);
 window.addEventListener('pageshow', event => {
-    if (event.persisted) fetchLibraryStorage();
+    if (event.persisted) {
+        fetchLibraryStorage();
+        fetchHistory();
+        loadTagCapabilities();
+    }
 });
 
 setInterval(() => {
@@ -1275,10 +1310,170 @@ let availableTags = [];
 let searchTerms = [];
 const editingTagIds = new Set();
 const tagDrafts = new Map();
-const pendingTagCommits = new Set();
+const pendingTagCommits = new Map();
+const tagEditorTokens = new Map();
+const tagEditPositions = new Map();
+const unavailableTagIds = new Set();
+const checkingTagAvailability = new Set();
+const submittedTagIntents = new Set();
+const recoveredTagIntents = new Set();
+let tagCapabilities = null;
+let tagRenderScheduled = false;
+let acceptingTagSnapshots = false;
+const tagMutationMetrics = {
+    submissions: 0, acknowledgements: 0, unconfirmedOutcomes: 0, conflicts: 0,
+    latestLocalFeedbackMs: null, latestAcknowledgementMs: null, reconciliationReads: 0,
+    pending: 0, unconfirmed: 0, conflicted: 0,
+};
+VDL.tagMutationMetrics = () => Object.freeze({ ...tagMutationMetrics });
+const tagState = VDL.createClientState();
+const tagMutations = VDL.createMutations({
+    state: tagState,
+    transport: async ({ url, method, body }) => {
+        const response = await apiFetch(url, {
+            method,
+            ...(body === undefined ? {} : {
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+            }),
+        });
+        return { status: response.status, body: await response.json().catch(() => null) };
+    },
+    onEvent: event => {
+        if (event.outcome === 'presented') tagMutationMetrics.submissions++;
+        if (event.outcome === 'confirmed') {
+            tagMutationMetrics.acknowledgements++;
+            tagMutationMetrics.latestAcknowledgementMs = event.elapsedMs;
+        }
+        if (event.outcome === 'unconfirmed') tagMutationMetrics.unconfirmedOutcomes++;
+        if (event.outcome === 'conflicted') tagMutationMetrics.conflicts++;
+        tagMutationMetrics.pending = event.pending;
+        tagMutationMetrics.unconfirmed = event.unconfirmed;
+        tagMutationMetrics.conflicted = event.conflicted;
+    },
+    onAuthLoss: resetTagSession,
+    onNotice: ({ message }) => announceTagStatus(message),
+});
+
+function resetTagSession() {
+    tagSessionEpoch += 1;
+    tagMutations.reset();
+    tagDrafts.clear();
+    editingTagIds.clear();
+    tagEditorTokens.clear();
+    tagEditPositions.clear();
+    pendingTagCommits.clear();
+    unavailableTagIds.clear();
+    submittedTagIntents.clear();
+    recoveredTagIntents.clear();
+    checkingTagAvailability.clear();
+    announceTagStatus('');
+    updateTagMutationSummary();
+    collectionSnapshots.library = [];
+    collectionSnapshots.current = [];
+    allLibraryEntries = [];
+    availableTags = [];
+    closeHistoryInfo();
+}
+
+function announceTagStatus(message) {
+    for (const id of ['tagMutationStatus', 'currentTagMutationStatus']) {
+        const status = document.getElementById(id);
+        if (status && status.textContent !== message) status.textContent = message;
+    }
+}
+
+function updateTagMutationSummary() {
+    for (const intentId of submittedTagIntents) {
+        if (tagMutations.status(intentId) !== null) continue;
+        submittedTagIntents.delete(intentId);
+        recoveredTagIntents.delete(intentId);
+    }
+    const intents = tagMutations.pending();
+    tagMutationMetrics.pending = intents.filter(intent => ['queued', 'sending', 'unconfirmed', 'conflicted'].includes(intent.status)).length;
+    tagMutationMetrics.unconfirmed = intents.filter(intent => intent.status === 'unconfirmed').length;
+    tagMutationMetrics.conflicted = intents.filter(intent => intent.status === 'conflicted').length;
+    const groups = [
+        [['queued', 'sending'], 'saving'],
+        [['unconfirmed'], 'not confirmed'],
+        [['conflicted'], 'in conflict'],
+        [['rejected'], 'needing correction'],
+    ];
+    const parts = groups.map(([states, description]) => {
+        const count = intents.filter(intent => states.includes(intent.status)).length;
+        return count ? `${count} tag ${count === 1 ? 'edit' : 'edits'} ${description}` : '';
+    }).filter(Boolean);
+    if (pendingTagCommits.size) parts.push(`${pendingTagCommits.size} tag requests awaiting confirmation`);
+    for (const id of ['tagMutationSummary', 'currentTagMutationSummary']) {
+        const summary = document.getElementById(id);
+        if (!summary) continue;
+        summary.hidden = !parts.length;
+        summary.textContent = parts.length ? `${parts.join('. ')}. Open the entry’s tags for details.` : '';
+    }
+}
+
+function projectTagEntry(info) {
+    const projected = tagState.selectDownload(String(info.id));
+    if (!projected) return info;
+    return { ...info, tags: projected.tags, tag_items: projected.tag_items,
+        tags_revision: projected.tags_revision, tag_chips: projected.tag_chips };
+}
+
+function hasTagProtocol() {
+    return tagCapabilities?.mutation_protocol === 1
+        && tagCapabilities.tag_identity_version === VDL.tagIdentity.version;
+}
+
+async function loadTagCapabilities() {
+    const epoch = tagSessionEpoch;
+    try {
+        const response = await apiFetch('/api/client-capabilities');
+        if (!response.ok) return;
+        const capabilities = await response.json();
+        if (epoch !== tagSessionEpoch) return;
+        tagCapabilities = capabilities;
+        tagMutations.setCapabilities(tagCapabilities);
+    } catch (_) {
+        // Older deployments retain the legacy contract until a page reload.
+    }
+}
+
+tagState.subscribe(ids => {
+    for (const id of ids) {
+        if (tagState.selectDownload(id) !== null) continue;
+        unavailableTagIds.add(String(id));
+        for (const key of ['library', 'current']) {
+            collectionSnapshots[key] = collectionSnapshots[key].filter(info => String(info.id) !== String(id));
+        }
+        allLibraryEntries = allLibraryEntries.filter(info => String(info.id) !== String(id));
+        editingTagIds.delete(String(id));
+        tagDrafts.delete(String(id));
+        tagEditPositions.delete(String(id));
+        if (String(openInfoId) === String(id)) closeHistoryInfo();
+    }
+    if (acceptingTagSnapshots || tagRenderScheduled) return;
+    tagRenderScheduled = true;
+    queueMicrotask(() => {
+        tagRenderScheduled = false;
+        renderDownloadCollections();
+        const statuses = ids.flatMap(id => tagState.selectDownload(id)?.tag_chips || [])
+            .filter(chip => chip.status !== 'confirmed')
+            .map(chip => chip.message || `${chip.operation === 'tag.remove' ? 'Removing' : 'Saving'} tag ${chip.name}`);
+        if (statuses.length) announceTagStatus(statuses.join('. '));
+    });
+});
+
+window.addEventListener('beforeunload', event => {
+    if (!tagMutations.hasPending() && ![...tagDrafts.values()].some(value => value.trim())) return;
+    event.preventDefault();
+    event.returnValue = '';
+});
+document.querySelector('form.logout-form')?.addEventListener('submit', resetTagSession);
+window.addEventListener('pagehide', resetTagSession);
 
 function tagSearchKey(value) {
-    return String(value || '').toLocaleLowerCase();
+    try { return VDL.tagIdentity.normalize(String(value || '')).key; }
+    catch (_) { return String(value || '').toLowerCase(); }
 }
 
 function sortTags(tags) {
@@ -1289,7 +1484,8 @@ function sortTags(tags) {
 function refreshAvailableTags(rows) {
     const names = new Set();
     rows.forEach(row => {
-        (Array.isArray(row.tags) ? row.tags : []).forEach(tag => names.add(tag));
+        const confirmed = tagState.writer.confirmed(String(row.id));
+        (Array.isArray(confirmed?.tags) ? confirmed.tags : (row.tags || [])).forEach(tag => names.add(tag));
     });
     availableTags = sortTags(Array.from(names));
 }
@@ -1689,112 +1885,154 @@ historySearchInput.addEventListener('blur', () => {
     }, 0);
 });
 
-function tagChipHtml(tag, removable) {
-    if (!removable) return `<span class="tag-chip">${escapeHtml(tag)}</span>`;
-    return `<span class="tag-chip tag-chip-editing">${escapeHtml(tag)}<button type="button" class="tag-remove" data-remove-tag="${escapeAttr(tag)}" aria-label="Remove ${escapeAttr(tag)}">×</button></span>`;
+function tagChipHtml(chip, removable) {
+    if (typeof chip === 'string') chip = { key: tagSearchKey(chip), name: chip, status: 'confirmed' };
+    const { name, key, status = 'confirmed', intentId } = chip;
+    const pending = ['queued', 'sending', 'unconfirmed'].includes(status);
+    const failed = ['rejected', 'conflicted', 'unconfirmed'].includes(status);
+    const slot = pending && !failed
+        ? '<span class="tag-status-slot"><span class="options-spinner tag-spinner" aria-hidden="true"></span></span>'
+        : failed
+            ? `<span class="tag-status-slot" aria-label="${escapeAttr(chip.message || 'Save not confirmed')}">!</span>`
+            : removable
+                ? `<button type="button" class="tag-remove tag-status-slot" data-remove-tag="${escapeAttr(name)}" aria-label="Remove ${escapeAttr(name)}">×</button>`
+                : '';
+    return `<span class="tag-chip${removable || pending || failed ? ' tag-chip-editing' : ''}${chip.operation === 'tag.remove' && pending ? ' tag-chip-removing' : ''}${failed ? ' tag-chip-failed' : ''}" data-tag-key="${escapeAttr(key)}" data-tag-state="${escapeAttr(status)}"${intentId ? ` data-tag-intent="${escapeAttr(intentId)}"` : ''}><span class="tag-chip-label">${escapeHtml(name)}</span>${slot}</span>`;
+}
+
+function tagMessagesHtml(chips) {
+    return chips.filter(chip => chip.intentId && (chip.delayed || ['queued', 'rejected', 'conflicted', 'unconfirmed'].includes(chip.status)))
+        .map(chip => {
+            const unknown = chip.status === 'unconfirmed';
+            const failed = ['rejected', 'conflicted'].includes(chip.status);
+            const message = chip.message || (unknown ? 'Save not confirmed' : failed ? 'Could not save tag' : chip.status === 'queued' ? 'Waiting to save' : 'Still saving tag');
+            const action = (label, name) => `<button type="button" data-tag-action="${name}" data-intent-id="${escapeAttr(chip.intentId)}">${label}</button>`;
+            return `<div class="tag-mutation-message"><span>${escapeHtml(chip.name)}: ${escapeHtml(message)}</span>${unknown ? action('Check save', 'check') + action('Recover save', 'recover') + action('Use current tags', 'dismiss') : failed ? action('Retry', 'retry') + (chip.operation === 'tag.add' ? action('Edit', 'edit') : '') + action('Dismiss', 'dismiss') : chip.status === 'queued' ? action('Discard queued edit', 'dismiss') : ''}</div>`;
+        }).join('');
 }
 
 function tagSuggestionsHtml(info, draft) {
-    const attached = new Set(Array.isArray(info.tags) ? info.tags : []);
+    const attached = new Set((info.tags || []).map(tagSearchKey));
     const query = tagSearchKey(draft.trim());
     return availableTags
-        .filter(tag => !attached.has(tag) && (!query || tagSearchKey(tag).includes(query)))
+        .filter(tag => !attached.has(tagSearchKey(tag)) && (!query || tagSearchKey(tag).includes(query)))
         .map(tag => `<button type="button" class="tag-suggestion" data-suggest-tag="${escapeAttr(tag)}" role="option">${escapeHtml(tag)}</button>`)
         .join('');
 }
 
 function renderTagControl(info) {
+    info = projectTagEntry(info);
     const id = String(info.id);
-    const tags = Array.isArray(info.tags) ? info.tags : [];
+    const chips = info.tag_chips || (info.tags || []).map(name => ({ key: tagSearchKey(name), name, status: 'confirmed' }));
+    const messages = tagMessagesHtml(chips);
+    const compatibility = pendingTagCommits.get(id);
+    const saving = compatibility ? `<div class="tag-mutation-message">${escapeHtml(compatibility)}</div>` : '';
     if (!editingTagIds.has(id)) {
-        const contents = tags.length
-            ? tags.map(tag => tagChipHtml(tag, false)).join('')
+        const contents = chips.length
+            ? chips.map(chip => tagChipHtml(chip, false)).join('')
             : '<span class="add-tag-affordance">Add tags</span>';
-        return `<div class="tag-row tag-display-row" data-tag-id="${escapeAttr(id)}" data-mode="display" role="button" tabindex="0" aria-label="Edit tags">${contents}</div>`;
+        return `<div class="tag-display-wrap" data-tag-id="${escapeAttr(id)}"><div class="tag-row tag-display-row" data-tag-id="${escapeAttr(id)}" data-mode="display" role="button" tabindex="0" aria-label="Edit tags">${contents}</div>${messages}${saving}</div>`;
     }
-
     const draft = tagDrafts.get(id) || '';
     const suggestions = tagSuggestionsHtml(info, draft);
     return `<div class="tag-editor-shell" data-tag-id="${escapeAttr(id)}">
                 <div class="tag-token-input">
-                    ${tags.map(tag => tagChipHtml(tag, true)).join('')}
-                    <input class="tag-entry-input" type="text" maxlength="64" value="${escapeAttr(draft)}" autocomplete="off" aria-label="Add tags" aria-expanded="${suggestions ? 'true' : 'false'}">
+                    ${chips.map(chip => tagChipHtml(chip, true)).join('')}
+                    <input class="tag-entry-input" type="text" value="${escapeAttr(draft)}" autocomplete="off" aria-label="Add tags" aria-expanded="${suggestions ? 'true' : 'false'}">
                 </div>
                 <div class="tag-suggestions tag-entry-suggestions" role="listbox"${suggestions ? '' : ' hidden'}>${suggestions}</div>
+                ${messages}${saving}
             </div>`;
 }
 
 function tagEditStart(id) {
-    editingTagIds.add(String(id));
-    tagDrafts.set(String(id), '');
-    fetchHistory().then(() => {
-        const input = document.querySelector(`.tag-editor-shell[data-tag-id="${CSS.escape(String(id))}"] .tag-entry-input`);
-        if (input) input.focus();
-    });
+    id = String(id);
+    editingTagIds.add(id);
+    tagEditorTokens.set(id, {});
+    tagDrafts.set(id, '');
+    tagEditPositions.set(id, historyPageItems.findIndex(info => String(info.id) === id));
+    tagState.beginEdit(id);
+    renderDownloadCollections();
+    document.querySelector(`.tag-editor-shell[data-tag-id="${CSS.escape(id)}"] .tag-entry-input`)?.focus();
 }
 
 function tagEditStop(id) {
-    editingTagIds.delete(String(id));
-    tagDrafts.delete(String(id));
-    fetchHistory();
-}
-
-function mutateDownloadTag(id, tag, method) {
-    return apiAction('/api/tags/' + encodeURIComponent(id), {
-        method,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tag }),
-    }).then(() => true).catch(() => false);
+    id = String(id);
+    editingTagIds.delete(id);
+    tagEditorTokens.delete(id);
+    tagDrafts.delete(id);
+    tagEditPositions.delete(id);
+    tagState.endEdit(id);
+    renderDownloadCollections();
+    resumeDeferredHistoryFetch();
 }
 
 function tagCommit(id, explicitTag) {
+    const startedAt = performance.now();
     const tagId = String(id);
     const input = document.querySelector(`.tag-editor-shell[data-tag-id="${CSS.escape(tagId)}"] .tag-entry-input`);
     const tag = explicitTag === undefined ? ((input && input.value) || '') : explicitTag;
     if (!tag.trim()) return;
-    if (pendingTagCommits.has(tagId)) return;
-
-    const draftBeforeCommit = (input && input.value) || '';
-    pendingTagCommits.add(tagId);
-    tagDrafts.set(tagId, '');
-    if (input) {
-        // Clear the live field before the API can publish an SSE change. Any
-        // reconciliation that wins the race now captures the intended empty
-        // draft instead of resurrecting the text that became a chip.
-        input.value = '';
-        input.dispatchEvent(new Event('input'));
+    if (!hasTagProtocol()) {
+        compatibilityTagMutation(tagId, tag, 'POST', input);
+        return;
     }
+    const result = tagMutations.submit({ kind: 'tag.add', targetId: tagId, value: tag, viewToken: tagEditorTokens.get(tagId) });
+    if (!result.accepted) {
+        announceTagStatus(result.message || 'Could not submit tag');
+        showActionError(result.message || 'Could not submit tag');
+        return;
+    }
+    if (result.intentId) submittedTagIntents.add(result.intentId);
+    // Transfer the submitted draft before any render can capture the live input.
+    tagDrafts.set(tagId, '');
+    if (input) input.value = '';
+    renderDownloadCollections();
+    announceTagStatus(`Saving tag ${tag}`);
+    tagMutationMetrics.latestLocalFeedbackMs = Math.max(0, performance.now() - startedAt);
+}
 
-    mutateDownloadTag(id, tag, 'POST')
-        .then(succeeded => {
-            if (!succeeded) {
-                tagDrafts.set(tagId, draftBeforeCommit);
-                const currentInput = document.querySelector(`.tag-editor-shell[data-tag-id="${CSS.escape(tagId)}"] .tag-entry-input`);
-                if (currentInput) currentInput.value = draftBeforeCommit;
-            }
-            return fetchHistory();
-        })
-        .then(() => {
-            const nextInput = document.querySelector(`.tag-editor-shell[data-tag-id="${CSS.escape(tagId)}"] .tag-entry-input`);
-            if (nextInput) nextInput.focus();
-        })
-        .finally(() => pendingTagCommits.delete(tagId));
+function compatibilityTagMutation(id, tag, method, input) {
+    if (pendingTagCommits.has(id)) return;
+    const draft = input?.value;
+    const token = tagEditorTokens.get(id);
+    const epoch = tagSessionEpoch;
+    pendingTagCommits.set(id, `${method === 'POST' ? 'Saving' : 'Removing'} tag ${tag}…`);
+    renderDownloadCollections();
+    apiFetch('/api/tags/' + encodeURIComponent(id), {
+        method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ tag }),
+    }).then(async response => {
+        const data = await response.json();
+        if (epoch !== tagSessionEpoch) return;
+        if (!response.ok) throw new Error(data.error || 'Save not confirmed');
+        if (token === tagEditorTokens.get(id) && tagDrafts.get(id) === draft && method === 'POST') {
+            tagDrafts.set(id, '');
+            const current = document.querySelector(`.tag-editor-shell[data-tag-id="${CSS.escape(id)}"] .tag-entry-input`);
+            if (current) current.value = '';
+        }
+        pendingTagCommits.delete(id);
+        return fetchHistory();
+    }).catch(() => {
+        if (epoch !== tagSessionEpoch) return;
+        pendingTagCommits.set(id, 'Save not confirmed. Refresh to check the current tags before trying again.');
+        renderDownloadCollections();
+    });
 }
 
 function tagRemove(id, tag) {
-    mutateDownloadTag(id, tag, 'DELETE')
-        .then(() => fetchHistory())
-        .then(() => {
-            const input = document.querySelector(`.tag-editor-shell[data-tag-id="${CSS.escape(String(id))}"] .tag-entry-input`);
-            if (input) input.focus();
-        });
+    if (!hasTagProtocol()) return compatibilityTagMutation(String(id), tag, 'DELETE');
+    const result = tagMutations.submit({ kind: 'tag.remove', targetId: String(id), value: tag, viewToken: tagEditorTokens.get(String(id)) });
+    if (!result.accepted) announceTagStatus(result.message || 'Could not remove tag');
+    else if (result.intentId) submittedTagIntents.add(result.intentId);
+    renderDownloadCollections();
 }
 
 function bindTagEditors() {
     document.querySelectorAll('.tag-display-row').forEach(row => {
         if (row.dataset.tagDisplayBound) return;
         row.dataset.tagDisplayBound = '1';
-        row.addEventListener('click', () => {
+        row.addEventListener('click', event => {
+            event.stopPropagation();
             if (row.classList.contains('tag-display-row')) tagEditStart(row.dataset.tagId);
         });
         row.addEventListener('keydown', event => {
@@ -1805,18 +2043,16 @@ function bindTagEditors() {
             }
         });
     });
-    document.querySelectorAll('.tag-editor-shell').forEach(shell => {
+    document.querySelectorAll('.tag-editor-shell, .tag-display-wrap').forEach(shell => {
         if (shell.dataset.tagEditorBound) return;
         shell.dataset.tagEditorBound = '1';
         const id = shell.dataset.tagId;
-        // Children change as chips and suggestions arrive; bind at the shell
-        // so retained editors always act on their current input and buttons.
         shell.addEventListener('input', event => {
             if (!event.target.matches('.tag-entry-input')) return;
             const input = event.target;
             tagDrafts.set(id, input.value);
             const suggestions = shell.querySelector('.tag-entry-suggestions');
-            const info = { tags: Array.from(shell.querySelectorAll('[data-remove-tag]')).map(button => button.dataset.removeTag) };
+            const info = tagState.selectDownload(id) || { tags: [] };
             const html = tagSuggestionsHtml(info, input.value);
             suggestions.innerHTML = html;
             suggestions.hidden = !html;
@@ -1828,11 +2064,13 @@ function bindTagEditors() {
                 event.preventDefault();
                 tagCommit(id);
             } else if (event.key === 'Backspace' && !event.target.value) {
-                const buttons = shell.querySelectorAll('[data-remove-tag]');
-                const last = buttons[buttons.length - 1];
+                const chips = shell.querySelectorAll('.tag-token-input > .tag-chip');
+                const last = chips[chips.length - 1];
                 if (last) {
                     event.preventDefault();
-                    tagRemove(id, last.dataset.removeTag);
+                    const remove = last.querySelector('[data-remove-tag]');
+                    if (remove) tagRemove(id, remove.dataset.removeTag);
+                    else announceTagStatus(`Tag ${last.querySelector('.tag-chip-label').textContent} is pending. Wait for confirmation.`);
                 }
             } else if (event.key === 'Escape') {
                 event.preventDefault();
@@ -1843,24 +2081,47 @@ function bindTagEditors() {
         shell.addEventListener('focusout', event => {
             const input = event.target;
             if (!input.matches('.tag-entry-input')) return;
+            const token = tagEditorTokens.get(id);
             setTimeout(() => {
-                // Reconciliation can remove an input while retaining its shell.
-                // A stale blur must not close a newly opened editing session.
-                if (!shell.isConnected || !input.isConnected) return;
+                if (!shell.isConnected || !input.isConnected || token !== tagEditorTokens.get(id)) return;
                 if (!shell.contains(document.activeElement)) tagEditStop(id);
             }, 0);
         });
         shell.addEventListener('mousedown', event => {
-            if (event.target.closest('[data-remove-tag], [data-suggest-tag]')) event.preventDefault();
+            if (event.target.closest('[data-remove-tag], [data-suggest-tag], [data-tag-action]')) event.preventDefault();
         });
         shell.addEventListener('click', event => {
+            const action = event.target.closest('[data-tag-action]');
             const remove = event.target.closest('[data-remove-tag]');
             const suggestion = event.target.closest('[data-suggest-tag]');
-            if (remove || suggestion) {
+            if (action) {
+                event.stopPropagation();
+                const intentId = action.dataset.intentId;
+                if (action.dataset.tagAction === 'check') tagMutations.recover(intentId);
+                else if (action.dataset.tagAction === 'recover') tagMutations.recover(intentId, { replay: true });
+                else if (action.dataset.tagAction === 'retry') tagMutations.retry(intentId);
+                else if (action.dataset.tagAction === 'dismiss') {
+                    if (!tagMutations.resolve(intentId)) announceTagStatus('The original save may still complete. Check its status before using the current tags.');
+                }
+                else if (action.dataset.tagAction === 'edit') {
+                    const chip = tagState.selectDownload(id)?.tag_chips.find(chip => chip.intentId === intentId);
+                    if (!chip) return;
+                    if (tagDrafts.get(id)) {
+                        announceTagStatus('Finish or clear your current draft before editing this failed tag.');
+                        return;
+                    }
+                    if (!editingTagIds.has(id)) tagEditStart(id);
+                    tagMutations.resolve(intentId);
+                    tagDrafts.set(id, chip.name);
+                    renderDownloadCollections();
+                    const input = document.querySelector(`.tag-editor-shell[data-tag-id="${CSS.escape(id)}"] .tag-entry-input`);
+                    if (input) { input.value = chip.name; input.focus(); }
+                }
+            } else if (remove || suggestion) {
                 event.stopPropagation();
                 if (remove) tagRemove(id, remove.dataset.removeTag);
                 else tagCommit(id, suggestion.dataset.suggestTag);
-            } else if (!event.target.closest('button')) {
+            } else if (!event.target.closest('button') && shell.matches('.tag-editor-shell')) {
                 shell.querySelector('.tag-entry-input')?.focus();
             }
         });
@@ -4142,13 +4403,62 @@ function fetchHistory({ sortFavorites = false } = {}) {
     return Promise.all([fetchDownloadCollection('library'), fetchDownloadCollection('current')]);
 }
 
+async function checkTagAvailability(id, { authoritative = false } = {}) {
+    if (checkingTagAvailability.has(id)) return;
+    checkingTagAvailability.add(id);
+    const epoch = tagSessionEpoch;
+    const context = tagState.capture();
+    try {
+        const response = await apiFetch(`/api/downloads/${encodeURIComponent(id)}/editable-state`);
+        if (epoch !== tagSessionEpoch) return;
+        if ([403, 404].includes(response.status)) tagMutations.fence(id);
+        else if (response.ok) {
+            const snapshot = await response.json();
+            if (epoch !== tagSessionEpoch) return;
+            if (tagState.acceptDownload(snapshot, { ...context, authoritative })) {
+                unavailableTagIds.delete(id);
+            }
+        }
+    } catch (_) { /* Absence from a collection alone does not establish deletion. */ }
+    finally { checkingTagAvailability.delete(id); }
+}
+
+function checkMissingTagTargets(previous, next) {
+    const present = new Set(next.map(info => String(info.id)));
+    for (const id of present) {
+        // Collection membership can suggest restored access; only a fresh,
+        // authorized targeted read may lift an existing availability fence.
+        if (unavailableTagIds.has(id)) checkTagAvailability(id, { authoritative: true });
+    }
+    for (const entry of previous) {
+        const id = String(entry.id);
+        if (present.has(id)) continue;
+        const model = tagState.selectDownload(id);
+        if (!model?.tag_chips.some(chip => chip.status !== 'confirmed') && !editingTagIds.has(id)) continue;
+        checkTagAvailability(id);
+    }
+}
+
+function recoverUnconfirmedTags() {
+    for (const intentId of submittedTagIntents) {
+        if (recoveredTagIntents.has(intentId)) continue;
+        if (tagMutations.status(intentId)?.status !== 'unconfirmed') continue;
+        recoveredTagIntents.add(intentId);
+        tagMutations.recover(intentId);
+    }
+}
+
 function fetchDownloadCollection(key) {
     return coordinateRefresh(key, async () => {
         const requestEpoch = libraryRequestEpoch;
+        const authEpoch = tagSessionEpoch;
+        const tagContext = tagState.capture();
+        tagMutationMetrics.reconciliationReads++;
         try {
             const snapshot = await readCollection(key === 'library'
                 ? '/api/library?include_order=true' : '/api/current-downloads', { ordered: key === 'library' });
-            if (key === 'library' && requestEpoch !== libraryRequestEpoch) return;
+            if (authEpoch !== tagSessionEpoch || (key === 'library' && requestEpoch !== libraryRequestEpoch)) return;
+            const previousEntries = collectionSnapshots[key];
             const data = key === 'library' ? snapshot.items : snapshot;
             if (key === 'library') {
                 const changed = libraryOrder.kind !== snapshot.order.kind
@@ -4159,7 +4469,7 @@ function fetchDownloadCollection(key) {
                 }
                 const complete = snapshot.order.kind === 'rotation'
                     ? await readCollection('/api/library-catalog') : data;
-                if (requestEpoch !== libraryRequestEpoch) return;
+                if (authEpoch !== tagSessionEpoch || requestEpoch !== libraryRequestEpoch) return;
                 if (changed && (historyRefreshBlocked() || renameDrafts.size || editingTagIds.size)) {
                     historyFetchDeferred = true;
                     return;
@@ -4176,7 +4486,13 @@ function fetchDownloadCollection(key) {
             }
             const removedCurrent = key === 'current' && collectionSnapshots.current.some(
                 previous => !data.some(info => info.id === previous.id));
+            acceptingTagSnapshots = true;
+            try {
+                for (const info of data) tagState.acceptDownload(info, tagContext);
+                if (key === 'library') for (const info of allLibraryEntries) tagState.acceptDownload(info, tagContext);
+            } finally { acceptingTagSnapshots = false; }
             collectionSnapshots[key] = data;
+            checkMissingTagTargets(previousEntries, data);
             if (key === 'library') libraryLoaded = true;
             else currentLoaded = true;
             updateCollectionError(key);
@@ -4188,7 +4504,7 @@ function fetchDownloadCollection(key) {
                 fetchPlaylists();
             }
         } catch (error) {
-            if (error.name === 'AbortError' || (key === 'library' && requestEpoch !== libraryRequestEpoch)) return;
+            if (authEpoch !== tagSessionEpoch || error.name === 'AbortError' || (key === 'library' && requestEpoch !== libraryRequestEpoch)) return;
             const name = key === 'library' ? 'Library' : 'Current Downloads';
             updateCollectionError(key, `Could not refresh ${name}. ${error.message || 'Try again shortly.'}`);
             if (key === 'current') document.getElementById('currentEmpty').textContent = collectionErrors.get(key);
@@ -4197,8 +4513,9 @@ function fetchDownloadCollection(key) {
 }
 
 function renderDownloadCollections({ sortFavorites = false } = {}) {
+    updateTagMutationSummary();
     updateDurationSearchFeedback();
-    const data = uploadCollectionData();
+    const data = uploadCollectionData().filter(info => !unavailableTagIds.has(String(info.id))).map(projectTagEntry);
     const itemCount = document.getElementById('itemCount');
     itemCount.textContent = `${data.length} ${data.length === 1 ? 'item' : 'items'}`;
     if (historyRefreshBlocked()) {
@@ -4213,7 +4530,7 @@ function renderDownloadCollections({ sortFavorites = false } = {}) {
         const members = new Set(collectionSnapshots.library.map(info => String(info.id)));
         historyEntries = historyEntries.filter(info => members.has(String(info.id)));
     }
-    libraryEntries = libraryOrder.kind === 'rotation' ? allLibraryEntries.slice() : historyEntries.slice();
+    libraryEntries = libraryOrder.kind === 'rotation' ? allLibraryEntries.filter(info => !unavailableTagIds.has(String(info.id))).map(projectTagEntry) : historyEntries.slice();
     renderPlaylists();
     if (libraryOrder.kind === 'rotation') {
         const byId = new Map(historyEntries.map(info => [String(info.id), info]));
@@ -4237,7 +4554,14 @@ function renderDownloadCollections({ sortFavorites = false } = {}) {
     }
     historyOrderIds = historyEntries.map(info => String(info.id));
     refreshAvailableTags(historyEntries);
-    const done = historyEntries.filter(info => matchesSearchFilter(info));
+    const done = historyEntries.filter(info => matchesSearchFilter(info) || editingTagIds.has(String(info.id)));
+    for (const [id, position] of tagEditPositions) {
+        const index = done.findIndex(info => String(info.id) === id);
+        if (index < 0 || position < 0) continue;
+        const [entry] = done.splice(index, 1);
+        const offset = endlessHistoryEnabled() ? 0 : historyPage * historyPageSize;
+        done.splice(Math.min(done.length, offset + position), 0, entry);
+    }
 
     historyTotal = done.length;
     const endless = endlessHistoryEnabled();
@@ -8190,6 +8514,7 @@ function connectEventStream() {
         invalidateLibraryOrder();
         hideServerStatus('events');
         scheduleFetch();
+        recoverUnconfirmedTags();
         scheduleAssetDemand({ reconcile: true, interaction: false });
     });
     es.addEventListener('assets', event => {
@@ -8213,11 +8538,12 @@ function connectEventStream() {
     return es;
 }
 
-window.addEventListener('focus', () => { invalidateLibraryOrder(); scheduleFetch(); });
+window.addEventListener('focus', () => { invalidateLibraryOrder(); scheduleFetch(); recoverUnconfirmedTags(); });
 document.addEventListener('visibilitychange', () => {
     if (!document.hidden) { invalidateLibraryOrder(); scheduleFetch(); }
 });
 
+loadTagCapabilities();
 connectEventStream();
 // A fresh page has no visual order to preserve, so establish favorite-first
 // ordering once. Later reconciliations keep that order until a filter runs.

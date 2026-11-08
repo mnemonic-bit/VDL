@@ -336,7 +336,8 @@ def require_authenticated_user():
 @app.after_request
 def companion_response_headers(response):
     """Apply the narrow CORS and cache boundary to companion responses."""
-    if request.endpoint == 'library_storage':
+    if request.endpoint in ('library_storage', 'client_capabilities',
+                            'editable_download_state', 'mutation_receipt', 'download_tags'):
         response.headers['Cache-Control'] = 'no-store'
     if request.endpoint not in EXTENSION_NO_STORE_ENDPOINTS:
         return response
@@ -812,6 +813,7 @@ def init_db():
             # Existing libraries start unstarred; favorites are an explicit
             # user choice rather than something inferred during migration.
             ("favorite", "ALTER TABLE downloads ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0"),
+            ("tags_revision", "ALTER TABLE downloads ADD COLUMN tags_revision INTEGER NOT NULL DEFAULT 0"),
             # A view is an explicit preview activation. Keeping the counter
             # independent of media requests avoids counting range fetches,
             # downloads, and generated hover previews as watches.
@@ -842,6 +844,47 @@ def init_db():
         ]:
             if col not in existing_cols:
                 conn.execute(ddl)
+        # Attachment triggers include legacy clients, imports and cleanup writers.
+        # Revisions therefore describe stored membership, independent of progress.
+        conn.executescript("""
+            CREATE TRIGGER IF NOT EXISTS download_tag_insert_revision
+            AFTER INSERT ON download_tags BEGIN
+                UPDATE downloads SET tags_revision = tags_revision + 1
+                WHERE id = NEW.download_id;
+            END;
+            CREATE TRIGGER IF NOT EXISTS download_tag_delete_revision
+            AFTER DELETE ON download_tags BEGIN
+                UPDATE downloads SET tags_revision = tags_revision + 1
+                WHERE id = OLD.download_id;
+            END;
+            CREATE TABLE IF NOT EXISTS retired_download_ids (
+                id TEXT PRIMARY KEY
+            );
+            CREATE TRIGGER IF NOT EXISTS retire_download_identity
+            AFTER DELETE ON downloads BEGIN
+                INSERT OR IGNORE INTO retired_download_ids(id) VALUES (OLD.id);
+            END;
+            CREATE TRIGGER IF NOT EXISTS reject_retired_download_identity
+            BEFORE INSERT ON downloads WHEN EXISTS (
+                SELECT 1 FROM retired_download_ids WHERE id = NEW.id
+            ) BEGIN
+                SELECT RAISE(ABORT, 'Download identities cannot be reused');
+            END;
+            CREATE TABLE IF NOT EXISTS mutation_receipts (
+                actor_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                mutation_id TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                status INTEGER NOT NULL,
+                response TEXT NOT NULL,
+                recorded_at REAL NOT NULL,
+                PRIMARY KEY(actor_id, mutation_id)
+            );
+            CREATE INDEX IF NOT EXISTS mutation_receipts_retention
+                ON mutation_receipts(recorded_at);
+            CREATE INDEX IF NOT EXISTS mutation_receipts_admission
+                ON mutation_receipts(actor_id, recorded_at);
+        """)
         conn.execute(
             "UPDATE downloads SET ingest_source_path = ("
             "SELECT source_path FROM ingest_receipts "
@@ -1212,6 +1255,7 @@ def _db_download_tags(conn, download_id):
 
 def db_get_download(download_id):
     with db() as conn:
+        conn.execute("BEGIN")
         row = conn.execute(
             "SELECT downloads.*, "
             "COALESCE(users.username, downloads.owner_username) "
@@ -1226,7 +1270,7 @@ def db_get_download(download_id):
         result = dict(row)
         result["favorite"] = bool(result["favorite"])
         result["quality"] = classify_video_quality(result["resolution"])
-        result["tags"] = _db_download_tags(conn, download_id)
+        result.update(_tag_snapshot(conn, download_id, row))
         return result
 
 
@@ -1327,6 +1371,191 @@ def classify_video_quality(resolution):
 
 
 TAG_MAX_LENGTH = 64
+TAG_IDENTITY_VERSION = 'python-casefold-' + unicodedata.unidata_version + '-v1'
+MUTATION_REPLAY_SECONDS = 24 * 60 * 60
+MUTATION_RETENTION_SECONDS = 48 * 60 * 60
+MUTATION_ACTOR_RECEIPT_LIMIT = 10000
+MUTATION_ACTOR_MINUTE_LIMIT = 120
+MUTATION_ID_PATTERN = re.compile(r'([0-9]{10,16})-([0-9a-f]{32})\Z')
+
+
+def _tag_snapshot(conn, download_id, row=None):
+    """Serialize values and their revision from the caller's transaction."""
+    if row is None:
+        row = conn.execute(
+            "SELECT tags_revision FROM downloads WHERE id = ?", (download_id,)
+        ).fetchone()
+    if row is None:
+        return None
+    items = [dict(tag) for tag in conn.execute(
+        "SELECT normalized_name AS key, name FROM tags "
+        "JOIN download_tags ON download_tags.tag_id = tags.id "
+        "WHERE download_tags.download_id = ? "
+        "ORDER BY name COLLATE NOCASE, name", (download_id,),
+    )]
+    return _serialize_tag_state(download_id, items, row['tags_revision'])
+
+
+def _serialize_tag_state(download_id, items, revision):
+    return {
+        'id': download_id, 'tags': [item['name'] for item in items],
+        'tag_items': items, 'tags_revision': str(revision),
+        'tag_identity_version': TAG_IDENTITY_VERSION,
+    }
+
+
+def _tag_actor(conn):
+    # Resolve current security state after entering the write serialization seam.
+    user = _db_user(conn, 'id = ?', (session.get('user_id'),))
+    if (user is None or user['suspended'] or user['password_hash'] is None
+            or user['session_version'] != session.get('session_version')):
+        return None
+    return user
+
+
+def _tag_visible_row(conn, download_id, actor):
+    row = conn.execute(
+        "SELECT id, visibility, owner_user_id, tags_revision "
+        "FROM downloads WHERE id = ?", (download_id,),
+    ).fetchone()
+    if row is not None and (row['visibility'] == 'public'
+            or row['owner_user_id'] == actor['id'] or 'admin' in actor['roles']):
+        return row
+    return None
+
+
+def _tag_vocabulary(conn, actor):
+    return [row['name'] for row in conn.execute(
+        "SELECT DISTINCT tags.name FROM tags "
+        "JOIN download_tags ON download_tags.tag_id = tags.id "
+        "JOIN downloads ON downloads.id = download_tags.download_id "
+        "WHERE ? OR downloads.visibility = 'public' OR downloads.owner_user_id = ? "
+        "ORDER BY tags.name COLLATE NOCASE, tags.name",
+        ('admin' in actor['roles'], actor['id']),
+    )]
+
+
+def _apply_tag(conn, download_id, name, key, method):
+    if method == 'POST':
+        conn.execute(
+            "INSERT OR IGNORE INTO tags(name, normalized_name, created_at) "
+            "VALUES (?, ?, ?)", (name, key, time.time()),
+        )
+        cursor = conn.execute(
+            "INSERT OR IGNORE INTO download_tags(download_id, tag_id, created_at) "
+            "SELECT ?, id, ? FROM tags WHERE normalized_name = ?",
+            (download_id, time.time(), key),
+        )
+    else:
+        cursor = conn.execute(
+            "DELETE FROM download_tags WHERE download_id = ? AND tag_id = "
+            "(SELECT id FROM tags WHERE normalized_name = ?)",
+            (download_id, key),
+        )
+    return cursor.rowcount == 1
+
+
+def _publish_tag_change():
+    # Broadcast hints must not disclose a private entry's identity. A publishing
+    # failure after commit cannot turn a durable success into a failed mutation.
+    try:
+        event_bus.publish('change', {'reason': 'tag'})
+    except Exception:
+        app.logger.warning('mutation action=tag outcome=committed publish=failed')
+
+
+def _execute_tag_mutation(download_id, payload, method):
+    protocol = 'client_mutation_id' in payload or 'expected_revision' in payload
+    mutation_id = payload.get('client_mutation_id')
+    changed = False
+    with _db_lock, db() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        actor = _tag_actor(conn)
+        if actor is None:
+            return {'error': 'Authentication required'}, 401
+        row = _tag_visible_row(conn, download_id, actor)
+        if row is None:
+            return {'error': 'Unknown download id'}, 404
+        state = _tag_snapshot(conn, download_id, row)
+        error = None
+        try:
+            name, key = _validated_tag_name(payload.get('tag'))
+        except ValueError as exc:
+            name, key, error = None, None, str(exc)
+        submitted_before = next((item for item in state['tag_items'] if item['key'] == key), None)
+        if not protocol:
+            if error:
+                return {'error': error}, 400
+            changed = _apply_tag(conn, download_id, name, key, method)
+            result = _tag_snapshot(conn, download_id)
+            result.update(changed=changed, available_tags=_tag_vocabulary(conn, actor))
+            status = 200
+        else:
+            match = MUTATION_ID_PATTERN.fullmatch(mutation_id) if isinstance(mutation_id, str) else None
+            if match is None:
+                return {'error': 'Invalid mutation identifier'}, 400
+            expected = payload.get('expected_revision')
+            fingerprint = hashlib.sha256(json.dumps(
+                [method, 'tag.add' if method == 'POST' else 'tag.remove',
+                 download_id, key if key is not None else payload.get('tag'), expected],
+                sort_keys=True, ensure_ascii=True, separators=(',', ':'),
+            ).encode()).hexdigest()
+            receipt = conn.execute(
+                'SELECT fingerprint, status, response FROM mutation_receipts '
+                'WHERE actor_id = ? AND mutation_id = ?', (actor['id'], mutation_id),
+            ).fetchone()
+            if receipt is not None:
+                if receipt['fingerprint'] != fingerprint:
+                    return {'error': 'Mutation identifier already used', 'code': 'mutation_id_conflict'}, 409
+                result = json.loads(receipt['response'])
+                result['available_tags'] = _tag_vocabulary(conn, actor)
+                return result, receipt['status']
+            now = time.time()
+            created = int(match.group(1)) / 1000
+            conn.execute('DELETE FROM mutation_receipts WHERE recorded_at < ?',
+                         (now - MUTATION_RETENTION_SECONDS,))
+            counts = conn.execute(
+                'SELECT COUNT(*) AS total, '
+                'COALESCE(SUM(recorded_at > ?), 0) AS recent FROM mutation_receipts '
+                'WHERE actor_id = ?', (now - 60, actor['id']),
+            ).fetchone()
+            if (counts['total'] >= MUTATION_ACTOR_RECEIPT_LIMIT
+                    or counts['recent'] >= MUTATION_ACTOR_MINUTE_LIMIT):
+                return {'error': 'Too many mutations; wait before submitting more',
+                        'code': 'mutation_limit'}, 429
+            status, outcome = 200, 'committed'
+            if created < now - MUTATION_REPLAY_SECONDS or created > now + 300:
+                error, status, outcome = 'Mutation identifier expired or clock is incorrect', 400, 'rejected'
+            elif not isinstance(expected, str) or not re.fullmatch(r'0|[1-9][0-9]{0,18}', expected):
+                error, status, outcome = 'Expected revision must be a decimal string', 400, 'rejected'
+            elif error:
+                status, outcome = 400, 'rejected'
+            elif expected != state['tags_revision']:
+                error, status, outcome = 'Tags changed; review the current state', 409, 'conflicted'
+            else:
+                changed = _apply_tag(conn, download_id, name, key, method)
+                state = _tag_snapshot(conn, download_id)
+            result = dict(state)
+            canonical = next((item for item in state['tag_items'] if item['key'] == key), submitted_before)
+            result.update({
+                'changed': changed, 'available_tags': _tag_vocabulary(conn, actor),
+                'submitted_tag': canonical or ({'key': key, 'name': name} if key else None),
+                'mutation': {'id': mutation_id, 'outcome': outcome, 'domain': 'tags',
+                             'revision': state['tags_revision']},
+                'server_time': int(now * 1000),
+            })
+            if error:
+                result['error'] = error
+            conn.execute(
+                'INSERT INTO mutation_receipts(actor_id, mutation_id, target_id, '
+                'fingerprint, status, response, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                (actor['id'], mutation_id, download_id, fingerprint, status,
+                 json.dumps({key: value for key, value in result.items()
+                             if key != 'available_tags'}, separators=(',', ':')), now),
+            )
+    if changed:
+        _publish_tag_change()
+    return result, status
 
 
 def _validated_tag_name(value):
@@ -1399,7 +1628,7 @@ def db_add_download_tag(download_id, value):
         changed = cursor.rowcount == 1
         tags = _db_download_tags(conn, download_id)
     if changed:
-        event_bus.publish("change", {"reason": "tag", "id": download_id})
+        _publish_tag_change()
     return tags, changed
 
 
@@ -1420,7 +1649,7 @@ def db_remove_download_tag(download_id, value):
         changed = cursor.rowcount == 1
         tags = _db_download_tags(conn, download_id)
     if changed:
-        event_bus.publish("change", {"reason": "tag", "id": download_id})
+        _publish_tag_change()
     return tags, changed
 
 
@@ -1602,6 +1831,7 @@ def db_clear_library():
 
 def db_list_downloads(user_id=None, is_admin=False, statuses=None):
     with db() as conn:
+        conn.execute("BEGIN")
         conditions = []
         values = []
         if user_id is not None and not is_admin:
@@ -1621,7 +1851,7 @@ def db_list_downloads(user_id=None, is_admin=False, statuses=None):
             "filename, display_filename, resolution, filesize, speed, eta, title, finished_at, "
             "duration_seconds, media_metadata_probed, "
             "formats, requested_format, downloaded_bytes, total_bytes, favorite, "
-            "view_count, "
+            "view_count, tags_revision, "
             "source_type, owner_user_id, visibility, browser_authenticated, "
             "(downloads.ingest_source_path IS NOT NULL) AS mounted_import, "
             "COALESCE(users.username, downloads.owner_username) "
@@ -1635,7 +1865,7 @@ def db_list_downloads(user_id=None, is_admin=False, statuses=None):
         downloads = [dict(r) for r in rows]
         tags_by_download = {}
         for row in conn.execute(
-            "SELECT download_tags.download_id, tags.name "
+            "SELECT download_tags.download_id, tags.name, tags.normalized_name "
             "FROM download_tags "
             "JOIN tags ON tags.id = download_tags.tag_id "
             "JOIN downloads ON downloads.id = download_tags.download_id "
@@ -1644,7 +1874,7 @@ def db_list_downloads(user_id=None, is_admin=False, statuses=None):
             values,
         ):
             tags_by_download.setdefault(row["download_id"], []).append(
-                row["name"]
+                {"key": row["normalized_name"], "name": row["name"]}
             )
         for download in downloads:
             download["favorite"] = bool(download["favorite"])
@@ -1658,7 +1888,10 @@ def db_list_downloads(user_id=None, is_admin=False, statuses=None):
             download["quality"] = classify_video_quality(
                 download["resolution"]
             )
-            download["tags"] = tags_by_download.get(download["id"], [])
+            download.update(_serialize_tag_state(
+                download['id'], tags_by_download.get(download['id'], []),
+                download['tags_revision'],
+            ))
             download["can_manage_visibility"] = (
                 is_admin or download["owner_user_id"] == user_id
             )
@@ -7660,30 +7893,74 @@ def record_download_view(download_id):
     return jsonify({"id": download_id, "view_count": view_count})
 
 
+@app.route('/api/client-capabilities', methods=['GET'])
+def client_capabilities():
+    response = jsonify({
+        'mutation_protocol': 1, 'actions': ['tag.add', 'tag.remove'],
+        'tag_identity_version': TAG_IDENTITY_VERSION,
+        'server_time': int(time.time() * 1000),
+    })
+    response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+@app.route('/api/downloads/<download_id>/editable-state', methods=['GET'])
+def editable_download_state(download_id):
+    with db() as conn:
+        conn.execute('BEGIN')
+        actor = _tag_actor(conn)
+        if actor is None:
+            return jsonify({'error': 'Authentication required'}), 401
+        row = _tag_visible_row(conn, download_id, actor)
+        if row is None:
+            return jsonify({'error': 'Unknown download id'}), 404
+        result = _tag_snapshot(conn, download_id, row)
+        result['permissions'] = {'tags': True}
+    response = jsonify(result)
+    response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+@app.route('/api/mutations/<mutation_id>', methods=['GET'])
+def mutation_receipt(mutation_id):
+    # Serializing recovery behind admitted writes makes expired absence final.
+    with _db_lock, db() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        actor = _tag_actor(conn)
+        if actor is None:
+            return jsonify({'error': 'Authentication required'}), 401
+        receipt = conn.execute(
+            'SELECT target_id, status, response FROM mutation_receipts '
+            'WHERE actor_id = ? AND mutation_id = ?', (actor['id'], mutation_id),
+        ).fetchone()
+        if receipt is not None:
+            if _tag_visible_row(conn, receipt['target_id'], actor) is None:
+                match = MUTATION_ID_PATTERN.fullmatch(mutation_id)
+                final = bool(match and int(match.group(1)) / 1000 < time.time() - MUTATION_REPLAY_SECONDS)
+                return jsonify({'error': 'Mutation unavailable', 'final': final}), 404
+            result = json.loads(receipt['response'])
+            result['available_tags'] = _tag_vocabulary(conn, actor)
+            response = jsonify(result)
+            response.status_code = receipt['status']
+        else:
+            match = MUTATION_ID_PATTERN.fullmatch(mutation_id)
+            final = bool(match and int(match.group(1)) / 1000 < time.time() - MUTATION_REPLAY_SECONDS)
+            response = jsonify({'error': 'Mutation unavailable', 'final': final})
+            response.status_code = 404
+    response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
 @app.route('/api/tags/<download_id>', methods=['POST', 'DELETE'])
 def download_tags(download_id):
-    if _visible_download(download_id) is None:
-        return jsonify({"error": "Unknown download id"}), 404
-    payload = request.get_json(silent=True) or {}
-    try:
-        if request.method == 'POST':
-            tags, changed = db_add_download_tag(download_id, payload.get('tag'))
-        else:
-            tags, changed = db_remove_download_tag(download_id, payload.get('tag'))
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
-
-    if tags is None:
-        return jsonify({"error": "Unknown download id"}), 404
-    return jsonify({
-        "id": download_id,
-        "tags": tags,
-        "available_tags": db_list_tags(
-            g.current_user['id'],
-            is_admin='admin' in g.current_user['roles'],
-        ),
-        "changed": changed,
-    })
+    payload, error = _read_json_body(4096)
+    if error is not None:
+        return error
+    result, status = _execute_tag_mutation(download_id, payload, request.method)
+    response = jsonify(result)
+    response.status_code = status
+    response.headers['Cache-Control'] = 'no-store'
+    return response
 
 
 @app.route('/api/events')

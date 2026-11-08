@@ -32,7 +32,7 @@ test('inline tag editor commits, discards drafts, and removes with Backspace', a
     await expect(row.locator('.tag-entry-input')).toBeFocused();
 });
 
-test('failed tag commits restore the draft for correction', async ({ page }) => {
+test('an unknown tag save retains its chip without restoring the submitted draft', async ({ page }) => {
     await seed(page, { id: 'tag-fail', status: 'cancelled', progress: 'Stopped' });
     await refresh(page);
     await openCurrent(page);
@@ -47,8 +47,9 @@ test('failed tag commits restore the draft for correction', async ({ page }) => 
     await row.locator('.tag-entry-input').fill('Keep this draft');
     await row.locator('.tag-entry-input').press('Enter');
 
-    await expect(page.locator('#currentDrawerError')).toContainText('Tag save failed');
-    await expect(row.locator('.tag-entry-input')).toHaveValue('Keep this draft');
+    await expect(row.locator('.tag-chip[data-tag-state="unconfirmed"]')).toContainText('Keep this draft');
+    await expect(row.locator('.tag-mutation-message')).toContainText('Save not confirmed');
+    await expect(row.locator('.tag-entry-input')).toHaveValue('');
 });
 
 test('choosing a known tag keeps the Info dialog open', async ({ page }) => {

@@ -299,7 +299,7 @@ class DatabaseContentionTest(AppCase):
                 self.connection.row_factory = value
 
             def commit(self):
-                writing = self.connection.in_transaction
+                writing = self.connection.total_changes > 0
                 self.connection.commit()
                 if writing:
                     elapsed[0] += 0.3

@@ -12,6 +12,7 @@ function harness(replies, { onDelay = () => {} } = {}) {
     const requests = [];
     const redirects = [];
     const listeningResets = [];
+    const tagResets = [];
     const elements = new Map();
     const context = vm.createContext({
         document: {
@@ -33,10 +34,16 @@ function harness(replies, { onDelay = () => {} } = {}) {
         },
         setTimeout: (callback, delay) => { delays.push(delay); onDelay(); callback(); },
         resetPlayerListening: () => listeningResets.push(true),
+        resetTagSession: () => tagResets.push(true),
+        tagSessionEpoch: 0,
+        DOMException,
         Date,
     });
     vm.runInContext(source, context);
-    return { apiFetch: context.apiFetch, delays, requests, redirects, elements, listeningResets };
+    return {
+        apiFetch: context.apiFetch, delays, requests, redirects, elements, listeningResets, tagResets,
+        advanceEpoch: () => { context.tagSessionEpoch++; },
+    };
 }
 
 function busy(retryAfter = '1') {
@@ -95,7 +102,18 @@ test('expired sessions still redirect to login without retrying authentication f
     await assert.rejects(client.apiFetch('/api/current-downloads'), /session has ended/);
     assert.deepEqual(client.redirects, ['/login']);
     assert.equal(client.listeningResets.length, 1);
+    assert.equal(client.tagResets.length, 1);
     assert.equal(client.requests.length, 2);
+});
+
+test('an old session response cannot reset or redirect a newer authentication epoch', async () => {
+    const client = harness([new Response('{}', { status: 401 })]);
+    const work = client.apiFetch('/api/current-downloads');
+    client.advanceEpoch();
+    await assert.rejects(work, { name: 'AbortError' });
+    assert.deepEqual(client.redirects, []);
+    assert.equal(client.tagResets.length, 0);
+    assert.equal(client.listeningResets.length, 0);
 });
 
 test('cancelled reads are never retried and do not show a server outage', async () => {

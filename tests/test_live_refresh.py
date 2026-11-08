@@ -33,7 +33,7 @@ class LiveRefreshBackendTest(AppCase):
                     'INSERT INTO downloads '
                     '(id, url, status, created_at, filename, output_dir) '
                     'VALUES (?, ?, ?, ?, ?, ?)',
-                    [(f'library{i}', 'https://fixture.invalid/video',
+                    [(f'library{size}-{i}', 'https://fixture.invalid/video',
                       'finished', i, media, self.download_dir)
                      for i in range(size)],
                 )

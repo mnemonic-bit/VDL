@@ -13,6 +13,7 @@ Flask + `yt-dlp` video-downloader UI. **Single-process, single-file backend** ([
 │   ├── app.js            # ALL frontend logic — no bundler, no modules
 │   └── styles.css        # CSS custom-property theming (light/dark)
 ├── templates/index.html  # Page shell + inline SVG icon library (#i-* symbols)
+├── ARCHITECTURE/         # Architecture proposals and implementation designs
 ├── media/                # gitignored — runtime download output
 ├── downloads.db          # gitignored — SQLite state, schema in init_db()
 ├── requirements.txt      # Flask>=2.0, yt-dlp>=2024.12.0
@@ -24,6 +25,7 @@ Flask + `yt-dlp` video-downloader UI. **Single-process, single-file backend** ([
 | Task | Location |
 |---|---|
 | Complete bug ledger (open and resolved) | [`BUGS/BUG-INDEX.md`](BUGS/BUG-INDEX.md) |
+| Server-backed UI interactions, pending states, mutation responses, or SSE reconciliation | Before changing these paths, read the [proposed immediate-feedback architecture](ARCHITECTURE/immediate-feedback-for-server-backed-interactions.md) and its linked [Feature 0051 requirements](FEATURES/feature-0051-immediate-feedback-for-server-backed-interactions.md). These describe proposed work, not implemented behavior. |
 | HTTP routes | [`vdl.py` Routes section](file:///workspace/vdl.py#L660-L989) |
 | Download lifecycle | [`background_download`](file:///workspace/vdl.py#L511-L636) + [`progress_hook`](file:///workspace/vdl.py#L323-L411) |
 | Pause / cancel flags | [in-memory dicts + lock](file:///workspace/vdl.py#L280-L321) |

@@ -143,3 +143,27 @@ parity. Pending roadmap features have no absence assertions.
 
 Failure screenshots and traces are generated under
 `tests/browser/test-results/` and are not golden inputs.
+
+Feature 0051's initial tag delivery has deterministic production-module tests,
+transactional route tests, and browser tests with held mutation responses:
+
+```bash
+python -m unittest tests.test_tag_mutations tests.test_tags -v
+node --test tests/mutations-client.test.cjs tests/tag-identity-parity.test.cjs
+python3 tests/browser/run.py tags.spec.cjs immediate-feedback.spec.cjs
+VDL_TEST_BROWSER=firefox python3 tests/browser/run.py tags.spec.cjs immediate-feedback.spec.cjs
+```
+
+The tag identity asset contains the Python Unicode tables used by supported
+native interpreters and the container. Regenerate it using Python 3.11, 3.12,
+3.13 and 3.14 together; `--check` verifies reproducibility without writing:
+
+```bash
+python3 scripts/generate-tag-identity.py --python python3.11 --python python3.12 --python python3.13 --python python3.14 --check
+```
+
+The parity test compares the helper with the actual server validator over case
+folds, whitespace, category boundaries and non-BMP input. Set `VDL_PYTHON` to
+select the server interpreter. Unknown Unicode versions deliberately use the
+compatibility path until matching identity data ships. Remaining action adapters
+are tracked in [the rollout inventory](../ARCHITECTURE/feature-0051-rollout.md).

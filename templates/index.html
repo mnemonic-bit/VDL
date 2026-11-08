@@ -841,6 +841,8 @@
                 </button>
             </div>
             <div class="current-drawer-body">
+                <p id="currentTagMutationSummary" class="tag-mutation-summary" hidden></p>
+                <div id="currentTagMutationStatus" class="visually-hidden" role="status" aria-live="polite" aria-atomic="true"></div>
                 <div id="currentDrawerError" class="action-error" role="alert" aria-live="assertive" hidden>
                     <span id="currentDrawerErrorMessage"></span>
                     <button type="button" class="action-error-close" onclick="hideActionError()" aria-label="Dismiss error"><svg width="14" height="14"><use href="#i-x"/></svg></button>
@@ -969,6 +971,7 @@
         </div>
     </div>
 
+    <p id="tagMutationSummary" class="tag-mutation-summary" hidden></p>
     <footer id="versionFooter" class="version-footer" data-ui-version="{{ ui_version }}">
         <span id="serverStatus" class="server-status" role="alert" hidden>Server is not available — actions will not work until the connection is restored.</span>
         <span id="itemCount">0 items</span><span aria-hidden="true"> · </span>
@@ -988,6 +991,10 @@
         <span id="versionStatus" class="visually-hidden" role="status" aria-live="polite">API version is being checked.</span>
     </footer>
 
+    <div id="tagMutationStatus" class="visually-hidden" role="status" aria-live="polite" aria-atomic="true"></div>
+    <script src="{{ url_for('static', filename='tag-identity.js', v=ui_version) }}"></script>
+    <script src="{{ url_for('static', filename='client-state.js', v=ui_version) }}"></script>
+    <script src="{{ url_for('static', filename='mutations.js', v=ui_version) }}"></script>
     <script src="{{ url_for('static', filename='app.js', v=ui_version) }}"></script>
 </body>
 </html>

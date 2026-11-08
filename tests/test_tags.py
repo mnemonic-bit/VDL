@@ -71,7 +71,7 @@ class DownloadTagsTest(AppCase):
 
         kind, payload = subscriber.get_nowait()
         self.assertEqual(kind, "change")
-        self.assertEqual(payload, {"reason": "tag", "id": "tagevent"})
+        self.assertEqual(payload, {"reason": "tag"})
 
     def test_tag_validation_and_unknown_download_errors(self):
         self.insert("tagvalid")

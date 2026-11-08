@@ -1138,6 +1138,25 @@ input[type="text"].tag-entry-input {
     font-size: 0.82em; line-height: 1.45; overflow-wrap: anywhere;
 }
 .tag-chip-editing { padding-right: 3px; }
+.tag-status-slot, .tag-chip .tag-status-slot {
+    display: inline-flex; align-items: center; justify-content: center;
+    flex: 0 0 18px; width: 18px; height: 18px;
+}
+.tag-status-slot .tag-spinner { width: 12px; height: 12px; border-width: 2px; }
+.tag-chip-removing .tag-chip-label { text-decoration: line-through; }
+.tag-chip-failed { border-color: var(--error-border); }
+.tag-chip-failed .tag-status-slot { color: var(--error-fg); font-weight: 700; }
+.tag-mutation-summary { margin: 10px 0; color: var(--muted); font-size: 0.85em; }
+.tag-mutation-message {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+    margin-top: 5px; color: var(--muted); font-size: 0.85em;
+}
+.tag-mutation-message button {
+    min-height: 28px; padding: 3px 7px; border: 1px solid var(--border);
+    border-radius: 4px; background: var(--surface-2); color: var(--fg);
+}
+.tag-mutation-message button:focus-visible { outline: 2px solid var(--muted); outline-offset: 2px; }
+
 .tag-chip button {
     display: inline-flex; align-items: center; justify-content: center;
     width: 18px; height: 18px; padding: 0; border: 0; border-radius: 50%;
