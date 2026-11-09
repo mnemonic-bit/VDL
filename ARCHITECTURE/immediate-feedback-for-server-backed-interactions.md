@@ -1,6 +1,6 @@
 # Architecture: immediate feedback for server-backed interactions
 
-**Status:** Foundation, tags, favorites, rename, preferences, playlist editor saves, playlist add/delete, download commands, and new-download acceptance implemented; additional adapters remain proposed.\
+**Status:** Foundation, tags, favorites, rename, preferences, playlist editor saves, playlist add/delete, download commands, new-download acceptance, and uploads implemented; additional adapters remain proposed.\
 **Date:** 2026-11-09\
 **Requirements:** [Feature 0051](../FEATURES/feature-0051-immediate-feedback-for-server-backed-interactions.md)
 
@@ -20,7 +20,8 @@ the feature explicitly rather than silently contradicting it here.
 
 The implementation adds the shared modules, tag protocol, and independent
 `favorite.set`, `rename.set`, `preference.set`, `playlist.create`,
-`playlist.replace`, `playlist.add`, `playlist.delete`, and `download.*` adapters described
+`playlist.replace`, `playlist.add`, `playlist.delete`, `download.*`,
+`upload.register`, and `upload.cancel` adapters described
 below. Other actions still use handlers and collection snapshots in
 `static/app.js`, server routes and persistence in `vdl.py`, and SSE hints that
 trigger collection reads. The [rollout inventory](feature-0051-rollout.md) records
@@ -59,7 +60,7 @@ reconciliation may still use the existing batching delays.
 
 ## Module responsibilities and proposed placement
 
-The client modules below host tags, favorites, rename, preferences, playlist actions, download commands, and new-download submissions. Additional action adapters
+The client modules below host tags, favorites, rename, preferences, playlist actions, download commands, new-download submissions, and discrete upload requests. Additional action adapters
 remain staged. The client remains raw browser JavaScript;
 new scripts expose factory functions through one `window.VDL` namespace and load
 in dependency order before `app.js`. No bundler or runtime package is required.
@@ -364,6 +365,41 @@ quotas, replay-window admission, and serialized expired-absence finality apply;
 matching collection reads never confirm an unknown submission. Authentication
 reset and known target unavailability fence obsolete callbacks. Upload and
 companion transports retain their specialized sequences.
+
+### Upload ownership and publication
+
+Feature 0059 adds `upload.register` and `upload.cancel` to the independent
+`upload` domain. Their status-only coordinator intents share the preallocated
+resource identity with the existing local transfer row. The UI owns its
+in-memory `File` and byte transport; progress events do not enter the mutation
+queue. Registration acknowledgement establishes acceptance and its single
+History attempt. A transfer acknowledgement or authorized status establishes
+publication, independently of SSE and collection reads.
+
+The `upload_operations` journal binds the actor, registration fingerprint,
+History attempt, decimal-string revision, cancellation request, and owned
+temporary/publication paths. Status exposes processing phases rather than
+filesystem records. Public Library visibility does not authorize another actor
+to supply bytes, cancel through the recovery adapter, or retrieve its receipts.
+Current authentication and ownership are checked at execution and recovery;
+publication checks authorization again before committing the finished identity.
+
+Transfer claims ownership durably before reading bytes. File publication uses
+exclusive creation and shares serialization with cancellation and other file
+operations. Restart resolves the recorded attempt and cleans only owned files;
+ambiguous replacements retain an explicit intervention requirement. A completed
+publication wins a later Stop. Browser abort ends local transport without
+establishing server cancellation. Unknown registration/cancellation requests
+retain coordinator receipt recovery; unknown transfer results offer authorized
+status checking, without resending the byte body. No browser file queue survives
+reload, and no recovery action automatically replays a write.
+
+The separate `upload_recovery` capability covers the discrete adapters and
+status contract. Legacy paths retain truthful pending feedback without assumed
+receipt support. Authentication reset clears local files, transfer presentation,
+and old callbacks. Diagnostics use bounded content-free aggregates through the
+shared seam. Playback, asset demand, worker scheduling, progress sequences,
+leases, and companion transport keep their existing ownership contracts.
 
 ### Rename filesystem recovery
 

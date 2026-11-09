@@ -2240,3 +2240,8 @@ body.history-open .create-playlist-button { display: none; }
 #downloadSubmissionStatus button:focus-visible, #downloadSubmissionSummary button:focus-visible {
     outline: 2px solid var(--link); outline-offset: 2px;
 }
+
+.upload-request-status { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem; color: var(--muted); font-size: .85rem; margin-block: .4rem; }
+.upload-request-status button { font: inherit; color: var(--fg); background: var(--bg); border: 1px solid var(--border); border-radius: .3rem; padding: .3rem .5rem; cursor: pointer; }
+.upload-request-status button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+#uploadRecoverySummary[hidden] { display: none; }

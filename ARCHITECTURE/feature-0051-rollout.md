@@ -5,7 +5,8 @@ migration in [Feature 0051](../FEATURES/feature-0051-immediate-feedback-for-serv
 The shared coordinator registers `tag.add`, `tag.remove`, `favorite.set`,
 `rename.set`, `preference.set`, `playlist.create`, `playlist.replace`,
 `playlist.add`, `playlist.delete`, `download.pause`, `download.unpause`,
-`download.stop`, `download.retry`, `download.resume`, and `download.submit`.
+`download.stop`, `download.retry`, `download.resume`, `download.submit`,
+`upload.register`, and `upload.cancel`.
 An existing API call does not gain receipt recovery merely because the new
 scripts are loaded. Mutating requests are never retried by `apiFetch`'s GET
 contention recovery.
@@ -194,6 +195,34 @@ truthful pending feedback and a read-only Current-downloads check without
 receipt recovery or replay. `VDL.downloadSubmissionMetrics()` exposes bounded,
 content-free aggregates. Uploads and companion requests retain their contracts.
 
+[Feature 0059: Uploads](../FEATURES/feature-0059-immediate-feedback-and-recovery-for-uploads.md)
+adds `upload.register` and `upload.cancel` in the independent `upload` domain.
+The existing preallocated transfer identity remains stable through registration,
+byte progress, processing, and publication. Registering and Stopping feedback is
+synchronous. Transfer completion alone cannot publish playable media; canonical
+responses and authorized status establish the server phase without SSE or a
+collection read. Unknown requests retain explicit checking and deliberate
+frozen-attempt recovery. Raw byte bodies are never replayed automatically.
+
+Actor-bound registration, its single History attempt, durable upload journal,
+and receipt commit together. Publication claims an exclusive destination and
+serializes with cancellation and other file operations. Cleanup journals owned
+source retirement before moving files, preserves unrelated replacements, and
+retains ambiguous ownership for intervention. Restart resolves the recorded
+attempt without launching another transfer. A Stop racing a completed
+publication preserves the finished file. Legacy Stop and command controls share
+the upload ownership and cancellation boundary.
+
+The separately negotiated `upload_recovery` capability covers discrete request
+recovery and status, independently of raw transfer support. Account changes clear
+private File references and fence older callbacks. Reload adopts accepted server
+uploads without restoring a File or dispatching bytes. Independent files keep
+their own progress and recovery status; closed Current downloads retain an
+accessible summary. `VDL.uploadMutationMetrics()` exposes bounded, content-free
+aggregates through the shared diagnostic seam. Upload recovery does not complete
+Features 0060–0067 or change playback, lease, asset-demand, worker, progress, or
+companion ownership.
+
 ## Remaining action adapters
 
 The rows below are explicit migration work, not claims that the app-wide
@@ -202,12 +231,11 @@ remain in force. They need their own behavior and regression evidence before
 adopting automatic recovery.
 
 Each remaining row now has a proposed feature spec. These links allocate work;
-they do not mark any remaining adapter implemented. Features 0059–0067 inherit Feature
+they do not mark any remaining adapter implemented. Features 0060–0067 inherit Feature
 0051 and the shared requirements below.
 
 | Controls / production entry points in `static/app.js` | Existing mechanism | Required migration / recovery boundary | Feature spec |
 | --- | --- | --- | --- |
-| Upload: `registerDroppedVideo`, `transferDroppedVideo`, `stopDroppedUpload` | Local transfer row with preallocated server ID, byte progress, registration acknowledgement and cancellation | Preserve transfer and worker semantics. Do not manufacture playable files or equate abort with server cancellation. | [0059: Uploads](../FEATURES/feature-0059-immediate-feedback-and-recovery-for-uploads.md) |
 | Entry removal: `deleteDownload` | Server remove request and collection refresh | Retain marked pending row until acknowledgement; prevent duplicate submission and fence authoritative deletion. Filesystem deletion needs operation-specific recovery. | [0060: Entry removal](../FEATURES/feature-0060-immediate-feedback-and-safe-entry-removal.md) |
 | Clear attempts/library: `clearHistory`, `clearLibrary` | Preview counts and explicit confirmation, then server request | Pending confirmation surface and duplicate guard; no claim of deletion before acknowledgement. | [0061: Bulk clear](../FEATURES/feature-0061-immediate-feedback-for-bulk-clear-actions.md) |
 | Visibility: `changeDownloadVisibility` | Explicit desired visibility; server permission checks | Display pending request beside confirmed security state. A pending grant must never enable authority. | [0062: Visibility](../FEATURES/feature-0062-immediate-feedback-for-visibility-changes.md) |
@@ -652,3 +680,57 @@ New-download delivery does not complete Features 0059–0067. Authentication
 fencing here covers the adopted submission and recovery callbacks. Upload
 transfer, playback, leases, progress writes, and companion transport retain
 their specialized ownership and recovery contracts.
+
+Upload verification commands for Feature 0059:
+
+```bash
+VDL_PYTHON=/path/to/python3.12 ./tests/run-all.sh --unit
+node --test tests/*.test.cjs
+VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py \
+    uploads-feedback.spec.cjs upload-drop.spec.cjs
+VDL_TEST_BROWSER=firefox VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py \
+    uploads-feedback.spec.cjs upload-drop.spec.cjs
+```
+
+Feature 0059 verified on 2026-11-09 for version `0.62.0`:
+
+- Python 3.12 unit gate: **757 tests, 9 skipped**; `vdl.py` line coverage
+  **92.8%** (7244/7806 executable lines; enforced minimum 90%). The 34 upload
+  protocol tests and 11 independent security checks cover atomic registration
+  and History linkage, simultaneous registration and transfer claims, frozen
+  fingerprints, shared quotas and retention, serialized expired-absence
+  finality, lost registration/cancellation/finalization responses, and restart
+  at each ownership/publication boundary. Real filesystem checks preserve
+  collisions and unrelated replacements, including a replacement racing source
+  retirement. Account deletion and suspension cannot publish media or abandon
+  owned bytes. Ambiguous cleanup remains visible and blocks removal; directory
+  errors omit private paths from responses and stored progress.
+- Node: **197 tests passed**, including 23 upload production-interface checks
+  for immediate status-only intents, strict acknowledgements and refusals,
+  canonical identity, deliberate frozen replay, missing-receipt finality,
+  independent files/domains, monotonic byte progress, rename interoperability,
+  authentication and availability fences, and canonical legacy-ID cancellation.
+- Chromium and Firefox: **43 focused upload scenarios passed in each browser**,
+  comprising 31 new checks and 12 existing upload checks. Controlled gates
+  establish local feedback below 50 ms, stable row identity, separate byte and
+  processing phases, and canonical publication with SSE and collection
+  responses blocked. Coverage includes Stop before registration, during
+  transfer/processing, and racing publication; dropped acknowledgements;
+  explicit checks and same-attempt replay; absent status before a late original
+  acknowledgement; stale reads; actual account switching; reload without body
+  replay; legacy eight-character IDs; definite refusals; unsupported servers;
+  untrusted filenames; keyboard controls; both themes; reduced motion; and
+  deduplicated announcements while Current downloads is open or closed.
+- Broader regressions: **384 Chromium checks across 29 suites** and
+  **165 Firefox checks across 12 suites** passed. These cover the adopted
+  mutation adapters, download forms and commands, worker recovery, History,
+  playback, rotation, storage, assets, authentication, settings, extension
+  settings, and refresh/database contention as applicable. The broad suites
+  exclude the focused upload files: totals are **427 distinct Chromium checks**
+  and **208 distinct Firefox checks**. Existing assertion deadlines were not
+  relaxed.
+
+Upload delivery does not complete Features 0060–0067. Browser Files and write
+queues do not survive reload, and recovery never automatically resends media
+bytes. Playback, progress writes, leases, asset demand, worker scheduling, and
+companion transport retain their specialized ownership contracts.

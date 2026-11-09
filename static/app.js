@@ -615,169 +615,390 @@ function hideUploadOverlay() {
     if (uploadDropOverlay.open) uploadDropOverlay.close();
 }
 
+function uploadIsCurrent(upload) {
+    return upload.epoch === tagSessionEpoch && droppedUploads.get(upload.info.id) === upload;
+}
+
+function hasUploadProtocol() {
+    return tagCapabilities?.upload_recovery === 1 && tagCapabilities?.mutation_protocol === 1
+        && ['upload.register', 'upload.cancel'].every(kind => tagCapabilities.actions?.includes(kind));
+}
+
+function uploadIntent(upload) {
+    return tagMutations.status(upload.cancelIntentId || upload.registerIntentId);
+}
+
+function uploadText(upload) {
+    const intent = uploadIntent(upload);
+    if (upload.recoveryRequired) return 'Upload recovery requires intervention. Check again after file ownership is repaired.';
+    if (['rejected', 'conflicted'].includes(intent?.status)) return intent.message;
+    if (upload.stopRequested && !['published', 'cancelled', 'failed'].includes(upload.phase)) {
+        return intent?.status === 'unconfirmed' || upload.unknown ? 'Stopping upload… Server cancellation not confirmed. Check upload status.' : 'Stopping upload…';
+    }
+    if (intent?.status === 'unconfirmed' || upload.unknown) return 'Upload outcome not confirmed. Check upload status.';
+    if (upload.adopted && upload.phase === 'registered') return 'Upload registered. The local file is unavailable on this page. Check upload status or stop the upload.';
+    if (upload.phase === 'failed' && upload.failure) return upload.failure;
+    if (intent?.delayed) return intent.message;
+    if (upload.delayed && upload.phase === 'processing') return 'Processing upload… Waiting for server confirmation.';
+    return ({ registering: 'Registering upload…', registered: 'Upload registered', transferring: 'Uploading…',
+        processing: 'Processing upload…', published: 'Video added to library', cancelled: 'Upload stopped', failed: 'Upload failed' })[upload.phase] || upload.info.upload_detail;
+}
+
+function uploadStatusMarkup(upload, summary = false) {
+    const intent = uploadIntent(upload);
+    const id = escapeAttr(upload.info.id);
+    const unknown = upload.unknown || intent?.status === 'unconfirmed';
+    const check = upload.protocol && (unknown || upload.recoveryRequired || upload.adopted || upload.stopRequested || upload.phase === 'processing')
+        ? `<button type="button" data-upload-recovery="check" data-upload-id="${id}"${upload.checking ? ' disabled' : ''}>Check upload status</button>` : '';
+    const replay = upload.protocol && intent?.status === 'unconfirmed' && !intent.replayExpired
+        ? `<button type="button" data-upload-recovery="replay" data-upload-id="${id}">${upload.cancelIntentId ? 'Recover cancellation' : 'Recover registration'}</button>` : '';
+    const dismiss = !upload.recoveryRequired && intent && (['rejected', 'conflicted'].includes(intent.status) || intent.status === 'unconfirmed' && intent.canResolve)
+        ? `<button type="button" data-upload-recovery="dismiss" data-upload-id="${id}">Dismiss upload request</button>` : '';
+    const legacyCheck = !upload.protocol && unknown ? `<button type="button" data-upload-recovery="current" data-upload-id="${id}">Check Current downloads</button>` : '';
+    return `<div class="upload-request-status" role="status" aria-live="off" data-upload-phase="${escapeAttr(upload.phase)}" data-upload-id="${id}">${summary ? `<strong>${escapeHtml(upload.info.title)}</strong>: ` : ''}<span>${escapeHtml(uploadText(upload))}</span> ${check}${replay}${dismiss}${legacyCheck}</div>`;
+}
+
+function uploadStatusSlot(id) {
+    const upload = droppedUploads.get(String(id));
+    return upload ? uploadStatusMarkup(upload) : '';
+}
+
+function uploadDiagnosticIntents() {
+    return [...droppedUploads.values()].filter(upload => !uploadIntent(upload) && (!upload.settled || upload.unknown || upload.recoveryRequired))
+        .map(upload => ({ kind: 'upload.transfer', status: upload.unknown ? 'unconfirmed' : 'sending' }));
+}
+
+function renderUploadRecovery() {
+    const summary = document.getElementById('uploadRecoverySummary');
+    const uploads = [...droppedUploads.values()];
+    const unresolved = uploads.filter(upload => !upload.settled || upload.unknown || upload.recoveryRequired || uploadIntent(upload));
+    const html = unresolved.map(upload => uploadStatusMarkup(upload, true)).join('');
+    if (summary.innerHTML !== html) summary.innerHTML = html;
+    summary.hidden = !unresolved.length;
+    uploadMutationMetrics.pending = unresolved.length;
+    uploadMutationMetrics.unconfirmed = unresolved.filter(upload => upload.unknown || uploadIntent(upload)?.status === 'unconfirmed').length;
+    uploadMutationMetrics.conflicted = unresolved.filter(upload => uploadIntent(upload)?.status === 'conflicted').length;
+}
+
+function renderDroppedUploads() {
+    clearTimeout(uploadProgressRenderTimer);
+    uploadProgressRenderTimer = null;
+    for (const upload of droppedUploads.values()) upload.info.upload_detail = uploadText(upload);
+    renderDownloadCollections();
+    renderUploadRecovery();
+}
+
+function acceptUploadReply(upload, data, { settle = true } = {}) {
+    if (!uploadIsCurrent(upload) || data?.id !== upload.info.id || !VDL.validUploadState(data.upload) || data.upload.id !== upload.info.id) return false;
+    const snapshot = data.upload;
+    const known = tagState.selectDownload(upload.info.id);
+    // Byte counts can advance within one phase revision. Skip unchanged
+    // render reconciliation so a store notification cannot feed itself.
+    const merge = !known?.upload || BigInt(snapshot.revision) > BigInt(known.upload.revision)
+        || snapshot.revision === known.upload.revision && (settle || snapshot.downloaded_bytes > known.upload.downloaded_bytes)
+        || data.download && !known.filename;
+    if (merge && !tagState.acceptDownload({ ...(data.download || {}), id: upload.info.id, upload_revision: snapshot.revision, upload: snapshot })) return false;
+    const canonical = tagState.selectDownload(upload.info.id)?.upload;
+    if (!canonical) return false;
+    upload.registered = true;
+    upload.recoveryRequired = !!canonical.recovery_required;
+    const transportPhase = upload.phase;
+    upload.phase = canonical.phase;
+    if (upload.transferStarted && !upload.adopted && ['registered', 'transferring'].includes(canonical.phase)) {
+        upload.phase = transportPhase === 'processing' ? 'processing' : 'transferring';
+    }
+    upload.info.status = upload.transferStarted && !upload.adopted && canonical.phase === 'registered' ? 'downloading' : canonical.download_status;
+    upload.info.downloaded_bytes = Math.max(upload.info.downloaded_bytes || 0, canonical.downloaded_bytes);
+    upload.info.total_bytes = canonical.total_bytes;
+    upload.info.progress = `${Math.min(100, upload.info.downloaded_bytes / canonical.total_bytes * 100).toFixed(1)}%`;
+    if (data.download && data.download.id === upload.info.id && canonical.phase === 'published') upload.info = { ...upload.info, ...data.download };
+    if (['published', 'cancelled', 'failed'].includes(canonical.phase)) {
+        upload.settled = !upload.recoveryRequired;
+        upload.file = null;
+        if (canonical.phase === 'failed' && typeof data.error === 'string') upload.failure = data.error;
+        if (settle) upload.unknown = false;
+        upload.timers.forEach(clearTimeout);
+        upload.timers = [];
+    }
+    return true;
+}
+
+function handleUploadMutationEvent(event) {
+    const upload = [...droppedUploads.values()].find(entry => entry.registerIntentId === event.intentId || entry.cancelIntentId === event.intentId);
+    if (!upload || !uploadIsCurrent(upload)) return;
+    if (event.outcome === 'reconciliation') uploadMutationMetrics.reconciliationReads++;
+    if (event.outcome === 'confirmed') {
+        const model = tagState.selectDownload(upload.info.id);
+        if (model?.upload) acceptUploadReply(upload, { id: upload.info.id, upload: model.upload, ...(model.upload.phase === 'published' && model.filename ? { download: model } : {}) });
+        upload.unknown = false;
+        const registration = event.action === 'upload.register';
+        if (registration) upload.registerIntentId = null;
+        else upload.cancelIntentId = null;
+        // Coordinator retirement completes after its event; dispatch a successor
+        // only after the original immutable attempt has left the conflict domain.
+        queueMicrotask(() => {
+            if (!uploadIsCurrent(upload)) return;
+            if (upload.stopRequested && !upload.settled) stopDroppedUpload(upload);
+            else if (registration && !upload.settled) beginDroppedTransfer(upload);
+            renderDroppedUploads();
+        });
+    } else if (event.outcome === 'unconfirmed') upload.unknown = true;
+    else if (['rejected', 'conflicted'].includes(event.outcome)) {
+        if (!upload.registered) upload.info.status = 'interrupted';
+        upload.settled = false;
+    }
+    renderDroppedUploads();
+}
+
+function recordUploadOutcome(upload, outcome, startedAt) {
+    if (!uploadIsCurrent(upload)) return;
+    for (const metrics of [uploadMutationMetrics, mutationMetrics]) {
+        if (outcome === 'confirmed') { metrics.acknowledgements++; metrics.latestAcknowledgementMs = Math.max(0, performance.now() - startedAt); }
+        if (outcome === 'unconfirmed' && !upload.unknown) metrics.unconfirmedOutcomes++;
+    }
+}
+
 function transferDroppedVideo(id, file) {
-    return new Promise((resolve, reject) => {
+    const upload = droppedUploads.get(String(id));
+    if (!upload || !uploadIsCurrent(upload) || activeUploadRequests.has(String(id))) return Promise.reject(new Error('Upload transfer is unavailable'));
+    return new Promise(resolve => {
         const request = new XMLHttpRequest();
+        const sentAt = performance.now();
         activeUploadRequests.set(String(id), request);
+        const current = () => uploadIsCurrent(upload) && activeUploadRequests.get(String(id)) === request;
         request.open('PUT', '/api/upload/' + encodeURIComponent(id));
-        request.setRequestHeader(
-            'Content-Type', file.type || 'application/octet-stream');
+        request.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
         request.upload.onprogress = event => {
-            const upload = droppedUploads.get(String(id));
-            if (!upload || upload.cancelled) return;
+            if (!current() || upload.stopRequested) return;
             upload.info.downloaded_bytes = event.loaded;
-            upload.info.upload_detail = event.loaded >= file.size
-                ? 'Validating video…' : 'Uploading…';
-            if (uploadProgressRenderTimer === null) {
-                uploadProgressRenderTimer = setTimeout(renderDroppedUploads, 150);
+            if (event.loaded >= file.size) {
+                upload.phase = 'processing';
+                if (!upload.timers.length) {
+                    upload.timers.push(setTimeout(() => {
+                        if (current() && !upload.settled) { upload.delayed = true; renderDroppedUploads(); }
+                    }, 5000));
+                    upload.timers.push(setTimeout(() => {
+                        if (current() && !upload.settled) { upload.unknown = true; renderDroppedUploads(); }
+                    }, 30000));
+                }
             }
+            if (uploadProgressRenderTimer === null) uploadProgressRenderTimer = setTimeout(renderDroppedUploads, 150);
         };
         request.onload = () => {
-            const data = (() => {
-                try { return JSON.parse(request.responseText || '{}'); }
-                catch (error) { return {}; }
-            })();
-            if (request.status >= 200 && request.status < 300) {
-                resolve(data);
-            } else if (request.status === 409 && data.error === 'Upload cancelled') {
-                resolve(data);
-            } else {
-                reject(new Error(data.error || request.statusText || 'Upload failed'));
-            }
+            if (!current()) { resolve(null); return; }
+            let data = null;
+            try { data = JSON.parse(request.responseText || '{}'); } catch (_) { /* A malformed acknowledgement leaves publication unknown. */ }
+            if (request.status === 401) { resetTagSession(); resolve(null); return; }
+            if (request.status === 403 || request.status === 404) { tagMutations.fence(String(id)); resolve(null); return; }
+            if (upload.protocol) {
+                if (!acceptUploadReply(upload, data)) { recordUploadOutcome(upload, 'unconfirmed', sentAt); upload.unknown = true; }
+                else recordUploadOutcome(upload, 'confirmed', sentAt);
+            } else if (request.status >= 200 && request.status < 300 && data?.id === id) {
+                upload.phase = 'published'; upload.settled = true; upload.file = null;
+                recordUploadOutcome(upload, 'confirmed', sentAt);
+            } else if (request.status === 409 && data?.error === 'Upload cancelled') {
+                upload.phase = 'cancelled'; upload.info.status = 'cancelled'; upload.settled = true; upload.file = null;
+            } else { recordUploadOutcome(upload, 'unconfirmed', sentAt); upload.unknown = true; }
+            resolve(data);
         };
-        request.onerror = () => reject(new Error('Upload connection failed'));
-        request.onabort = () => resolve({ cancelled: true });
+        request.onerror = request.onabort = () => {
+            if (current() && !upload.settled) { recordUploadOutcome(upload, 'unconfirmed', sentAt); upload.unknown = true; }
+            // A local abort says nothing about server cancellation or publication.
+            resolve(null);
+        };
         request.onloadend = () => {
-            activeUploadRequests.delete(String(id));
+            const owned = activeUploadRequests.get(String(id)) === request;
+            if (owned) activeUploadRequests.delete(String(id));
+            upload.timers.forEach(clearTimeout); upload.timers = [];
+            if (!owned || !uploadIsCurrent(upload)) return;
+            renderDroppedUploads();
             fetchHistory({ sortFavorites: true }).catch(() => {});
         };
         request.send(file);
     });
 }
 
-function renderDroppedUploads() {
-    clearTimeout(uploadProgressRenderTimer);
-    uploadProgressRenderTimer = null;
-    renderDownloadCollections();
+async function beginDroppedTransfer(upload) {
+    if (!uploadIsCurrent(upload) || upload.transferStarted || upload.stopRequested || upload.settled || !upload.file) return;
+    upload.transferStarted = true;
+    upload.phase = 'transferring';
+    upload.info.status = 'downloading';
+    renderDroppedUploads();
+    try { await transferDroppedVideo(upload.info.id, upload.file); }
+    catch (_) { if (uploadIsCurrent(upload)) upload.unknown = true; }
+    if (uploadIsCurrent(upload)) renderDroppedUploads();
 }
 
 async function registerDroppedVideo(upload, file) {
-    const response = await apiFetch('/api/upload', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: upload.info.id, filename: file.name, filesize: file.size }),
-    });
-    if (!response.ok) {
-        const data = await response.json().catch(() => ({}));
-        throw new Error(data.error || response.statusText || 'Upload failed');
-    }
-    const data = await response.json();
-    if (data.id !== upload.info.id) throw new Error('Upload registration returned a different id');
-    upload.registered = true;
-    // Do not abort registration: the server may already have created the row.
-    // A Stop during preparation is applied as soon as registration acknowledges it.
-    if (upload.cancelled) {
-        await stopDroppedUpload(upload);
+    if (!uploadIsCurrent(upload) || upload.registrationStarted) return;
+    upload.registrationStarted = true;
+    if (!upload.protocol) for (const metrics of [uploadMutationMetrics, mutationMetrics]) metrics.submissions++;
+    if (upload.protocol) {
+        tagState.acceptDownload({ ...upload.info, upload_revision: '0', upload: null });
+        const submitted = tagMutations.submit({ kind: 'upload.register', targetId: upload.info.id, value: { filename: file.name, filesize: file.size } });
+        if (submitted.accepted) upload.registerIntentId = submitted.intentId;
+        else { upload.info.status = 'interrupted'; upload.phase = 'failed'; upload.failure = submitted.message; upload.settled = true; upload.file = null; showActionError(submitted.message); }
+        renderDroppedUploads();
         return;
     }
-    upload.info.status = 'downloading';
-    upload.info.upload_detail = 'Uploading…';
-    renderDroppedUploads();
-    fetchHistory().catch(() => {});
-    const result = await transferDroppedVideo(data.id, file);
-    if (result.cancelled || result.error === 'Upload cancelled') {
-        upload.cancelled = true;
-        upload.info.status = 'cancelled';
-        upload.info.upload_detail = 'Upload stopped';
-    }
-    if (!upload.cancelled && !result.cancelled && !result.error) {
-        upload.info.status = 'finished';
-        upload.info.upload_detail = '';
-    }
+    try {
+        const response = await apiFetch('/api/upload', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: upload.info.id, filename: file.name, filesize: file.size }) });
+        const data = await response.json().catch(() => null);
+        if (!uploadIsCurrent(upload)) return;
+        if (!response.ok || data?.id !== upload.info.id) {
+            if (response.status === 400) { upload.phase = 'failed'; upload.info.status = 'interrupted'; upload.settled = true; upload.file = null; }
+            else upload.unknown = true;
+            upload.info.upload_detail = data?.error || 'Upload registration not confirmed';
+            if (upload.phase === 'failed') { upload.failure = upload.info.upload_detail; showActionError(upload.failure); }
+        } else {
+            upload.registered = true; upload.phase = 'registered';
+            if (upload.stopRequested) await stopDroppedUpload(upload);
+            else await beginDroppedTransfer(upload);
+        }
+    } catch (_) { if (uploadIsCurrent(upload)) upload.unknown = true; }
+    if (uploadIsCurrent(upload)) renderDroppedUploads();
 }
 
 function uploadDroppedVideos(files) {
     hideUploadOverlay();
     if (!files.length) return;
-    closeAllMenus();
-    hideActionError();
-    const uploads = files.map(file => {
-        // getRandomValues also works on HTTP LAN deployments where randomUUID
-        // is unavailable. Only hex IDs enter row selectors and action handlers.
-        const id = Array.from(crypto.getRandomValues(new Uint8Array(16)),
-            byte => byte.toString(16).padStart(2, '0')).join('');
+    closeAllMenus(); hideActionError();
+    const startedAt = performance.now();
+    const uploads = [];
+    for (const file of files) {
+        if (droppedUploads.size >= 128) { showActionError('Resolve pending uploads before adding more files.'); break; }
+        const id = Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('');
         const upload = {
-            registered: false, cancelled: false, dismissed: false, settled: false,
-            info: {
-                id, title: file.name, requested_filename: file.name,
-                source_type: 'upload', url: '', status: 'starting',
-                progress: '0%', downloaded_bytes: 0, total_bytes: file.size,
-                filesize: file.size, created_at: Date.now() / 1000,
-                upload_detail: 'Preparing upload…',
-            },
+            epoch: tagSessionEpoch, file, timers: [], protocol: hasUploadProtocol(), phase: 'registering',
+            registered: false, stopRequested: false, settled: false, unknown: false,
+            info: { id, title: file.name, requested_filename: file.name, source_type: 'upload', url: '', status: 'starting',
+                progress: '0%', downloaded_bytes: 0, total_bytes: file.size, filesize: file.size,
+                created_at: Date.now() / 1000, upload_detail: 'Registering upload…' },
         };
-        droppedUploads.set(id, upload);
-        return upload;
-    });
+        droppedUploads.set(id, upload); uploads.push(upload);
+    }
     renderDroppedUploads();
-    // Start all registrations independently, and attach a rejection handler
-    // immediately so one failed file cannot hide or delay its siblings.
-    uploads.forEach((upload, index) => {
-        registerDroppedVideo(upload, files[index]).catch(error => {
-            if (upload.cancelled) return;
-            upload.info.status = 'interrupted';
-            upload.info.upload_detail = error.message || 'Upload failed';
-            showActionError(`${files[index].name}: ${upload.info.upload_detail}`);
-        }).finally(() => {
-            upload.settled = true;
-            if (upload.dismissed && !upload.registered) droppedUploads.delete(upload.info.id);
-            renderDroppedUploads();
-            fetchHistory({ sortFavorites: true }).catch(() => {});
-        });
-    });
+    uploadMutationMetrics.latestLocalFeedbackMs = Math.max(0, performance.now() - startedAt);
+    mutationMetrics.latestLocalFeedbackMs = uploadMutationMetrics.latestLocalFeedbackMs;
+    uploads.forEach(upload => registerDroppedVideo(upload, upload.file));
 }
 
 async function stopDroppedUpload(upload) {
-    if (!upload.registered) return;
-    const id = upload.info.id;
-    await apiAction('/api/stop/' + encodeURIComponent(id), { method: 'POST' });
-    activeUploadRequests.get(id)?.abort();
-    if (upload.dismissed) {
-        await apiAction('/api/remove/' + encodeURIComponent(id), { method: 'POST' });
-        droppedUploads.delete(id);
-        collectionSnapshots.current = collectionSnapshots.current.filter(info => String(info.id) !== id);
+    if (!uploadIsCurrent(upload) || ['published', 'cancelled', 'failed'].includes(upload.phase)) return;
+    const startedAt = performance.now();
+    upload.stopRequested = true;
+    renderDroppedUploads();
+    uploadMutationMetrics.latestLocalFeedbackMs = Math.max(0, performance.now() - startedAt);
+    mutationMetrics.latestLocalFeedbackMs = uploadMutationMetrics.latestLocalFeedbackMs;
+    activeUploadRequests.get(upload.info.id)?.abort();
+    if (!upload.registered || upload.registerIntentId && tagMutations.status(upload.registerIntentId)) return;
+    if (upload.protocol) {
+        if (upload.cancelIntentId || upload.cancelSubmitted) return;
+        const result = tagMutations.submit({ kind: 'upload.cancel', targetId: upload.info.id, value: {} });
+        if (result.accepted) { upload.cancelSubmitted = true; upload.cancelIntentId = result.intentId; }
+        else upload.unknown = true;
         renderDroppedUploads();
+        return;
     }
-    fetchHistory().catch(() => {});
+    if (upload.cancelSubmitted) return;
+    upload.cancelSubmitted = true;
+    for (const metrics of [uploadMutationMetrics, mutationMetrics]) metrics.submissions++;
+    try {
+        const response = await apiFetch('/api/stop/' + encodeURIComponent(upload.info.id), { method: 'POST' });
+        const data = await response.json().catch(() => null);
+        if (!uploadIsCurrent(upload)) return;
+        if (response.ok && data?.upload && VDL.validUploadState(data.upload)) acceptUploadReply(upload, data);
+        // Legacy acceptance may merely set a worker flag. Its collection state,
+        // rather than the fetch abort, establishes eventual cancellation.
+        else upload.unknown = true;
+    } catch (_) { if (uploadIsCurrent(upload)) upload.unknown = true; }
+    if (uploadIsCurrent(upload)) { renderDroppedUploads(); fetchHistory().catch(() => {}); }
+}
+
+function adoptServerUploads(entries) {
+    if (!hasUploadProtocol()) return;
+    for (const info of entries) {
+        if (info.source_type !== 'upload' || info.can_manage_upload !== true || !VDL.validUploadState(info.upload) || droppedUploads.has(String(info.id))) continue;
+        if (['published', 'cancelled', 'failed'].includes(info.upload.phase) && !info.upload.recovery_required) continue;
+        const upload = { epoch: tagSessionEpoch, file: null, timers: [], protocol: true, phase: info.upload.phase,
+            registered: true, registrationStarted: true, transferStarted: true,
+            stopRequested: !!info.upload.cancel_requested, settled: false, unknown: false,
+            info: { ...info }, adopted: true };
+        droppedUploads.set(String(info.id), upload);
+        acceptUploadReply(upload, { id: String(info.id), upload: info.upload });
+    }
 }
 
 function uploadCollectionData() {
-    if (!droppedUploads.size) {
-        return collectionSnapshots.library.concat(collectionSnapshots.current);
-    }
-    const byId = new Map(collectionSnapshots.current.concat(collectionSnapshots.library)
-        .map(info => [String(info.id), info]));
+    const byId = new Map(collectionSnapshots.current.concat(collectionSnapshots.library).map(info => [String(info.id), info]));
+    const announcements = [];
     for (const [id, upload] of droppedUploads) {
+        if (!uploadIsCurrent(upload)) continue;
         const server = byId.get(id);
-        if (!upload.dismissed && upload.settled && server && (
-            server.status === 'finished' || (upload.cancelled && server.status === 'cancelled'))) {
-            droppedUploads.delete(id);
-            continue;
+        if (upload.protocol && server?.upload && VDL.validUploadState(server.upload)) acceptUploadReply(upload, { id, upload: server.upload, ...(server.status === 'finished' ? { download: server } : {}) }, { settle: false });
+        if (!upload.protocol && server && ['finished', 'cancelled', 'error'].includes(server.status)) {
+            upload.phase = ({ finished: 'published', cancelled: 'cancelled', error: 'failed' })[server.status];
+            upload.settled = true; upload.unknown = false; upload.file = null; upload.info = { ...upload.info, ...server };
         }
-        if (upload.dismissed) {
-            byId.delete(id);
-        } else if (server?.status === 'finished') {
-            // Only the server can publish validated media into the Library.
-            byId.set(id, server);
-        } else {
-            byId.set(id, {
-                ...server, ...upload.info,
-                downloaded_bytes: Math.max(server?.downloaded_bytes || 0, upload.info.downloaded_bytes),
-            });
+        const announcement = `${upload.info.title}: ${uploadText(upload)}`;
+        if (upload.announcedText !== announcement) {
+            upload.announcedText = announcement;
+            announcements.push(announcement);
         }
+        const confirmed = tagState.selectDownload(id);
+        byId.set(id, { ...server, ...upload.info, ...(confirmed?.upload ? { upload: confirmed.upload, upload_revision: confirmed.upload_revision } : {}), downloaded_bytes: Math.max(server?.downloaded_bytes || 0, upload.info.downloaded_bytes) });
+        if (upload.settled && !upload.unknown && !uploadIntent(upload) && server && server.status === upload.info.status) droppedUploads.delete(id);
     }
+    // The active dialog owns an inner live region; phase text changes once,
+    // while byte progress and repeat renders remain silent.
+    if (announcements.length) announceTagStatus(announcements.join('. '));
     return [...byId.values()];
 }
+
+document.addEventListener('click', async event => {
+    const button = event.target.closest('[data-upload-recovery]');
+    if (!button) return;
+    const upload = droppedUploads.get(button.dataset.uploadId);
+    if (!upload || !uploadIsCurrent(upload) || upload.checking) return;
+    if (button.dataset.uploadRecovery === 'current') { openCurrentDownloads(); fetchHistory().catch(() => {}); return; }
+    if (button.dataset.uploadRecovery === 'dismiss') {
+        const intentId = upload.cancelIntentId || upload.registerIntentId;
+        if (intentId && tagMutations.resolve(intentId)) {
+            upload.cancelIntentId = null; upload.registerIntentId = null;
+            if (!upload.registered) { droppedUploads.delete(upload.info.id); upload.file = null; }
+            else {
+                upload.stopRequested = false; upload.cancelSubmitted = false;
+                upload.settled = ['published', 'cancelled', 'failed'].includes(upload.phase) && !upload.recoveryRequired;
+                if (upload.settled) upload.file = null;
+            }
+        }
+        renderDroppedUploads(); return;
+    }
+    upload.checking = true;
+    renderDroppedUploads();
+    try {
+        const intentId = upload.cancelIntentId || upload.registerIntentId;
+        if (intentId && tagMutations.status(intentId)?.status === 'unconfirmed') await tagMutations.recover(intentId, { replay: button.dataset.uploadRecovery === 'replay' });
+        if (!uploadIsCurrent(upload)) return;
+        if (button.dataset.uploadRecovery === 'check') {
+            uploadMutationMetrics.reconciliationReads++; mutationMetrics.reconciliationReads++;
+            const response = await apiFetch(`/api/upload/${encodeURIComponent(upload.info.id)}/status`);
+            const data = await response.json().catch(() => null);
+            if (!uploadIsCurrent(upload)) return;
+            if ((response.status === 403 || response.status === 404 && data?.error !== 'Mutation unavailable') && upload.registered) tagMutations.fence(upload.info.id);
+            else if (response.status === 403 || response.status === 404) upload.unknown = true;
+            else if (response.ok && acceptUploadReply(upload, data)) {
+                if (!uploadIntent(upload) && !upload.stopRequested && !upload.transferStarted && upload.phase === 'registered') await beginDroppedTransfer(upload);
+                else if (upload.stopRequested && upload.phase === 'registered') stopDroppedUpload(upload);
+                if (!['published', 'cancelled', 'failed'].includes(upload.phase) && upload.transferStarted && !activeUploadRequests.has(upload.info.id)) upload.unknown = true;
+            }
+        }
+    } catch (_) {
+        if (uploadIsCurrent(upload)) upload.unknown = true;
+    } finally {
+        if (uploadIsCurrent(upload)) { upload.checking = false; renderDroppedUploads(); }
+    }
+});
 
 document.addEventListener('dragenter', event => {
     if (!isFileDrag(event)) return;
@@ -1546,6 +1767,8 @@ const preferenceMutationMetrics = { ...tagMutationMetrics };
 const playlistMutationMetrics = { ...tagMutationMetrics };
 const downloadCommandMetrics = { ...tagMutationMetrics };
 const downloadSubmissionMetrics = { ...tagMutationMetrics };
+const uploadMutationMetrics = { ...tagMutationMetrics };
+VDL.uploadMutationMetrics = () => Object.freeze({ ...uploadMutationMetrics });
 VDL.downloadSubmissionMetrics = () => Object.freeze({ ...downloadSubmissionMetrics });
 VDL.downloadCommandMetrics = () => Object.freeze({ ...downloadCommandMetrics });
 const compatibilityCommands = new Map();
@@ -1591,7 +1814,7 @@ const tagMutations = VDL.createMutations({
         return { status: response.status, body: await response.json().catch(() => null) };
     },
     onEvent: event => {
-        const domainMetrics = event.action === 'download.submit' ? downloadSubmissionMetrics : event.action.startsWith('download.') ? downloadCommandMetrics : event.action.startsWith('playlist.') ? playlistMutationMetrics : event.action === 'preference.set' ? preferenceMutationMetrics : event.action === 'rename.set' ? renameMutationMetrics : event.action === 'favorite.set' ? favoriteMutationMetrics : tagMutationMetrics;
+        const domainMetrics = event.action.startsWith('upload.') ? uploadMutationMetrics : event.action === 'download.submit' ? downloadSubmissionMetrics : event.action.startsWith('download.') ? downloadCommandMetrics : event.action.startsWith('playlist.') ? playlistMutationMetrics : event.action === 'preference.set' ? preferenceMutationMetrics : event.action === 'rename.set' ? renameMutationMetrics : event.action === 'favorite.set' ? favoriteMutationMetrics : tagMutationMetrics;
         for (const metrics of [domainMetrics, mutationMetrics]) {
             if (event.outcome === 'presented') metrics.submissions++;
             if (event.outcome === 'confirmed') {
@@ -1605,6 +1828,7 @@ const tagMutations = VDL.createMutations({
         mutationMetrics.pending = event.pending;
         mutationMetrics.unconfirmed = event.unconfirmed;
         mutationMetrics.conflicted = event.conflicted;
+        if (event.action.startsWith('upload.')) handleUploadMutationEvent(event);
         if (event.action === 'download.submit') handleDownloadSubmissionEvent(event);
         else if (event.action.startsWith('download.')) {
             if (event.outcome === 'reconciliation') downloadCommandMetrics.reconciliationReads++;
@@ -1645,6 +1869,12 @@ const tagMutations = VDL.createMutations({
 
 function resetTagSession() {
     tagSessionEpoch += 1;
+    for (const upload of droppedUploads.values()) upload.timers.forEach(clearTimeout);
+    droppedUploads.clear();
+    for (const request of activeUploadRequests.values()) request.abort();
+    activeUploadRequests.clear();
+    clearTimeout(uploadProgressRenderTimer); uploadProgressRenderTimer = null;
+    renderUploadRecovery();
     resetDownloadSubmission(true);
     for (const entry of compatibilityCommands.values()) entry.timers.forEach(clearTimeout);
     compatibilityCommands.clear(); commandNotices.clear(); commandAnnouncements.clear();
@@ -1694,7 +1924,7 @@ function updateTagMutationSummary() {
         submittedTagIntents.delete(intentId);
         recoveredTagIntents.delete(intentId);
     }
-    const allIntents = tagMutations.pending().concat(downloadSubmission?.legacy ? [{ ...downloadSubmission.legacy, kind: 'download.submit' }] : []).concat(preferenceSubmission?.legacy ? [{ ...preferenceSubmission.legacy, kind: 'preference.set' }] : []).concat([...playlistSubmissions.values()].filter(entry => entry.legacy).map(entry => ({ ...entry.legacy, kind: entry.kind })));
+    const allIntents = tagMutations.pending().concat(uploadDiagnosticIntents()).concat(downloadSubmission?.legacy ? [{ ...downloadSubmission.legacy, kind: 'download.submit' }] : []).concat(preferenceSubmission?.legacy ? [{ ...preferenceSubmission.legacy, kind: 'preference.set' }] : []).concat([...playlistSubmissions.values()].filter(entry => entry.legacy).map(entry => ({ ...entry.legacy, kind: entry.kind })));
     const intents = allIntents.filter(intent => intent.kind.startsWith('tag.'));
     const favoriteIntents = allIntents.filter(intent => intent.kind === 'favorite.set');
     updateFavoriteMutationSummary(favoriteIntents);
@@ -1730,7 +1960,7 @@ function updateTagMutationSummary() {
 function projectTagEntry(info) {
     const projected = tagState.selectDownload(String(info.id));
     if (!projected) return info;
-    return { ...info, ...(info.current_attempt_id !== projected.current_attempt_id && typeof projected.command_revision === 'string' ? { status: projected.status, progress: projected.progress, speed: projected.speed, eta: projected.eta, downloaded_bytes: projected.downloaded_bytes, total_bytes: projected.total_bytes, finished_at: projected.finished_at } : {}), command_revision: projected.command_revision, current_attempt_id: projected.current_attempt_id, job_id: projected.job_id, filename: projected.filename, display_filename: projected.display_filename,
+    return { ...info, ...(projected.upload && (!info.upload || BigInt(info.upload.revision) < BigInt(projected.upload.revision)) ? { status: projected.upload.download_status, downloaded_bytes: projected.upload.downloaded_bytes, total_bytes: projected.upload.total_bytes, upload: projected.upload, upload_revision: projected.upload_revision } : {}), ...(info.current_attempt_id !== projected.current_attempt_id && typeof projected.command_revision === 'string' ? { status: projected.status, progress: projected.progress, speed: projected.speed, eta: projected.eta, downloaded_bytes: projected.downloaded_bytes, total_bytes: projected.total_bytes, finished_at: projected.finished_at } : {}), command_revision: projected.command_revision, current_attempt_id: projected.current_attempt_id, job_id: projected.job_id, filename: projected.filename, display_filename: projected.display_filename,
         rename_revision: projected.rename_revision, requested_filename: ['sending', 'unconfirmed'].includes(compatibilityRenames.get(String(info.id))?.status) ? compatibilityRenames.get(String(info.id)).value : projected.requested_filename, rename_intents: projected.rename_intents, tags: projected.tags, tag_items: projected.tag_items,
         tags_revision: projected.tags_revision, tag_chips: projected.tag_chips,
         favorite: projected.favorite, favorite_revision: projected.favorite_revision, favorite_intents: projected.favorite_intents };
@@ -1750,6 +1980,8 @@ async function loadTagCapabilities() {
         if (epoch !== tagSessionEpoch) return;
         tagCapabilities = capabilities;
         tagMutations.setCapabilities(tagCapabilities);
+        adoptServerUploads(collectionSnapshots.current);
+        renderDroppedUploads();
     } catch (_) {
         // Older deployments retain the legacy contract until a page reload.
     }
@@ -1781,6 +2013,8 @@ tagState.subscribe(ids => {
     for (const id of ids) {
         if (tagState.selectDownload(id) !== null) continue;
         unavailableTagIds.add(String(id));
+        const upload = droppedUploads.get(String(id));
+        if (upload) { upload.timers.forEach(clearTimeout); droppedUploads.delete(String(id)); activeUploadRequests.get(String(id))?.abort(); activeUploadRequests.delete(String(id)); renderUploadRecovery(); }
         for (const key of ['library', 'current']) {
             collectionSnapshots[key] = collectionSnapshots[key].filter(info => String(info.id) !== String(id));
         }
@@ -1813,6 +2047,7 @@ tagState.subscribe(ids => {
         releaseSettledRenameInteractions();
         releaseSettledFavoriteInteractions();
         renderDownloadCollections();
+        renderUploadRecovery();
         refreshRenamePresentations();
         const statuses = ids.flatMap(id => tagState.selectDownload(id)?.tag_chips || [])
             .filter(chip => chip.status !== 'confirmed')
@@ -1827,7 +2062,7 @@ tagState.subscribe(ids => {
 });
 
 window.addEventListener('beforeunload', event => {
-    if (!playlistActions.size && !playlistSubmissions.size && !playlistRetainedDrafts.size && !(playlistEditorDraft && playlistEditorSnapshot() !== playlistEditorBaseline) && !preferenceDirty && !preferenceSubmission && !tagMutations.hasPending() && ![...tagDrafts.values()].some(value => value.trim()) && !renameDrafts.size && !compatibilityRenames.size && !compatibilityCommands.size && !downloadSubmission?.legacy && !urlInput.value.trim()) return;
+    if (![...droppedUploads.values()].some(upload => !upload.settled || upload.unknown || uploadIntent(upload)) && !playlistActions.size && !playlistSubmissions.size && !playlistRetainedDrafts.size && !(playlistEditorDraft && playlistEditorSnapshot() !== playlistEditorBaseline) && !preferenceDirty && !preferenceSubmission && !tagMutations.hasPending() && ![...tagDrafts.values()].some(value => value.trim()) && !renameDrafts.size && !compatibilityRenames.size && !compatibilityCommands.size && !downloadSubmission?.legacy && !urlInput.value.trim()) return;
     event.preventDefault();
     event.returnValue = '';
 });
@@ -2495,10 +2730,6 @@ function stopDownload(id, attemptId) {
     closeAllMenus();
     const upload = droppedUploads.get(String(id));
     if (upload) {
-        upload.cancelled = true;
-        upload.info.status = 'cancelled';
-        upload.info.upload_detail = 'Upload stopped';
-        renderDroppedUploads();
         stopDroppedUpload(upload).catch(() => {});
         return;
     }
@@ -2978,13 +3209,15 @@ function deleteDownload(id) {
     closeHistoryInfo();
     closeAllMenus();
     const upload = droppedUploads.get(String(id));
-    if (upload) {
-        upload.dismissed = true;
-        if (!upload.registered) {
-            if (upload.settled) droppedUploads.delete(String(id));
-            renderDroppedUploads();
-            return;
-        }
+    if (upload && !upload.registered && upload.settled && !upload.unknown && !uploadIntent(upload)) {
+        droppedUploads.delete(String(id));
+        tagMutations.fence(String(id));
+        renderDroppedUploads();
+        return;
+    }
+    if (upload && (!upload.settled || upload.unknown || uploadIntent(upload))) {
+        announceTagStatus('Check upload status and wait for its confirmed outcome before removing it.');
+        return;
     }
     const row = document.querySelector(`[data-row-id="${id}"]`);
     if (row) {
@@ -3000,7 +3233,7 @@ function deleteDownload(id) {
             return fetchHistory();
         })
         .catch(() => {
-            if (upload) upload.dismissed = false;
+            if (upload && !uploadIsCurrent(upload)) return;
             renderDroppedUploads();
             return fetchHistory();
         });
@@ -4157,7 +4390,7 @@ function renderPlaylistSaveStatus() {
     const summaryMessage = closed.length === 1 && ['queued', 'sending'].includes(playlistSubmissionIntent(closed[0])?.status) ? closed[0].kind === 'playlist.create' ? 'Creating playlist…' : 'Saving playlist…' : closed.length ? `${closed.length} playlist ${closed.length === 1 ? 'save' : 'saves'} ${closed.some(entry => playlistSubmissionIntent(entry)?.status === 'unconfirmed') ? 'not confirmed' : closed.some(entry => playlistSubmissionIntent(entry)?.status === 'conflicted') ? 'in conflict' : 'pending or needing review'}.` : '';
     const closedMessage = summaryMessage + (closedDrafts.length ? ` ${closedDrafts.length} unsaved playlist ${closedDrafts.length === 1 ? 'draft' : 'drafts'}.` : '');
     if (summary.querySelector('span').textContent !== closedMessage) summary.querySelector('span').textContent = closedMessage;
-    const aggregate = tagMutations.pending().concat(downloadSubmission?.legacy ? [{ ...downloadSubmission.legacy, kind: 'download.submit' }] : []).concat(entries.filter(entry => entry.legacy).map(entry => entry.legacy), [...playlistActions.values()].filter(entry => entry.legacy).map(entry => entry.legacy), preferenceSubmission?.legacy ? [preferenceSubmission.legacy] : []);
+    const aggregate = tagMutations.pending().concat(uploadDiagnosticIntents()).concat(downloadSubmission?.legacy ? [{ ...downloadSubmission.legacy, kind: 'download.submit' }] : []).concat(entries.filter(entry => entry.legacy).map(entry => entry.legacy), [...playlistActions.values()].filter(entry => entry.legacy).map(entry => entry.legacy), preferenceSubmission?.legacy ? [preferenceSubmission.legacy] : []);
     for (const [field, states] of [['pending', ['queued', 'sending', 'unconfirmed', 'conflicted']], ['unconfirmed', ['unconfirmed']], ['conflicted', ['conflicted']]]) mutationMetrics[field] = aggregate.filter(entry => states.includes(entry.status)).length;
     for (const [field, states] of [['pending', ['queued', 'sending', 'unconfirmed', 'conflicted']], ['unconfirmed', ['unconfirmed']], ['conflicted', ['conflicted']]]) playlistMutationMetrics[field] = entries.filter(entry => states.includes(playlistSubmissionIntent(entry)?.status)).length + [...playlistActions.values()].filter(entry => states.includes(playlistActionIntent(entry)?.status)).length;
 }
@@ -4496,7 +4729,7 @@ function renderPlaylistActionStatus() {
     }
     renderPlaylistChooser();
     const entries = [...playlistActions.values()].map(playlistActionIntent).filter(Boolean);
-    const all = tagMutations.pending().concat(downloadSubmission?.legacy ? [{ ...downloadSubmission.legacy, kind: 'download.submit' }] : []).concat([...playlistSubmissions.values()].filter(entry => entry.legacy).map(entry => entry.legacy), [...playlistActions.values()].filter(entry => entry.legacy).map(entry => entry.legacy), preferenceSubmission?.legacy ? [preferenceSubmission.legacy] : []);
+    const all = tagMutations.pending().concat(uploadDiagnosticIntents()).concat(downloadSubmission?.legacy ? [{ ...downloadSubmission.legacy, kind: 'download.submit' }] : []).concat([...playlistSubmissions.values()].filter(entry => entry.legacy).map(entry => entry.legacy), [...playlistActions.values()].filter(entry => entry.legacy).map(entry => entry.legacy), preferenceSubmission?.legacy ? [preferenceSubmission.legacy] : []);
     for (const [field, statuses] of [['pending', ['queued', 'sending', 'unconfirmed', 'conflicted']], ['unconfirmed', ['unconfirmed']], ['conflicted', ['conflicted']]]) {
         mutationMetrics[field] = all.filter(entry => statuses.includes(entry.status)).length;
         playlistMutationMetrics[field] = entries.concat([...playlistSubmissions.values()].map(playlistSubmissionIntent).filter(Boolean)).filter(entry => statuses.includes(entry.status)).length;
@@ -4770,6 +5003,7 @@ function renderHistoryCard(info) {
                             <div id="menu-${escapeAttr(id)}" class="kebab-menu">${menuItems.join('')}</div>
                         </div>
                     </div>
+                    ${uploadStatusSlot(id)}
                     ${downloadCommandStatusSlot(id)}
                     <div id="info-${escapeAttr(id)}" class="history-info-popover" role="dialog" aria-label="Download information">
                         <div class="history-info-content">
@@ -4814,7 +5048,7 @@ function renderItem(info, inHistoryView = false) {
     let primary = '';
     const menuItems = [];
 
-    if (isRunning) {
+    if (isRunning && (!isUpload || info.can_manage_upload !== false)) {
         primary = `<button class="stop-btn icon-only" data-download-command="stop" data-command-attempt="${escapeAttr(info.current_attempt_id || '')}" data-download-id="${escapeAttr(id)}" onclick="stopDownload('${id}', this.dataset.commandAttempt || null)" aria-label="Stop" title="Stop">${renderActionProgressIcon('i-pause', info)}</button>`;
     } else if (isPaused) {
         primary = `<button class="continue-btn" data-download-command="unpause" data-command-attempt="${escapeAttr(info.current_attempt_id || '')}" data-download-id="${escapeAttr(id)}" onclick="unpauseDownload('${id}', this.dataset.commandAttempt || null)">${renderActionProgressIcon('i-play', info)}Resume</button>`;
@@ -4977,6 +5211,7 @@ function renderItem(info, inHistoryView = false) {
                     ${tagRow}
                     ${bottom}
                     ${downloadSummaryRow}
+                    ${uploadStatusSlot(id)}
                     ${downloadCommandStatusSlot(id)}
                     ${errorBlock}
                 </div>
@@ -5744,10 +5979,17 @@ function fetchDownloadCollection(key) {
                 previous => !data.some(info => info.id === previous.id));
             acceptingTagSnapshots = true;
             try {
-                for (const info of data) tagState.acceptDownload(info, tagContext);
+                for (const info of data) {
+                    if (info.can_manage_upload === false && droppedUploads.get(String(info.id))?.registered) {
+                        tagMutations.fence(String(info.id));
+                        continue;
+                    }
+                    tagState.acceptDownload(info.upload && VDL.validUploadState(info.upload) ? { ...info, upload_revision: info.upload.revision } : info, tagContext);
+                }
                 if (key === 'library') for (const info of allLibraryEntries) tagState.acceptDownload(info, tagContext);
             } finally { acceptingTagSnapshots = false; }
             collectionSnapshots[key] = data;
+            adoptServerUploads(data);
             checkMissingTagTargets(previousEntries, data);
             if (key === 'library') libraryLoaded = true;
             else currentLoaded = true;

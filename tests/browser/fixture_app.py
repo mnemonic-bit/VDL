@@ -46,6 +46,7 @@ def test_reset():
             vdl.request_cancel(row["id"])
     with vdl._file_operation_lock, vdl._db_lock, vdl.db() as connection:
         connection.execute("DELETE FROM playlists")
+        connection.execute("DELETE FROM upload_operations")
         connection.execute("DELETE FROM downloads")
         connection.execute("DELETE FROM download_attempts")
         # A reset represents a new isolated database, including identities and

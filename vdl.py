@@ -340,7 +340,7 @@ def companion_response_headers(response):
     """Apply the narrow CORS and cache boundary to companion responses."""
     if request.endpoint in ('library_storage', 'client_capabilities',
                             'editable_download_state', 'mutation_receipt', 'download_tags',
-                            'set_download_favorite', 'preferences'):
+                            'set_download_favorite', 'preferences', 'start_video_upload', 'upload_status', 'cancel_video_upload', 'receive_video_upload'):
         response.headers['Cache-Control'] = 'no-store'
     if request.endpoint not in EXTENSION_NO_STORE_ENDPOINTS:
         return response
@@ -485,7 +485,7 @@ _file_operation_lock = threading.RLock()
 _rotation_lock = threading.RLock()
 _rotation_timer = None
 _rotation_timer_db = None
-_upload_lock = threading.Lock()
+_upload_lock = threading.RLock()
 # One queue instance belongs to one database and one serving process.
 _asset_queue = None
 _asset_queue_db = None
@@ -1067,6 +1067,28 @@ def init_db():
             CREATE INDEX IF NOT EXISTS download_commands_target ON download_commands(target_id, phase);
             CREATE INDEX IF NOT EXISTS download_commands_attempt ON download_commands(attempt_id, recorded_at, id);
         """)
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS upload_operations (
+                id TEXT PRIMARY KEY REFERENCES downloads(id) ON DELETE CASCADE,
+                actor_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                actor_session_version INTEGER NOT NULL,
+                mutation_id TEXT,
+                fingerprint TEXT NOT NULL,
+                attempt_id TEXT,
+                phase TEXT NOT NULL DEFAULT 'registered',
+                revision INTEGER NOT NULL DEFAULT 1,
+                cancel_requested INTEGER NOT NULL DEFAULT 0,
+                temporary_path TEXT,
+                final_path TEXT,
+                device TEXT,
+                inode TEXT,
+                cleanup_pending INTEGER NOT NULL DEFAULT 0,
+                retired_paths TEXT NOT NULL DEFAULT '[]',
+                recorded_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS upload_operations_actor
+                ON upload_operations(actor_id, phase, recorded_at);
+        """)
         download_history.initialize(conn)
         conn.executescript("""
             CREATE TRIGGER IF NOT EXISTS download_attempt_delete_command_revision
@@ -1091,6 +1113,7 @@ def init_db():
             "UPDATE downloads SET status = 'interrupted', progress = 'Interrupted' "
             "WHERE status IN ('starting', 'downloading', 'paused')"
         )
+    _recover_upload_operations()
     _recover_rename_operations()
     _reconcile_preference_runtime(restore_rotation=False)
     # The debug reloader's parent must not renew the shared deck alongside
@@ -1362,6 +1385,8 @@ def db_get_download(download_id):
         result.update(_favorite_snapshot(conn, download_id, row))
         result.update(_rename_snapshot(conn, download_id, row))
         result.update(_download_command_snapshot(conn, download_id, row))
+        if row['source_type'] == 'upload':
+            result['upload'] = _upload_snapshot(conn, download_id)
         result["quality"] = classify_video_quality(result["resolution"])
         result.update(_tag_snapshot(conn, download_id, row))
         return result
@@ -1803,6 +1828,9 @@ def _rename_unresolved():
 def _assert_no_pending_rename(entry, exclude=None):
     with db() as conn:
         operations = conn.execute('SELECT * FROM rename_operations').fetchall()
+        upload = conn.execute('SELECT cleanup_pending FROM upload_operations WHERE id=?', (entry['id'],)).fetchone()
+        if upload and upload['cleanup_pending']:
+            raise OSError('Upload recovery requires intervention before another file operation')
     path = entry.get('filename')
     real = os.path.realpath(path) if path else None
     for operation in operations:
@@ -2539,6 +2567,9 @@ def db_list_downloads(user_id=None, is_admin=False, statuses=None):
             )
         for download in downloads:
             download.update(_download_command_snapshot(conn, download["id"], download))
+            if download["source_type"] == "upload":
+                download["upload"] = _upload_snapshot(conn, download["id"])
+                download["can_manage_upload"] = bool(user_id is not None and download["owner_user_id"] == user_id and conn.execute('SELECT 1 FROM upload_operations WHERE id=? AND actor_id=?', (download["id"], user_id)).fetchone())
             download["rename_revision"] = str(download["rename_revision"])
             download.update(_serialize_favorite_state(
                 download['id'], download['favorite'], download['favorite_revision'],
@@ -7331,215 +7362,516 @@ def add_download():
     return jsonify({"message": "Download started", "id": download_id})
 
 
+def _prepare_upload_directory(path):
+    try:
+        return os.path.abspath(_prepare_download_directory(path))
+    except ValueError:
+        # The shared preparer includes OS diagnostics; upload recovery errors
+        # are public and must not copy physical paths into responses or History.
+        raise ValueError('Upload directory is unavailable; review Settings') from None
+
+
+def _upload_checkpoint(phase, operation):
+    """Failure-injection seam at durable ownership/publication boundaries."""
+
+
+def _upload_snapshot(conn, download_id):
+    row = conn.execute('SELECT u.*, d.status, d.downloaded_bytes, d.total_bytes '
+                       'FROM upload_operations u JOIN downloads d ON d.id=u.id WHERE u.id=?',
+                       (download_id,)).fetchone()
+    if row is None:
+        return None
+    return {'id': row['id'], 'phase': 'processing' if row['phase'] == 'publishing' else row['phase'], 'revision': str(row['revision']),
+            'attempt_id': row['attempt_id'], 'download_status': row['status'],
+            'downloaded_bytes': row['downloaded_bytes'] or 0,
+            'total_bytes': row['total_bytes'] or 0,
+            'cancel_requested': bool(row['cancel_requested']),
+            'recovery_required': bool(row['cleanup_pending'] and row['phase'] in ('published', 'cancelled', 'failed'))}
+
+
+def _authorized_upload(conn, download_id, actor):
+    # Public playback visibility is not authority to supply another actor's bytes.
+    row = conn.execute('SELECT * FROM upload_operations WHERE id=?', (download_id,)).fetchone()
+    if row is None or actor is None or row['actor_id'] != actor['id']:
+        return None
+    target = conn.execute('SELECT owner_user_id FROM downloads WHERE id=?', (download_id,)).fetchone()
+    if target is None or target['owner_user_id'] != actor['id']:
+        return None
+    return dict(row)
+
+
+def _upload_result(conn, download_id, mutation_id=None, action=None):
+    snapshot = _upload_snapshot(conn, download_id)
+    result = {'id': download_id, 'upload': snapshot}
+    if snapshot and snapshot['phase'] == 'published':
+        row = dict(conn.execute('SELECT * FROM downloads WHERE id=?', (download_id,)).fetchone())
+        public = _public_download_entry(row)
+        result['download'] = {key: public.get(key) for key in (
+            'id', 'url', 'status', 'progress', 'created_at', 'filename', 'display_filename',
+            'resolution', 'filesize', 'speed', 'eta', 'title', 'finished_at', 'duration_seconds',
+            'media_metadata_probed', 'formats', 'requested_format', 'downloaded_bytes', 'total_bytes',
+            'favorite', 'view_count', 'source_type', 'visibility', 'browser_authenticated')}
+        owner = conn.execute('SELECT username FROM users WHERE id=?', (row['owner_user_id'],)).fetchone()
+        result['download']['downloaded_by'] = owner['username'] if owner else row['owner_username']
+        result['download']['can_manage_visibility'] = True
+        result['download']['can_manage_upload'] = True
+        result['download'].update(_tag_snapshot(conn, download_id, row))
+        result['download'].update(_favorite_snapshot(conn, download_id, row))
+        result['download'].update(_rename_snapshot(conn, download_id, row))
+        result['download'].update(_download_command_snapshot(conn, download_id, row))
+        result['download']['quality'] = classify_video_quality(row['resolution'])
+        result['download']['filename'] = public['filename']
+        result['download']['upload'] = snapshot
+    if action == 'upload.register':
+        result['message'] = 'Video upload registered'
+    elif action == 'upload.cancel':
+        result['message'] = 'Upload already published' if snapshot['phase'] == 'published' else 'Stop requested'
+    if mutation_id:
+        result['mutation'] = {'id': mutation_id, 'domain': 'upload', 'action': action,
+                              'outcome': 'accepted', 'revision': snapshot['revision']}
+    return result
+
+
+def _upload_decline(download_id, mutation_id, error, status, outcome='rejected'):
+    return {'id': download_id, 'upload': None, 'error': error,
+            'mutation': {'id': mutation_id, 'domain': 'upload', 'outcome': outcome, 'revision': '0'}}, status
+
+
+def _upload_admission(conn, actor, mutation_id, fingerprint, download_id, *, existing_only=False):
+    if mutation_id is None:
+        return None
+    match = MUTATION_ID_PATTERN.fullmatch(mutation_id) if isinstance(mutation_id, str) else None
+    if not match:
+        return _upload_decline(download_id, mutation_id, 'Invalid mutation id', 400)
+    receipt = conn.execute('SELECT * FROM mutation_receipts WHERE actor_id=? AND mutation_id=?',
+                           (actor['id'], mutation_id)).fetchone()
+    if receipt:
+        if receipt['fingerprint'] != fingerprint or receipt['target_id'] != download_id:
+            return _upload_decline(download_id, mutation_id, 'Mutation id is already bound to another request', 409, 'conflicted')
+        if _authorized_upload(conn, download_id, actor) is None:
+            return {'error': 'Upload unavailable'}, 404
+        result = json.loads(receipt['response'])
+        latest = _upload_result(conn, download_id)
+        result.update(latest)
+        result['mutation']['revision'] = result['upload']['revision']
+        return result, receipt['status']
+    if existing_only:
+        return None
+    if conn.execute('SELECT 1 FROM rename_operations WHERE actor_id=? AND mutation_id=?', (actor['id'], mutation_id)).fetchone():
+        return _upload_decline(download_id, mutation_id, 'Mutation id is already bound to another request', 409, 'conflicted')
+    now = time.time()
+    _prune_mutation_receipts(conn, now)
+    counts = conn.execute('SELECT COUNT(*) AS total, COALESCE(SUM(recorded_at>?),0) AS recent '
+                          'FROM mutation_receipts WHERE actor_id=?', (now-60, actor['id'])).fetchone()
+    active = conn.execute("SELECT COUNT(*) FROM rename_operations WHERE actor_id=? AND "
+                          "(phase!='done' OR NOT EXISTS (SELECT 1 FROM mutation_receipts r "
+                          "WHERE r.actor_id=rename_operations.actor_id AND r.mutation_id=rename_operations.mutation_id))",
+                          (actor['id'],)).fetchone()[0]
+    if counts['total'] + active >= MUTATION_ACTOR_RECEIPT_LIMIT or counts['recent'] + active >= MUTATION_ACTOR_MINUTE_LIMIT:
+        return _upload_decline(download_id, mutation_id, 'Mutation quota exceeded', 429)
+    created = int(match.group(1)) / 1000
+    if created < now-MUTATION_REPLAY_SECONDS or created > now+300:
+        return _upload_decline(download_id, mutation_id, 'Mutation attempt has expired', 409)
+    return None
+
+
+def _record_upload_receipt(conn, actor, mutation_id, fingerprint, result, status):
+    if mutation_id:
+        conn.execute('INSERT INTO mutation_receipts(actor_id,mutation_id,target_id,fingerprint,status,response,recorded_at) '
+                     'VALUES (?,?,?,?,?,?,?)', (actor['id'], mutation_id, result['id'], fingerprint,
+                                               status, json.dumps(result), time.time()))
+
+
+def _upload_phase(download_id, phase, **fields):
+    with _db_lock, db() as conn:
+        assignments = ['phase=?', 'revision=revision+1'] + [f'{name}=?' for name in fields]
+        conn.execute(f'UPDATE upload_operations SET {", ".join(assignments)} WHERE id=?',
+                     [phase, *fields.values(), download_id])
+        operation = dict(conn.execute('SELECT * FROM upload_operations WHERE id=?', (download_id,)).fetchone())
+    _upload_checkpoint(phase, operation)
+    return operation
+
+
+def _upload_cleanup(operation, *, preserve_final=False):
+    """Retire owned paths exclusively before inspecting or removing them."""
+    clean = True
+    paths = [operation.get('temporary_path')]
+    if not preserve_final:
+        paths.append(operation.get('final_path'))
+    retired = json.loads(operation.get('retired_paths') or '[]')
+    # Persist the retirement destination before moving anything. Recovery can
+    # find the pinned inode even if the process dies during cleanup.
+    for path in paths:
+        if not path or any(item['source'] == path for item in retired):
+            continue
+        target = os.path.join(os.path.dirname(path), f'.vdl_{operation["id"]}.{secrets.token_hex(16)}.upload.retired')
+        retired.append({'source': path, 'retired': target})
+    with _db_lock, db() as conn:
+        conn.execute('UPDATE upload_operations SET retired_paths=? WHERE id=?',
+                     (json.dumps(retired), operation['id']))
+    operation['retired_paths'] = json.dumps(retired)
+    for item in retired:
+        source, target = item['source'], item['retired']
+        try:
+            try:
+                info = os.lstat(target)
+            except FileNotFoundError:
+                try:
+                    info = os.lstat(source)
+                except FileNotFoundError:
+                    continue
+                if (str(info.st_dev) != operation.get('device') or str(info.st_ino) != operation.get('inode')
+                        or not stat.S_ISREG(info.st_mode)):
+                    clean = False
+                    continue
+                _upload_checkpoint('before_retire', {**operation, 'source': source})
+                _rename_noreplace(source, target)
+                _rename_sync(os.path.dirname(source))
+                info = os.lstat(target)
+            if (str(info.st_dev) != operation.get('device') or str(info.st_ino) != operation.get('inode')
+                    or not stat.S_ISREG(info.st_mode)):
+                # A replacement raced the exclusive move. Restore it only if
+                # its original location is still free; never overwrite either.
+                try:
+                    _rename_noreplace(target, source)
+                    _rename_sync(os.path.dirname(source))
+                except OSError:
+                    pass
+                clean = False
+                continue
+            os.unlink(target)
+            _rename_sync(os.path.dirname(target))
+        except FileNotFoundError:
+            pass
+        except OSError:
+            clean = False
+    return clean
+
+
+def _finish_upload_failure(download_id, phase, message, *, interrupted=False):
+    with _upload_lock:
+        with db() as conn:
+            row = conn.execute('SELECT * FROM upload_operations WHERE id=?', (download_id,)).fetchone()
+        if row is None or row['phase'] == 'published':
+            return
+        operation = dict(row)
+        clean = _upload_cleanup(operation)
+        status = 'interrupted' if interrupted else 'cancelled' if phase == 'cancelled' else 'error'
+        with _db_lock, db() as conn:
+            conn.execute('UPDATE upload_operations SET phase=?,revision=revision+1,cleanup_pending=? WHERE id=?',
+                         (phase, not clean, download_id))
+            conn.execute('UPDATE downloads SET status=?,progress=?,finished_at=? WHERE id=?',
+                         (status, message if clean else 'Upload recovery requires intervention', time.time(), download_id))
+            download_history.record(conn, download_id)
+    _publish_metadata_change('upload')
+
+
+def _recover_upload_operations():
+    # A browser File cannot survive restart. Resolve the same attempt rather
+    # than launching a transfer or guessing that a precommit hardlink published.
+    with _file_operation_lock, db() as conn:
+        operations = [dict(row) for row in conn.execute('SELECT * FROM upload_operations')]
+    for operation in operations:
+        if operation['phase'] == 'published':
+            clean = _upload_cleanup(operation, preserve_final=True)
+            with _db_lock, db() as conn:
+                conn.execute('UPDATE upload_operations SET cleanup_pending=? WHERE id=?', (not clean, operation['id']))
+        elif operation['phase'] not in ('cancelled', 'failed') or operation['cleanup_pending']:
+            cancelled = operation['cancel_requested']
+            _finish_upload_failure(operation['id'], 'cancelled' if cancelled else 'failed',
+                                   'Cancelled' if cancelled else 'Upload interrupted; choose the file again',
+                                   interrupted=not cancelled)
+
+
 @app.route('/api/upload', methods=['POST'])
 def start_video_upload():
-    """Register a dropped video so it is visible before transfer begins."""
-    data = request.get_json(silent=True) or {}
+    data, error = _read_json_body(16384)
+    if error is not None:
+        return error
     try:
         original_name = _validated_upload_filename(data.get('filename'))
         filesize = data.get('filesize')
-        if (isinstance(filesize, bool) or not isinstance(filesize, int)
-                or filesize <= 0):
+        if isinstance(filesize, bool) or not isinstance(filesize, int) or filesize <= 0 or filesize > 9007199254740991:
             raise ValueError('Uploaded video size must be a positive integer')
-        # A browser can render preparation before registration returns. Keeping
-        # its ID avoids duplicate rows when SSE beats the registration response.
         download_id = data.get('id', str(uuid.uuid4())[:8])
-        if 'id' in data and (not isinstance(download_id, str)
-                            or not re.fullmatch(r'[0-9a-f]{32}', download_id)):
+        if 'id' in data and (not isinstance(download_id, str) or not re.fullmatch(r'[0-9a-f]{32}', download_id)):
             raise ValueError('Invalid upload id')
-        output_dir = _prepare_download_directory(
-            db_get_preferences().get('download_dir', '.')
-        )
+        mutation_id = data.get('client_mutation_id')
+        if 'client_mutation_id' in data and mutation_id is None:
+            raise ValueError('Invalid mutation id')
+        if 'client_mutation_id' in data and 'id' not in data:
+            raise ValueError('A preallocated upload id is required')
+        if mutation_id is not None and set(data) - {'id', 'filename', 'filesize', 'client_mutation_id'}:
+            raise ValueError('Unsupported upload registration fields')
     except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
-
-    output_dir = os.path.abspath(output_dir)
-    title = os.path.splitext(original_name)[0] or original_name
+        result, status = _upload_decline(data.get('id'), data.get('client_mutation_id'), str(exc), 400)
+        return jsonify(result), status
+    fingerprint = hashlib.sha256(json.dumps({'action': 'upload.register', 'id': download_id,
+                              'filename': data['filename'], 'filesize': filesize}, sort_keys=True).encode()).hexdigest()
     try:
-        db_insert_upload(
-            download_id,
-            original_name,
-            title,
-            filesize,
-            output_dir,
-            g.current_user['id'],
-            g.current_user['username'],
-        )
+        # Recover an already accepted operation before consulting preferences
+        # that may have changed since its output directory was captured.
+        with _db_lock, db() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            actor = _tag_actor(conn)
+            if actor is None:
+                return jsonify({'error': 'Authentication required'}), 401
+            replay = _upload_admission(conn, actor, mutation_id, fingerprint, download_id, existing_only=True)
+            if replay:
+                return jsonify(replay[0]), replay[1]
+            if mutation_id is None:
+                operation = _authorized_upload(conn, download_id, actor)
+                if operation and operation['fingerprint'] == fingerprint:
+                    return jsonify(_upload_result(conn, download_id, action='upload.register')), 202
+        output_dir = _prepare_upload_directory(db_get_preferences().get('download_dir', '.'))
+        with _db_lock, db() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            actor = _tag_actor(conn)
+            if actor is None:
+                return jsonify({'error': 'Authentication required'}), 401
+            admission = _upload_admission(conn, actor, mutation_id, fingerprint, download_id)
+            if admission:
+                return jsonify(admission[0]), admission[1]
+            existing = conn.execute('SELECT * FROM upload_operations WHERE id=?', (download_id,)).fetchone()
+            if existing:
+                if existing['actor_id'] != actor['id'] or existing['fingerprint'] != fingerprint:
+                    result, status = _upload_decline(download_id, mutation_id, 'Upload id already exists', 409, 'conflicted')
+                    return jsonify(result), status
+                result = _upload_result(conn, download_id, mutation_id, 'upload.register')
+            else:
+                active = conn.execute("SELECT COUNT(*) FROM upload_operations WHERE actor_id=? "
+                                      "AND phase IN ('registered','transferring','processing','publishing')", (actor['id'],)).fetchone()[0]
+                if active >= 100:
+                    result, status = _upload_decline(download_id, mutation_id, 'Too many outstanding uploads', 429)
+                    return jsonify(result), status
+                title = os.path.splitext(original_name)[0] or original_name
+                conn.execute("INSERT INTO downloads(id,url,status,progress,created_at,filesize,title,output_dir,"
+                             "requested_filename,downloaded_bytes,total_bytes,source_type,owner_user_id,owner_username) "
+                             "VALUES (?,'','starting','0%',?,?,?,?,?,0,?,'upload',?,?)",
+                             (download_id,time.time(),filesize,title,output_dir,original_name,filesize,actor['id'],actor['username']))
+                download_history.record(conn, download_id, create=True)
+                attempt = conn.execute('SELECT id FROM download_attempts WHERE work_id=? ORDER BY started_at DESC,id DESC LIMIT 1',
+                                       (download_id,)).fetchone()
+                conn.execute('INSERT INTO upload_operations(id,actor_id,actor_session_version,mutation_id,fingerprint,attempt_id,recorded_at) '
+                             'VALUES (?,?,?,?,?,?,?)', (download_id,actor['id'],actor['session_version'],mutation_id,fingerprint,attempt['id'],time.time()))
+                result = _upload_result(conn, download_id, mutation_id, 'upload.register')
+            _record_upload_receipt(conn, actor, mutation_id, fingerprint, result, 202)
+        _upload_checkpoint('registered', {'id': download_id})
+        _publish_metadata_change('upload')
+        return jsonify(result), 202
+    except ValueError as exc:
+        result, status = _upload_decline(download_id, mutation_id, str(exc), 400)
+        return jsonify(result), status
     except sqlite3.IntegrityError:
-        return jsonify({"error": "Upload id already exists"}), 409
+        result, status = _upload_decline(download_id, mutation_id, 'Upload id already exists', 409, 'conflicted')
+        return jsonify(result), status
     except sqlite3.Error:
-        return jsonify({"error": "Unable to start the video upload"}), 500
-    return jsonify({
-        "message": "Video upload registered",
-        "id": download_id,
-    }), 202
+        return jsonify({'error': 'Unable to start the video upload'}), 500
+
+
+@app.route('/api/upload/<download_id>/status', methods=['GET'])
+def upload_status(download_id):
+    with _db_lock, db() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        actor = _tag_actor(conn)
+        if actor is None:
+            return jsonify({'error': 'Authentication required'}), 401
+        if _authorized_upload(conn, download_id, actor) is None:
+            return jsonify({'error': 'Upload unavailable'}), 404
+        response = jsonify(_upload_result(conn, download_id))
+        response.headers['Cache-Control'] = 'no-store'
+        return response
+
+
+def _cancel_upload(download_id, payload):
+    mutation_id = payload.get('client_mutation_id')
+    if 'client_mutation_id' in payload and mutation_id is None:
+        return _upload_decline(download_id, mutation_id, 'Invalid mutation id', 400)
+    if mutation_id is not None and set(payload) - {'client_mutation_id', 'expected_revision'}:
+        return _upload_decline(download_id, mutation_id, 'Unsupported upload cancellation fields', 400)
+    fingerprint = hashlib.sha256(json.dumps({'action':'upload.cancel','id':download_id,'payload':payload}, sort_keys=True).encode()).hexdigest()
+    with _file_operation_lock, _upload_lock:
+        with _db_lock, db() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            actor = _tag_actor(conn)
+            if actor is None:
+                return {'error': 'Authentication required'}, 401
+            operation = _authorized_upload(conn, download_id, actor)
+            if operation is None:
+                return {'error': 'Upload unavailable'}, 404
+            admission = _upload_admission(conn, actor, mutation_id, fingerprint, download_id)
+            if admission:
+                return admission
+            if operation['phase'] not in ('published','cancelled','failed'):
+                conn.execute('UPDATE upload_operations SET cancel_requested=1,revision=revision+1 WHERE id=?', (download_id,))
+            result = _upload_result(conn, download_id, mutation_id, 'upload.cancel')
+            _record_upload_receipt(conn, actor, mutation_id, fingerprint, result, 200)
+        if operation['phase'] not in ('published','cancelled','failed'):
+            request_cancel(download_id)
+            if download_id not in _live_worker_ids:
+                _finish_upload_failure(download_id, 'cancelled', 'Cancelled')
+                clear_cancel(download_id)
+        with db() as conn:
+            result['upload'] = _upload_snapshot(conn, download_id)
+            if mutation_id:
+                result['mutation']['revision'] = result['upload']['revision']
+    _publish_metadata_change('upload')
+    return result, 200
+
+
+@app.route('/api/upload/<download_id>/cancel', methods=['POST'])
+def cancel_video_upload(download_id):
+    payload, error = _read_json_body(4096)
+    if error is not None:
+        return error
+    result, status = _cancel_upload(download_id, payload)
+    response = jsonify(result)
+    response.status_code = status
+    response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+def _upload_progress(download_id, received, expected_size):
+    with _db_lock, db() as conn:
+        conn.execute("UPDATE downloads SET status='downloading',progress=?,downloaded_bytes=?,total_bytes=? WHERE id=?",
+                     (f'{received / expected_size * 100:.1f}%',received,expected_size,download_id))
+        download_history.record(conn, download_id)
+    _publish_metadata_change('upload')
 
 
 @app.route('/api/upload/<download_id>', methods=['PUT'])
 def receive_video_upload(download_id):
-    """Stream one registered upload to disk while publishing byte progress."""
-    entry = _visible_download(download_id)
-    if entry is None:
-        return jsonify({"error": "Unknown upload id"}), 404
-    if entry.get('source_type') != 'upload':
-        return jsonify({"error": "Entry is not a local upload"}), 409
-    if entry.get('status') != 'starting':
-        return jsonify({
-            "error": f"Cannot upload from status '{entry.get('status')}'"
-        }), 409
-
-    with _worker_condition:
-        if download_id in _live_worker_ids:
-            return jsonify({"error": "Upload is already active"}), 409
+    with _file_operation_lock, _worker_condition, _upload_lock:
+        with _db_lock, db() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            actor = _tag_actor(conn)
+            if actor is None:
+                return jsonify({'error': 'Authentication required'}), 401
+            operation = _authorized_upload(conn, download_id, actor)
+            entry = conn.execute('SELECT * FROM downloads WHERE id=?', (download_id,)).fetchone()
+            if operation is None:
+                visible = _tag_visible_row(conn, download_id, actor)
+                non_upload = visible is not None and visible['source_type'] != 'upload'
+                return jsonify({'error': 'Entry is not a local upload' if non_upload else 'Unknown upload id'}), 409 if non_upload else 404
+            if operation['actor_session_version'] != actor['session_version']:
+                return jsonify({'error': 'Upload belongs to an expired session'}), 403
+            if operation['phase'] != 'registered' or operation['cancel_requested'] or entry['status'] != 'starting':
+                return jsonify({'error': 'Upload transfer already claimed or unavailable', **_upload_result(conn, download_id)}), 409
+            conn.execute("UPDATE upload_operations SET phase='transferring',revision=revision+1 WHERE id=?", (download_id,))
+            conn.execute("UPDATE downloads SET status='downloading',progress='0%' WHERE id=?", (download_id,))
+            download_history.record(conn, download_id)
+            entry = dict(entry)
         _live_worker_ids.add(download_id)
-
-    original_name = entry.get('requested_filename')
-    expected_size = int(entry.get('total_bytes') or 0)
-    output_dir = entry.get('output_dir')
-    temporary_path = None
-    final_path = None
-    registered = False
     received = 0
+    expected_size = int(entry['total_bytes'])
+    completed = False
     try:
-        if is_cancel_requested(download_id):
-            raise DownloadCancelled()
-        output_dir = os.path.abspath(_prepare_download_directory(output_dir))
-        db_update_download(
-            download_id,
-            status='downloading',
-            progress='0%',
-            downloaded_bytes=0,
-            total_bytes=expected_size,
-        )
-        with tempfile.NamedTemporaryFile(
-                mode='wb', dir=output_dir,
-                prefix=f'.vdl_{download_id}.', suffix='.upload.part',
-                delete=False) as temporary:
-            temporary_path = temporary.name
+        output_dir = _prepare_upload_directory(entry['output_dir'])
+        temporary_path = os.path.join(output_dir, f'.vdl_{download_id}.{secrets.token_hex(16)}.upload.part')
+        _upload_phase(download_id, 'transferring', temporary_path=temporary_path, cleanup_pending=1)
+        with open(temporary_path, 'xb') as temporary:
+            info = os.fstat(temporary.fileno())
+            operation = _upload_phase(download_id, 'transferring', device=str(info.st_dev), inode=str(info.st_ino))
             while True:
                 if is_cancel_requested(download_id):
                     raise DownloadCancelled()
-                chunk = request.stream.read(1024 * 1024)
+                chunk = request.stream.read(1024*1024)
                 if not chunk:
                     break
                 received += len(chunk)
                 if received > expected_size:
                     raise ValueError('Uploaded video is larger than declared')
                 temporary.write(chunk)
-                percent = (received / expected_size) * 100
-                db_update_download(
-                    download_id,
-                    status='downloading',
-                    progress=f'{percent:.1f}%',
-                    downloaded_bytes=received,
-                    total_bytes=expected_size,
-                )
-
-        if is_cancel_requested(download_id):
-            raise DownloadCancelled()
+                _upload_progress(download_id, received, expected_size)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        _rename_sync(output_dir)
         if received != expected_size:
             raise ValueError('Uploaded video ended before all bytes arrived')
+        if is_cancel_requested(download_id):
+            raise DownloadCancelled()
+        _upload_phase(download_id, 'processing')
         try:
             resolution = inspect_uploaded_video(temporary_path)
-            duration_seconds = _consume_media_probe(
-                temporary_path, resolution
-            )
+            duration = _consume_media_probe(temporary_path, resolution)
         except ValueError as exc:
-            db_update_download(
-                download_id, status='error', progress=str(exc),
-                finished_at=time.time(),
-            )
-            return jsonify({"error": str(exc)}), 415
+            _finish_upload_failure(download_id, 'failed', str(exc))
+            with db() as conn:
+                return jsonify({'error': str(exc), **_upload_result(conn, download_id)}), 415
         except RuntimeError as exc:
-            db_update_download(
-                download_id, status='error', progress=str(exc),
-                finished_at=time.time(),
-            )
-            return jsonify({"error": str(exc)}), 503
-
-        if is_cancel_requested(download_id):
-            raise DownloadCancelled()
-
-        with _upload_lock:
-            final_path = _reserve_upload_path(output_dir, original_name)
-            os.replace(temporary_path, final_path)
-            temporary_path = None
-        if is_cancel_requested(download_id):
-            raise DownloadCancelled()
-
-        db_update_download(
-            download_id,
-            status='finished',
-            progress='100%',
-            filename=final_path,
-            filesize=received,
-            resolution=resolution,
-            duration_seconds=duration_seconds,
-            media_metadata_probed=True,
-            speed=0.0,
-            eta=0,
-            finished_at=time.time(),
-            downloaded_bytes=received,
-            total_bytes=received,
-        )
-        registered = True
-        return jsonify({
-            "message": "Video added to library",
-            "id": download_id,
-            "filename": os.path.basename(final_path),
-        })
+            _finish_upload_failure(download_id, 'failed', str(exc))
+            with db() as conn:
+                return jsonify({'error': str(exc), **_upload_result(conn, download_id)}), 503
+        # Removal, cancellation and publication share this boundary. A Stop
+        # arriving after the finished commit observes publication, never erases it.
+        with _file_operation_lock, _upload_lock:
+            with _db_lock, db() as conn:
+                actor = _tag_actor(conn)
+                operation = _authorized_upload(conn, download_id, actor)
+                if operation is None or operation['actor_session_version'] != actor['session_version']:
+                    raise PermissionError('Upload authorization changed')
+                if operation['cancel_requested'] or is_cancel_requested(download_id):
+                    raise DownloadCancelled()
+            stem, extension = os.path.splitext(entry['requested_filename'])
+            for suffix in range(10000):
+                final_path = os.path.join(output_dir, entry['requested_filename'] if suffix == 0 else f'{stem} ({suffix}){extension}')
+                operation = _upload_phase(download_id, 'publishing', final_path=final_path)
+                try:
+                    os.link(temporary_path, final_path)
+                    break
+                except FileExistsError:
+                    continue
+            else:
+                raise OSError('Unable to choose an unused upload filename')
+            _rename_sync(output_dir)
+            _upload_checkpoint('linked', operation)
+            with _db_lock, db() as conn:
+                conn.execute('BEGIN IMMEDIATE')
+                actor = _tag_actor(conn)
+                current = _authorized_upload(conn, download_id, actor)
+                if current is None or current['actor_session_version'] != actor['session_version']:
+                    raise PermissionError('Upload authorization changed')
+                if current['cancel_requested']:
+                    raise DownloadCancelled()
+                # A replacement cannot be published as the bytes we validated.
+                final_info = os.stat(final_path, follow_symlinks=False)
+                if str(final_info.st_dev) != operation['device'] or str(final_info.st_ino) != operation['inode']:
+                    raise OSError('Upload destination identity changed')
+                conn.execute("UPDATE downloads SET status='finished',progress='100%',filename=?,filesize=?,resolution=?,"
+                             "duration_seconds=?,media_metadata_probed=1,speed=0,eta=0,finished_at=?,downloaded_bytes=?,total_bytes=? WHERE id=?",
+                             (final_path,received,resolution,duration,time.time(),received,received,download_id))
+                conn.execute("UPDATE upload_operations SET phase='published',revision=revision+1,cleanup_pending=0 WHERE id=?", (download_id,))
+                conn.execute("INSERT OR IGNORE INTO media_hashes(download_id,state) VALUES (?,'pending')", (download_id,))
+                download_history.record(conn, download_id)
+            completed = True
+            _upload_checkpoint('published', operation)
+            clean = _upload_cleanup(operation, preserve_final=True)
+            with _db_lock, db() as conn:
+                conn.execute('UPDATE upload_operations SET cleanup_pending=? WHERE id=?', (not clean,download_id))
+        _publish_metadata_change('upload')
+        _register_media_assets(download_id)
+        _wake_duplicate_backfill()
+        with db() as conn:
+            return jsonify({'message':'Video added to library','filename':os.path.basename(final_path), **_upload_result(conn, download_id)})
     except DownloadCancelled:
-        db_update_download(
-            download_id,
-            status='cancelled',
-            progress='Cancelled',
-            downloaded_bytes=received,
-            total_bytes=expected_size,
-            finished_at=time.time(),
-        )
-        return jsonify({"error": "Upload cancelled"}), 409
+        _finish_upload_failure(download_id, 'cancelled', 'Cancelled')
+        with db() as conn:
+            return jsonify({'error':'Upload cancelled', **_upload_result(conn, download_id)}), 409
     except ValueError as exc:
-        db_update_download(
-            download_id, status='error', progress=str(exc),
-            downloaded_bytes=received, total_bytes=expected_size,
-            finished_at=time.time(),
-        )
-        return jsonify({"error": str(exc)}), 400
-    except (OSError, sqlite3.Error) as exc:
-        message = f'Unable to store the uploaded video: {exc}'
-        db_update_download(
-            download_id, status='error', progress=message,
-            downloaded_bytes=received, total_bytes=expected_size,
-            finished_at=time.time(),
-        )
-        return jsonify({"error": message}), 500
-    except Exception as exc:
-        if is_cancel_requested(download_id):
-            db_update_download(
-                download_id, status='cancelled', progress='Cancelled',
-                downloaded_bytes=received, total_bytes=expected_size,
-                finished_at=time.time(),
-            )
-            return jsonify({"error": "Upload cancelled"}), 409
-        message = f'Upload failed: {exc}'
-        db_update_download(
-            download_id, status='error', progress=message,
-            downloaded_bytes=received, total_bytes=expected_size,
-            finished_at=time.time(),
-        )
-        return jsonify({"error": message}), 500
+        _finish_upload_failure(download_id, 'failed', str(exc))
+        with db() as conn:
+            return jsonify({'error':str(exc), **_upload_result(conn, download_id)}), 400
+    except PermissionError:
+        _finish_upload_failure(download_id, 'failed', 'Upload authorization changed')
+        return jsonify({'error': 'Upload authorization changed'}), 401
+    except Exception:
+        if not completed:
+            cancelled = is_cancel_requested(download_id)
+            _finish_upload_failure(download_id, 'cancelled' if cancelled else 'failed',
+                                   'Cancelled' if cancelled else 'Upload failed; choose the file again')
+        with db() as conn:
+            return jsonify({'error':'Upload result not confirmed; check upload status', **_upload_result(conn, download_id)}), 500
     finally:
-        for path in (
-                temporary_path,
-                final_path if final_path and not registered else None):
-            if not path:
-                continue
-            try:
-                os.remove(path)
-            except FileNotFoundError:
-                pass
-            except OSError:
-                pass
         clear_cancel(download_id)
         with _worker_condition:
             _live_worker_ids.discard(download_id)
@@ -7632,7 +7964,10 @@ def _prune_mutation_receipts(conn, now):
                  "AND a.status IN ('starting', 'downloading', 'paused'))", (cutoff,))
     conn.execute('DELETE FROM mutation_receipts WHERE recorded_at < ? AND NOT EXISTS '
                  '(SELECT 1 FROM download_commands c WHERE c.actor_id = mutation_receipts.actor_id '
-                 'AND c.mutation_id = mutation_receipts.mutation_id)', (cutoff,))
+                 'AND c.mutation_id = mutation_receipts.mutation_id) AND NOT EXISTS '
+                 '(SELECT 1 FROM upload_operations u WHERE u.actor_id = mutation_receipts.actor_id '
+                 'AND u.id = mutation_receipts.target_id '
+                 "AND (u.phase IN ('registered','transferring','processing','publishing') OR u.cleanup_pending = 1))", (cutoff,))
 
 
 def _command_receipt_state(conn, result):
@@ -7698,6 +8033,10 @@ def _dispatch_download_command(command_id):
                 request_pause(target)
         elif action == 'unpause':
             clear_pause(target)
+        elif action == 'stop' and row['source_type'] == 'upload':
+            _result, status = _cancel_upload(target, {})
+            if status >= 400:
+                raise RuntimeError('Upload stop unavailable')
         elif action == 'stop':
             request_cancel(target)
             if (target not in _live_worker_ids and target not in _worker_hosts
@@ -7835,7 +8174,9 @@ def _execute_download_command(download_id, payload, action):
             if actor is None:
                 return {'error': 'Authentication required'}, 401
             row = _tag_visible_row(conn, download_id, actor)
-            if row is None:
+            if (row is None or action in ('stop', 'pause', 'unpause')
+                    and row['source_type'] == 'upload'
+                    and _authorized_upload(conn, download_id, actor) is None):
                 return {'error': 'Unknown download id'}, 404
             receipt = conn.execute('SELECT * FROM mutation_receipts WHERE actor_id = ? AND mutation_id = ?',
                                    (actor['id'], mutation_id)).fetchone()
@@ -7872,6 +8213,8 @@ def _execute_download_command(download_id, payload, action):
                     status, outcome, error = 409, 'conflicted', 'Download attempt changed; review the current work'
                 elif conn.execute("SELECT 1 FROM download_commands WHERE target_id = ? AND phase IN ('accepted', 'dispatching')", (download_id,)).fetchone():
                     status, outcome, error = 409, 'conflicted', 'An accepted command is still awaiting dispatch'
+                elif action in ('pause', 'unpause') and row['source_type'] == 'upload':
+                    status, outcome, error = 409, 'rejected', 'Uploads do not support pausing'
                 elif action in ('retry', 'resume') and (row['source_type'] != 'download' or row['browser_authenticated']):
                     status, outcome, error = 409, 'rejected', 'Send this source again to start a new attempt'
                 elif action in ('retry', 'resume') and (row['status'] not in (TERMINAL_STATUSES if action == 'retry' else ('cancelled', 'interrupted')) or download_id in _live_worker_ids or download_id in _worker_hosts or any(job['id'] == download_id for job in _worker_queue)):
@@ -7999,6 +8342,9 @@ def stop_download(download_id):
     entry = _visible_download(download_id)
     if entry is None:
         return jsonify({"error": "Unknown download id"}), 404
+    if entry.get('source_type') == 'upload':
+        result, status = _cancel_upload(download_id, {})
+        return jsonify(result), status
     # Stopping a paused download is also valid -- request_cancel() drops the
     # pause flag so the worker wakes up and aborts cleanly.
     if entry['status'] not in ('starting', 'downloading', 'paused'):
@@ -9073,7 +9419,8 @@ def record_download_view(download_id):
 @app.route('/api/client-capabilities', methods=['GET'])
 def client_capabilities():
     response = jsonify({
-        'mutation_protocol': 1, 'actions': ['tag.add', 'tag.remove', 'favorite.set', 'rename.set', 'preference.set', 'playlist.create', 'playlist.replace', 'playlist.add', 'playlist.delete', 'download.pause', 'download.unpause', 'download.stop', 'download.retry', 'download.resume', 'download.submit'],
+        'mutation_protocol': 1, 'actions': ['tag.add', 'tag.remove', 'favorite.set', 'rename.set', 'preference.set', 'playlist.create', 'playlist.replace', 'playlist.add', 'playlist.delete', 'download.pause', 'download.unpause', 'download.stop', 'download.retry', 'download.resume', 'download.submit', 'upload.register', 'upload.cancel'],
+        'upload_recovery': 1,
         'tag_identity_version': TAG_IDENTITY_VERSION,
         'server_time': int(time.time() * 1000),
     })
@@ -9125,6 +9472,12 @@ def mutation_receipt(mutation_id):
             ).fetchone()
             if receipt is not None:
                 result = json.loads(receipt['response'])
+                if result.get('mutation', {}).get('domain') == 'upload':
+                    operation = _authorized_upload(conn, receipt['target_id'], actor)
+                    if operation is None:
+                        return jsonify({'error': 'Mutation unavailable'}), 404
+                    result.update(_upload_result(conn, receipt['target_id']))
+                    result['mutation']['revision'] = result['upload']['revision']
                 preference_receipt = result.get('mutation', {}).get('domain') == 'preferences' and receipt['target_id'] == 'installation'
                 playlist_receipt = result.get('mutation', {}).get('domain') == 'playlist'
                 submission_rejection = (result.get('mutation', {}).get('domain') == 'download-submission'

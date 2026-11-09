@@ -1,8 +1,8 @@
 # Immediate feedback and recovery for uploads
 
 **Source:** Remaining Feature 0051 rollout item\
-**Status:** Proposed; not implemented\
-**Last refined:** 2026-11-08\
+**Status:** Implemented in version `0.62.0`\
+**Last refined:** 2026-11-09\
 **Extends:** [Feature 0051](feature-0051-immediate-feedback-for-server-backed-interactions.md), [Feature 0021, Local video import](feature-0021-import-and-export-local-videos.md)\
 **Rollout:** [Shared requirements and inventory](../ARCHITECTURE/feature-0051-rollout.md#shared-requirements-for-the-remaining-specs)
 
@@ -67,6 +67,57 @@ callbacks or dispatch. Server authorization still governs already submitted
 work. On reload, reconcile accepted server uploads; do not silently persist or
 restart local file transfers, and retain ordinary unsaved-work warnings.
 
+## Adapter and wire contract
+
+`upload.register` and `upload.cancel` are discrete, status-only actions in the
+independent `upload` domain. Their conflict boundary is one preallocated upload
+ID. Current downloads and its closed-drawer summary retain delivery and recovery
+status; Library publication follows confirmed server state. Byte progress uses
+the existing raw transfer transport rather than one mutation per progress event.
+
+Recovery support is negotiated separately as `upload_recovery: 1`. Supported
+registration sends the frozen `id`, `filename`, `filesize`, and
+`client_mutation_id` to `POST /api/upload`. Cancellation sends a frozen mutation
+ID to `POST /api/upload/<id>/cancel`. Canonical acknowledgements correlate the
+mutation, upload resource, decimal-string revision, and single History attempt.
+The shared actor-scoped receipt endpoint recovers these discrete requests;
+missing receipts alone never confirm or reject them.
+
+Adopted registration requires the explicit preallocated 32-character lowercase
+hexadecimal ID. Legacy registration may still request a generated server ID.
+Cancellation acceptance and completed cleanup remain distinct: the accepted
+response can still report processing with `cancel_requested: true`. Only a
+terminal canonical phase establishes cancellation, publication, or failure.
+
+`GET /api/upload/<id>/status` supplies an authorized `upload` snapshot with
+`id`, `phase`, decimal-string `revision`, `attempt_id`, `download_status`,
+`downloaded_bytes`, and `total_bytes`. Upload phases are `registered`,
+`transferring`, `processing`, `published`, `cancelled`, and `failed`; they do
+not extend the canonical download status vocabulary. Status establishes the
+resource's current processing or terminal state without inventing a receipt for
+an unknown registration or cancellation request.
+
+Published responses also supply the canonical public `download` snapshot so
+the validated Library entry can appear without a collection read. Collection
+entries expose `can_manage_upload` as a derived permission rather than an account
+ID. Normal temporary-file ownership is internal; `recovery_required` describes
+terminal cleanup that actually needs intervention. On reload, authorized active
+uploads regain status and cancellation controls without a File or a new PUT.
+
+The original actor owns registration, transfer, and recovery. Public Library
+visibility does not grant another account upload ownership. Every execution
+and recovery checks current session and ownership; a preallocated ID grants no
+authority. Receipts share the existing admission, quota, retention, and expiry
+rules. No capability enables automatic mutation replay or automatic byte-body
+replay. Lost transfer responses offer status checking rather than a second PUT.
+
+The durable upload operation records temporary-file and publication ownership.
+Publication and cancellation serialize with file operations; exclusive
+publication preserves unrelated destinations. Restart resolves interrupted
+operations from their recorded ownership without creating another attempt or
+resending bytes. Ambiguous file identity remains visible for intervention rather
+than authorizing deletion of an unrelated replacement.
+
 ## Acceptance criteria
 
 1. Gate registration, byte transfer, processing, and publication independently.
@@ -81,3 +132,12 @@ restart local file transfers, and retain ordinary unsaved-work warnings.
 5. Test unavailable files, validation/permission failures, accessible byte and
    pending status, keyboard Stop, both themes, and existing upload/History
    regressions. Complete shared verification before advertising recovery.
+
+## Verification
+
+The [rollout inventory](../ARCHITECTURE/feature-0051-rollout.md) records the
+version `0.62.0` completion evidence and verification commands. Production-route
+coverage lives in `tests/test_upload_recovery.py`, `tests/test_upload_security.py`,
+and the existing upload/command suites. Production store/coordinator checks live
+in `tests/uploads-client.test.cjs`; browser integration checks live in
+`tests/browser/uploads-feedback.spec.cjs` and `tests/browser/upload-drop.spec.cjs`.

@@ -10,6 +10,16 @@
         return value;
     }
     const revision = value => typeof value === 'string' && /^(0|[1-9]\d*)$/.test(value);
+    const uploadPhases = new Set(['registered', 'transferring', 'processing', 'published', 'cancelled', 'failed']);
+    const validUploadState = value => !!value && typeof value.id === 'string' && !!value.id
+        && revision(value.revision) && BigInt(value.revision) > 0n && uploadPhases.has(value.phase)
+        && typeof value.attempt_id === 'string' && !!value.attempt_id
+        && ['starting', 'downloading', 'paused', 'finished', 'error', 'cancelled', 'interrupted'].includes(value.download_status)
+        && Number.isSafeInteger(value.downloaded_bytes) && value.downloaded_bytes >= 0
+        && Number.isSafeInteger(value.total_bytes) && value.total_bytes > 0
+        && value.downloaded_bytes <= value.total_bytes
+        && (value.phase !== 'published' || value.download_status === 'finished')
+        && (value.phase !== 'cancelled' || value.download_status === 'cancelled');
     const preferenceFields = Object.freeze([
         'download_dir', 'format', 'history_page_size', 'max_concurrent',
         'max_concurrent_per_host', 'max_total_download_mbps', 'player_mode',
@@ -56,6 +66,7 @@
             if (snapshot.rename_revision !== undefined && (!revision(snapshot.rename_revision) || !(snapshot.filename === null || typeof snapshot.filename === 'string') || !(snapshot.display_filename == null || typeof snapshot.display_filename === 'string'))) return false;
             if (snapshot.preferences_revision !== undefined && (String(snapshot.id) !== 'installation' || !revision(snapshot.preferences_revision) || !preferenceValues(snapshot.values))) return false;
             if (snapshot.submission_revision !== undefined && (!revision(snapshot.submission_revision) || !String(snapshot.id).startsWith('submission:') || !(snapshot.submission === null || snapshot.submission && typeof snapshot.submission.id === 'string' && snapshot.submission.job?.download_id === snapshot.submission.id && typeof snapshot.submission.job.id === 'string' && typeof snapshot.submission.job.attempt_id === 'string'))) return false;
+            if (snapshot.upload_revision !== undefined && (!revision(snapshot.upload_revision) || !(snapshot.upload === null && snapshot.upload_revision === '0' || validUploadState(snapshot.upload) && snapshot.upload.id === String(snapshot.id) && snapshot.upload.revision === snapshot.upload_revision))) return false;
             const id = String(snapshot.id);
             const fence = fences.get(id);
             if (fence !== undefined) {
@@ -65,6 +76,21 @@
             const old = downloads.get(id);
             if (snapshot.playlist_revision !== undefined && (!Number.isSafeInteger(snapshot.playlist_revision) || snapshot.playlist_revision < 0 || !snapshot.playlist || !Array.isArray(snapshot.playlist.items))) return false;
             const next = { ...(old || {}), ...copy(snapshot), id };
+            if (old && revision(old.upload_revision)) {
+                if (!revision(snapshot.upload_revision) || BigInt(snapshot.upload_revision) < BigInt(old.upload_revision)) {
+                    next.upload_revision = old.upload_revision;
+                    next.upload = old.upload;
+                    if (old.upload && Object.hasOwn(snapshot, 'upload_revision')) for (const field of ['status', 'filename', 'downloaded_bytes', 'total_bytes', 'progress']) {
+                        if (Object.hasOwn(old, field)) next[field] = old[field];
+                        else delete next[field];
+                    }
+                } else if (old.upload && snapshot.upload && old.upload.attempt_id !== snapshot.upload.attempt_id) return false;
+                else if (old.upload && snapshot.upload_revision === old.upload_revision && (old.upload.phase !== snapshot.upload?.phase || old.upload.download_status !== snapshot.upload?.download_status)) return false;
+                else if (old.upload && snapshot.upload && old.upload.phase === snapshot.upload.phase && old.upload.downloaded_bytes > snapshot.upload.downloaded_bytes) {
+                    next.upload.downloaded_bytes = old.upload.downloaded_bytes;
+                    if (Object.hasOwn(old, 'downloaded_bytes')) next.downloaded_bytes = old.downloaded_bytes;
+                }
+            }
             if (old && revision(old.submission_revision)) {
                 if (!revision(snapshot.submission_revision) || BigInt(snapshot.submission_revision) < BigInt(old.submission_revision)) {
                     next.submission_revision = old.submission_revision;
@@ -168,6 +194,7 @@
             const playlistIntents = [];
             const commandIntents = [];
             const submissionIntents = [];
+            const uploadIntents = [];
             let requestedFilename = null;
             const chips = new Map();
             for (const tag of download.tag_items || (download.tags || []).map(name => VDL.tagIdentity.normalize(name))) {
@@ -175,6 +202,7 @@
             }
             for (const intent of intents.values()) {
                 if (intent.targetId !== id) continue;
+                if (intent.kind.startsWith('upload.')) { uploadIntents.push(copy(intent)); continue; }
                 if (intent.kind === 'download.submit') { submissionIntents.push(copy(intent)); continue; }
                 if (intent.kind.startsWith('download.')) { commandIntents.push(copy(intent)); continue; }
                 if (intent.kind.startsWith('playlist.')) { playlistIntents.push(copy(intent)); continue; }
@@ -212,7 +240,7 @@
                 rows.sort((a, b) => a.name.localeCompare(b.name));
             }
             const effective = rows.filter(tag => tag.effective).map(tag => ({ key: tag.key, name: tag.name }));
-            return freeze(copy({ ...download, submission_intents: submissionIntents, command_intents: commandIntents, playlist_intents: playlistIntents, requested_filename: requestedFilename, rename_intents: renameIntents, preference_intents: preferenceIntents, favorite, favorite_intents: favoriteIntents, tags: effective.map(tag => tag.name), tag_items: effective, tag_chips: rows }));
+            return freeze(copy({ ...download, upload_intents: uploadIntents, submission_intents: submissionIntents, command_intents: commandIntents, playlist_intents: playlistIntents, requested_filename: requestedFilename, rename_intents: renameIntents, preference_intents: preferenceIntents, favorite, favorite_intents: favoriteIntents, tags: effective.map(tag => tag.name), tag_items: effective, tag_chips: rows }));
         }
         function fence(id) {
             id = String(id);
@@ -287,6 +315,7 @@
             }),
         });
     }
+    VDL.validUploadState = validUploadState;
     VDL.createClientState = createClientState;
     VDL.preferenceFields = preferenceFields;
     VDL.validPreferenceValues = preferenceValues;

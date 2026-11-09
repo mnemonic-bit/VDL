@@ -2,7 +2,10 @@ const { test, expect } = require('@playwright/test');
 const { reset, seed, refresh, openNewDownload, openCurrent, closeCurrent } = require('./support.cjs');
 
 
-test.beforeEach(async ({ page }) => reset(page));
+test.beforeEach(async ({ page }) => {
+    await reset(page);
+    await expect.poll(() => page.evaluate(() => tagCapabilities?.upload_recovery)).toBe(1);
+});
 
 async function dropVideos(page, names) {
     await page.evaluate(names => {
@@ -35,7 +38,7 @@ test('pending registration leaves the page usable and every upload visible', asy
     await expect(page.locator('#activeList .history-item')).toHaveCount(2);
     await expect(page.locator('#activeList')).toContainText('first.mp4');
     await expect(page.locator('#activeList')).toContainText('second.mp4');
-    await expect(page.locator('#activeList')).toContainText('Preparing upload');
+    await expect(page.locator('#activeList')).toContainText('Registering upload');
 });
 
 async function assertPageUsable(page, count) {
@@ -78,7 +81,7 @@ test('slow second registration does not block the first transfer or a later drop
     await expect.poll(() => transferred.length).toBe(2);
     await assertPageUsable(page, 3);
     await openCurrent(page);
-    await expect(page.locator('#activeList .history-item', { hasText: 'slow.mp4' })).toContainText('Preparing upload');
+    await expect(page.locator('#activeList .history-item', { hasText: 'slow.mp4' })).toContainText('Registering upload');
 });
 
 test('slow collection reads do not block uploads or preparation rows', async ({ page }) => {
@@ -118,13 +121,13 @@ test('registration reconciles into the same row even when SSE arrives before its
         await expect.poll(() => transfers).toBe(1);
         await expect(row).toHaveAttribute('data-row-id', id);
         expect(await row.evaluate(element => element === window.__preparationRow)).toBe(true);
-        await expect(row).not.toContainText('Preparing upload');
+        await expect(row).not.toContainText('Registering upload');
     } finally {
         release();
     }
 });
 
-test('stopping and deleting during registration cancels only that file after acknowledgement', async ({ page }) => {
+test('stopping during registration retains the row until acknowledgement and cancels only that file', async ({ page }) => {
     let release;
     const gate = new Promise(resolve => { release = resolve; });
     const transferred = [];
@@ -142,15 +145,19 @@ test('stopping and deleting during registration cancels only that file after ack
         await openCurrent(page);
         const row = page.locator('#activeList .history-item', { hasText: 'stop.mp4' });
         await row.getByRole('button', { name: 'Stop', exact: true }).click();
+        await expect(row).toContainText('Stopping upload');
+        await expect(row).not.toContainText('Upload stopped');
+        await expect(row).toHaveCount(1);
+        await expect(page.locator('#currentBadge')).toHaveText('2');
+        const cancelled = page.waitForResponse(response =>
+            response.url().endsWith(`/api/upload/${stoppedId}/cancel`));
+        release();
+        expect((await cancelled).status()).toBe(200);
         await expect(row).toContainText('Upload stopped');
         await row.locator('.kebab-btn').click();
         await row.getByRole('button', { name: 'Delete', exact: true }).click();
         await expect(row).toHaveCount(0);
         await expect(page.locator('#currentBadge')).toHaveText('1');
-        const removed = page.waitForResponse(response =>
-            response.url().endsWith(`/api/remove/${stoppedId}`));
-        release();
-        expect((await removed).status()).toBe(200);
         await expect.poll(async () => {
             const response = await page.request.get('/api/current-downloads');
             return (await response.json()).map(info => info.id);
@@ -170,7 +177,10 @@ test('mixed registration and transfer failures keep successful siblings and usef
         const data = route.request().postDataJSON();
         ids.set(data.filename, data.id);
         if (data.filename === 'rejected.mp4') {
-            return route.fulfill({ status: 400, json: { error: 'Registration rejected' } });
+            return route.fulfill({ status: 400, json: {
+                id: data.id, upload: null, error: 'Registration rejected',
+                mutation: { id: data.client_mutation_id, domain: 'upload', outcome: 'rejected', revision: '0' },
+            } });
         }
         return route.continue();
     });
@@ -186,11 +196,12 @@ test('mixed registration and transfer failures keep successful siblings and usef
     await openCurrent(page);
     const failed = page.locator('#activeList .history-item', { hasText: 'rejected.mp4' });
     await expect(failed).toContainText('Registration rejected');
-    await expect(page.locator('#activeList .history-item', { hasText: 'invalid.mp4' })).toContainText('No video stream');
+    // A proxy-style refusal without canonical upload state cannot prove that
+    // transfer finalization did not reach the server.
+    await expect(page.locator('#activeList .history-item', { hasText: 'invalid.mp4' })).toContainText('Upload outcome not confirmed');
     await expect(page.locator('#historyList .history-card', { hasText: 'invalid' })).toHaveCount(0);
     await expect(failed.getByRole('button', { name: 'Continue', exact: true })).toHaveCount(0);
-    await failed.locator('.kebab-btn').click();
-    await failed.getByRole('button', { name: 'Delete', exact: true }).click();
+    await failed.getByRole('button', { name: 'Dismiss upload request', exact: true }).click();
     await expect(failed).toHaveCount(0);
 });
 
@@ -203,10 +214,10 @@ test('validation keeps the page usable and Stop affects only one upload', async 
         const stoppedRow = page.locator('#activeList .history-item', { hasText: 'stop-validating' });
         const sibling = page.locator('#activeList .history-item', { hasText: 'finish-validating' });
         await expect(stoppedRow).toContainText('Uploaded: 100%');
-        await expect(sibling).toContainText('Validating video');
+        await expect(sibling).toContainText('Processing upload');
         await expect(sibling).toContainText('Bytes uploaded: 4.0 B');
         await expect(page.locator('#historyList .history-card')).toHaveCount(0);
-        const stopped = page.waitForResponse(response => response.url().includes('/api/stop/'));
+        const stopped = page.waitForResponse(response => response.url().endsWith('/cancel'));
         await stoppedRow.getByRole('button', { name: 'Stop', exact: true }).click();
         expect((await stopped).status()).toBe(200);
         await expect(sibling.getByRole('button', { name: 'Stop', exact: true })).toBeVisible();
@@ -330,7 +341,7 @@ test('an in-progress upload can be stopped and removed from Current downloads', 
     await expect(row).toContainText('Uploaded: 100%');
     await expect(row.getByRole('button', { name: 'Pause' })).toHaveCount(0);
     await expect(row.getByRole('button', { name: 'Open URL' })).toHaveCount(0);
-    const stopped = page.waitForResponse(response => response.url().includes('/api/stop/'));
+    const stopped = page.waitForResponse(response => response.url().endsWith('/cancel'));
     await row.getByRole('button', { name: 'Stop', exact: true }).click();
     expect((await stopped).status()).toBe(200);
     await page.request.post('/__test__/release-uploads');
