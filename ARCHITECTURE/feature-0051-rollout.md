@@ -5,7 +5,7 @@ migration in [Feature 0051](../FEATURES/feature-0051-immediate-feedback-for-serv
 The shared coordinator registers `tag.add`, `tag.remove`, `favorite.set`,
 `rename.set`, `preference.set`, `playlist.create`, `playlist.replace`,
 `playlist.add`, `playlist.delete`, `download.pause`, `download.unpause`,
-`download.stop`, `download.retry`, and `download.resume`.
+`download.stop`, `download.retry`, `download.resume`, and `download.submit`.
 An existing API call does not gain receipt recovery merely because the new
 scripts are loaded. Mutating requests are never retried by `apiFetch`'s GET
 contention recovery.
@@ -169,6 +169,31 @@ access fences cover adopted command callbacks and History reads.
 diagnostics through the shared seam. Upload transfer and playback sequences
 retain their specialized contracts.
 
+[Feature 0058: New downloads](../FEATURES/feature-0058-durable-acceptance-for-new-downloads.md)
+adds `download.submit` in the independent `download-submission` domain.
+Starting feedback is synchronous and duplicate submission is guarded. Captured
+URL/options, newer editable drafts, probe generations, and dialog sessions stay
+separate. A correlated canonical acknowledgement maps one local request to its
+download, History attempt, and durable job without SSE or a collection read.
+The request never creates a playable placeholder or projects worker completion.
+
+Creation, its single attempt, durable acceptance, and actor-scoped receipt commit
+together before dispatch through the existing worker-ownership boundary.
+Identical replay returns the same identities; deliberate later submissions of
+the same URL remain distinct operations. Restart interrupts vanished work
+without dispatching a replacement attempt. Current and History reads expose the
+linked job while the shared ledger retains it. Receipts contain identities,
+not submitted URLs/options or credentials.
+
+Unknown outcomes retain an in-memory recovery summary with receipt checks and
+deliberate frozen-attempt replay. Matching reads never confirm acceptance;
+shared quotas, expiry, current authorization, active-job retention, and
+serialized expired-absence finality apply. Authentication and known deletion
+fences cover callbacks and mapped identities. Unsupported servers retain
+truthful pending feedback and a read-only Current-downloads check without
+receipt recovery or replay. `VDL.downloadSubmissionMetrics()` exposes bounded,
+content-free aggregates. Uploads and companion requests retain their contracts.
+
 ## Remaining action adapters
 
 The rows below are explicit migration work, not claims that the app-wide
@@ -177,12 +202,11 @@ remain in force. They need their own behavior and regression evidence before
 adopting automatic recovery.
 
 Each remaining row now has a proposed feature spec. These links allocate work;
-they do not mark any remaining adapter implemented. Features 0058–0067 inherit Feature
+they do not mark any remaining adapter implemented. Features 0059–0067 inherit Feature
 0051 and the shared requirements below.
 
 | Controls / production entry points in `static/app.js` | Existing mechanism | Required migration / recovery boundary | Feature spec |
 | --- | --- | --- | --- |
-| New download: `submitDownload` | `downloadSubmitting`, probe generation and dialog-session guards | Retain existing immediate submission state. Lost acceptance needs a durable job identity before replay. | [0058: New downloads](../FEATURES/feature-0058-durable-acceptance-for-new-downloads.md) |
 | Upload: `registerDroppedVideo`, `transferDroppedVideo`, `stopDroppedUpload` | Local transfer row with preallocated server ID, byte progress, registration acknowledgement and cancellation | Preserve transfer and worker semantics. Do not manufacture playable files or equate abort with server cancellation. | [0059: Uploads](../FEATURES/feature-0059-immediate-feedback-and-recovery-for-uploads.md) |
 | Entry removal: `deleteDownload` | Server remove request and collection refresh | Retain marked pending row until acknowledgement; prevent duplicate submission and fence authoritative deletion. Filesystem deletion needs operation-specific recovery. | [0060: Entry removal](../FEATURES/feature-0060-immediate-feedback-and-safe-entry-removal.md) |
 | Clear attempts/library: `clearHistory`, `clearLibrary` | Preview counts and explicit confirmation, then server request | Pending confirmation surface and duplicate guard; no claim of deletion before acknowledgement. | [0061: Bulk clear](../FEATURES/feature-0061-immediate-feedback-for-bulk-clear-actions.md) |
@@ -565,3 +589,66 @@ Download command delivery does not complete Features 0058–0067. New-download
 acceptance, upload transfers, playback sessions, leases, progress writes, and
 companion requests retain their specialized ownership and recovery contracts.
 Authentication fencing here covers the adopted commands and History callbacks.
+
+New-download acceptance verification commands for Feature 0058:
+
+```bash
+VDL_PYTHON=/path/to/python3.12 ./tests/run-all.sh --unit
+VDL_PYTHON=/path/to/python3.12 node --test tests/*.test.cjs
+VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py \
+    download-submissions-feedback.spec.cjs download-form.spec.cjs \
+    download-options.spec.cjs download-entry.spec.cjs
+VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py \
+    download-commands-feedback.spec.cjs worker-recovery.spec.cjs \
+    history-actions.spec.cjs attempt-history.spec.cjs live-updates.spec.cjs \
+    upload-drop.spec.cjs auth.spec.cjs playlists.spec.cjs playback.spec.cjs \
+    tags.spec.cjs immediate-feedback.spec.cjs
+VDL_TEST_BROWSER=firefox VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py \
+    download-submissions-feedback.spec.cjs download-form.spec.cjs \
+    download-options.spec.cjs download-entry.spec.cjs \
+    download-commands-feedback.spec.cjs worker-recovery.spec.cjs \
+    history-actions.spec.cjs attempt-history.spec.cjs upload-drop.spec.cjs
+```
+
+Feature 0058 verified on 2026-11-09 for version `0.61.0`:
+
+- Python 3.12 unit gate: **712 tests, 9 skipped**; `vdl.py` line coverage
+  **92.8%** (6972/7512 executable lines; enforced minimum 90%). The 29 new
+  submission protocol tests cover atomic download/attempt/job/receipt creation,
+  simultaneous replay, exact fingerprints, intentional repeated URLs, rollback,
+  current authorization, quotas, expiry, serialized finality, active-job receipt
+  retention, and response loss. Restart is injected before dispatch, after its
+  durable claim, after enqueueing, and after real scheduler ownership
+  registration. Recovery retains one interrupted job and attempt without
+  launching a replacement owner. Retry/resume acknowledgement, receipt,
+  Current, and History job identities also converge.
+- Node: **174 tests passed**, including 15 new submission production-interface
+  checks and three command job-identity regressions. These cover synchronous
+  status-only presentation, immutable captured options, strict acknowledgement
+  decoding, deliberate same-attempt replay, missing-receipt finality, bounded
+  admission, malformed responses, definite validation/quota refusal, and
+  authentication/deletion fences. Older reads cannot replace a newer attempt's
+  job binding, and legacy generation changes do not inherit an obsolete job.
+- Chromium: **220 distinct scenarios passed** across the final suites and
+  focused follow-ups. Firefox: **159 distinct scenarios passed**. All **27 new
+  submission scenarios passed in each browser**, using controlled request gates
+  for feedback below 50 ms, SSE-free acceptance without collection reads,
+  canonical identity mapping, duplicate guards, newer URL/options drafts and
+  focus, probe races, close/reopen, frozen replay after real response loss,
+  expiry, quota refusal, access loss, actual session expiry/account switching,
+  deletion before acknowledgement, reload, and unsupported servers. Keyboard,
+  both themes, reduced motion, and narrow layouts are covered. Existing
+  regressions cover form/probe behavior, download commands, worker recovery,
+  History, uploads, live updates, authentication, playlists, playback, tags,
+  and immediate feedback.
+
+Unchanged filename blur events no longer advance a submitted draft generation;
+actual edits, including editing away and back, remain protected. Expiry test
+fixtures freeze time only after authenticating their clients so coverage
+instrumentation cannot create future-dated cookies. No assertion deadlines
+were relaxed.
+
+New-download delivery does not complete Features 0059–0067. Authentication
+fencing here covers the adopted submission and recovery callbacks. Upload
+transfer, playback, leases, progress writes, and companion transport retain
+their specialized ownership and recovery contracts.

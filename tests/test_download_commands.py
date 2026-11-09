@@ -62,12 +62,19 @@ class DownloadCommandTest(AppCase):
                 self.assertEqual(first.status_code, 202)
                 self.assertEqual(replay.json['command']['id'], first.json['command']['id'])
                 self.assertEqual(first.json['command']['job_id'], first.json['command']['id'])
+                self.assertEqual(first.json['job_id'], first.json['command']['job_id'])
                 self.assertNotEqual(first.json['command']['attempt_id'], payload['expected_attempt_id'])
                 enqueue.assert_called_once_with('https://fixture.invalid/video', target)
             with vdl.db() as conn:
                 self.assertEqual(conn.execute('SELECT COUNT(*) FROM download_attempts WHERE work_id = ?', (target,)).fetchone()[0], 2)
             checked = self.receipt(payload).json
             self.assertEqual(checked['command']['attempt_id'], first.json['command']['attempt_id'])
+            self.assertEqual(checked['job_id'], first.json['job_id'])
+            current = next(row for row in self.client.get('/api/current-downloads').json if row['id'] == target)
+            history = next(row for row in self.client.get('/api/history').json['items']
+                           if row['id'] == first.json['current_attempt_id'])
+            self.assertEqual(current['job_id'], first.json['job_id'])
+            self.assertEqual(history['job_id'], first.json['job_id'])
             self.assertEqual(vdl.db_get_download(target)['status'], 'starting')
 
     def test_simultaneous_replay_dispatches_exactly_once(self):
@@ -317,8 +324,10 @@ class DownloadCommandTest(AppCase):
         target = self.terminal()
         payload = self.command(target)
         admission, release, lookup_started = threading.Event(), threading.Event(), threading.Event()
-        clock = [time.time()]
         clients = [self.authenticated_client(), self.authenticated_client()]
+        # Session cookies are timestamped when signed. Freeze only after login
+        # so crossing a second during password checks cannot make them future-dated.
+        clock = [time.time()]
         record = vdl.download_history.record
         def hold(conn, download_id, **kwargs):
             result = record(conn, download_id, **kwargs)

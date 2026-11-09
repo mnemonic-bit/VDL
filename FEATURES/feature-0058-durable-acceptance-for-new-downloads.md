@@ -1,8 +1,8 @@
 # Durable acceptance for new downloads
 
-**Source:** Remaining Feature 0051 rollout item\
-**Status:** Proposed; not implemented\
-**Last refined:** 2026-11-08\
+**Source:** Feature 0051 rollout item\
+**Status:** Implemented in version `0.61.0`\
+**Last refined:** 2026-11-09\
 **Extends:** [Feature 0051](feature-0051-immediate-feedback-for-server-backed-interactions.md), [Feature 0037, Probe readiness](feature-0037-show-download-probe-readiness.md)\
 **Related:** [Feature 0057, Durable download commands](feature-0057-immediate-feedback-and-durable-download-commands.md)\
 **Rollout:** [Shared requirements and inventory](../ARCHITECTURE/feature-0051-rollout.md#shared-requirements-for-the-remaining-specs)
@@ -54,6 +54,17 @@ Return a correlated `accepted` outcome with durable identities, not a claim
 that probing or downloading finished. Current download/History reads and
 authorized job recovery converge on those same identities. Keep existing
 scheduling, probe readiness, format fallback, and download status semantics.
+
+The page action is `download.submit` in the `download-submission` domain.
+Its conflict boundary is one local submission operation, independent of URL
+equality or a future download's command revision. Download dialog and summary
+presentation use the shared coordinator; URL/options drafts retain their own
+generations. Current authentication authorizes creation; current target
+visibility additionally gates accepted-job recovery. Canonical acceptance
+requires matching mutation correlation, a decimal-string submission revision,
+and consistent download, job, and attempt identities. The
+[architecture](../ARCHITECTURE/immediate-feedback-for-server-backed-interactions.md#new-download-acceptance)
+records the wire decoder, dispatch boundary, and recovery responsibilities.
 
 ## Recovery and compatibility
 

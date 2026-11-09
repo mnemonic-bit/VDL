@@ -1,6 +1,6 @@
 # Architecture: immediate feedback for server-backed interactions
 
-**Status:** Foundation, tags, favorites, rename, preferences, playlist editor saves, playlist add/delete, and download commands implemented; additional adapters remain proposed.\
+**Status:** Foundation, tags, favorites, rename, preferences, playlist editor saves, playlist add/delete, download commands, and new-download acceptance implemented; additional adapters remain proposed.\
 **Date:** 2026-11-09\
 **Requirements:** [Feature 0051](../FEATURES/feature-0051-immediate-feedback-for-server-backed-interactions.md)
 
@@ -59,7 +59,7 @@ reconciliation may still use the existing batching delays.
 
 ## Module responsibilities and proposed placement
 
-The client modules below host tags, favorites, rename, preferences, playlist actions, and download commands. Additional action adapters
+The client modules below host tags, favorites, rename, preferences, playlist actions, download commands, and new-download submissions. Additional action adapters
 remain staged. The client remains raw browser JavaScript;
 new scripts expose factory functions through one `window.VDL` namespace and load
 in dependency order before `app.js`. No bundler or runtime package is required.
@@ -330,6 +330,40 @@ Current, Library, History, and a compact summary. Legacy capability fallback has
 delivery feedback without receipt replay. Authentication and access fences cover
 command callbacks and History reads. Upload transfer, playback, and scheduling
 keep their specialized sequences.
+
+### New-download acceptance
+
+Feature 0058 registers `download.submit` in the independent
+`download-submission` domain. Its affected surfaces are the Download dialog and
+an in-memory recovery summary. A stable local operation key identifies one
+submission; URL equality never identifies a job. The coordinator guards an
+unresolved submission while the UI retains newer URL/options drafts and dialog
+generations independently. Presentation describes delivery only and does not
+create a playable placeholder or project worker progress.
+
+The trusted descriptor sends `POST /api/download` with `client_mutation_id`,
+`url`, and optional `format` and `filename`. Creation has no expected resource
+revision. Its decoder requires the matching mutation identity and domain,
+`accepted` outcome, decimal-string submission revision, and consistent download,
+attempt, and job identities. A definite rejection has no job. Unsupported
+servers retain delivery feedback without receipt replay.
+
+The existing `download_commands` ledger also records the `submit` action.
+Current authorization, selected-option validation, the new download, its single
+History attempt, durable job, and actor-scoped receipt share one transaction.
+The fingerprint binds the exact submitted URL/options; receipt presentation
+contains identities rather than submitted URLs or credentials. Dispatch uses
+the existing scheduler boundary and claims ownership durably before enqueueing,
+outside the database write lock. Restart exposes interruption without creating
+a replacement attempt. Current and History snapshots expose the linked job.
+
+Recovery checks current session and target authorization, returns the same job,
+and reports its current execution status separately from acceptance. Deliberate
+replay uses the frozen request and original mutation ID. Shared retention,
+quotas, replay-window admission, and serialized expired-absence finality apply;
+matching collection reads never confirm an unknown submission. Authentication
+reset and known target unavailability fence obsolete callbacks. Upload and
+companion transports retain their specialized sequences.
 
 ### Rename filesystem recovery
 

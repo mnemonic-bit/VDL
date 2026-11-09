@@ -242,3 +242,37 @@ test('rename acknowledgement updates its identity beside an independent command 
     assert.equal(h.mutations.status(entry.intentId), null);
     assert.equal(h.requests.length, 1);
 });
+
+test('retry acceptance binds its new job and stale reads cannot combine it with the prior attempt', async () => {
+    const h = harness();
+    h.state.acceptDownload({ id: 'a', current_attempt_id: 'attempt-1', command_revision: '0', job_id: 'previous-job', status: 'cancelled' });
+    const entry = h.submit('retry');
+    await tick();
+    h.requests[0].resolve(h.ack(h.requests[0]));
+    await tick();
+    let model = h.state.selectDownload('a');
+    assert.equal(h.mutations.status(entry.intentId), null);
+    assert.equal(model.current_attempt_id, 'new-attempt');
+    assert.equal(model.job_id, 'job-1');
+    h.state.acceptDownload({ id: 'a', current_attempt_id: 'attempt-1', command_revision: '0', job_id: 'previous-job', status: 'cancelled' });
+    model = h.state.selectDownload('a');
+    assert.equal(model.current_attempt_id, 'new-attempt');
+    assert.equal(model.job_id, 'job-1');
+    h.state.acceptDownload({ id: 'a', current_attempt_id: 'new-attempt', command_revision: '1', job_id: 'job-1', status: 'starting' });
+    assert.equal(h.state.selectDownload('a').job_id, 'job-1');
+    assert.equal(h.requests.length, 1);
+});
+
+test('legacy generation changes without job identities clear the previous binding', () => {
+    const h = harness();
+    h.state.acceptDownload({ id: 'a', current_attempt_id: 'attempt-1', command_revision: '0', job_id: 'previous-job' });
+    h.state.acceptDownload({ id: 'a', current_attempt_id: 'legacy-attempt', command_revision: '1' });
+    assert.equal(h.state.selectDownload('a').job_id, undefined);
+});
+
+test('an inconsistent top-level job cannot acknowledge a different accepted retry job', async () => {
+    const h = harness(); const entry = h.submit('retry'); await tick();
+    h.requests[0].resolve(h.ack(h.requests[0], '1', { job_id: 'different-job' })); await tick();
+    assert.equal(h.mutations.status(entry.intentId).status, 'unconfirmed');
+    assert.equal(h.state.selectDownload('a').current_attempt_id, 'attempt-1');
+});

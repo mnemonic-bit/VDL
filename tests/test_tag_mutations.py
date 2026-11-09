@@ -36,7 +36,7 @@ class TagMutationProtocolTest(AppCase):
         self.assertEqual(capabilities.json['mutation_protocol'], 1)
         self.assertEqual(capabilities.json['tag_identity_version'], vdl.TAG_IDENTITY_VERSION)
         self.assertEqual(set(capabilities.json['actions']),
-                         {'tag.add', 'tag.remove', 'favorite.set', 'rename.set', 'preference.set', 'playlist.create', 'playlist.replace', 'playlist.add', 'playlist.delete', 'download.pause', 'download.unpause', 'download.stop', 'download.retry', 'download.resume'})
+                         {'tag.add', 'tag.remove', 'favorite.set', 'rename.set', 'preference.set', 'playlist.create', 'playlist.replace', 'playlist.add', 'playlist.delete', 'download.pause', 'download.unpause', 'download.stop', 'download.retry', 'download.resume', 'download.submit'})
         payload = self.attempt('  Straße   Videos ')
         response = self.mutate(payload)
         self.assertEqual(response.status_code, 200)

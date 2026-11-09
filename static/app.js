@@ -1058,34 +1058,207 @@ function startDownload(event) {
         }
     }
     
-    apiAction('/api/download', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            url: url,
-            format: finalFormat || undefined,
-            filename: customFilename || undefined
-        })
-    }).then(() => {
-        // A completed submission must not discard a newer URL draft or close
-        // a dialog that the user reopened while acceptance was pending.
-        if (generation !== probeGeneration || dialogSession !== newDownloadSession) {
-            fetchHistory();
-            return;
-        }
-        document.getElementById('urlInput').value = '';
+    for (const id of ['optionsQualitySelect', 'optionsContainerSelect', 'optionsFilename']) downloadOptionValues.set(id, document.getElementById(id).value);
+    submitDownloadRequest({ url, ...(finalFormat ? { format: finalFormat } : {}), ...(customFilename ? { filename: customFilename } : {}) }, {
+        generation, dialogSession, draftGeneration: downloadDraftGeneration,
+        fields: downloadOptionDraft(),
+    });
+}
+
+function downloadOptionDraft() {
+    return { url: urlInput.value.trim(), quality: document.getElementById('optionsQualitySelect').value,
+        container: document.getElementById('optionsContainerSelect').value, filename: document.getElementById('optionsFilename').value };
+}
+function downloadSubmissionIntent() {
+    return downloadSubmission?.intentId ? tagMutations.status(downloadSubmission.intentId) : downloadSubmission?.legacy || null;
+}
+function resetDownloadSubmission(clearDraft = false) {
+    downloadSubmission?.timers?.forEach(clearTimeout);
+    const oldKey = downloadSubmission?.key;
+    downloadSubmission = null;
+    if (oldKey) tagState.writer.forgetSubmission(oldKey);
+    downloadSubmitting = false;
+    if (clearDraft) {
+        downloadDraftGeneration++;
+        // Authentication changes discard the private draft and invalidate old probes.
+        urlInput.value = '';
+        invalidateProbe();
+        updateUrlClear();
+    }
+    renderDownloadSubmission();
+}
+function downloadSubmissionText(entry) {
+    if (downloadSubmission?.accepted) return downloadSubmission.accepted.status === 'interrupted'
+        ? 'Download request accepted; work was interrupted. Review Current downloads to resume or retry.'
+        : 'Download request accepted. Worker status updates separately.';
+    return entry?.message || 'Starting download…';
+}
+function renderDownloadSubmission() {
+    const entry = downloadSubmissionIntent();
+    const active = !!entry && ['queued', 'sending', 'unconfirmed', 'conflicted'].includes(entry.status);
+    downloadSubmitting = active;
+    const button = (mode, label) => `<button type="button" data-submission-recovery="${mode}">${label}</button>`;
+    const actions = entry?.status === 'unconfirmed' ? (entry.legacy ? button('current', 'Check Current downloads') : button('check', 'Check request') + button('replay', 'Recover request') + button('resolve', 'Resolve request'))
+        : entry?.status === 'rejected' ? button('restore', 'Use submitted input') + button('resolve', 'Review input')
+        : downloadSubmission?.accepted ? button('dismiss', 'Dismiss') : '';
+    const text = downloadSubmission ? downloadSubmissionText(entry) : '';
+    const html = text ? `<span>${escapeHtml(text)}</span>${actions}` : '';
+    for (const id of ['downloadSubmissionStatus', 'downloadSubmissionSummary']) {
+        const node = document.getElementById(id);
+        if (!node) continue;
+        if (node.innerHTML !== html) node.innerHTML = html;
+        node.hidden = !text;
+        node.dataset.submissionState = downloadSubmission?.accepted ? 'accepted' : entry?.status || '';
+        node.dataset.downloadId = downloadSubmission?.accepted?.download_id || '';
+        node.dataset.jobId = downloadSubmission?.accepted?.id || '';
+        node.dataset.attemptId = downloadSubmission?.accepted?.attempt_id || '';
+    }
+    const summary = document.getElementById('downloadSubmissionSummary');
+    if (summary) summary.hidden = !text || document.getElementById('newDownloadDialog').open;
+    for (const [field, states] of [['pending', ['queued', 'sending', 'unconfirmed', 'conflicted']], ['unconfirmed', ['unconfirmed']], ['conflicted', ['conflicted']]]) {
+        downloadSubmissionMetrics[field] = states.includes(entry?.status) ? 1 : 0;
+    }
+    renderProbeState();
+}
+function finishDownloadSubmission(record, job) {
+    if (downloadSubmission !== record) return;
+    record.timers?.forEach(clearTimeout);
+    record.accepted = job;
+    record.legacy = null;
+    downloadSubmitting = false;
+    if (record.generation === probeGeneration && record.dialogSession === newDownloadSession
+            && record.draftGeneration === downloadDraftGeneration
+            && JSON.stringify(record.fields) === JSON.stringify(downloadOptionDraft())) {
+        urlInput.value = '';
         invalidateProbe();
         updateUrlClear();
         if (optionsDetails && !optionsOpenedManually) setOptionsOpen(false);
         closeNewDownload();
-        fetchHistory();
-    })
-    .catch(() => {})
-    .finally(() => {
-        downloadSubmitting = false;
-        renderProbeState();
-    });
+    }
+    renderDownloadSubmission();
 }
+function handleDownloadSubmissionEvent(event) {
+    const record = downloadSubmission;
+    if (!record || record.intentId && record.intentId !== event.intentId) return;
+    if (!record.intentId) record.intentId = event.intentId;
+    if (event.outcome === 'confirmed') {
+        const job = tagMutations.status(event.intentId)?.acceptedJob;
+        if (job) finishDownloadSubmission(record, job);
+    } else {
+        renderDownloadSubmission();
+    }
+    if (event.outcome === 'reconciliation') downloadSubmissionMetrics.reconciliationReads++;
+}
+function submitDownloadRequest(value, draft) {
+    const started = performance.now();
+    if (downloadSubmission?.intentId && !tagMutations.resolve(downloadSubmission.intentId)) {
+        // A confirmed operation has already left the coordinator; unresolved
+        // acceptance must retain its identity until explicit recovery settles it.
+        if (tagMutations.status(downloadSubmission.intentId)) { renderDownloadSubmission(); return; }
+    }
+    downloadSubmission?.timers?.forEach(clearTimeout);
+    const oldKey = downloadSubmission?.key;
+    downloadSubmission = null;
+    if (oldKey) tagState.writer.forgetSubmission(oldKey);
+    const record = { ...draft, value, key: `submission:${++downloadSubmissionSequence}`, timers: [] };
+    downloadSubmission = record;
+    if (tagCapabilities?.mutation_protocol === 1 && tagCapabilities.actions?.includes('download.submit')) {
+        tagState.acceptDownload({ id: record.key, submission_revision: '0', submission: null });
+        const result = tagMutations.submit({ kind: 'download.submit', targetId: record.key, value, viewToken: draft.dialogSession });
+        if (!result.accepted) {
+            record.legacy = { status: 'rejected', message: result.message, legacy: true };
+            renderDownloadSubmission();
+            return;
+        }
+        record.intentId = result.intentId;
+    } else {
+        record.legacy = { status: 'sending', message: 'Starting download…', legacy: true };
+        for (const metrics of [downloadSubmissionMetrics, mutationMetrics]) metrics.submissions++;
+        const epoch = tagSessionEpoch;
+        const current = () => downloadSubmission === record && epoch === tagSessionEpoch;
+        const unknown = () => {
+            if (!current()) return;
+            if (record.legacy.status !== 'unconfirmed') for (const metrics of [downloadSubmissionMetrics, mutationMetrics]) metrics.unconfirmedOutcomes++;
+            record.legacy.status = 'unconfirmed';
+            record.legacy.message = 'Download request not confirmed. This server cannot safely recover it. Check Current downloads, then reload to intentionally start a separate request; the original may still complete.';
+            renderDownloadSubmission();
+        };
+        record.timers = [setTimeout(() => {
+            if (!current() || record.legacy?.status !== 'sending') return;
+            record.legacy.message = 'Still waiting for download request confirmation.';
+            renderDownloadSubmission();
+        }, 5000), setTimeout(unknown, 30000)];
+        Promise.resolve().then(() => {
+            if (!current()) return;
+            return apiFetch('/api/download', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) });
+        }).then(async response => {
+            if (!response) return;
+            const body = await response.json().catch(() => null);
+            if (!current()) return;
+            if ([401, 403].includes(response.status)) { resetDownloadSubmission(); return; }
+            if (response.ok && typeof body?.id === 'string' && body.id) {
+                if (tagState.isFenced(body.id)) { resetDownloadSubmission(); return; }
+                for (const metrics of [downloadSubmissionMetrics, mutationMetrics]) { metrics.acknowledgements++; metrics.latestAcknowledgementMs = performance.now() - started; }
+                finishDownloadSubmission(record, { id: '', download_id: body.id, attempt_id: '', status: 'accepted' });
+                fetchHistory();
+            } else if ([400, 409, 413, 422, 429].includes(response.status)) {
+                record.legacy.status = 'rejected';
+                record.legacy.message = 'Download request refused. Review the retained input before submitting again.';
+                for (const metrics of [downloadSubmissionMetrics, mutationMetrics]) metrics.rejectedOutcomes++;
+                renderDownloadSubmission();
+            } else unknown();
+        }).catch(unknown).finally(() => record.timers.forEach(clearTimeout));
+    }
+    renderDownloadSubmission();
+    downloadSubmissionMetrics.latestLocalFeedbackMs = Math.max(0, performance.now() - started);
+    mutationMetrics.latestLocalFeedbackMs = downloadSubmissionMetrics.latestLocalFeedbackMs;
+}
+document.addEventListener('click', async event => {
+    const button = event.target.closest('[data-submission-recovery]');
+    const record = downloadSubmission;
+    if (!button || !record) return;
+    const action = button.dataset.submissionRecovery;
+    const entry = downloadSubmissionIntent();
+    if (action === 'current' && entry?.legacy) {
+        closeNewDownload();
+        openCurrentDownloads();
+        downloadSubmissionMetrics.reconciliationReads++;
+        await fetchHistory();
+        return;
+    }
+    if (action === 'check' || action === 'replay') {
+        await tagMutations.recover(record.intentId, action === 'replay' ? { replay: true } : {});
+    } else {
+        if (action !== 'dismiss' && (record.legacy ? entry?.status !== 'rejected' : entry && !tagMutations.resolve(record.intentId))) {
+            announceTagStatus('The original download request may still complete. Check its status before submitting again.');
+            return;
+        }
+        if (action === 'restore') {
+            openNewDownload();
+            const fields = record.fields;
+            if (urlInput.value !== fields.url || probedUrl !== fields.url.trim()) {
+                urlInput.value = fields.url;
+                scheduleProbe(fields.url.trim(), 0);
+            }
+            // Restore only choices available in the current probe; a new URL
+            // must finish its own probe before its options can be selected.
+            for (const [id, value] of [['optionsQualitySelect', fields.quality], ['optionsContainerSelect', fields.container]]) {
+                const select = document.getElementById(id);
+                if ([...select.options].some(option => option.value === value)) select.value = value;
+            }
+            document.getElementById('optionsFilename').value = fields.filename;
+            downloadDraftGeneration++;
+            downloadRestoredOptions = { fields, generation: probeGeneration, draftGeneration: downloadDraftGeneration, dialogSession: newDownloadSession };
+            updateUrlClear();
+        }
+        record.timers.forEach(clearTimeout);
+        downloadSubmission = null;
+        tagState.writer.forgetSubmission(record.key);
+        downloadSubmitting = false;
+        if (action === 'resolve') openNewDownload();
+    }
+    renderDownloadSubmission();
+});
 
 let probeTimeout;
 // A request may finish after its URL has been replaced or cleared. Generation
@@ -1094,9 +1267,14 @@ let probeGeneration = 0;
 let probeState = 'empty';
 let probedUrl = '';
 let downloadSubmitting = false;
+let downloadDraftGeneration = 0;
+let downloadRestoredOptions = null;
+let downloadSubmission = null;
+let downloadSubmissionSequence = 0;
 const urlInput = document.getElementById('urlInput');
 const urlClear = document.getElementById('urlClear');
 const optionsDetails = document.querySelector('#optionsContainer details');
+const downloadOptionValues = new Map();
 
 function updateUrlClear() {
     urlClear.style.display = urlInput.value ? '' : 'none';
@@ -1104,7 +1282,7 @@ function updateUrlClear() {
 
 function renderProbeState() {
     const checking = probeState === 'checking';
-    const ready = probeState === 'ready' && !downloadSubmitting;
+    const ready = probeState === 'ready';
     const content = document.getElementById('optionsContent');
     const overlay = document.getElementById('optionsOverlay');
     content.dataset.state = downloadSubmitting ? 'submitting' : probeState;
@@ -1123,7 +1301,7 @@ function renderProbeState() {
     // Keep the live region outside the busy options region, and avoid repeating
     // Checking announcements for each keystroke during the debounce.
     const status = document.getElementById('downloadReadinessStatus');
-    const message = downloadSubmitting ? 'Starting download…' : messages[probeState];
+    const message = downloadSubmission ? downloadSubmissionText(downloadSubmissionIntent()) : messages[probeState];
     if (status.textContent !== message) status.textContent = message;
 
     for (const id of ['optionsQualitySelect', 'optionsContainerSelect']) {
@@ -1131,10 +1309,12 @@ function renderProbeState() {
         select.disabled = !ready || select.options.length <= 1;
     }
     document.getElementById('optionsFilename').disabled = !ready;
-    document.getElementById('downloadSubmit').disabled = !ready;
+    document.getElementById('downloadSubmit').disabled = !ready || downloadSubmitting;
+    document.getElementById('downloadSubmit').setAttribute('aria-busy', String(downloadSubmitting));
 }
 
 function invalidateProbe(state = 'empty') {
+    downloadRestoredOptions = null;
     clearTimeout(probeTimeout);
     probeGeneration += 1;
     probedUrl = '';
@@ -1151,6 +1331,7 @@ function scheduleProbe(url, delay = 500) {
 }
 
 urlClear.addEventListener('click', () => {
+    downloadDraftGeneration++;
     urlInput.value = '';
     invalidateProbe();
     if (optionsDetails && !optionsOpenedManually) setOptionsOpen(false);
@@ -1227,8 +1408,23 @@ urlInput.addEventListener('input', () => {
     // Equivalent input must not invalidate a pending submission's success
     // callback: whitespace and repeated pastes still refer to the same URL.
     if (url === probedUrl) return;
+    downloadDraftGeneration++;
     scheduleProbe(url);
 });
+
+for (const id of ['optionsQualitySelect', 'optionsContainerSelect', 'optionsFilename']) {
+    const field = document.getElementById(id);
+    downloadOptionValues.set(id, field.value);
+    const changed = () => {
+        // A text field's change event may arrive only when it blurs after
+        // submission. Its earlier input event already recorded that value.
+        if (downloadOptionValues.get(id) === field.value) return;
+        downloadOptionValues.set(id, field.value);
+        downloadDraftGeneration++;
+    };
+    field.addEventListener('input', changed);
+    field.addEventListener('change', changed);
+}
 
 // Native paste fires input after updating the field, including clipboard
 // shortcuts. Use that single path so one paste schedules only one probe.
@@ -1283,6 +1479,14 @@ function probeVideoUrl(url, generation) {
             option.textContent = ext.toUpperCase();
             containerSelect.appendChild(option);
         });
+        const restored = downloadRestoredOptions;
+        if (restored && restored.generation === probeGeneration && restored.draftGeneration === downloadDraftGeneration && restored.dialogSession === newDownloadSession) {
+            for (const [select, value] of [[document.getElementById('optionsQualitySelect'), restored.fields.quality], [containerSelect, restored.fields.container]]) {
+                if ([...select.options].some(option => option.value === value)) select.value = value;
+            }
+            document.getElementById('optionsFilename').value = restored.fields.filename;
+        }
+        downloadRestoredOptions = null;
         probeState = 'ready';
         renderProbeState();
     })
@@ -1341,6 +1545,8 @@ const mutationMetrics = { ...tagMutationMetrics };
 const preferenceMutationMetrics = { ...tagMutationMetrics };
 const playlistMutationMetrics = { ...tagMutationMetrics };
 const downloadCommandMetrics = { ...tagMutationMetrics };
+const downloadSubmissionMetrics = { ...tagMutationMetrics };
+VDL.downloadSubmissionMetrics = () => Object.freeze({ ...downloadSubmissionMetrics });
 VDL.downloadCommandMetrics = () => Object.freeze({ ...downloadCommandMetrics });
 const compatibilityCommands = new Map();
 const commandNotices = new Map();
@@ -1385,7 +1591,7 @@ const tagMutations = VDL.createMutations({
         return { status: response.status, body: await response.json().catch(() => null) };
     },
     onEvent: event => {
-        const domainMetrics = event.action.startsWith('download.') ? downloadCommandMetrics : event.action.startsWith('playlist.') ? playlistMutationMetrics : event.action === 'preference.set' ? preferenceMutationMetrics : event.action === 'rename.set' ? renameMutationMetrics : event.action === 'favorite.set' ? favoriteMutationMetrics : tagMutationMetrics;
+        const domainMetrics = event.action === 'download.submit' ? downloadSubmissionMetrics : event.action.startsWith('download.') ? downloadCommandMetrics : event.action.startsWith('playlist.') ? playlistMutationMetrics : event.action === 'preference.set' ? preferenceMutationMetrics : event.action === 'rename.set' ? renameMutationMetrics : event.action === 'favorite.set' ? favoriteMutationMetrics : tagMutationMetrics;
         for (const metrics of [domainMetrics, mutationMetrics]) {
             if (event.outcome === 'presented') metrics.submissions++;
             if (event.outcome === 'confirmed') {
@@ -1399,7 +1605,8 @@ const tagMutations = VDL.createMutations({
         mutationMetrics.pending = event.pending;
         mutationMetrics.unconfirmed = event.unconfirmed;
         mutationMetrics.conflicted = event.conflicted;
-        if (event.action.startsWith('download.')) {
+        if (event.action === 'download.submit') handleDownloadSubmissionEvent(event);
+        else if (event.action.startsWith('download.')) {
             if (event.outcome === 'reconciliation') downloadCommandMetrics.reconciliationReads++;
             handleDownloadCommandEvent(event);
         }
@@ -1438,6 +1645,7 @@ const tagMutations = VDL.createMutations({
 
 function resetTagSession() {
     tagSessionEpoch += 1;
+    resetDownloadSubmission(true);
     for (const entry of compatibilityCommands.values()) entry.timers.forEach(clearTimeout);
     compatibilityCommands.clear(); commandNotices.clear(); commandAnnouncements.clear();
     ++attemptRequest;
@@ -1486,7 +1694,7 @@ function updateTagMutationSummary() {
         submittedTagIntents.delete(intentId);
         recoveredTagIntents.delete(intentId);
     }
-    const allIntents = tagMutations.pending().concat(preferenceSubmission?.legacy ? [{ ...preferenceSubmission.legacy, kind: 'preference.set' }] : []).concat([...playlistSubmissions.values()].filter(entry => entry.legacy).map(entry => ({ ...entry.legacy, kind: entry.kind })));
+    const allIntents = tagMutations.pending().concat(downloadSubmission?.legacy ? [{ ...downloadSubmission.legacy, kind: 'download.submit' }] : []).concat(preferenceSubmission?.legacy ? [{ ...preferenceSubmission.legacy, kind: 'preference.set' }] : []).concat([...playlistSubmissions.values()].filter(entry => entry.legacy).map(entry => ({ ...entry.legacy, kind: entry.kind })));
     const intents = allIntents.filter(intent => intent.kind.startsWith('tag.'));
     const favoriteIntents = allIntents.filter(intent => intent.kind === 'favorite.set');
     updateFavoriteMutationSummary(favoriteIntents);
@@ -1522,7 +1730,7 @@ function updateTagMutationSummary() {
 function projectTagEntry(info) {
     const projected = tagState.selectDownload(String(info.id));
     if (!projected) return info;
-    return { ...info, ...(info.current_attempt_id !== projected.current_attempt_id && typeof projected.command_revision === 'string' ? { status: projected.status, progress: projected.progress, speed: projected.speed, eta: projected.eta, downloaded_bytes: projected.downloaded_bytes, total_bytes: projected.total_bytes, finished_at: projected.finished_at } : {}), command_revision: projected.command_revision, current_attempt_id: projected.current_attempt_id, filename: projected.filename, display_filename: projected.display_filename,
+    return { ...info, ...(info.current_attempt_id !== projected.current_attempt_id && typeof projected.command_revision === 'string' ? { status: projected.status, progress: projected.progress, speed: projected.speed, eta: projected.eta, downloaded_bytes: projected.downloaded_bytes, total_bytes: projected.total_bytes, finished_at: projected.finished_at } : {}), command_revision: projected.command_revision, current_attempt_id: projected.current_attempt_id, job_id: projected.job_id, filename: projected.filename, display_filename: projected.display_filename,
         rename_revision: projected.rename_revision, requested_filename: ['sending', 'unconfirmed'].includes(compatibilityRenames.get(String(info.id))?.status) ? compatibilityRenames.get(String(info.id)).value : projected.requested_filename, rename_intents: projected.rename_intents, tags: projected.tags, tag_items: projected.tag_items,
         tags_revision: projected.tags_revision, tag_chips: projected.tag_chips,
         favorite: projected.favorite, favorite_revision: projected.favorite_revision, favorite_intents: projected.favorite_intents };
@@ -1548,6 +1756,12 @@ async function loadTagCapabilities() {
 }
 
 tagState.subscribe(ids => {
+    if (downloadSubmission && ids.some(id => id === downloadSubmission.key || id === downloadSubmission.accepted?.download_id)) {
+        if (!downloadSubmission.legacy && !tagState.isAvailable(downloadSubmission.key) || downloadSubmission.accepted && tagState.isFenced(downloadSubmission.accepted.download_id)) resetDownloadSubmission();
+        else renderDownloadSubmission();
+    }
+    ids = ids.filter(id => !id.startsWith('submission:'));
+    if (!ids.length) return;
     if (ids.some(id => id.startsWith('playlist:'))) {
         for (const id of ids.filter(id => id.startsWith('playlist:'))) {
             if (tagState.isAvailable(id)) continue;
@@ -1613,7 +1827,7 @@ tagState.subscribe(ids => {
 });
 
 window.addEventListener('beforeunload', event => {
-    if (!playlistActions.size && !playlistSubmissions.size && !playlistRetainedDrafts.size && !(playlistEditorDraft && playlistEditorSnapshot() !== playlistEditorBaseline) && !preferenceDirty && !preferenceSubmission && !tagMutations.hasPending() && ![...tagDrafts.values()].some(value => value.trim()) && !renameDrafts.size && !compatibilityRenames.size && !compatibilityCommands.size) return;
+    if (!playlistActions.size && !playlistSubmissions.size && !playlistRetainedDrafts.size && !(playlistEditorDraft && playlistEditorSnapshot() !== playlistEditorBaseline) && !preferenceDirty && !preferenceSubmission && !tagMutations.hasPending() && ![...tagDrafts.values()].some(value => value.trim()) && !renameDrafts.size && !compatibilityRenames.size && !compatibilityCommands.size && !downloadSubmission?.legacy && !urlInput.value.trim()) return;
     event.preventDefault();
     event.returnValue = '';
 });
@@ -2622,7 +2836,7 @@ function clearCompatibilityCommand(id) {
     compatibilityCommands.delete(id);
 }
 function downloadCommandIntents(id) {
-    return tagMutations.pending().filter(entry => entry.kind.startsWith('download.') && entry.targetId === String(id))
+    return tagMutations.pending().filter(entry => entry.kind.startsWith('download.') && entry.kind !== 'download.submit' && entry.targetId === String(id))
         .concat(compatibilityCommands.has(String(id)) ? [compatibilityCommands.get(String(id))] : []);
 }
 function downloadCommandText(intent) {
@@ -2649,7 +2863,7 @@ function downloadCommandStatusSlot(id, attemptId = null) {
     return `<div class="download-command-status" data-download-command-status="${escapeAttr(id)}"${attemptId === null ? '' : ` data-command-attempt="${escapeAttr(attemptId)}"`} role="status" aria-live="off" aria-atomic="true">${downloadCommandStatusHtml(id, attemptId)}</div>`;
 }
 function refreshDownloadCommandPresentations() {
-    const entries = tagMutations.pending().filter(entry => entry.kind.startsWith('download.')).concat([...compatibilityCommands.values()]);
+    const entries = tagMutations.pending().filter(entry => entry.kind.startsWith('download.') && entry.kind !== 'download.submit').concat([...compatibilityCommands.values()]);
     for (const entry of entries) if (entry.status === 'sending' && entry.delayed) announceDownloadCommand(entry, downloadCommandText(entry));
     for (const node of document.querySelectorAll('[data-download-command-status]')) {
         const html = downloadCommandStatusHtml(node.dataset.downloadCommandStatus, node.dataset.commandAttempt || null);
@@ -3943,7 +4157,7 @@ function renderPlaylistSaveStatus() {
     const summaryMessage = closed.length === 1 && ['queued', 'sending'].includes(playlistSubmissionIntent(closed[0])?.status) ? closed[0].kind === 'playlist.create' ? 'Creating playlist…' : 'Saving playlist…' : closed.length ? `${closed.length} playlist ${closed.length === 1 ? 'save' : 'saves'} ${closed.some(entry => playlistSubmissionIntent(entry)?.status === 'unconfirmed') ? 'not confirmed' : closed.some(entry => playlistSubmissionIntent(entry)?.status === 'conflicted') ? 'in conflict' : 'pending or needing review'}.` : '';
     const closedMessage = summaryMessage + (closedDrafts.length ? ` ${closedDrafts.length} unsaved playlist ${closedDrafts.length === 1 ? 'draft' : 'drafts'}.` : '');
     if (summary.querySelector('span').textContent !== closedMessage) summary.querySelector('span').textContent = closedMessage;
-    const aggregate = tagMutations.pending().concat(entries.filter(entry => entry.legacy).map(entry => entry.legacy), [...playlistActions.values()].filter(entry => entry.legacy).map(entry => entry.legacy), preferenceSubmission?.legacy ? [preferenceSubmission.legacy] : []);
+    const aggregate = tagMutations.pending().concat(downloadSubmission?.legacy ? [{ ...downloadSubmission.legacy, kind: 'download.submit' }] : []).concat(entries.filter(entry => entry.legacy).map(entry => entry.legacy), [...playlistActions.values()].filter(entry => entry.legacy).map(entry => entry.legacy), preferenceSubmission?.legacy ? [preferenceSubmission.legacy] : []);
     for (const [field, states] of [['pending', ['queued', 'sending', 'unconfirmed', 'conflicted']], ['unconfirmed', ['unconfirmed']], ['conflicted', ['conflicted']]]) mutationMetrics[field] = aggregate.filter(entry => states.includes(entry.status)).length;
     for (const [field, states] of [['pending', ['queued', 'sending', 'unconfirmed', 'conflicted']], ['unconfirmed', ['unconfirmed']], ['conflicted', ['conflicted']]]) playlistMutationMetrics[field] = entries.filter(entry => states.includes(playlistSubmissionIntent(entry)?.status)).length + [...playlistActions.values()].filter(entry => states.includes(playlistActionIntent(entry)?.status)).length;
 }
@@ -4282,7 +4496,7 @@ function renderPlaylistActionStatus() {
     }
     renderPlaylistChooser();
     const entries = [...playlistActions.values()].map(playlistActionIntent).filter(Boolean);
-    const all = tagMutations.pending().concat([...playlistSubmissions.values()].filter(entry => entry.legacy).map(entry => entry.legacy), [...playlistActions.values()].filter(entry => entry.legacy).map(entry => entry.legacy), preferenceSubmission?.legacy ? [preferenceSubmission.legacy] : []);
+    const all = tagMutations.pending().concat(downloadSubmission?.legacy ? [{ ...downloadSubmission.legacy, kind: 'download.submit' }] : []).concat([...playlistSubmissions.values()].filter(entry => entry.legacy).map(entry => entry.legacy), [...playlistActions.values()].filter(entry => entry.legacy).map(entry => entry.legacy), preferenceSubmission?.legacy ? [preferenceSubmission.legacy] : []);
     for (const [field, statuses] of [['pending', ['queued', 'sending', 'unconfirmed', 'conflicted']], ['unconfirmed', ['unconfirmed']], ['conflicted', ['conflicted']]]) {
         mutationMetrics[field] = all.filter(entry => statuses.includes(entry.status)).length;
         playlistMutationMetrics[field] = entries.concat([...playlistSubmissions.values()].map(playlistSubmissionIntent).filter(Boolean)).filter(entry => statuses.includes(entry.status)).length;
@@ -8597,6 +8811,7 @@ function openNewDownload() {
         newDownloadSession += 1;
     }
     if (optionsDetails.open) setOptionsOpen(true);
+    renderDownloadSubmission();
     urlInput.focus();
     urlInput.select();
 }
@@ -8618,6 +8833,7 @@ function restoreDownloadFocus(target) {
 }
 
 newDownloadDialog.addEventListener('close', () => {
+    renderDownloadSubmission();
     hideActionError();
     restoreDownloadFocus(newDownloadReturnFocus);
     newDownloadReturnFocus = null;

@@ -2230,3 +2230,13 @@ body.history-open .create-playlist-button { display: none; }
 .download-command-summary { padding: .65rem; }
 .download-command-summary-entry + .download-command-summary-entry { margin-top: .5rem; }
 .download-command-message button { font: inherit; }
+
+#downloadSubmissionStatus[hidden], #downloadSubmissionSummary[hidden] { display: none; }
+#downloadSubmissionStatus { margin: .65rem 0; color: var(--muted); font-size: .85rem; }
+#downloadSubmissionStatus[data-submission-state="unconfirmed"],
+#downloadSubmissionSummary[data-submission-state="unconfirmed"],
+#downloadSubmissionStatus[data-submission-state="rejected"],
+#downloadSubmissionSummary[data-submission-state="rejected"] { color: var(--error-fg); }
+#downloadSubmissionStatus button:focus-visible, #downloadSubmissionSummary button:focus-visible {
+    outline: 2px solid var(--link); outline-offset: 2px;
+}

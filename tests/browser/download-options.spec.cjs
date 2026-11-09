@@ -1,5 +1,6 @@
 const { test, expect } = require('@playwright/test');
 const { reset, closeCurrent, openNewDownload } = require('./support.cjs');
+const { downloadAcceptance } = require('./submission-support.cjs');
 
 test.beforeEach(async ({ page }) => {
     await reset(page);
@@ -24,7 +25,7 @@ test('MP4 option builds a compatible MP4-video plus M4A-audio selector', async (
     let payload;
     await page.route('**/api/download', async route => {
         payload = route.request().postDataJSON();
-        await route.fulfill({ status: 200, contentType: 'application/json', body: '{"id":"format01"}' });
+        await route.fulfill({ status: 202, json: downloadAcceptance(payload, 'format01') });
     });
     await page.locator('#downloadForm button[type=submit]').click();
     await expect(page.locator('#urlInput')).toHaveValue('');
@@ -179,7 +180,7 @@ for (const response of [
             let payload;
             await page.route('**/api/download', route => {
                 payload = route.request().postDataJSON();
-                return route.fulfill({ json: { id: 'defaults' } });
+                return route.fulfill({ status: 202, json: downloadAcceptance(payload, 'defaults') });
             });
             await page.locator('#downloadSubmit').click();
             await expect(page.locator('#newDownloadDialog')).toBeHidden();

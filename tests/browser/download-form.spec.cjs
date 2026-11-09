@@ -1,5 +1,6 @@
 const { test, expect } = require('@playwright/test');
 const { reset, openNewDownload } = require('./support.cjs');
+const { downloadAcceptance, downloadRejection } = require('./submission-support.cjs');
 
 test.beforeEach(async ({ page }) => reset(page));
 
@@ -21,7 +22,7 @@ test('Enter submits and clears the accepted URL without opening Current download
     await page.route('**/api/download', async route => {
         submitted = route.request().postDataJSON();
         submissions += 1;
-        await route.fulfill({ status: 202, contentType: 'application/json', body: '{"id":"form0001"}' });
+        await route.fulfill({ status: 202, json: downloadAcceptance(submitted, 'form0001') });
     });
     await openNewDownload(page);
     await page.locator('#urlInput').fill('https://fixture.invalid/enter');
@@ -124,9 +125,8 @@ test('Escape closes New download without discarding its draft', async ({ page })
 
 test('rejected submission retains the form and reports the server error', async ({ page }) => {
     await page.route('**/api/download', route => route.fulfill({
-        status: 500,
-        contentType: 'application/json',
-        body: '{"error":"fixture rejected the request"}',
+        status: 400,
+        json: downloadRejection(route.request().postDataJSON(), 'fixture rejected the request'),
     }));
     await openNewDownload(page);
     await page.locator('#urlInput').fill('https://fixture.invalid/rejected');
@@ -139,8 +139,9 @@ test('rejected submission retains the form and reports the server error', async 
     await expect(page.locator('#optionsQualitySelect')).toHaveValue('bestvideo[height<=360]+bestaudio/best');
     await expect(page.locator('#optionsContainerSelect')).toHaveValue('mp4');
     await expect(page.locator('#optionsFilename')).toHaveValue('keep-this-name');
-    await expect(page.getByText('fixture rejected the request')).toBeVisible();
+    await expect(page.locator('#downloadSubmissionStatus')).toContainText('fixture rejected the request');
     await expect(page.locator('#newDownloadDialog')).toBeVisible();
+    await page.locator('#downloadSubmissionStatus').getByRole('button', { name: 'Review input', exact: true }).click();
     await expect(page.locator('#downloadSubmit')).toBeEnabled();
     await expect(page.locator('#optionsContent')).toHaveAttribute('data-state', 'ready');
 });
@@ -165,10 +166,11 @@ test('a pending submission preserves selections and blocks repeated Enter and cl
     await page.locator('#urlInput').press('Enter');
     await page.evaluate(() => { startDownload(); document.getElementById('downloadSubmit').click(); });
     expect(submissions).toBe(1);
-    await pendingDownload.fulfill({ status: 500, json: { error: 'Try again' } });
+    await pendingDownload.fulfill({ status: 400, json: downloadRejection(pendingDownload.request().postDataJSON(), 'Try again') });
+    await expect(page.locator('#downloadSubmissionStatus')).toContainText('Try again');
+    await page.locator('#downloadSubmissionStatus').getByRole('button', { name: 'Review input', exact: true }).click();
     await expect(page.locator('#downloadSubmit')).toBeEnabled();
     await expect(page.locator('#optionsFilename')).toHaveValue('chosen-name');
-    await expect(page.locator('#newDownloadError')).toContainText('Try again');
     await expect(page.locator('#newDownloadDialog')).toBeVisible();
     await expect(page.locator('#urlInput')).toHaveValue('https://fixture.invalid/submit-once');
     await expect(page.locator('#optionsQualitySelect')).toHaveValue('bestvideo[height<=360]+bestaudio/best');
@@ -207,7 +209,7 @@ test('editing the URL during submission keeps its newer draft and blocks another
     await expect(page.locator('#downloadSubmit')).toBeDisabled();
     await page.evaluate(() => startDownload());
     expect(submissions).toBe(1);
-    await pendingDownload.fulfill({ json: { id: 'accepted' } });
+    await pendingDownload.fulfill({ status: 202, json: downloadAcceptance(pendingDownload.request().postDataJSON(), 'accepted') });
     await expect(page.locator('#downloadSubmit')).toBeEnabled();
     await expect(page.locator('#urlInput')).toHaveValue('https://fixture.invalid/new-draft');
     await expect(page.locator('#newDownloadDialog')).toBeVisible();
@@ -224,7 +226,7 @@ test('delayed acceptance preserves a reopened dialog even with the same URL', as
     await page.getByRole('button', { name: 'Close new download' }).click();
     await expect(page.locator('#newDownloadDialog')).toBeHidden();
     await openNewDownload(page);
-    await pendingDownload.fulfill({ json: { id: 'older-submission' } });
+    await pendingDownload.fulfill({ status: 202, json: downloadAcceptance(pendingDownload.request().postDataJSON(), 'older-submission') });
     await expect(page.locator('#downloadSubmit')).toBeEnabled();
     await expect(page.locator('#newDownloadDialog')).toBeVisible();
     await expect(page.locator('#urlInput')).toHaveValue('https://fixture.invalid/reopened');
@@ -234,7 +236,7 @@ test('Enter from the ready filename field submits the selected name', async ({ p
     let payload;
     await page.route('**/api/download', route => {
         payload = route.request().postDataJSON();
-        return route.fulfill({ json: { id: 'filename-enter' } });
+        return route.fulfill({ status: 202, json: downloadAcceptance(payload, 'filename-enter') });
     });
     await openNewDownload(page);
     await page.locator('#urlInput').fill('https://fixture.invalid/filename-enter');

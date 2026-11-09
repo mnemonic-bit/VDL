@@ -51,9 +51,11 @@
             if (!snapshot || snapshot.id == null || (context.epoch !== undefined && context.epoch !== epoch)) return false;
             if (snapshot.tags_revision !== undefined && (!revision(snapshot.tags_revision) || !Array.isArray(snapshot.tags) || !Array.isArray(snapshot.tag_items) || snapshot.tags.length !== snapshot.tag_items.length || snapshot.tag_items.some((tag, index) => !tag || typeof tag.key !== 'string' || typeof tag.name !== 'string' || tag.name !== snapshot.tags[index]) || new Set(snapshot.tag_items.map(tag => tag.key)).size !== snapshot.tag_items.length)) return false;
             if (snapshot.command_revision !== undefined && (!revision(snapshot.command_revision) || !(snapshot.current_attempt_id === null || typeof snapshot.current_attempt_id === 'string' && snapshot.current_attempt_id))) return false;
+            if (Object.hasOwn(snapshot, 'job_id') && !(snapshot.job_id === null || typeof snapshot.job_id === 'string' && snapshot.job_id)) return false;
             if (snapshot.favorite_revision !== undefined && (!revision(snapshot.favorite_revision) || typeof snapshot.favorite !== 'boolean')) return false;
             if (snapshot.rename_revision !== undefined && (!revision(snapshot.rename_revision) || !(snapshot.filename === null || typeof snapshot.filename === 'string') || !(snapshot.display_filename == null || typeof snapshot.display_filename === 'string'))) return false;
             if (snapshot.preferences_revision !== undefined && (String(snapshot.id) !== 'installation' || !revision(snapshot.preferences_revision) || !preferenceValues(snapshot.values))) return false;
+            if (snapshot.submission_revision !== undefined && (!revision(snapshot.submission_revision) || !String(snapshot.id).startsWith('submission:') || !(snapshot.submission === null || snapshot.submission && typeof snapshot.submission.id === 'string' && snapshot.submission.job?.download_id === snapshot.submission.id && typeof snapshot.submission.job.id === 'string' && typeof snapshot.submission.job.attempt_id === 'string'))) return false;
             const id = String(snapshot.id);
             const fence = fences.get(id);
             if (fence !== undefined) {
@@ -63,6 +65,12 @@
             const old = downloads.get(id);
             if (snapshot.playlist_revision !== undefined && (!Number.isSafeInteger(snapshot.playlist_revision) || snapshot.playlist_revision < 0 || !snapshot.playlist || !Array.isArray(snapshot.playlist.items))) return false;
             const next = { ...(old || {}), ...copy(snapshot), id };
+            if (old && revision(old.submission_revision)) {
+                if (!revision(snapshot.submission_revision) || BigInt(snapshot.submission_revision) < BigInt(old.submission_revision)) {
+                    next.submission_revision = old.submission_revision;
+                    next.submission = old.submission;
+                } else if (old.submission && (snapshot.submission?.id !== old.submission.id || snapshot.submission?.job.id !== old.submission.job.id || snapshot.submission?.job.attempt_id !== old.submission.job.attempt_id)) return false;
+            }
             if (old && revision(old.tags_revision)) {
                 if (!revision(snapshot.tags_revision) || BigInt(snapshot.tags_revision) < BigInt(old.tags_revision)) {
                     next.tags = old.tags;
@@ -78,6 +86,8 @@
                 if (!revision(snapshot.command_revision) || BigInt(snapshot.command_revision) < BigInt(old.command_revision)) {
                     next.command_revision = old.command_revision;
                     next.current_attempt_id = old.current_attempt_id;
+                    if (Object.hasOwn(old, 'job_id')) next.job_id = old.job_id;
+                    else delete next.job_id;
                     // Worker fields from an earlier execution cannot re-enable
                     // controls or replace the current generation's progress.
                     if (Object.hasOwn(snapshot, 'current_attempt_id') && snapshot.current_attempt_id !== old.current_attempt_id) {
@@ -87,6 +97,7 @@
                         }
                     }
                 } else if (snapshot.command_revision === old.command_revision && snapshot.current_attempt_id !== old.current_attempt_id) return false;
+                else if (snapshot.current_attempt_id !== old.current_attempt_id && !Object.hasOwn(snapshot, 'job_id')) delete next.job_id;
             }
             if (old && revision(old.favorite_revision)) {
                 if (!revision(snapshot.favorite_revision) || BigInt(snapshot.favorite_revision) < BigInt(old.favorite_revision)) {
@@ -156,6 +167,7 @@
             const preferenceIntents = [];
             const playlistIntents = [];
             const commandIntents = [];
+            const submissionIntents = [];
             let requestedFilename = null;
             const chips = new Map();
             for (const tag of download.tag_items || (download.tags || []).map(name => VDL.tagIdentity.normalize(name))) {
@@ -163,6 +175,7 @@
             }
             for (const intent of intents.values()) {
                 if (intent.targetId !== id) continue;
+                if (intent.kind === 'download.submit') { submissionIntents.push(copy(intent)); continue; }
                 if (intent.kind.startsWith('download.')) { commandIntents.push(copy(intent)); continue; }
                 if (intent.kind.startsWith('playlist.')) { playlistIntents.push(copy(intent)); continue; }
                 if (intent.kind === 'preference.set') {
@@ -199,10 +212,11 @@
                 rows.sort((a, b) => a.name.localeCompare(b.name));
             }
             const effective = rows.filter(tag => tag.effective).map(tag => ({ key: tag.key, name: tag.name }));
-            return freeze(copy({ ...download, command_intents: commandIntents, playlist_intents: playlistIntents, requested_filename: requestedFilename, rename_intents: renameIntents, preference_intents: preferenceIntents, favorite, favorite_intents: favoriteIntents, tags: effective.map(tag => tag.name), tag_items: effective, tag_chips: rows }));
+            return freeze(copy({ ...download, submission_intents: submissionIntents, command_intents: commandIntents, playlist_intents: playlistIntents, requested_filename: requestedFilename, rename_intents: renameIntents, preference_intents: preferenceIntents, favorite, favorite_intents: favoriteIntents, tags: effective.map(tag => tag.name), tag_items: effective, tag_chips: rows }));
         }
         function fence(id) {
             id = String(id);
+            for (const [key, value] of downloads) if (key !== id && value.submission?.id === id) fence(key);
             fences.set(id, ++generation);
             downloads.delete(id);
             editOrders.delete(id);
@@ -230,6 +244,7 @@
             subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
             capture() { return Object.freeze({ epoch, generation }); },
             epoch() { return epoch; },
+            isFenced(id) { return fences.has(String(id)); },
             isAvailable(id) { return downloads.has(String(id)) && !fences.has(String(id)); },
             beginEdit(id) {
                 id = String(id);
@@ -261,6 +276,13 @@
                 put(intent) { intents.set(intent.id, copy(intent)); notify(intent.targetId); },
                 remove(id) { const intent = intents.get(id); intents.delete(id); if (intent) notify(intent.targetId); },
                 confirmed(id) { const value = downloads.get(String(id)); return value ? freeze(copy(value)) : null; },
+                forgetSubmission(id) {
+                    id = String(id);
+                    if (!id.startsWith('submission:')) return;
+                    downloads.delete(id); fences.delete(id);
+                    for (const [key, intent] of intents) if (intent.targetId === id) intents.delete(key);
+                    notify(id);
+                },
                 fence,
             }),
         });

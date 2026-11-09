@@ -355,8 +355,12 @@ test('real Resume replay returns one durable job and one linked new attempt afte
     expect(acknowledgements[1].command.id).toBe(acknowledgements[0].command.id);
     expect(acknowledgements[1].command.job_id).toBe(acknowledgements[0].command.job_id);
     expect(acknowledgements[1].command.attempt_id).toBe(acknowledgements[0].command.attempt_id);
+    const current = (await (await page.request.get('/api/current-downloads')).json()).find(item => item.id === id);
+    expect(current.current_attempt_id).toBe(acknowledgements[0].command.attempt_id);
+    expect(current.job_id).toBe(acknowledgements[0].command.job_id);
     const attempts = await (await page.request.get('/api/history')).json();
     expect(attempts.items.filter(item => item.download_id === id)).toHaveLength(2);
+    expect(attempts.items.find(item => item.id === current.current_attempt_id).job_id).toBe(current.job_id);
 });
 
 test('a held old History Retry cannot start a second execution after another tab takes ownership', async ({ page }) => {
@@ -555,6 +559,11 @@ test('a stale pre-command collection response cannot rewind acknowledged attempt
     releaseRead();
     await staleRead;
     expect(await page.evaluate(id => tagState.selectDownload(id).current_attempt_id, id)).toBe('acknowledged-new-attempt');
+    const mapped = await page.evaluate(id => {
+        const projected = projectTagEntry({ id, command_revision: '0', current_attempt_id: 'obsolete-attempt', job_id: 'obsolete-job' });
+        return { job: tagState.selectDownload(id).job_id, projectedJob: projected.job_id, projectedAttempt: projected.current_attempt_id };
+    }, id);
+    expect(mapped).toEqual({ job: gate.requests[0].client_mutation_id, projectedJob: gate.requests[0].client_mutation_id, projectedAttempt: 'acknowledged-new-attempt' });
     await expect(feedback(card(page, id), id)).not.toContainText('Request not confirmed');
 });
 
