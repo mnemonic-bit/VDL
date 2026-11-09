@@ -2,6 +2,12 @@
 
 **Generated:** 2026-05-03 · **Commit:** `0214834` · **Branch:** `main`
 
+## REQUIRED SESSION INSTRUCTIONS
+
+Before starting any task, read `AGENT-LANG.md` in the repository root completely
+and follow its instructions alongside this file. If it is missing or unreadable,
+report that before making changes.
+
 ## OVERVIEW
 Flask + `yt-dlp` video-downloader UI. **Single-process, single-file backend** ([`vdl.py`](file:///workspace/vdl.py), 1004 lines), vanilla-JS frontend ([`static/app.js`](file:///workspace/static/app.js), 929 lines), SQLite for state, **SSE for live UI push** (no polling).
 
