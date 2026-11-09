@@ -23,6 +23,7 @@ async function create(page, name = 'Confirmed playlist', ids = ['playlist-feedba
     return result;
 }
 async function openNew(page, name = 'New playlist') {
+    await expect.poll(() => page.evaluate(() => playableLibraryEntries().some(item => item.id === 'playlist-feedback-one'))).toBe(true);
     await page.getByRole('button', { name: 'Create playlist', exact: true }).click();
     await page.locator('#playlistName').fill(name);
     await page.locator('#playlistAvailable').getByRole('button', { name: /First video/ }).click();
@@ -343,7 +344,7 @@ test('five seconds of waiting changes spinner-only feedback to explanatory text'
     await expect(editor(page)).toBeHidden();
 });
 
-test('a confirmed local deletion fences an older successful replacement response', async ({ page }) => {
+test('known deletion fences an older successful replacement response', async ({ page }) => {
     await ready(page);
     const playlist = await create(page);
     await openExisting(page, playlist);
@@ -352,9 +353,11 @@ test('a confirmed local deletion fences an older successful replacement response
     await save(page).click(); await expect.poll(() => gate.releases.length).toBe(1);
     await close(page);
     const card = page.locator(`[data-playlist-id="${playlist.id}"]`);
-    await card.locator('.kebab-btn').click();
-    page.once('dialog', dialog => dialog.accept());
-    await card.getByRole('button', { name: 'Delete playlist' }).click();
+    // A remote writer may delete after commit while this client still waits.
+    // Local contradictory writes share the unresolved playlist boundary.
+    expect((await page.request.delete(`/api/playlists/${playlist.id}`)).ok()).toBeTruthy();
+    await page.evaluate(id => tagMutations.fence(`playlist:${id}`), playlist.id);
+    await page.evaluate(() => fetchPlaylists());
     await expect(card).toHaveCount(0);
     await release(gate);
     await expect(card).toHaveCount(0);
@@ -505,12 +508,9 @@ test('an older successful save cannot remove a newer quick-add or reorder unrela
     const gate = saveGate(page, { committed: true }); await gate.installed;
     await save(page).click(); await expect.poll(() => gate.releases.length).toBe(1);
     await close(page);
-    const third = page.locator('[data-row-id="playlist-feedback-three"]');
-    await third.locator('.kebab-btn').click();
-    await third.getByRole('button', { name: 'Add to playlist…' }).click();
-    await page.locator('#playlistChooserDialog').getByRole('button', { name: /Confirmed playlist/ }).click();
-    await expect(page.locator(`[data-playlist-id="${playlist.id}"]`)).toContainText('3 videos');
+    expect((await page.request.post(`/api/playlists/${playlist.id}/items`, { data: { download_id: 'playlist-feedback-three' } })).ok()).toBeTruthy();
     await page.evaluate(() => fetchPlaylists());
+    await expect(page.locator(`[data-playlist-id="${playlist.id}"]`)).toContainText('3 videos');
     const shelfBefore = await page.locator('.playlist-card').evaluateAll(cards => cards.map(card => card.dataset.playlistId));
     await release(gate);
     await expect(page.locator('#playlistMutationSummary')).toBeHidden();
@@ -569,10 +569,8 @@ test('a newer draft keeps its acknowledged base revision when a later quick-add 
     const gate = saveGate(page, { committed: true }); await gate.installed;
     await save(page).click(); await expect.poll(() => gate.releases.length).toBe(1);
     await page.locator('#playlistName').fill('Newer retained draft');
-    await page.evaluate(async id => {
-        playlistChooserDownloadId = 'playlist-feedback-three';
-        await quickAddToPlaylist(id);
-    }, playlist.id);
+    expect((await page.request.post(`/api/playlists/${playlist.id}/items`, { data: { download_id: 'playlist-feedback-three' } })).ok()).toBeTruthy();
+    await page.evaluate(() => fetchPlaylists());
     const newer = await (await page.request.get(`/api/playlists/${playlist.id}`)).json();
     expect(newer.items).toHaveLength(3);
     await release(gate);
@@ -625,8 +623,9 @@ test('deleting a creation discovered by reconciliation fences its later acknowle
     const card = page.locator('.playlist-card', { hasText: 'Created before deletion' });
     await expect(card).toBeVisible();
     const id = await card.getAttribute('data-playlist-id');
-    page.once('dialog', dialog => dialog.accept());
-    await page.evaluate(playlistId => deletePlaylist(playlistId), id);
+    expect((await page.request.delete(`/api/playlists/${id}`)).ok()).toBeTruthy();
+    await page.evaluate(playlistId => tagMutations.fence(`playlist:${playlistId}`), id);
+    await page.evaluate(() => fetchPlaylists());
     await expect(card).toHaveCount(0);
     await release(gate);
     await expect(editor(page)).toBeHidden();

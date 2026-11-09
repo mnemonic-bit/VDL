@@ -913,12 +913,33 @@
         </form>
     </dialog>
 
+    <div id="playlistActionAnnouncement" class="visually-hidden" role="status" aria-live="polite"></div>
+    <div id="playlistActionSummary" class="tag-mutation-summary" hidden></div>
+    <dialog id="playlistDeleteDialog" class="playlist-chooser-dialog" aria-labelledby="playlistDeleteTitle">
+        <div class="playlist-chooser-shell">
+            <div class="playlist-editor-header">
+                <h2 id="playlistDeleteTitle">Delete playlist?</h2>
+                <button id="playlistDeleteClose" type="button" class="playlist-dialog-close" onclick="closePlaylistDelete()" aria-label="Close playlist request"><svg aria-hidden="true"><use href="#i-x"/></svg></button>
+            </div>
+            <p id="playlistDeleteStatus"></p>
+            <pre id="playlistActionCurrent" hidden></pre>
+            <div class="playlist-recovery">
+                <button id="playlistDeleteConfirm" type="button" onclick="confirmPlaylistDelete()">Delete playlist</button>
+                <button id="playlistActionCheck" type="button" onclick="playlistActionRecovery('check')" hidden>Check request status</button>
+                <button id="playlistActionReplay" type="button" onclick="playlistActionRecovery('replay')" hidden>Replay original request</button>
+                <button id="playlistActionReview" type="button" onclick="playlistActionRecovery('review')" hidden>Review current version</button>
+                <button id="playlistActionDismiss" type="button" onclick="playlistActionRecovery('current')" hidden>Use current version</button>
+            </div>
+        </div>
+    </dialog>
+
     <dialog id="playlistChooserDialog" class="playlist-chooser-dialog" aria-labelledby="playlistChooserTitle">
         <div class="playlist-chooser-shell">
             <div class="playlist-editor-header">
                 <h2 id="playlistChooserTitle">Add to playlist</h2>
                 <button type="button" class="playlist-dialog-close" onclick="closePlaylistChooser()" aria-label="Close playlist chooser"><svg aria-hidden="true"><use href="#i-x"/></svg></button>
             </div>
+            <p id="playlistChooserEntry" class="playlist-chooser-entry"></p>
             <div id="playlistChooserList" class="playlist-chooser-list"></div>
             <button type="button" class="playlist-new-choice" onclick="createPlaylistFromChooser()"><svg aria-hidden="true"><use href="#i-plus"/></svg>New playlist…</button>
         </div>

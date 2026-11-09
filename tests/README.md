@@ -168,6 +168,23 @@ select the server interpreter. Unknown Unicode versions deliberately use the
 compatibility path until matching identity data ships. Remaining action adapters
 are tracked in [the rollout inventory](../ARCHITECTURE/feature-0051-rollout.md).
 
+Playlist editor saves and quick-add/delete share one integer revision and
+receipt boundary. Their browser checks hold actual requests and committed
+responses to verify immediate status, direct canonical confirmation, explicit
+conflict review, frozen-attempt recovery, and deletion/authentication fences:
+
+```bash
+VDL_PYTHON=/path/to/python3.12 ./tests/run-all.sh --unit
+VDL_PYTHON=/path/to/python3.12 node --test tests/*.test.cjs
+VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py playlists-actions-feedback.spec.cjs playlists-feedback.spec.cjs playlists.spec.cjs
+VDL_TEST_BROWSER=firefox VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py playlists-actions-feedback.spec.cjs playlists-feedback.spec.cjs playlists.spec.cjs
+```
+
+Run the coverage gate separately from browser work so instrumentation of the
+large asset-queue regression has its normal execution budget. Deletion receipts
+recover the removed identity without returning its former private contents;
+they do not establish deletion of videos or media files.
+
 Feature 0055's playlist editor saves use the same production coordinator and
 actor-bound receipts while retaining integer playlist revisions:
 

@@ -409,3 +409,395 @@ class PlaylistMutationProtocolTest(AppCase):
             self.assertEqual(value['mosaic_ids'], [])
             self.assertIsNone(value['progress'])
             self.assertTrue(value['items'][0]['unavailable'])
+
+    def playlist_action(self, target, kind, revision=1, download_id=None, client=None,
+                        payload=None):
+        if payload is None:
+            payload = {'client_mutation_id': self.attempt()['client_mutation_id'],
+                       'expected_revision': revision}
+            if kind == 'add':
+                payload['download_id'] = download_id
+        client = client or self.client
+        url = '/api/playlists/' + target
+        return (client.post(url + '/items', json=payload) if kind == 'add' else
+                client.delete(url, json=payload)), payload
+
+    def test_add_returns_ordered_canonical_ack_and_noop_receipt(self):
+        for identity in ('one', 'two'):
+            self.video(identity)
+        target = self.mutate(self.attempt(ids=['one'])).json['id']
+        added, attempt = self.playlist_action(target, 'add', download_id='two')
+        self.assertEqual(added.status_code, 200)
+        self.assertEqual(added.headers['Cache-Control'], 'no-store')
+        self.assertEqual(added.json['member_ids'], ['one', 'two'])
+        self.assertTrue(added.json['changed'])
+        self.assertEqual(added.json['mutation'], {
+            'id': attempt['client_mutation_id'], 'domain': 'playlist',
+            'revision': 2, 'outcome': 'committed',
+        })
+        self.assertEqual(self.receipt(attempt).json, added.json)
+        no_op, duplicate = self.playlist_action(target, 'add', 2, 'two')
+        self.assertEqual(no_op.status_code, 200)
+        self.assertFalse(no_op.json['changed'])
+        self.assertEqual(no_op.json['revision'], 2)
+        self.assertEqual(self.receipt(duplicate).json, no_op.json)
+
+    def test_delete_ack_and_recovery_contain_only_correlated_removal(self):
+        self.video('secret-member')
+        target = self.mutate(self.attempt('Private title', ['secret-member'])).json['id']
+        response, attempt = self.playlist_action(target, 'delete')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers['Cache-Control'], 'no-store')
+        self.assertEqual(set(response.json), {
+            'id', 'removed', 'membership_invalidated', 'revision', 'mutation', 'server_time',
+        })
+        self.assertEqual(response.json['id'], target)
+        self.assertTrue(response.json['removed'])
+        self.assertTrue(response.json['membership_invalidated'])
+        self.assertEqual(response.json['revision'], 2)
+        self.assertEqual(response.json['mutation']['revision'], 2)
+        self.assertEqual(self.receipt(attempt).json, response.json)
+        self.assertNotIn('secret-member', json.dumps(response.json))
+        self.assertNotIn('Private title', json.dumps(response.json))
+        self.assertEqual(self.client.get('/api/playlists/' + target).status_code, 404)
+        self.assertIsNotNone(vdl.db_get_download('secret-member'))
+
+    def test_add_delete_simultaneous_replay_is_exactly_once(self):
+        self.video('one')
+        for kind in ('add', 'delete'):
+            target = self.mutate(self.attempt()).json['id']
+            payload = {'client_mutation_id': self.attempt()['client_mutation_id'], 'expected_revision': 1}
+            if kind == 'add':
+                payload['download_id'] = 'one'
+            clients = [self.authenticated_client(), self.authenticated_client()]
+            barrier = threading.Barrier(2)
+            def send(index):
+                barrier.wait()
+                return self.playlist_action(target, kind, client=clients[index], payload=payload)[0]
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                replies = list(pool.map(send, range(2)))
+            self.assertEqual([reply.status_code for reply in replies], [200, 200])
+            self.assertEqual(replies[0].json, replies[1].json)
+            self.assertEqual(self.receipt(payload).json, replies[0].json)
+            current = self.client.get('/api/playlists/' + target)
+            if kind == 'add':
+                self.assertEqual(current.json['member_ids'], ['one'])
+                self.assertEqual(current.json['revision'], 2)
+            else:
+                self.assertEqual(current.status_code, 404)
+
+    def test_add_delete_and_replace_compete_at_same_revision(self):
+        self.video('one')
+        for other in ('delete', 'replace', 'add'):
+            target = self.mutate(self.attempt()).json['id']
+            add, _ = self.playlist_action(target, 'add', download_id='one')
+            if other == 'replace':
+                stale = self.mutate(self.attempt('Stale', [], 1), target)
+            else:
+                stale, _ = self.playlist_action(target, other, download_id='one')
+            self.assertEqual(add.status_code, 200)
+            self.assertEqual(stale.status_code, 409)
+            self.assertEqual(stale.json['mutation']['outcome'], 'conflicted')
+            self.assertEqual(stale.json['member_ids'], ['one'])
+            self.assertEqual(stale.json['revision'], 2)
+        target = self.mutate(self.attempt()).json['id']
+        self.playlist_action(target, 'delete')
+        self.assertEqual(self.playlist_action(target, 'add', download_id='one')[0].status_code, 404)
+        self.assertEqual(self.mutate(self.attempt(revision=1), target).status_code, 404)
+
+    def test_delete_fences_earlier_add_receipt_and_replay(self):
+        self.video('one')
+        target = self.mutate(self.attempt()).json['id']
+        _, add = self.playlist_action(target, 'add', download_id='one')
+        self.playlist_action(target, 'delete', 2)
+        self.assertEqual(self.receipt(add).status_code, 404)
+        self.assertEqual(self.playlist_action(target, 'add', payload=add)[0].status_code, 404)
+
+    def test_add_delete_fingerprint_binds_action_payload_target_and_revision(self):
+        self.video('one')
+        target = self.mutate(self.attempt()).json['id']
+        other = self.mutate(self.attempt()).json['id']
+        for kind in ('add', 'delete'):
+            result, payload = self.playlist_action(target, kind, 1 if kind == 'add' else 2, 'one')
+            self.assertEqual(result.status_code, 200)
+            changes = [dict(payload, expected_revision=12), dict(payload, unknown=True)]
+            if kind == 'add':
+                changes.append(dict(payload, download_id='other'))
+            for changed in changes:
+                reply, _ = self.playlist_action(target, kind, payload=changed)
+                self.assertEqual(reply.status_code, 409)
+                self.assertEqual(reply.json['code'], 'mutation_id_conflict')
+            self.assertEqual(self.playlist_action(other, kind, payload=payload)[0].json['code'], 'mutation_id_conflict')
+            other_kind = 'add' if kind == 'delete' else 'delete'
+            self.assertEqual(self.playlist_action(target, other_kind, payload=payload)[0].json['code'], 'mutation_id_conflict')
+
+    def test_add_delete_validation_rejections_are_receipted(self):
+        self.video('one')
+        target = self.mutate(self.attempt()).json['id']
+        for kind in ('add', 'delete'):
+            for revision in (True, '1', 0, -1, 1.0, None):
+                response, payload = self.playlist_action(target, kind, revision, 'one')
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(response.json['mutation']['outcome'], 'rejected')
+                self.assertEqual(self.receipt(payload).json, response.json)
+            response, payload = self.playlist_action(target, kind, payload={
+                'client_mutation_id': self.attempt()['client_mutation_id'],
+                'expected_revision': 1, 'shared': True,
+            })
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(self.receipt(payload).json, response.json)
+        for identity in (None, '', 'missing', 123):
+            response, payload = self.playlist_action(target, 'add', download_id=identity)
+            self.assertEqual(response.status_code, 400)
+            self.assertIn('download_id', response.json['field_errors'])
+            self.assertEqual(self.receipt(payload).json, response.json)
+        with mock.patch.object(vdl, 'PLAYLIST_MAX_ITEMS', 0):
+            response, _ = self.playlist_action(target, 'add', download_id='one')
+            self.assertEqual(response.status_code, 400)
+        for kind in ('add', 'delete'):
+            self.assertEqual(self.playlist_action(target, kind, payload={'client_mutation_id': 'bad'})[0].status_code, 400)
+        self.assertEqual(self.client.delete('/api/playlists/' + target, json=[]).status_code, 400)
+        self.assertEqual(self.client.delete('/api/playlists/' + target, data='broken', content_type='application/json').status_code, 400)
+
+    def test_add_delete_receipt_failure_rolls_back_membership_and_removal(self):
+        self.video('one')
+        self.video('two')
+        original = vdl.db
+        @contextmanager
+        def failing_db():
+            with original() as conn:
+                class Connection:
+                    def __getattr__(self, name):
+                        return getattr(conn, name)
+                    def execute(self, sql, *args):
+                        if sql.startswith('INSERT INTO mutation_receipts'):
+                            raise RuntimeError('receipt failure')
+                        return conn.execute(sql, *args)
+                yield Connection()
+        target = self.mutate(self.attempt(ids=['one'])).json['id']
+        self.client.put('/api/playlists/' + target + '/progress', json={
+            'download_id': 'one', 'position_seconds': 12, 'completed': False, 'write_sequence': 1,
+        })
+        before = self.client.get('/api/playlists/' + target).json
+        for kind in ('add', 'delete'):
+            payload = {'client_mutation_id': self.attempt()['client_mutation_id'], 'expected_revision': 1}
+            if kind == 'add':
+                payload['download_id'] = 'two'
+            with mock.patch.object(vdl, 'db', failing_db), self.assertRaises(RuntimeError):
+                self.playlist_action(target, kind, payload=payload)
+            self.assertEqual(self.receipt(payload).status_code, 404)
+            self.assertEqual(self.client.get('/api/playlists/' + target).json, before)
+
+    def test_add_delete_response_loss_and_restart_recover_without_second_write(self):
+        self.video('one')
+        for kind in ('add', 'delete'):
+            target = self.mutate(self.attempt()).json['id']
+            with mock.patch.object(vdl, '_publish_metadata_change', side_effect=RuntimeError('response lost')):
+                payload = {'client_mutation_id': self.attempt()['client_mutation_id'], 'expected_revision': 1}
+                if kind == 'add':
+                    payload['download_id'] = 'one'
+                with self.assertRaises(RuntimeError):
+                    self.playlist_action(target, kind, payload=payload)
+            # Reinitializing the database models a new process with only durable
+            # state; no client or process-local operation record is needed.
+            vdl.init_db()
+            recovered = self.receipt(payload)
+            replayed, _ = self.playlist_action(target, kind, payload=payload)
+            self.assertEqual(recovered.status_code, 200)
+            self.assertEqual(replayed.json, recovered.json)
+            self.assertEqual(recovered.json['revision'], 2)
+
+    def test_delete_recovery_is_actor_scoped_and_rechecks_active_account(self):
+        user = vdl.db_create_user('editor', 'password', 'normal')
+        client = self.authenticated_client('editor', 'password')
+        target = self.mutate(self.attempt('Secret title'), client=client).json['id']
+        response, payload = self.playlist_action(target, 'delete', client=client)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.receipt(payload).status_code, 404)
+        self.assertEqual(self.playlist_action(target, 'delete', payload=payload)[0].status_code, 404)
+        with vdl._db_lock, vdl.db() as conn:
+            conn.execute('UPDATE users SET session_version = session_version + 1 WHERE id = ?', (user['id'],))
+        self.assertEqual(self.receipt(payload, client).status_code, 401)
+        self.assertEqual(self.playlist_action(target, 'delete', client=client, payload=payload)[0].status_code, 401)
+        client = self.authenticated_client('editor', 'password')
+        self.assertEqual(self.receipt(payload, client).json, response.json)
+        with vdl._db_lock, vdl.db() as conn:
+            conn.execute('UPDATE users SET suspended = 1 WHERE id = ?', (user['id'],))
+        self.assertEqual(self.receipt(payload, client).status_code, 401)
+
+    def test_add_authorization_race_and_recovery_redact_lost_member_access(self):
+        self.video('secret')
+        vdl.db_create_user('editor', 'password', 'normal')
+        client = self.authenticated_client('editor', 'password')
+        target = self.mutate(self.attempt(), client=client).json['id']
+        original = vdl._tag_actor
+        def hide(conn):
+            conn.execute("UPDATE downloads SET visibility = 'private' WHERE id = 'secret'")
+            return original(conn)
+        with mock.patch.object(vdl, '_tag_actor', side_effect=hide):
+            response, rejected = self.playlist_action(target, 'add', download_id='secret', client=client)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json['member_ids'], [])
+        vdl.db_set_download_visibility('secret', 'public')
+        response, payload = self.playlist_action(target, 'add', download_id='secret', client=client)
+        self.assertEqual(response.status_code, 200)
+        vdl.db_set_download_visibility('secret', 'private')
+        for recovered in (self.receipt(payload, client), self.playlist_action(target, 'add', client=client, payload=payload)[0]):
+            self.assertEqual(recovered.status_code, 200)
+            self.assertEqual(recovered.json['member_ids'], [None])
+            self.assertNotIn('secret', json.dumps(recovered.json))
+        no_op, _ = self.playlist_action(target, 'add', 2, 'secret', client=client)
+        self.assertEqual(no_op.status_code, 400)
+        with vdl._db_lock, vdl.db() as conn:
+            conn.execute('UPDATE playlists SET owner_user_id = ? WHERE id = ?',
+                         (vdl.db_get_user_by_username('admin')['id'], target))
+        self.assertEqual(self.receipt(payload, client).status_code, 404)
+        self.assertEqual(self.playlist_action(target, 'add', client=client, payload=payload)[0].status_code, 404)
+
+    def test_add_delete_use_shared_quota_expiry_namespace_and_finality(self):
+        self.video('one')
+        target = self.mutate(self.attempt()).json['id']
+        for kind in ('add', 'delete'):
+            for limit in ('MUTATION_ACTOR_RECEIPT_LIMIT', 'MUTATION_ACTOR_MINUTE_LIMIT'):
+                with mock.patch.object(vdl, limit, 1):
+                    self.assertEqual(self.playlist_action(target, kind, download_id='one')[0].status_code, 429)
+            for created in (time.time() - 86401, time.time() + 301):
+                payload = {'client_mutation_id': self.attempt(created=created)['client_mutation_id'], 'expected_revision': 1}
+                if kind == 'add':
+                    payload['download_id'] = 'one'
+                rejected, _ = self.playlist_action(target, kind, payload=payload)
+                self.assertEqual(rejected.status_code, 400)
+                self.assertEqual(rejected.json['mutation']['outcome'], 'rejected')
+                self.assertEqual(self.receipt(payload).json, rejected.json)
+            namespace = self.attempt()
+            self.mutate(namespace)
+            payload = {'client_mutation_id': namespace['client_mutation_id'], 'expected_revision': 1}
+            if kind == 'add':
+                payload['download_id'] = 'one'
+            self.assertEqual(self.playlist_action(target, kind, payload=payload)[0].json['code'], 'mutation_id_conflict')
+        expired = self.attempt(created=time.time() - 86401)
+        self.assertTrue(self.receipt(expired).json['final'])
+        self.assertFalse(self.receipt(self.attempt()).json['final'])
+
+    def test_add_delete_preserve_request_security_progress_and_worker_ownership(self):
+        self.video('one')
+        target = self.mutate(self.attempt(ids=['one'])).json['id']
+        self.client.put('/api/playlists/' + target + '/progress', json={
+            'download_id': 'one', 'position_seconds': 12, 'completed': False, 'write_sequence': 1,
+        })
+        before = self.client.get('/api/playlists/' + target).json['progress']
+        for kind in ('add', 'delete'):
+            url = '/api/playlists/' + target + ('/items' if kind == 'add' else '')
+            sender = self.client.post if kind == 'add' else self.client.delete
+            self.assertEqual(sender(url, json={'client_mutation_id': self.attempt()['client_mutation_id'], 'expected_revision': 1},
+                                    headers={'Origin': 'https://attacker.invalid'}).status_code, 403)
+        with mock.patch.object(vdl, '_new_rotation_members', side_effect=AssertionError('rotation changed')):
+            added, _ = self.playlist_action(target, 'add', download_id='one')
+            self.assertEqual(added.json['progress'], before)
+            removed, _ = self.playlist_action(target, 'delete')
+            self.assertEqual(removed.status_code, 200)
+        self.assertEqual(vdl._playback_sessions, {})
+        self.assertIsNotNone(vdl.db_get_download('one'))
+
+    def test_delete_receipt_does_not_authorize_a_reused_foreign_identity(self):
+        target = self.mutate(self.attempt()).json['id']
+        _, payload = self.playlist_action(target, 'delete')
+        owner = vdl.db_create_user('other-owner', 'password', 'normal')
+        with vdl._db_lock, vdl.db() as conn:
+            conn.execute('INSERT INTO playlists(id, owner_user_id, name, revision, created_at, content_updated_at) VALUES (?, ?, ?, 1, ?, ?)',
+                         (target, owner['id'], 'Other private playlist', time.time(), time.time()))
+        self.assertEqual(self.receipt(payload).status_code, 404)
+        self.assertEqual(self.playlist_action(target, 'delete', payload=payload)[0].status_code, 404)
+
+    def test_add_delete_expired_recovery_waits_behind_admitted_commit(self):
+        self.video('one')
+        original = vdl.db
+        for kind in ('add', 'delete'):
+            target = self.mutate(self.attempt()).json['id']
+            clients = [self.authenticated_client(), self.authenticated_client()]
+            real_now = time.time()
+            payload = {'client_mutation_id': self.attempt(created=real_now - vdl.MUTATION_REPLAY_SECONDS + 1)['client_mutation_id'],
+                       'expected_revision': 1}
+            if kind == 'add':
+                payload['download_id'] = 'one'
+            clock = [real_now]
+            written, release, recovering = threading.Event(), threading.Event(), threading.Event()
+            @contextmanager
+            def gated_db():
+                with original() as conn:
+                    class Connection:
+                        def __getattr__(self, name):
+                            return getattr(conn, name)
+                        def execute(self, sql, *args):
+                            if sql.startswith('INSERT INTO mutation_receipts'):
+                                written.set()
+                                if not release.wait(5):
+                                    raise AssertionError('receipt gate was not released')
+                            return conn.execute(sql, *args)
+                    yield Connection()
+            def recover():
+                recovering.set()
+                return self.receipt(payload, clients[1])
+            with mock.patch.object(vdl, 'db', gated_db), mock.patch.object(vdl.time, 'time', side_effect=lambda: clock[0]):
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    write = pool.submit(self.playlist_action, target, kind, client=clients[0], payload=payload)
+                    self.assertTrue(written.wait(5))
+                    clock[0] += 2
+                    recovery = pool.submit(recover)
+                    self.assertTrue(recovering.wait(5))
+                    self.assertFalse(recovery.done())
+                    release.set()
+                    committed = write.result(5)[0]
+                    recovered = recovery.result(5)
+            self.assertEqual(committed.status_code, 200)
+            self.assertEqual(recovered.json, committed.json)
+
+    def test_add_delete_share_pending_rename_namespace_and_quota(self):
+        self.video('rename-source')
+        target = self.mutate(self.attempt()).json['id']
+        attempt = self.attempt()
+        def crash(phase, operation):
+            if phase == 'prepared':
+                raise RuntimeError('injected restart')
+        with mock.patch.object(vdl, '_rename_checkpoint', side_effect=crash), self.assertRaises(RuntimeError):
+            self.client.post('/api/rename/rename-source', json={
+                'filename': 'New', 'expected_revision': '1',
+                'client_mutation_id': attempt['client_mutation_id'],
+            })
+        with vdl.db() as conn:
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM rename_operations').fetchone()[0], 1)
+        for kind in ('add', 'delete'):
+            payload = {'client_mutation_id': attempt['client_mutation_id'], 'expected_revision': 1}
+            if kind == 'add':
+                payload['download_id'] = 'rename-source'
+            self.assertEqual(self.playlist_action(target, kind, payload=payload)[0].json['code'], 'mutation_id_conflict')
+            # The creation receipt plus the active rename exhaust this quota.
+            with mock.patch.object(vdl, 'MUTATION_ACTOR_RECEIPT_LIMIT', 2):
+                self.assertEqual(self.playlist_action(target, kind, download_id='rename-source')[0].status_code, 429)
+
+    def test_add_delete_transaction_rechecks_session_before_effects(self):
+        self.video('one')
+        target = self.mutate(self.attempt()).json['id']
+        actor_id = vdl.db_get_user_by_username('admin')['id']
+        original = vdl._tag_actor
+        def expire(conn):
+            conn.execute('UPDATE users SET session_version = session_version + 1 WHERE id = ?', (actor_id,))
+            return original(conn)
+        for kind in ('add', 'delete'):
+            client = self.authenticated_client()
+            with mock.patch.object(vdl, '_tag_actor', side_effect=expire):
+                response, _ = self.playlist_action(target, kind, download_id='one', client=client)
+            self.assertEqual(response.status_code, 401)
+        self.client = self.authenticated_client()
+        self.assertEqual(self.client.get('/api/playlists/' + target).json['member_ids'], [])
+        self.assertEqual(self.client.get('/api/playlists/' + target).json['revision'], 1)
+
+    def test_delete_receipt_recovery_is_invalidated_by_account_removal(self):
+        user = vdl.db_create_user('removed-owner', 'password', 'normal')
+        client = self.authenticated_client('removed-owner', 'password')
+        target = self.mutate(self.attempt(), client=client).json['id']
+        _, payload = self.playlist_action(target, 'delete', client=client)
+        with vdl._db_lock, vdl.db() as conn:
+            conn.execute('DELETE FROM users WHERE id = ?', (user['id'],))
+        self.assertEqual(self.receipt(payload, client).status_code, 401)
+        self.assertEqual(self.playlist_action(target, 'delete', payload=payload, client=client)[0].status_code, 401)

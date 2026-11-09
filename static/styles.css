@@ -2216,3 +2216,9 @@ body.history-open .create-playlist-button { display: none; }
 #playlistSaveButton { display: inline-flex; align-items: center; gap: .5rem; }
 .playlist-saving-spinner { display: inline-block; width: 1rem; height: 1rem; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: options-spin .7s linear infinite; }
 @media (prefers-reduced-motion: reduce) { .playlist-saving-spinner { animation: none; } }
+
+.playlist-request-status { display: block; color: var(--muted); font-size: 0.8rem; margin-top: 0.25rem; }
+#playlistActionSummary > div { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
+#playlistActionCurrent { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+.playlist-chooser-entry, #playlistDeleteStatus, #playlistActionCurrent, #playlistDeleteDialog .playlist-recovery { margin-left: 16px; margin-right: 16px; overflow-wrap: anywhere; }

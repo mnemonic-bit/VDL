@@ -1,8 +1,8 @@
 # Immediate feedback for playlist add and delete
 
 **Source:** Remaining Feature 0051 rollout item\
-**Status:** Proposed; not implemented\
-**Last refined:** 2026-11-08\
+**Status:** Implemented in version `0.59.0`; verification recorded in the rollout inventory\
+**Last refined:** 2026-11-09\
 **Extends:** [Feature 0051](feature-0051-immediate-feedback-for-server-backed-interactions.md), [Feature 0031, Playlists](feature-0031-add-personal-video-playlists.md)\
 **Rollout:** [Shared requirements and inventory](../ARCHITECTURE/feature-0051-rollout.md#shared-requirements-for-the-remaining-specs)
 
@@ -32,6 +32,36 @@ before allowing any retry of an uncertain request.
   Preserve existing playback-session behavior when a playlist disappears.
 
 ## State and server contract
+
+### Adopted action boundary
+
+- **Actions:** `playlist.add` and `playlist.delete`, sharing domain `playlist`
+  with editor creation/replacement. The existing integer revision is retained.
+  One unresolved transmitted action blocks contradictory writes to its playlist;
+  unrelated playlists and unsubmitted editor drafts remain usable.
+- **Affected views:** the quick-add destination and entry, deletion confirmation
+  surface, affected shelf card, and an in-memory recovery summary that remains
+  available when the initiating surface closes. Pending state is status only:
+  it grants no membership, playback selection, or deletion authority.
+- **Add wire:** `POST /api/playlists/<id>/items` accepts `download_id`, integer
+  `expected_revision`, and `client_mutation_id`. A canonical playlist response
+  includes `changed` and the correlated `playlist` mutation result. An already
+  present member returns `changed: false` and the unchanged revision; an append
+  advances the revision once and preserves existing order.
+- **Delete wire:** `DELETE /api/playlists/<id>` accepts integer
+  `expected_revision` and `client_mutation_id`. A committed response contains
+  the removed `id`, `removed: true`, `membership_invalidated: true`, and the
+  integer terminal revision (`expected_revision + 1`), correlated through
+  `mutation`. It contains no former playlist name or member data. Conflicts and
+  validation rejections return the current authorized canonical playlist and
+  their correlated outcome. Empty-body legacy deletion retains its existing
+  204 response.
+- **Permissions and recovery:** the serialized transaction checks the current
+  actor/session, ownership, and added-entry visibility/playability. Receipts
+  share the actor-scoped namespace, quotas, expiry, and deliberate frozen-attempt
+  replay contract. Deletion recovery requires a currently authorized account;
+  old add/replacement receipts still require live playlist ownership and redact
+  member details that are no longer visible.
 
 Coordinate quick-add, editor replacement, and deletion in the same playlist
 conflict boundary as [Feature 0055](feature-0055-immediate-feedback-for-playlist-editor-saves.md).

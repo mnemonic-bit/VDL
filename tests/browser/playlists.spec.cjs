@@ -74,6 +74,7 @@ test('creates, quick-adds, reorders, and deletes a personal playlist', async ({ 
     const chooser = page.locator('#playlistChooserDialog');
     await chooser.getByRole('button', { name: /Weekend/ }).click();
     await expect(card).toContainText('3 videos');
+    await chooser.getByRole('button', { name: 'Close playlist chooser' }).click();
 
     await card.locator('.kebab-btn').click();
     await card.getByRole('button', { name: 'Edit playlist' }).click();
@@ -88,8 +89,8 @@ test('creates, quick-adds, reorders, and deletes a personal playlist', async ({ 
         await card.locator('.kebab-btn').click();
         await expect(deleteButton).toBeVisible({ timeout: 500 });
     }).toPass({ timeout: 3000 });
-    page.once('dialog', dialog => dialog.accept());
     await deleteButton.click();
+    await page.locator('#playlistDeleteConfirm').click();
     await expect(card).toHaveCount(0);
     await expect(page.locator('[data-row-id="playlist-one"]')).toBeVisible();
 });

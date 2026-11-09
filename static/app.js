@@ -1355,14 +1355,19 @@ const tagState = VDL.createClientState();
 const tagMutations = VDL.createMutations({
     state: tagState,
     transport: async ({ url, method, body }) => {
-        if (['POST', 'PUT'].includes(method) && url.startsWith('/api/playlists')) {
-            const submission = [...playlistSubmissions.values()].find(entry => !entry.mutationId && !entry.legacy);
+        if (method === 'POST' && url === '/api/playlists' || method === 'PUT' && /^\/api\/playlists\/[^/]+$/.test(url)) {
+            const submission = [...playlistSubmissions.values()].find(entry => !entry.legacy && (method === 'POST' ? entry.kind === 'playlist.create' && !entry.mutationId : entry.key === decodeURIComponent(url.split('/')[3])));
             if (submission) submission.mutationId = body?.client_mutation_id;
+        }
+        if (method !== 'GET' && url.startsWith('/api/playlists/')) {
+            const id = decodeURIComponent(url.split('/')[3]);
+            const action = playlistActions.get(id);
+            if (action) action.mutationId = body?.client_mutation_id;
         }
         if (method === 'POST' && url === '/api/preferences' && preferenceSubmission) preferenceSubmission.mutationId = body?.client_mutation_id;
         if (method === 'GET') {
             mutationMetrics.reconciliationReads++;
-            if (url.startsWith('/api/playlists') || [...playlistSubmissions.values()].some(entry => entry.mutationId && url.endsWith(entry.mutationId))) playlistMutationMetrics.reconciliationReads++;
+            if (url.startsWith('/api/playlists') || [...playlistSubmissions.values(), ...playlistActions.values()].some(entry => entry.mutationId && url.endsWith(entry.mutationId))) playlistMutationMetrics.reconciliationReads++;
             if (url === '/api/preferences' || (preferenceSubmission?.mutationId && url === `/api/mutations/${encodeURIComponent(preferenceSubmission.mutationId)}`)) preferenceMutationMetrics.reconciliationReads++;
         }
         const response = await apiFetch(url, {
@@ -1533,6 +1538,8 @@ tagState.subscribe(ids => {
             fencePlaylistPresentation(id.slice(9));
         }
         renderPlaylistSaveStatus();
+        renderPlaylistActionStatus();
+        renderPlaylists();
     }
     ids = ids.filter(id => !id.startsWith('playlist:'));
     if (ids.includes('installation')) {
@@ -1580,7 +1587,7 @@ tagState.subscribe(ids => {
 });
 
 window.addEventListener('beforeunload', event => {
-    if (!playlistSubmissions.size && !playlistRetainedDrafts.size && !(playlistEditorDraft && playlistEditorSnapshot() !== playlistEditorBaseline) && !preferenceDirty && !preferenceSubmission && !tagMutations.hasPending() && ![...tagDrafts.values()].some(value => value.trim()) && !renameDrafts.size && !compatibilityRenames.size) return;
+    if (!playlistActions.size && !playlistSubmissions.size && !playlistRetainedDrafts.size && !(playlistEditorDraft && playlistEditorSnapshot() !== playlistEditorBaseline) && !preferenceDirty && !preferenceSubmission && !tagMutations.hasPending() && ![...tagDrafts.values()].some(value => value.trim()) && !renameDrafts.size && !compatibilityRenames.size) return;
     event.preventDefault();
     event.returnValue = '';
 });
@@ -3451,6 +3458,9 @@ let playlistReviewVisible = false;
 const playlistSubmissions = new Map();
 const playlistRetainedDrafts = new Map();
 const playlistDeletedIds = new Set();
+const playlistActions = new Map();
+let playlistActionDialogId = null;
+let playlistActionReturnFocus = null;
 let playlistChooserDownloadId = null;
 let playlistChooserReturnFocus = null;
 
@@ -3493,6 +3503,8 @@ function renderPlaylistMosaic(playlist) {
 
 function renderPlaylistCard(playlist) {
     const id = escapeAttr(playlist.id);
+    const action = playlistActions.get(playlist.id);
+    const blocked = !!action && playlistActionIntent(action)?.status !== 'rejected' || playlistSubmissions.has(playlist.id);
     const duration = formatMediaDuration(playlist.duration_seconds);
     const meta = `${playlist.item_count} ${playlist.item_count === 1 ? 'video' : 'videos'}${duration ? ` · ${duration}` : ''}`;
     const completed = Boolean(playlist.progress && playlist.progress.completed);
@@ -3504,13 +3516,13 @@ function renderPlaylistCard(playlist) {
             <span class="playlist-preview-meta">${escapeHtml(meta)}</span>
         </button>
         <div class="playlist-card-caption">
-            <div><strong title="${escapeAttr(playlist.name)}">${escapeHtml(playlist.name)}</strong><span class="playlist-resume">${escapeHtml(playlistProgressText(playlist))}</span></div>
+            <div><strong title="${escapeAttr(playlist.name)}">${escapeHtml(playlist.name)}</strong><span class="playlist-resume">${escapeHtml(playlistProgressText(playlist))}</span>${action ? `<span class="playlist-request-status">${escapeHtml((action.entryLabel ? action.entryLabel + ': ' : '') + playlistActionMessage(action))}</span>` : ''}</div>
             <div class="menu-wrap">
                 <button class="kebab-btn" type="button" onclick="togglePlaylistMenu('${id}', event)" aria-label="More actions for ${escapeAttr(playlist.name)}"><svg class="icon"><use href="#i-kebab"/></svg></button>
                 <div id="playlist-menu-${id}" class="kebab-menu playlist-card-menu">
                     <button type="button" onclick="startPlaylistPlayback('${id}', true)"><svg class="menu-icon"><use href="#i-play"/></svg>Play from beginning</button>
                     <button type="button" onclick="openPlaylistEditor('${id}')"><svg class="menu-icon"><use href="#i-playlist"/></svg>Edit playlist</button>
-                    <button type="button" class="danger" onclick="deletePlaylist('${id}')"><svg class="menu-icon"><use href="#i-trash"/></svg>Delete playlist</button>
+                    <button type="button" class="danger" onclick="deletePlaylist('${id}')" ${blocked ? 'disabled' : ''}><svg class="menu-icon"><use href="#i-trash"/></svg>Delete playlist</button>
                 </div>
             </div>
         </div>
@@ -3519,7 +3531,7 @@ function renderPlaylistCard(playlist) {
 
 function renderPlaylists() {
     const shelf = document.getElementById('playlistShelf');
-    const visible = playlistSummaries.filter(playlistMatchesSearch);
+    const visible = playlistSummaries.filter(item => playlistActions.has(item.id) || playlistMatchesSearch(item));
     visiblePlaylistCount = visible.length;
     shelf.hidden = visible.length === 0;
     document.getElementById('playlistShelfCount').textContent =
@@ -3535,11 +3547,20 @@ function fetchPlaylists() {
         try {
             const snapshots = await readCollection('/api/playlists');
             if (epoch !== tagSessionEpoch || generation !== playlistCollectionGeneration) return;
+            const held = playlistSummaries.filter(item => playlistActions.has(item.id));
+            for (const item of snapshots) if (!playlistDeletedIds.has(item.id)) tagState.acceptPlaylist(item);
             playlistSummaries = snapshots.filter(item => !playlistDeletedIds.has(item.id)).map(item => {
                 const known = tagState.selectPlaylist(item.id);
-                return known && known.revision > item.revision ? { ...item, ...known } : item;
+                return known && known.revision >= item.revision ? { ...item, ...known } : item;
             });
+            // Pending requests retain their initiating card and position even
+            // when a background collection omits or reorders the target.
+            for (const item of held) {
+                playlistSummaries = playlistSummaries.filter(entry => entry.id !== item.id);
+                playlistSummaries.splice(Math.min(playlistActions.get(item.id)?.index ?? held.indexOf(item), playlistSummaries.length), 0, tagState.selectPlaylist(item.id) || item);
+            }
             renderPlaylists();
+            renderPlaylistActionStatus();
             updateCollectionError('playlists');
         } catch (error) {
             if (epoch === tagSessionEpoch && error.name !== 'AbortError') updateCollectionError('playlists', `Could not refresh Playlists. ${error.message}`);
@@ -3740,10 +3761,12 @@ function renderPlaylistSaveStatus() {
     if (!status) return;
     const submission = playlistEditorDraft && playlistSubmissions.get(playlistEditorDraft.key);
     const intent = playlistSubmissionIntent(submission);
+    const currentAction = playlistEditorDraft && playlistActions.get(playlistEditorDraft.key);
+    const actionPending = currentAction && playlistActionIntent(currentAction)?.status !== 'rejected';
     const pending = intent && ['queued', 'sending'].includes(intent.status);
     const unknown = intent?.status === 'unconfirmed';
     const conflict = intent?.status === 'conflicted';
-    let message = playlistSaveMessage;
+    let message = actionPending ? 'A playlist request is unresolved. Your draft remains editable; resolve that request before saving.' : playlistSaveMessage;
     if (pending) message = intent.delayed ? 'Still waiting for playlist confirmation. Your submitted draft is retained.' : submission.kind === 'playlist.create' ? 'Creating playlist…' : 'Saving playlist…';
     if (unknown) message = (submission.legacy ? 'Save not confirmed. This server has no receipt recovery. Reload to read current playlists; the earlier request may still complete.' : 'Save not confirmed. Check its status before replaying the original save.') + (playlistSaveMessage ? ` ${playlistSaveMessage}` : '');
     if (conflict) message = 'Playlist changed elsewhere. Review the current version before saving your draft again.';
@@ -3751,7 +3774,7 @@ function renderPlaylistSaveStatus() {
     if (pending && submission.generation !== submission.draft.generation) message += ' Newer edits remain unsaved.';
     if (status.textContent !== message) status.textContent = message || '';
     const button = document.getElementById('playlistSaveButton');
-    button.disabled = !!pending || !!unknown || !!conflict;
+    button.disabled = !!pending || !!unknown || !!conflict || !!actionPending;
     button.setAttribute('aria-busy', String(!!pending));
     button.querySelector('span').textContent = pending ? submission.kind === 'playlist.create' ? 'Creating…' : 'Saving…' : 'Save playlist';
     document.getElementById('playlistSavingSpinner').hidden = !pending;
@@ -3776,12 +3799,13 @@ function renderPlaylistSaveStatus() {
     const summaryMessage = closed.length === 1 && ['queued', 'sending'].includes(playlistSubmissionIntent(closed[0])?.status) ? closed[0].kind === 'playlist.create' ? 'Creating playlist…' : 'Saving playlist…' : closed.length ? `${closed.length} playlist ${closed.length === 1 ? 'save' : 'saves'} ${closed.some(entry => playlistSubmissionIntent(entry)?.status === 'unconfirmed') ? 'not confirmed' : closed.some(entry => playlistSubmissionIntent(entry)?.status === 'conflicted') ? 'in conflict' : 'pending or needing review'}.` : '';
     const closedMessage = summaryMessage + (closedDrafts.length ? ` ${closedDrafts.length} unsaved playlist ${closedDrafts.length === 1 ? 'draft' : 'drafts'}.` : '');
     if (summary.querySelector('span').textContent !== closedMessage) summary.querySelector('span').textContent = closedMessage;
-    const aggregate = tagMutations.pending().concat(entries.filter(entry => entry.legacy).map(entry => entry.legacy), preferenceSubmission?.legacy ? [preferenceSubmission.legacy] : []);
+    const aggregate = tagMutations.pending().concat(entries.filter(entry => entry.legacy).map(entry => entry.legacy), [...playlistActions.values()].filter(entry => entry.legacy).map(entry => entry.legacy), preferenceSubmission?.legacy ? [preferenceSubmission.legacy] : []);
     for (const [field, states] of [['pending', ['queued', 'sending', 'unconfirmed', 'conflicted']], ['unconfirmed', ['unconfirmed']], ['conflicted', ['conflicted']]]) mutationMetrics[field] = aggregate.filter(entry => states.includes(entry.status)).length;
-    for (const [field, states] of [['pending', ['queued', 'sending', 'unconfirmed', 'conflicted']], ['unconfirmed', ['unconfirmed']], ['conflicted', ['conflicted']]]) playlistMutationMetrics[field] = entries.filter(entry => states.includes(playlistSubmissionIntent(entry)?.status)).length;
+    for (const [field, states] of [['pending', ['queued', 'sending', 'unconfirmed', 'conflicted']], ['unconfirmed', ['unconfirmed']], ['conflicted', ['conflicted']]]) playlistMutationMetrics[field] = entries.filter(entry => states.includes(playlistSubmissionIntent(entry)?.status)).length + [...playlistActions.values()].filter(entry => states.includes(playlistActionIntent(entry)?.status)).length;
 }
 
 function handlePlaylistMutationEvent(event) {
+    if (event.action === 'playlist.add' || event.action === 'playlist.delete') { handlePlaylistActionEvent(event); return; }
     const submission = [...playlistSubmissions.values()].find(entry => entry.intentId === event.intentId || (event.outcome === 'presented' && !entry.intentId && !entry.legacy));
     if (!submission || submission.epoch !== tagSessionEpoch) return;
     if (event.outcome === 'presented') submission.intentId = event.intentId;
@@ -3841,6 +3865,7 @@ function savePlaylistEditor(event) {
     if (!playlistEditorDraft) return;
     markPlaylistEditorDirty();
     const draft = playlistEditorDraft;
+    if (playlistActions.has(draft.key) && playlistActionIntent(playlistActions.get(draft.key))?.status !== 'rejected') { showPlaylistEditorError('Resolve the current playlist request before saving.'); return; }
     const prior = playlistSubmissions.get(draft.key);
     if (prior) {
         if (playlistSubmissionIntent(prior)?.status !== 'rejected') return;
@@ -3852,7 +3877,9 @@ function savePlaylistEditor(event) {
     showPlaylistEditorError('');
     playlistSaveMessage = '';
     playlistReviewVisible = false;
-    if (playlistSubmissions.size + playlistRetainedDrafts.size - (playlistRetainedDrafts.has(draft.key) ? 1 : 0) >= 128) { showPlaylistEditorError('Too many pending edits. Resolve existing playlist saves first.'); return; }
+    if (playlistActions.size + playlistSubmissions.size + playlistRetainedDrafts.size - (playlistRetainedDrafts.has(draft.key) ? 1 : 0) >= 128) { showPlaylistEditorError('Too many pending edits. Resolve existing playlist saves first.'); return; }
+    const priorAction = playlistActions.get(draft.key);
+    if (priorAction && playlistActionIntent(priorAction)?.status === 'rejected') { if (priorAction.intentId) tagMutations.resolve(priorAction.intentId); playlistActions.delete(draft.key); }
     const kind = draft.id ? 'playlist.replace' : 'playlist.create';
     const submission = { key: draft.key, draft, kind, generation: draft.generation, viewToken: playlistEditorViewToken,
         epoch: tagSessionEpoch, baseline: playlistEditorBaseline, sentAt: performance.now(),
@@ -3941,6 +3968,11 @@ function fencePlaylistPresentation(key) {
     const submission = playlistSubmissions.get(key);
     playlistSubmissions.delete(key);
     playlistRetainedDrafts.delete(key);
+    const action = playlistActions.get(key);
+    if (action?.timer) clearTimeout(action.timer);
+    if (action?.timeout) clearTimeout(action.timeout);
+    if (playlistActionDialogId === key) closePlaylistDelete();
+    playlistActions.delete(key);
     const id = submission?.draft.id || key;
     playlistDeletedIds.add(id);
     playlistCollectionGeneration++;
@@ -3955,12 +3987,18 @@ function fencePlaylistPresentation(key) {
     }
     renderPlaylistSaveStatus();
     renderPlaylists();
+    renderPlaylistActionStatus();
 }
 
 function resetPlaylistSession() {
     ++playlistEditorViewToken;
     ++playlistCollectionGeneration;
     playlistSubmissions.clear(); playlistRetainedDrafts.clear(); playlistDeletedIds.clear();
+    for (const action of playlistActions.values()) { if (action.timer) clearTimeout(action.timer); if (action.timeout) clearTimeout(action.timeout); }
+    playlistActions.clear(); playlistActionDialogId = null;
+    document.getElementById('playlistActionAnnouncement').textContent = '';
+    const actionDialog = document.getElementById('playlistDeleteDialog');
+    if (actionDialog.open) actionDialog.close();
     playlistEditorDraft = null; playlistSummaries = [];
     playlistSaveMessage = ''; playlistReviewVisible = false;
     const dialog = document.getElementById('playlistEditorDialog');
@@ -3969,6 +4007,8 @@ function resetPlaylistSession() {
     document.getElementById('playlistSelected').replaceChildren();
     document.getElementById('playlistAvailable').replaceChildren();
     document.getElementById('playlistChooserList').replaceChildren();
+    document.getElementById('playlistChooserEntry').textContent = '';
+    document.getElementById('playlistActionCurrent').textContent = '';
     document.getElementById('playlistVideoSearch').value = '';
     document.getElementById('playlistCurrentVersion').textContent = '';
     playlistChooserDownloadId = null;
@@ -3976,53 +4016,43 @@ function resetPlaylistSession() {
     if (chooser.open) chooser.close();
     renderPlaylistSaveStatus();
     renderPlaylists();
+    renderPlaylistActionStatus();
 }
 
 function openPlaylistChooser(downloadId, opener = null) {
     closeAllMenus();
     playlistChooserDownloadId = String(downloadId);
     playlistChooserReturnFocus = opener || document.activeElement;
-    const list = document.getElementById('playlistChooserList');
-    list.innerHTML = playlistSummaries.length
-        ? playlistSummaries.map(playlist => {
-            const included = (playlist.member_ids || []).includes(playlistChooserDownloadId);
-            return `<button type="button" onclick="quickAddToPlaylist('${escapeAttr(playlist.id)}')" ${included ? 'disabled' : ''}><span>${escapeHtml(playlist.name)}</span><span>${included ? 'Already added' : `${playlist.item_count} videos`}</span></button>`;
-        }).join('')
-        : '<p>You have no playlists yet.</p>';
+    renderPlaylistChooser();
     document.getElementById('playlistChooserDialog').showModal();
+    placePlaylistActionAnnouncer();
 }
 
 function closePlaylistChooser() {
     const dialog = document.getElementById('playlistChooserDialog');
     if (dialog.open) dialog.close();
+    placePlaylistActionAnnouncer();
     if (playlistChooserReturnFocus && playlistChooserReturnFocus.isConnected) {
         playlistChooserReturnFocus.focus();
     }
 }
 
-async function quickAddToPlaylist(playlistId) {
-    const epoch = tagSessionEpoch;
-    const chooserId = playlistChooserDownloadId;
-    const response = await apiFetch(
-        '/api/playlists/' + encodeURIComponent(playlistId) + '/items', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ download_id: playlistChooserDownloadId }),
-        },
-    );
-    if (epoch !== tagSessionEpoch) return;
-    if (!response.ok) {
-        const data = await response.json().catch(() => ({}));
-        if (epoch !== tagSessionEpoch) return;
-        showActionError(data.error || 'The video could not be added.');
-        return;
-    }
-    const canonical = await response.json();
-    if (epoch !== tagSessionEpoch || playlistDeletedIds.has(playlistId)) return;
-    tagState.acceptPlaylist(canonical);
-    mergeConfirmedPlaylist(canonical);
-    if (playlistChooserDownloadId === chooserId) closePlaylistChooser();
-    await fetchPlaylists();
+function renderPlaylistChooser() {
+    const selected = libraryEntries.find(item => String(item.id) === playlistChooserDownloadId);
+    document.getElementById('playlistChooserEntry').textContent = playlistChooserDownloadId ? libraryTitle(selected) : '';
+    const list = document.getElementById('playlistChooserList');
+    const entries = playlistSummaries;
+    reconcileCards(list, entries, playlist => {
+        const included = (playlist.member_ids || []).includes(playlistChooserDownloadId);
+        const action = playlistActions.get(playlist.id);
+        const blocked = !!action && playlistActionIntent(action)?.status !== 'rejected' || playlistSubmissions.has(playlist.id);
+        return `<button data-playlist-add-id="${escapeAttr(playlist.id)}" type="button" onclick="quickAddToPlaylist('${escapeAttr(playlist.id)}')" ${included || blocked ? 'disabled' : ''}><span>${escapeHtml(playlist.name)}</span><span>${escapeHtml(action ? (action.entryLabel ? action.entryLabel + ': ' : '') + playlistActionMessage(action) : included ? 'Already added' : `${playlist.item_count} videos`)}</span></button>`;
+    }, 'data-playlist-add-id');
+    if (!entries.length) list.textContent = 'You have no playlists yet.';
+}
+
+function quickAddToPlaylist(playlistId) {
+    beginPlaylistAction(playlistId, 'playlist.add', { download_id: playlistChooserDownloadId });
 }
 
 function createPlaylistFromChooser() {
@@ -4031,22 +4061,192 @@ function createPlaylistFromChooser() {
     openPlaylistEditor(null, downloadId);
 }
 
-async function deletePlaylist(id) {
-    const epoch = tagSessionEpoch;
+function deletePlaylist(id) {
     closeAllMenus();
-    if (!window.confirm('Delete this playlist? Its videos will remain in your library.')) return;
-    const response = await apiFetch('/api/playlists/' + encodeURIComponent(id), {
-        method: 'DELETE',
-    });
-    if (epoch !== tagSessionEpoch) return;
-    if (!response.ok) {
-        const data = await response.json().catch(() => ({}));
-        if (epoch !== tagSessionEpoch) return;
-        showActionError(data.error || 'The playlist could not be deleted.');
+    if (playlistActions.has(id) && playlistActionIntent(playlistActions.get(id))?.status !== 'rejected' || playlistSubmissions.has(id)) return;
+    const prior = playlistActions.get(id);
+    if (prior?.intentId) tagMutations.resolve(prior.intentId);
+    playlistActions.delete(id);
+    playlistActionDialogId = id;
+    playlistActionReturnFocus = document.activeElement;
+    document.getElementById('playlistDeleteDialog').showModal();
+    renderPlaylistActionStatus();
+}
+
+function confirmPlaylistDelete() {
+    if (playlistActionDialogId) beginPlaylistAction(playlistActionDialogId, 'playlist.delete', {});
+}
+
+function closePlaylistDelete() {
+    const dialog = document.getElementById('playlistDeleteDialog');
+    if (dialog.open) dialog.close();
+    playlistActionDialogId = null;
+    placePlaylistActionAnnouncer();
+    if (playlistActionReturnFocus?.isConnected) playlistActionReturnFocus.focus();
+}
+
+function playlistActionIntent(action) {
+    return action?.intentId ? tagMutations.status(action.intentId) : action?.legacy;
+}
+
+function playlistActionMessage(action) {
+    const intent = playlistActionIntent(action);
+    const noun = action.kind === 'playlist.add' ? 'Add' : 'Delete';
+    if (intent?.status === 'unconfirmed') return `${noun} not confirmed. ${action.legacy ? 'This server has no receipt recovery. The earlier request may still complete.' : 'Check its status before replaying the original request.'}`;
+    if (intent?.status === 'conflicted') return 'Playlist changed elsewhere. Review the current version before making a new request.';
+    if (intent?.status === 'rejected') return intent.message || `${noun} was rejected. Review the current state.`;
+    return intent?.delayed ? 'Still waiting for playlist confirmation. The request may still complete.' : action.kind === 'playlist.add' ? 'Adding to playlist…' : 'Deleting playlist…';
+}
+
+function placePlaylistActionAnnouncer() {
+    const announcer = document.getElementById('playlistActionAnnouncement');
+    const dialogs = [...document.querySelectorAll('dialog[open]')];
+    const host = document.activeElement?.closest('dialog[open]') || dialogs[dialogs.length - 1] || document.body;
+    if (announcer.parentNode !== host) host.appendChild(announcer);
+}
+
+function renderPlaylistActionStatus() {
+    const summary = document.getElementById('playlistActionSummary');
+    if (!summary) return;
+    placePlaylistActionAnnouncer();
+    summary.hidden = !playlistActions.size;
+    if (playlistActions.size) {
+        const announcement = [...playlistActions.values()].map(action => `${action.entryLabel ? action.entryLabel + ' → ' : ''}${action.name}: ${playlistActionMessage(action)}`).join(' ');
+        const announcer = document.getElementById('playlistActionAnnouncement');
+        if (announcer.textContent !== announcement) announcer.textContent = announcement;
+    }
+    reconcileCards(summary, [...playlistActions.values()].map(action => ({ ...action, id: action.key })), action => `<div data-playlist-action-id="${escapeAttr(action.key)}"><span>${escapeHtml(action.entryLabel ? action.entryLabel + ' → ' : '')}${escapeHtml(action.name)}: ${escapeHtml(playlistActionMessage(action))}</span> <button type="button" onclick="openPlaylistActionRecovery('${escapeAttr(action.key)}')">Review request</button></div>`, 'data-playlist-action-id');
+    const action = playlistActions.get(playlistActionDialogId);
+    const intent = playlistActionIntent(action);
+    const unknown = intent?.status === 'unconfirmed';
+    const conflict = intent?.status === 'conflicted';
+    document.getElementById('playlistDeleteTitle').textContent = action?.kind === 'playlist.add' ? 'Add to playlist' : 'Delete playlist?';
+    const message = action ? (action.entryLabel ? action.entryLabel + ': ' : '') + playlistActionMessage(action) : 'Its videos and media files will remain in your library.';
+    const status = document.getElementById('playlistDeleteStatus');
+    if (status.textContent !== message) status.textContent = message;
+    document.getElementById('playlistDeleteConfirm').hidden = !!action;
+    document.getElementById('playlistActionCheck').hidden = !unknown || !!action?.legacy;
+    document.getElementById('playlistActionReplay').hidden = !unknown || !!action?.legacy;
+    document.getElementById('playlistActionReview').hidden = !conflict;
+    document.getElementById('playlistActionDismiss').hidden = !unknown && !conflict && intent?.status !== 'rejected';
+    const current = document.getElementById('playlistActionCurrent');
+    current.hidden = !action?.reviewed;
+    if (!action?.reviewed) current.textContent = '';
+    if (action?.reviewed) {
+        const canonical = tagState.selectPlaylist(action.key);
+        current.textContent = canonical ? `${canonical.name}\n${canonical.items.map(item => item.title).join('\n')}` : 'Playlist unavailable.';
+    }
+    renderPlaylistChooser();
+    const entries = [...playlistActions.values()].map(playlistActionIntent).filter(Boolean);
+    const all = tagMutations.pending().concat([...playlistSubmissions.values()].filter(entry => entry.legacy).map(entry => entry.legacy), [...playlistActions.values()].filter(entry => entry.legacy).map(entry => entry.legacy), preferenceSubmission?.legacy ? [preferenceSubmission.legacy] : []);
+    for (const [field, statuses] of [['pending', ['queued', 'sending', 'unconfirmed', 'conflicted']], ['unconfirmed', ['unconfirmed']], ['conflicted', ['conflicted']]]) {
+        mutationMetrics[field] = all.filter(entry => statuses.includes(entry.status)).length;
+        playlistMutationMetrics[field] = entries.concat([...playlistSubmissions.values()].map(playlistSubmissionIntent).filter(Boolean)).filter(entry => statuses.includes(entry.status)).length;
+    }
+}
+
+function openPlaylistActionRecovery(id) {
+    if (!playlistActions.has(id)) return;
+    playlistActionDialogId = id;
+    playlistActionReturnFocus = document.activeElement;
+    const dialog = document.getElementById('playlistDeleteDialog');
+    if (!dialog.open) dialog.showModal();
+    renderPlaylistActionStatus();
+}
+
+async function playlistActionRecovery(mode) {
+    const action = playlistActions.get(playlistActionDialogId);
+    const intent = playlistActionIntent(action);
+    if (!action || !intent) return;
+    if (mode === 'check') return tagMutations.recover(action.intentId);
+    if (mode === 'replay') return tagMutations.recover(action.intentId, { replay: true });
+    if (mode === 'review') { action.reviewed = true; renderPlaylistActionStatus(); return; }
+    if (intent.status === 'conflicted' && !action.reviewed) { action.reviewed = true; renderPlaylistActionStatus(); return; }
+    if (action.legacy ? intent.status === 'unconfirmed' : !tagMutations.resolve(action.intentId)) {
+        document.getElementById('playlistDeleteStatus').textContent = 'The original request may still complete. Check its status before making another request.';
         return;
     }
-    tagMutations.fence(`playlist:${id}`);
-    await fetchPlaylists();
+    playlistActions.delete(action.key);
+    if (action.timer) clearTimeout(action.timer);
+    if (action.timeout) clearTimeout(action.timeout);
+    closePlaylistDelete(); renderPlaylistActionStatus(); renderPlaylists(); renderPlaylistSaveStatus();
+}
+
+function beginPlaylistAction(id, kind, value) {
+    const prior = playlistActions.get(id);
+    if (prior && playlistActionIntent(prior)?.status === 'rejected') {
+        if (prior.intentId) tagMutations.resolve(prior.intentId);
+        playlistActions.delete(id);
+    }
+    if (!id || playlistDeletedIds.has(id) || playlistActions.has(id) || playlistSubmissions.has(id)) return;
+    const canonical = tagState.selectPlaylist(id) || playlistSummaries.find(item => item.id === id);
+    if (!canonical) return;
+    const retainedRecords = playlistActions.size + playlistSubmissions.size + playlistRetainedDrafts.size;
+    const legacyWork = [...playlistActions.values(), ...playlistSubmissions.values()].filter(entry => entry.legacy).length
+        + (preferenceSubmission?.legacy ? 1 : 0);
+    if (retainedRecords >= 128 || tagMutations.pending().length + legacyWork >= 128) {
+        showActionError('Too many pending edits. Resolve existing requests first.');
+        return;
+    }
+    const started = performance.now();
+    tagState.acceptPlaylist(canonical);
+    const entryLabel = kind === 'playlist.add' ? libraryTitle(libraryEntries.find(item => String(item.id) === value.download_id)) : null;
+    const action = { key: id, kind, value, entryLabel, name: canonical.name, epoch: tagSessionEpoch, sentAt: performance.now(), index: playlistSummaries.findIndex(item => item.id === id) };
+    playlistActions.set(id, action);
+    if (hasPlaylistProtocol(kind)) {
+        const result = tagMutations.submit({ kind, targetId: `playlist:${id}`, value });
+        if (result.accepted) action.intentId = result.intentId;
+        else { playlistActions.delete(id); showActionError(result.message); }
+    } else sendLegacyPlaylistAction(action);
+    renderPlaylistActionStatus(); renderPlaylists(); renderPlaylistSaveStatus();
+    playlistMutationMetrics.latestLocalFeedbackMs = performance.now() - started;
+    mutationMetrics.latestLocalFeedbackMs = playlistMutationMetrics.latestLocalFeedbackMs;
+}
+
+function handlePlaylistActionEvent(event) {
+    const action = [...playlistActions.values()].find(entry => entry.intentId === event.intentId || (event.outcome === 'presented' && !entry.intentId && !entry.legacy && entry.kind === event.action));
+    if (!action || action.epoch !== tagSessionEpoch) {
+        if (event.outcome === 'confirmed' && event.action === 'playlist.delete') document.getElementById('playlistActionAnnouncement').textContent = 'Playlist deleted. Its videos remain in your library.';
+        return;
+    }
+    if (event.outcome === 'presented') action.intentId = event.intentId;
+    if (event.outcome === 'confirmed') {
+        document.getElementById('playlistActionAnnouncement').textContent = action.kind === 'playlist.add' ? 'Added to playlist.' : 'Playlist deleted. Its videos remain in your library.';
+        if (action.kind === 'playlist.add') mergeConfirmedPlaylist(tagState.selectPlaylist(action.key));
+        playlistActions.delete(action.key);
+        if (playlistActionDialogId === action.key) closePlaylistDelete();
+    } else if (event.outcome === 'conflicted' || event.outcome === 'rejected') mergeConfirmedPlaylist(tagState.selectPlaylist(action.key));
+    renderPlaylistActionStatus(); renderPlaylists(); renderPlaylistSaveStatus();
+}
+
+function setLegacyPlaylistActionOutcome(action, status, message = '') {
+    if (action.legacy?.status !== status) for (const metrics of [playlistMutationMetrics, mutationMetrics]) metrics[status === 'conflicted' ? 'conflicts' : status === 'rejected' ? 'rejectedOutcomes' : 'unconfirmedOutcomes']++;
+    action.legacy = { status, message };
+    renderPlaylistActionStatus(); renderPlaylists(); renderPlaylistSaveStatus();
+}
+
+async function sendLegacyPlaylistAction(action) {
+    action.legacy = { status: 'sending' };
+    for (const metrics of [playlistMutationMetrics, mutationMetrics]) metrics.submissions++;
+    const current = () => action.epoch === tagSessionEpoch && playlistActions.get(action.key) === action;
+    action.timer = setTimeout(() => { if (current() && action.legacy.status === 'sending') { action.legacy.delayed = true; renderPlaylistActionStatus(); renderPlaylists(); } }, 5000);
+    action.timeout = setTimeout(() => { if (current() && action.legacy.status === 'sending') { setLegacyPlaylistActionOutcome(action, 'unconfirmed'); } }, 30000);
+    try {
+        const response = await apiFetch('/api/playlists/' + encodeURIComponent(action.key) + (action.kind === 'playlist.add' ? '/items' : ''), { method: action.kind === 'playlist.add' ? 'POST' : 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(action.value) });
+        if (!current()) return;
+        const body = response.status === 204 ? null : await response.json().catch(() => null);
+        if (!current()) return;
+        if ([401, 403, 404].includes(response.status)) { tagMutations.fence(`playlist:${action.key}`); return; }
+        if (response.ok && (action.kind === 'playlist.delete' ? response.status === 204 : body?.id === action.key && Number.isSafeInteger(body.revision) && Array.isArray(body.items))) {
+            for (const metrics of [playlistMutationMetrics, mutationMetrics]) { metrics.acknowledgements++; metrics.latestAcknowledgementMs = Math.max(0, performance.now() - action.sentAt); }
+            if (action.kind === 'playlist.delete') tagMutations.fence(`playlist:${action.key}`);
+            else { tagState.acceptPlaylist(body); mergeConfirmedPlaylist(tagState.selectPlaylist(action.key)); playlistActions.delete(action.key); }
+            if (playlistActionDialogId === action.key) closePlaylistDelete();
+        } else {
+            setLegacyPlaylistActionOutcome(action, response.status === 409 ? 'conflicted' : response.status >= 400 && response.status < 500 ? 'rejected' : 'unconfirmed', typeof body?.error === 'string' ? body.error : 'Request not confirmed.');
+        }
+    } catch (_) { if (current()) setLegacyPlaylistActionOutcome(action, 'unconfirmed'); }
+    finally { clearTimeout(action.timer); clearTimeout(action.timeout); renderPlaylistActionStatus(); renderPlaylists(); renderPlaylistSaveStatus(); }
 }
 
 function renderHistoryCard(info) {
@@ -8177,7 +8377,10 @@ document.addEventListener('keydown', (ev) => {
     // Editors use Escape to cancel their own transient state. Respect that
     // before treating the same key as a request to close an enclosing layer.
     if (ev.defaultPrevented) return;
-    if (ev.key === 'Escape' && document.getElementById('playerBackdrop').classList.contains('open')) {
+    if (ev.key === 'Escape' && document.getElementById('playlistDeleteDialog').open) {
+        ev.preventDefault();
+        closePlaylistDelete();
+    } else if (ev.key === 'Escape' && document.getElementById('playerBackdrop').classList.contains('open')) {
         ev.preventDefault();
         closePlayer();
     } else if (ev.key === 'Escape' && document.getElementById('playlistEditorDialog').open) {
@@ -9513,3 +9716,5 @@ document.getElementById('playlistChooserDialog').addEventListener('cancel', even
     event.preventDefault();
     closePlaylistChooser();
 });
+
+document.getElementById('playlistDeleteDialog').addEventListener('cancel', event => { event.preventDefault(); closePlaylistDelete(); });

@@ -245,3 +245,204 @@ test('authorized redacted committed receipt validates against submitted position
     assert.equal(h.events.at(-1).outcome, 'confirmed');
     h.mutations.reset();
 });
+
+function actionHarness() {
+    const h = harness();
+    h.mutations.setCapabilities({ ...h.capabilities, actions: [...h.capabilities.actions, 'playlist.add', 'playlist.delete'] });
+    h.action = (kind, downloadId = 'three') => h.mutations.submit({ kind: `playlist.${kind}`, targetId: `playlist:${h.key}`, value: kind === 'add' ? { download_id: downloadId } : {} });
+    h.addReply = (request, changed = true, revision = changed ? 2 : 1, ids = changed ? ['one', 'two', 'three'] : ['one', 'two']) => ({ status: 200, body: { ...h.snapshot(revision, 'Confirmed', ids), changed, mutation: { id: request.body.client_mutation_id, domain: 'playlist', revision, outcome: 'committed' } } });
+    h.deleteReply = request => ({ status: 200, body: { id: h.key, removed: true, membership_invalidated: true, revision: 2, mutation: { id: request.body.client_mutation_id, domain: 'playlist', revision: 2, outcome: 'committed' } } });
+    return h;
+}
+
+for (const kind of ['add', 'delete']) {
+    test(`${kind} shows request state synchronously without projecting membership or removal`, async () => {
+        const h = actionHarness(), submitted = h.action(kind);
+        assert.equal(submitted.accepted, true);
+        assert.equal(h.state.selectPlaylist(h.key).playlist_intents[0].status, 'sending');
+        assert.deepEqual(plain(h.state.selectPlaylist(h.key).member_ids), ['one', 'two']);
+        assert.equal(h.action(kind).intentId, submitted.intentId);
+        assert.equal(h.action(kind === 'add' ? 'delete' : 'add').reason, 'unresolved');
+        assert.equal(h.submit().reason, 'unresolved');
+        await tick();
+        assert.equal(h.requests.length, 1);
+        assert.equal(h.requests[0].method, kind === 'add' ? 'POST' : 'DELETE');
+        assert.equal(h.requests[0].url, '/api/playlists/playlist-1' + (kind === 'add' ? '/items' : ''));
+        assert.equal(h.requests[0].body.expected_revision, 1);
+        h.mutations.reset();
+    });
+
+    test(`${kind} confirms directly from its canonical response without a collection read`, async () => {
+        const h = actionHarness(), captured = h.state.capture(), submission = h.action(kind);
+        await tick();
+        const frames = [];
+        h.state.subscribe(() => frames.push(plain(h.state.selectPlaylist(h.key))));
+        h.requests[0].resolve(kind === 'add' ? h.addReply(h.requests[0]) : h.deleteReply(h.requests[0]));
+        await tick();
+        assert.equal(h.requests.length, 1);
+        assert.equal(h.mutations.status(submission.intentId), null);
+        assert.equal(frames.length, 1);
+        if (kind === 'add') assert.deepEqual(plain(h.state.selectPlaylist(h.key).member_ids), ['one', 'two', 'three']);
+        else {
+            assert.equal(h.state.selectPlaylist(h.key), null);
+            assert.equal(h.state.acceptPlaylist(h.snapshot(), captured), false);
+            assert.equal(h.state.acceptPlaylist(h.snapshot(5)), false);
+        }
+        h.mutations.reset();
+    });
+
+    test(`${kind} lost response recovers once through receipt and never automatically replays`, async () => {
+        const h = actionHarness(), submitted = h.action(kind); await tick();
+        const original = plain(h.requests[0].body);
+        h.requests[0].reject(new Error('post-commit response loss')); await tick();
+        assert.equal(h.mutations.status(submitted.intentId).status, 'unconfirmed');
+        assert.match(h.mutations.status(submitted.intentId).message, new RegExp(kind === 'add' ? 'Add not confirmed' : 'Delete not confirmed'));
+        assert.equal(h.requests[1].method, 'GET');
+        h.requests[1].resolve({ status: 404, body: { error: 'Mutation unavailable', final: false } }); await tick();
+        assert.equal(h.mutations.resolve(submitted.intentId), false);
+        assert.equal(h.requests.length, 2);
+        const replay = h.mutations.recover(submitted.intentId, { replay: true });
+        h.requests[2].resolve({ status: 404, body: { error: 'Mutation unavailable', final: false } }); await replay; await tick();
+        assert.deepEqual(plain(h.requests[3].body), original);
+        h.requests[3].resolve(kind === 'add' ? h.addReply(h.requests[0]) : h.deleteReply(h.requests[0])); await tick();
+        assert.equal(h.mutations.status(submitted.intentId), null);
+        assert.equal(h.events.filter(event => event.outcome === 'confirmed').length, 1);
+        h.mutations.reset();
+    });
+
+    test(`${kind} conflict never reapplies the frozen request to a newer ordered list`, async () => {
+        const h = actionHarness(), submitted = h.action(kind); await tick();
+        h.requests[0].resolve(h.reply(h.requests[0], 'conflicted', 7, 'Remote', ['two', 'one'])); await tick();
+        assert.equal(h.mutations.status(submitted.intentId).status, 'conflicted');
+        assert.equal(h.action(kind).accepted, false);
+        assert.equal(h.mutations.retry(submitted.intentId).reason, 'review_required');
+        assert.deepEqual(plain(h.state.selectPlaylist(h.key).member_ids), ['two', 'one']);
+        assert.equal(h.mutations.resolve(submitted.intentId), true);
+        h.action(kind); await tick();
+        assert.equal(h.requests[1].body.expected_revision, 7);
+        assert.notEqual(h.requests[1].body.client_mutation_id, h.requests[0].body.client_mutation_id);
+        h.mutations.reset();
+    });
+
+    test(`${kind} delayed feedback, expired receipt and authentication fences retain truthful finality`, async () => {
+        const h = actionHarness(), submitted = h.action(kind); await tick();
+        h.advance(5000);
+        assert.match(h.mutations.status(submitted.intentId).message, /Still waiting/);
+        h.advance(25000);
+        h.requests[1].resolve({ status: 404, body: { error: 'Mutation unavailable', final: true } }); await tick();
+        assert.equal(h.mutations.resolve(submitted.intentId), true);
+        assert.notEqual(h.state.selectPlaylist(h.key), null);
+        assert.equal(h.events.some(event => event.outcome === 'confirmed'), false);
+        h.mutations.reset();
+        h.requests[0].resolve(kind === 'add' ? h.addReply(h.requests[0]) : h.deleteReply(h.requests[0])); await tick();
+        assert.equal(h.state.selectPlaylist(h.key), null);
+    });
+}
+
+test('already-present add is a correlated no-op preserving the integer revision', async () => {
+    const h = actionHarness(), submitted = h.action('add', 'one'); await tick();
+    h.requests[0].resolve(h.addReply(h.requests[0], false)); await tick();
+    assert.equal(h.mutations.status(submitted.intentId), null);
+    assert.equal(h.state.selectPlaylist(h.key).revision, 1);
+    assert.deepEqual(plain(h.state.selectPlaylist(h.key).member_ids), ['one', 'two']);
+    h.mutations.reset();
+});
+
+test('add validates canonical order, requested member, changed flag, target and revision before confirmation', async () => {
+    for (const corrupt of [
+        reply => { reply.body.changed = 'true'; },
+        reply => { reply.body.changed = false; },
+        reply => { reply.body.id = 'another-playlist'; },
+        reply => { reply.body.mutation.id = 'foreign-attempt'; },
+        reply => { reply.body.revision = 8; reply.body.mutation.revision = 8; },
+        reply => { reply.body.name = 'Other name'; },
+        reply => { reply.body.items.reverse().forEach((item, index) => { item.position = index; }); reply.body.member_ids.reverse(); },
+        reply => { reply.body.items[2].id = 'foreign-video'; reply.body.member_ids[2] = 'foreign-video'; reply.body.mosaic_ids[2] = 'foreign-video'; },
+    ]) {
+        const h = actionHarness(), submitted = h.action('add'); await tick();
+        const reply = h.addReply(h.requests[0]); corrupt(reply); h.requests[0].resolve(reply); await tick();
+        assert.equal(h.mutations.status(submitted.intentId).status, 'unconfirmed');
+        assert.deepEqual(plain(h.state.selectPlaylist(h.key).member_ids), ['one', 'two']);
+        h.mutations.reset();
+    }
+});
+
+test('delete requires correlated removed identity and membership invalidation before installing its fence', async () => {
+    for (const corrupt of [
+        reply => { reply.body.id = 'foreign'; }, reply => { reply.body.removed = false; },
+        reply => { delete reply.body.membership_invalidated; }, reply => { reply.body.revision = 1; reply.body.mutation.revision = 1; },
+        reply => { reply.body.mutation.id = 'foreign'; }, reply => { reply.body.mutation.domain = 'tags'; },
+    ]) {
+        const h = actionHarness(), submitted = h.action('delete'); await tick();
+        const reply = h.deleteReply(h.requests[0]); corrupt(reply); h.requests[0].resolve(reply); await tick();
+        assert.equal(h.mutations.status(submitted.intentId).status, 'unconfirmed');
+        assert.notEqual(h.state.selectPlaylist(h.key), null);
+        h.mutations.reset();
+    }
+});
+
+test('known deletion fences an older add response and unrelated playlists remain usable', async () => {
+    const h = actionHarness(); h.action('add');
+    h.state.acceptPlaylist({ ...h.snapshot(), id: 'independent' });
+    assert.equal(h.mutations.submit({ kind: 'playlist.delete', targetId: 'playlist:independent', value: {} }).accepted, true);
+    await tick(); assert.equal(h.requests.length, 2);
+    h.mutations.fence(`playlist:${h.key}`);
+    h.requests[0].resolve(h.addReply(h.requests[0])); await tick();
+    assert.equal(h.state.selectPlaylist(h.key), null);
+    assert.equal(h.mutations.hasPending(), true);
+    assert.doesNotMatch(JSON.stringify(h.events), /playlist-1|three|Confirmed/);
+    h.mutations.reset();
+});
+
+test('adopted add/delete validation is narrow and capability-specific', () => {
+    const h = actionHarness();
+    assert.equal(h.mutations.submit({ kind: 'playlist.add', targetId: `playlist:${h.key}`, value: { download_id: 'three', name: 'extra' } }).reason, 'validation');
+    assert.equal(h.mutations.submit({ kind: 'playlist.delete', targetId: `playlist:${h.key}`, value: { all: true } }).reason, 'validation');
+    h.mutations.setCapabilities(h.capabilities);
+    assert.equal(h.action('add').reason, 'unsupported');
+    assert.equal(h.action('delete').reason, 'unsupported');
+    h.mutations.reset();
+});
+
+test('older add acknowledgement cannot rewind independently sequenced playback progress', async () => {
+    const h = actionHarness(), submitted = h.action('add'); await tick();
+    const acknowledgement = h.addReply(h.requests[0]);
+    acknowledgement.body.progress = { download_id: 'one', position_seconds: 12, completed: false, write_sequence: 2 };
+    acknowledgement.body.resume_position = 0;
+    const laterRead = h.snapshot(2, 'Confirmed', ['one', 'two', 'three']);
+    laterRead.progress = { download_id: 'two', position_seconds: 47, completed: true, write_sequence: 3 };
+    laterRead.resume_position = 1;
+    h.state.acceptPlaylist(laterRead);
+    h.requests[0].resolve(acknowledgement); await tick();
+    assert.equal(h.mutations.status(submitted.intentId), null);
+    assert.deepEqual(plain(h.state.selectPlaylist(h.key).progress), laterRead.progress);
+    assert.equal(h.state.selectPlaylist(h.key).resume_position, 1);
+    assert.equal(h.requests.length, 1);
+    h.mutations.reset();
+});
+
+test('newer independent progress follows accepted membership order and cannot restore removed or redacted members', () => {
+    const h = actionHarness();
+    const original = h.snapshot();
+    original.progress = { download_id: 'two', position_seconds: 47, completed: false, write_sequence: 8 };
+    original.resume_position = 1;
+    h.state.acceptPlaylist(original);
+    const reordered = h.snapshot(2, 'Reordered', ['two', 'one']);
+    reordered.progress = { download_id: 'one', position_seconds: 0, completed: false, write_sequence: 7 };
+    reordered.resume_position = 1;
+    h.state.acceptPlaylist(reordered);
+    assert.deepEqual(plain(h.state.selectPlaylist(h.key).progress), original.progress);
+    assert.equal(h.state.selectPlaylist(h.key).resume_position, 0);
+    const removed = h.snapshot(3, 'Removed', ['one']);
+    h.state.acceptPlaylist(removed);
+    assert.equal(h.state.selectPlaylist(h.key).progress, null);
+    assert.equal(h.state.selectPlaylist(h.key).resume_position, 0);
+    h.state.acceptPlaylist({ ...original, revision: 4 });
+    const redacted = h.snapshot(4, 'Confirmed', ['one', 'two']);
+    redacted.items[1] = { id: null, position: 1, title: 'Unavailable video', unavailable: true };
+    redacted.member_ids[1] = null; redacted.mosaic_ids = ['one'];
+    h.state.acceptPlaylist(redacted);
+    assert.equal(h.state.selectPlaylist(h.key).progress, null);
+    assert.equal(h.state.selectPlaylist(h.key).resume_position, 0);
+    h.mutations.reset();
+});

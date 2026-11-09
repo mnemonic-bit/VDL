@@ -1,7 +1,7 @@
 # Architecture: immediate feedback for server-backed interactions
 
-**Status:** Foundation, tags, favorites, rename, preferences, and playlist editor saves implemented; additional adapters remain proposed.\
-**Date:** 2026-11-08\
+**Status:** Foundation, tags, favorites, rename, preferences, playlist editor saves, and playlist add/delete implemented; additional adapters remain proposed.\
+**Date:** 2026-11-09\
 **Requirements:** [Feature 0051](../FEATURES/feature-0051-immediate-feedback-for-server-backed-interactions.md)
 
 ## Purpose and document ownership
@@ -19,8 +19,9 @@ detailed requirements. If implementation requires changing a requirement, update
 the feature explicitly rather than silently contradicting it here.
 
 The implementation adds the shared modules, tag protocol, and independent
-`favorite.set`, `rename.set`, `preference.set`, `playlist.create`, and
-`playlist.replace` adapters described below. Other actions still use handlers and collection snapshots in
+`favorite.set`, `rename.set`, `preference.set`, `playlist.create`,
+`playlist.replace`, `playlist.add`, and `playlist.delete` adapters described
+below. Other actions still use handlers and collection snapshots in
 `static/app.js`, server routes and persistence in `vdl.py`, and SSE hints that
 trigger collection reads. The [rollout inventory](feature-0051-rollout.md) records
 which adapters remain staged. Existing
@@ -58,7 +59,7 @@ reconciliation may still use the existing batching delays.
 
 ## Module responsibilities and proposed placement
 
-The client modules below host tags, favorites, rename, preferences, and playlist editor saves. Additional action adapters
+The client modules below host tags, favorites, rename, preferences, and playlist actions. Additional action adapters
 remain staged. The client remains raw browser JavaScript;
 new scripts expose factory functions through one `window.VDL` namespace and load
 in dependency order before `app.js`. No bundler or runtime package is required.
@@ -348,11 +349,12 @@ process-local configuration while retaining the debug reloader's timer-owner
 restriction. The [preference effect audit](../FEATURES/feature-0054-immediate-feedback-for-preference-saves.md#preference-effect-audit)
 records each boundary.
 
-### Playlist transactions and editor recovery
+### Playlist transactions and recovery
 
-The `playlist.create` and `playlist.replace` descriptors use the existing
-integer playlist revision. They retain one unresolved whole-list submission per
-playlist rather than queuing later editor drafts. Creation uses an in-memory
+The `playlist.create`, `playlist.replace`, `playlist.add`, and `playlist.delete`
+descriptors use the existing integer playlist revision and share one conflict
+boundary. They retain one unresolved submission per playlist rather than
+queuing contradictory writes or later editor drafts. Creation uses an in-memory
 editor key until a canonical acknowledgement supplies the server identity.
 The editor owns draft generations and view tokens; the shared store owns
 confirmed playlist snapshots and status-only intents. Confirmed playback and
@@ -364,16 +366,27 @@ membership and submitted options to the shared actor-scoped receipt namespace,
 then commits the canonical playlist and receipt together. Matching receipt
 replay precedes the original expected-revision check. Authorized recovery
 retains the original outcome while redacting member details that are no longer
-visible. Existing quick-add and removal writers retain the same integer
-revision boundary; this adapter does not advertise their receipt support.
+visible. Quick-add commits membership and its receipt together, including a
+confirmed no-op for an already present video. Deletion commits removal and a
+receipt containing only the correlated removed identity, terminal revision,
+and membership invalidation. A currently authorized actor can recover their
+own deletion after the playlist is gone without receiving former private
+content. Other playlist receipts still require current live ownership.
 
 Canonical responses merge the affected playlist without a collection refresh.
 Collection generations and deletion fences reject older reads and callbacks.
+Progress keeps its independent monotonic write sequence: an older membership
+acknowledgement cannot replace newer known progress. Retained progress must
+still name a visible member, and its resume position follows the accepted order.
 Conflicts retain the draft and expose the current authorized ordered list for
 explicit review. Unknown outcomes retain their frozen attempt and block another
 save in that domain until receipt or finality rules establish safety. Closing
-the editor leaves a compact recovery summary. Authentication reset clears the
-editor, recovery state, and prior callbacks.
+the editor, chooser, or deletion confirmation leaves a compact recovery summary.
+Quick-add and deletion show status without projecting membership or removal;
+the shelf retains its pending card until canonical deletion installs a removal
+fence. Unsupported actions use their legacy endpoints with pending feedback
+and no replay. Authentication reset clears editors, recovery state, and prior
+callbacks.
 
 ## Bootstrap, compatibility, and deployment
 

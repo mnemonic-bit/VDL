@@ -3891,49 +3891,44 @@ class PlaylistService:
         _publish_metadata_change('playlist')
         return result
 
-    def add(self, playlist_id, user_id, download_id, is_admin=False):
+    def _add(self, conn, playlist_id, user_id, download_id, is_admin=False):
         if not isinstance(download_id, str) or not download_id:
             raise ValueError('download_id is required')
-        now = time.time()
-        changed = False
+        self._owned(conn, playlist_id, user_id)
+        entry = self._validated_downloads(conn, [download_id], user_id, is_admin)[0]
+        existing = conn.execute(
+            "SELECT 1 FROM playlist_items WHERE playlist_id = ? AND download_id = ?",
+            (playlist_id, download_id),
+        ).fetchone()
+        if existing is None:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM playlist_items WHERE playlist_id = ?",
+                (playlist_id,),
+            ).fetchone()[0]
+            if count >= PLAYLIST_MAX_ITEMS:
+                raise ValueError(f'A playlist may contain at most {PLAYLIST_MAX_ITEMS} videos')
+            now = time.time()
+            conn.execute(
+                "INSERT INTO playlist_items(playlist_id, download_id, position, added_at) "
+                "VALUES (?, ?, ?, ?)", (playlist_id, entry['id'], count, now),
+            )
+            conn.execute(
+                "UPDATE playlists SET revision = revision + 1, content_updated_at = ? WHERE id = ?",
+                (now, playlist_id),
+            )
+        result = self._snapshot(conn, playlist_id, user_id, is_admin)
+        result['changed'] = existing is None
+        return result
+
+    def add(self, playlist_id, user_id, download_id, is_admin=False):
         with _db_lock, db() as conn:
             conn.execute('BEGIN IMMEDIATE')
             user_id, is_admin = _playlist_current_actor(conn, user_id, is_admin)
-            self._owned(conn, playlist_id, user_id)
-            entry = self._validated_downloads(
-                conn, [download_id], user_id, is_admin
-            )[0]
-            existing = conn.execute(
-                "SELECT 1 FROM playlist_items "
-                "WHERE playlist_id = ? AND download_id = ?",
-                (playlist_id, download_id),
-            ).fetchone()
-            if existing is None:
-                count = conn.execute(
-                    "SELECT COUNT(*) FROM playlist_items WHERE playlist_id = ?",
-                    (playlist_id,),
-                ).fetchone()[0]
-                if count >= PLAYLIST_MAX_ITEMS:
-                    raise ValueError(
-                        f'A playlist may contain at most {PLAYLIST_MAX_ITEMS} videos'
-                    )
-                conn.execute(
-                    "INSERT INTO playlist_items(playlist_id, download_id, "
-                    "position, added_at) VALUES (?, ?, ?, ?)",
-                    (playlist_id, entry['id'], count, now),
-                )
-                conn.execute(
-                    "UPDATE playlists SET revision = revision + 1, "
-                    "content_updated_at = ? WHERE id = ?",
-                    (now, playlist_id),
-                )
-                changed = True
-        if changed:
+            result = self._add(conn, playlist_id, user_id, download_id, is_admin)
+        if result['changed']:
             event_bus.publish('change', {
                 'reason': 'playlist-add', 'playlist_id': playlist_id,
             }, owner_user_id=user_id)
-        result = self.get(playlist_id, user_id, is_admin)
-        result['changed'] = changed
         return result
 
     def delete(self, playlist_id, user_id):
@@ -4095,6 +4090,16 @@ def _authorized_playlist_receipt(conn, result, actor):
     """Revalidate cached identities without replacing the attempt's outcome."""
     if result.get('id') is None:
         return result
+    if result.get('removed') is True:
+        # The actor-scoped receipt records only a removed identity, never its
+        # former title or members. A live authenticated actor may recover their
+        # own deletion after the target is gone. Reused identities still obey
+        # current ownership rather than inheriting the deleted target's rights.
+        live = conn.execute('SELECT owner_user_id FROM playlists WHERE id = ?',
+                            (result['id'],)).fetchone()
+        if live is not None and live['owner_user_id'] != actor['id']:
+            raise PlaylistNotFound()
+        return result
     playlists._owned(conn, result['id'], actor['id'])
     for position, item in enumerate(result['items']):
         entry = _playlist_download_row(conn, item.get('id'))
@@ -4103,11 +4108,15 @@ def _authorized_playlist_receipt(conn, result, actor):
     return _playlist_summary(result)
 
 
-def _execute_playlist_mutation(payload, playlist_id=None):
+def _execute_playlist_mutation(payload, playlist_id=None, action=None):
     """Atomically authorize, conditionally save and record a canonical receipt."""
-    creating = playlist_id is None
-    action = 'playlist.create' if creating else 'playlist.replace'
-    method = 'POST' if creating else 'PUT'
+    action = action or ('playlist.create' if playlist_id is None else 'playlist.replace')
+    creating = action == 'playlist.create'
+    method = {'playlist.create': 'POST', 'playlist.replace': 'PUT',
+              'playlist.add': 'POST', 'playlist.delete': 'DELETE'}[action]
+    allowed_fields = ({'download_id'} if action == 'playlist.add' else set()
+                      if action == 'playlist.delete' else {'name', 'download_ids', 'download_id'})
+    allowed_fields |= {'expected_revision', 'client_mutation_id'}
     mutation_id = payload.get('client_mutation_id')
     match = MUTATION_ID_PATTERN.fullmatch(mutation_id) if isinstance(mutation_id, str) else None
     if match is None:
@@ -4125,13 +4134,6 @@ def _execute_playlist_mutation(payload, playlist_id=None):
         if actor is None:
             return {'error': 'Authentication required'}, 401
         is_admin = 'admin' in actor['roles']
-        try:
-            state = ({'id': None, 'name': '', 'revision': 0, 'items': [], 'progress': None,
-                      'item_count': 0, 'member_ids': [], 'mosaic_ids': [],
-                      'duration_seconds': None, 'resume_position': 0} if creating else
-                     playlists._snapshot(conn, playlist_id, actor['id'], is_admin, repair=False))
-        except PlaylistNotFound:
-            return {'error': 'Unknown playlist'}, 404
         receipt = conn.execute(
             'SELECT fingerprint, status, response FROM mutation_receipts '
             'WHERE actor_id = ? AND mutation_id = ?', (actor['id'], mutation_id),
@@ -4144,6 +4146,13 @@ def _execute_playlist_mutation(payload, playlist_id=None):
             except PlaylistNotFound:
                 return {'error': 'Unknown playlist'}, 404
             return result, receipt['status']
+        try:
+            state = ({'id': None, 'name': '', 'revision': 0, 'items': [], 'progress': None,
+                      'item_count': 0, 'member_ids': [], 'mosaic_ids': [],
+                      'duration_seconds': None, 'resume_position': 0} if creating else
+                     playlists._snapshot(conn, playlist_id, actor['id'], is_admin, repair=False))
+        except PlaylistNotFound:
+            return {'error': 'Unknown playlist'}, 404
         if conn.execute("SELECT 1 FROM rename_operations WHERE actor_id = ? AND mutation_id = ? AND phase != 'done'",
                         (actor['id'], mutation_id)).fetchone():
             return {'error': 'Mutation identifier already used', 'code': 'mutation_id_conflict'}, 409
@@ -4163,7 +4172,7 @@ def _execute_playlist_mutation(payload, playlist_id=None):
         created = int(match.group(1)) / 1000
         if created < now - MUTATION_REPLAY_SECONDS or created > now + 300:
             error, status, outcome = 'Mutation identifier expired or clock is incorrect', 400, 'rejected'
-        elif set(payload) - {'name', 'download_ids', 'download_id', 'expected_revision', 'client_mutation_id'}:
+        elif set(payload) - allowed_fields:
             error, status, outcome = 'Unsupported playlist option', 400, 'rejected'
         elif creating and expected is not None:
             error, status, outcome = 'Creation does not accept an expected revision', 400, 'rejected'
@@ -4171,6 +4180,16 @@ def _execute_playlist_mutation(payload, playlist_id=None):
             error, status, outcome = 'expected_revision must be a positive integer', 400, 'rejected'
         elif not creating and expected != state['revision']:
             error, status, outcome = 'Playlist state changed; review the current version', 409, 'conflicted'
+        elif action == 'playlist.delete':
+            conn.execute('DELETE FROM playlists WHERE id = ?', (playlist_id,))
+            state = {'id': playlist_id, 'removed': True, 'membership_invalidated': True,
+                     'revision': state['revision'] + 1}
+        elif action == 'playlist.add':
+            try:
+                state = playlists._add(conn, playlist_id, actor['id'], payload.get('download_id'), is_admin)
+            except ValueError as invalid:
+                error, field_errors = str(invalid), {'download_id': str(invalid)}
+                status, outcome = 400, 'rejected'
         else:
             ids = payload.get('download_ids')
             if ids is None and creating:
@@ -7898,8 +7917,22 @@ def playlist_resource(playlist_id):
         if request.method == 'GET':
             return jsonify(playlists.get(playlist_id, user_id, is_admin))
         if request.method == 'DELETE':
-            playlists.delete(playlist_id, user_id)
-            return '', 204
+            if request.content_length is not None and request.content_length > 4096:
+                return _read_json_body(4096)[1]
+            if not request.get_data():
+                playlists.delete(playlist_id, user_id)
+                return '', 204
+            payload, invalid = _read_json_body(4096)
+            if invalid is not None:
+                return invalid
+            if 'client_mutation_id' not in payload:
+                playlists.delete(playlist_id, user_id)
+                return '', 204
+            result, status = _execute_playlist_mutation(payload, playlist_id, 'playlist.delete')
+            response = jsonify(result)
+            response.status_code = status
+            response.headers['Cache-Control'] = 'no-store'
+            return response
         payload, invalid = _read_json_body(2 * 1024 * 1024)
         if invalid is not None:
             return invalid
@@ -7918,9 +7951,15 @@ def playlist_resource(playlist_id):
 
 @app.route('/api/playlists/<playlist_id>/items', methods=['POST'])
 def playlist_items(playlist_id):
-    payload = request.get_json(silent=True)
-    if not isinstance(payload, dict):
-        return jsonify({'error': 'A JSON object is required'}), 400
+    payload, invalid = _read_json_body(4096)
+    if invalid is not None:
+        return invalid
+    if 'client_mutation_id' in payload:
+        result, status = _execute_playlist_mutation(payload, playlist_id, 'playlist.add')
+        response = jsonify(result)
+        response.status_code = status
+        response.headers['Cache-Control'] = 'no-store'
+        return response
     try:
         result = playlists.add(
             playlist_id,
@@ -8626,7 +8665,7 @@ def record_download_view(download_id):
 @app.route('/api/client-capabilities', methods=['GET'])
 def client_capabilities():
     response = jsonify({
-        'mutation_protocol': 1, 'actions': ['tag.add', 'tag.remove', 'favorite.set', 'rename.set', 'preference.set', 'playlist.create', 'playlist.replace'],
+        'mutation_protocol': 1, 'actions': ['tag.add', 'tag.remove', 'favorite.set', 'rename.set', 'preference.set', 'playlist.create', 'playlist.replace', 'playlist.add', 'playlist.delete'],
         'tag_identity_version': TAG_IDENTITY_VERSION,
         'server_time': int(time.time() * 1000),
     })

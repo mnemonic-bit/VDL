@@ -3,7 +3,8 @@
 This inventory separates the initial tag delivery from the remaining app-wide
 migration in [Feature 0051](../FEATURES/feature-0051-immediate-feedback-for-server-backed-interactions.md).
 The shared coordinator registers `tag.add`, `tag.remove`, `favorite.set`,
-`rename.set`, `preference.set`, `playlist.create`, and `playlist.replace`.
+`rename.set`, `preference.set`, `playlist.create`, `playlist.replace`,
+`playlist.add`, and `playlist.delete`.
 An existing API call does not gain receipt recovery merely because the new
 scripts are loaded. Mutating requests are never retried by `apiFetch`'s GET
 contention recovery.
@@ -112,10 +113,30 @@ Current authorization gates execution and recovery, including member-data
 redaction after visibility loss. Missing receipts and matching reads do not
 confirm a save. Recovery checks and deliberate frozen-attempt replay use the
 shared expiry and quota rules, with no persistent browser queue or automatic
-write replay. Quick-add and deletion retain their existing mechanisms and
-revision boundary; their complete adapters remain Feature 0056.
+write replay. Quick-add and deletion share this revision boundary through
+the Feature 0056 adapters below.
 `VDL.playlistMutationMetrics()` exposes bounded, content-free aggregate
 diagnostics through the shared seam.
+
+[Feature 0056: Playlist add/delete](../FEATURES/feature-0056-immediate-feedback-for-playlist-add-and-delete.md)
+extends the same playlist domain with `playlist.add` and `playlist.delete`.
+Quick-add shows immediate pending feedback without projecting membership;
+canonical acknowledgements update the affected playlist directly, including
+confirmed no-op adds. Deletion retains a confirmation surface and the pending
+shelf card until a correlated removal acknowledgement installs a deletion
+fence. Pending actions survive surface closure through an in-memory recovery
+summary. Conflicting local writes are guarded while drafts and unrelated
+playlists remain usable.
+
+Membership changes or removal commit atomically with actor-scoped receipts.
+Deletion receipts retain only the removed identity, integer terminal revision,
+and membership invalidation; current account authorization gates recovery after
+the target is gone. Add and editor receipts still require live playlist
+ownership and redact newly inaccessible members. Conflicts require explicit
+review, and unknown results permit only receipt checks or deliberate replay of
+the original frozen attempt. Unsupported actions keep legacy semantics and
+truthful pending feedback without replay. Playlist diagnostics include both
+actions through the existing bounded aggregate seam.
 
 ## Remaining action adapters
 
@@ -125,12 +146,11 @@ remain in force. They need their own behavior and regression evidence before
 adopting automatic recovery.
 
 Each remaining row now has a proposed feature spec. These links allocate work;
-they do not mark any remaining adapter implemented. Features 0056–0067 inherit Feature
+they do not mark any remaining adapter implemented. Features 0057–0067 inherit Feature
 0051 and the shared requirements below.
 
 | Controls / production entry points in `static/app.js` | Existing mechanism | Required migration / recovery boundary | Feature spec |
 | --- | --- | --- | --- |
-| Playlist add/delete: `quickAddToPlaylist`, `deletePlaylist` | Server response, deletion confirmation, playlist refresh | Pending initiating controls and receipt-safe recovery before retries. | [0056: Playlist add/delete](../FEATURES/feature-0056-immediate-feedback-for-playlist-add-and-delete.md) |
 | Pause/unpause/stop/retry/resume: download controls and attempt-history actions | Worker status remains server-owned; collection reconciliation | Request feedback is separate from worker transition. Durable job acceptance and crash recovery are required before replay. | [0057: Download commands](../FEATURES/feature-0057-immediate-feedback-and-durable-download-commands.md) |
 | New download: `submitDownload` | `downloadSubmitting`, probe generation and dialog-session guards | Retain existing immediate submission state. Lost acceptance needs a durable job identity before replay. | [0058: New downloads](../FEATURES/feature-0058-durable-acceptance-for-new-downloads.md) |
 | Upload: `registerDroppedVideo`, `transferDroppedVideo`, `stopDroppedUpload` | Local transfer row with preallocated server ID, byte progress, registration acknowledgement and cancellation | Preserve transfer and worker semantics. Do not manufacture playable files or equate abort with server cancellation. | [0059: Uploads](../FEATURES/feature-0059-immediate-feedback-and-recovery-for-uploads.md) |
@@ -414,3 +434,55 @@ deletion, progress writes, leases, playback sessions, downloads, uploads, and
 companion requests retain their existing ownership and recovery contracts.
 Feature 0032's import and collaborative-sharing controls remain proposed;
 verification here covers personal playlists and videos visible across users.
+
+Playlist add/delete verification commands for Feature 0056:
+
+```bash
+VDL_PYTHON=/path/to/python3.12 ./tests/run-all.sh --unit
+VDL_PYTHON=/path/to/python3.12 node --test tests/*.test.cjs
+VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py playlists-actions-feedback.spec.cjs playlists-feedback.spec.cjs playlists.spec.cjs
+VDL_TEST_BROWSER=firefox VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py playlists-actions-feedback.spec.cjs playlists-feedback.spec.cjs playlists.spec.cjs
+```
+
+Feature 0056 verified on 2026-11-09 for version `0.59.0`:
+
+- Python 3.12 unit gate: **653 tests, 9 skipped**; `vdl.py` line coverage
+  **92.7%** (6649/7169 executable lines; enforced minimum 90%). The 18 new
+  protocol tests cover canonical and no-op adds, integer revision conflicts,
+  simultaneous replay, immutable fingerprints, shared namespace/quotas/expiry,
+  receipt rollback, post-commit response loss, restart, serialized expired
+  recovery behind an admitted write, and current authorization. Deletion
+  recovery remains actor-scoped after removal and is invalidated by session,
+  suspension, account removal, or foreign ownership changes. No former name
+  or member data is returned by a deletion receipt.
+- Node: **135 tests passed**, including 17 new playlist production-interface
+  checks for status-only add/delete intents, shared conflict guards, strict
+  canonical acknowledgement decoding, frozen replay, missing-receipt finality,
+  independent playlists, deletion/authentication fences, and content-free
+  diagnostics. Independently sequenced newer progress survives an older add
+  acknowledgement; removed or redacted members cannot regain progress.
+- Chromium and Firefox with Python 3.12: **66 distinct playlist scenarios
+  passed in each browser**, across full runs and focused follow-ups: 34 new
+  add/delete checks, 29 editor feedback checks, and 3 existing playlist checks.
+  Controlled request gates establish feedback below 50 ms, canonical
+  confirmation without SSE or collection reads, duplicate guards, retained
+  shelf identity/order, confirmation cancellation and close/reopen recovery,
+  explicit conflict review, deliberate identical-attempt replay, malformed
+  success and unknown outcomes, legacy fallback, access loss, real account
+  switching, keyboard controls, both themes, reduced motion, and narrow layouts.
+  A reopened chooser identifies the original submitted video while its new
+  selection remains separate. Closing deletion confirmation with Escape
+  preserves active playback. A held committed add response cannot rewind newer
+  canonical playback progress.
+- Chromium: **355 distinct relevant scenarios passed** across the 354-check
+  regression run and the new progress follow-up. Coverage includes all adopted
+  mutation adapters, playlists, history, playback and keyboard controls,
+  rotation, assets, live updates and contention, uploads, authentication,
+  preferences, attempt history, and extension settings. Browser helpers wait
+  for actual card animations and Library readiness before opening controls;
+  they introduce no arbitrary sleeps or relaxed deadlines.
+
+Playlist add/delete delivery does not complete Features 0057–0067.
+Authentication fencing here covers the adopted playlist callbacks. Progress,
+leases, playback sessions, workers, uploads, and companion requests retain
+their specialized ownership and recovery contracts.

@@ -111,6 +111,22 @@
                     if (next.playlist.progress && !visible.has(next.playlist.progress.download_id)) next.playlist.progress = null;
                 }
             }
+            if (next.playlist) {
+                const knownProgress = old?.playlist?.progress;
+                const receivedProgress = next.playlist.progress;
+                const knownSequence = knownProgress?.write_sequence;
+                const receivedSequence = Number.isSafeInteger(receivedProgress?.write_sequence) ? receivedProgress.write_sequence : -1;
+                const knownPosition = next.playlist.items.findIndex(item => item.id !== null && item.id === knownProgress?.download_id);
+                // Progress writes have their own sequence and can outlive a
+                // metadata response. Keep newer progress only while its member
+                // remains visible in the accepted membership and order.
+                if (Number.isSafeInteger(knownSequence) && knownSequence >= 0 && knownSequence > receivedSequence && knownPosition !== -1) {
+                    next.playlist.progress = copy(knownProgress);
+                }
+                const position = next.playlist.items.findIndex(item => item.id !== null && item.id === next.playlist.progress?.download_id);
+                if (position === -1) next.playlist.progress = null;
+                next.playlist.resume_position = Math.max(0, position);
+            }
             downloads.set(id, next);
             notify(id);
             return true;
