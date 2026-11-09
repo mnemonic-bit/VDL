@@ -2,6 +2,9 @@ const { test, expect } = require('@playwright/test');
 const { reset, seed, refresh, openCurrent, openSettings, openNewDownload } = require('./support.cjs');
 
 async function openInfo(row) {
+    await row.evaluate(async element => {
+        await Promise.all(element.getAnimations().map(animation => animation.finished.catch(() => {})));
+    });
     await row.locator('.kebab-btn').click();
     await row.getByRole('button', { name: 'Info', exact: true }).click();
     await expect(row.locator('.history-info-popover')).toBeVisible();

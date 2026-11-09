@@ -4,7 +4,8 @@ This inventory separates the initial tag delivery from the remaining app-wide
 migration in [Feature 0051](../FEATURES/feature-0051-immediate-feedback-for-server-backed-interactions.md).
 The shared coordinator registers `tag.add`, `tag.remove`, `favorite.set`,
 `rename.set`, `preference.set`, `playlist.create`, `playlist.replace`,
-`playlist.add`, and `playlist.delete`.
+`playlist.add`, `playlist.delete`, `download.pause`, `download.unpause`,
+`download.stop`, `download.retry`, and `download.resume`.
 An existing API call does not gain receipt recovery merely because the new
 scripts are loaded. Mutating requests are never retried by `apiFetch`'s GET
 contention recovery.
@@ -138,6 +139,36 @@ the original frozen attempt. Unsupported actions keep legacy semantics and
 truthful pending feedback without replay. Playlist diagnostics include both
 actions through the existing bounded aggregate seam.
 
+[Feature 0057: Download commands](../FEATURES/feature-0057-immediate-feedback-and-durable-download-commands.md)
+adds the independent `download-command` domain for pause, unpause, stop, retry,
+and resume in Current downloads, Library controls, and attempt History. Local
+status appears synchronously beside the confirmed worker state. Contradictory
+commands serialize per work item; Stop supersedes an unsent pause or visibly
+waits for a transmitted pause. An unknown pause keeps Stop queued. Canonical
+acknowledgements confirm acceptance without SSE or collection reads, while
+worker progress continues to reconcile separately.
+
+Decimal-string command revisions and current attempt identities fence stale
+controls and competing tabs. Durable acceptance, its actor-scoped receipt, and
+the single new retry/resume attempt commit together before dispatch. Dispatch
+claims its effects before cleanup or worker enqueueing. Replays return the same
+command/job identity; restart interrupts vanished work without repeating retry
+cleanup or launching replacement threads. Terminal control races cannot leave
+pause/cancel flags behind. Legacy controls share serialization, current
+authorization, generation hints, and revision updates.
+Old-worker cleanup preserves a queued successor's accepted flags under the
+scheduler lock; legacy Resume clears stale flags during the ownership handoff.
+
+Receipt checks and deliberate frozen-attempt replay retain the shared limits,
+expiry, current authorization, and serialized expired-absence finality. Active
+work protects its acceptance from every adapter's receipt cleanup. Unknown
+results and closed surfaces retain an in-memory recovery summary. Unsupported
+servers receive pending feedback without replay. Authentication, deletion, and
+access fences cover adopted command callbacks and History reads.
+`VDL.downloadCommandMetrics()` exposes bounded, content-free aggregate
+diagnostics through the shared seam. Upload transfer and playback sequences
+retain their specialized contracts.
+
 ## Remaining action adapters
 
 The rows below are explicit migration work, not claims that the app-wide
@@ -146,12 +177,11 @@ remain in force. They need their own behavior and regression evidence before
 adopting automatic recovery.
 
 Each remaining row now has a proposed feature spec. These links allocate work;
-they do not mark any remaining adapter implemented. Features 0057–0067 inherit Feature
+they do not mark any remaining adapter implemented. Features 0058–0067 inherit Feature
 0051 and the shared requirements below.
 
 | Controls / production entry points in `static/app.js` | Existing mechanism | Required migration / recovery boundary | Feature spec |
 | --- | --- | --- | --- |
-| Pause/unpause/stop/retry/resume: download controls and attempt-history actions | Worker status remains server-owned; collection reconciliation | Request feedback is separate from worker transition. Durable job acceptance and crash recovery are required before replay. | [0057: Download commands](../FEATURES/feature-0057-immediate-feedback-and-durable-download-commands.md) |
 | New download: `submitDownload` | `downloadSubmitting`, probe generation and dialog-session guards | Retain existing immediate submission state. Lost acceptance needs a durable job identity before replay. | [0058: New downloads](../FEATURES/feature-0058-durable-acceptance-for-new-downloads.md) |
 | Upload: `registerDroppedVideo`, `transferDroppedVideo`, `stopDroppedUpload` | Local transfer row with preallocated server ID, byte progress, registration acknowledgement and cancellation | Preserve transfer and worker semantics. Do not manufacture playable files or equate abort with server cancellation. | [0059: Uploads](../FEATURES/feature-0059-immediate-feedback-and-recovery-for-uploads.md) |
 | Entry removal: `deleteDownload` | Server remove request and collection refresh | Retain marked pending row until acknowledgement; prevent duplicate submission and fence authoritative deletion. Filesystem deletion needs operation-specific recovery. | [0060: Entry removal](../FEATURES/feature-0060-immediate-feedback-and-safe-entry-removal.md) |
@@ -486,3 +516,52 @@ Playlist add/delete delivery does not complete Features 0057–0067.
 Authentication fencing here covers the adopted playlist callbacks. Progress,
 leases, playback sessions, workers, uploads, and companion requests retain
 their specialized ownership and recovery contracts.
+
+Download command verification commands for Feature 0057:
+
+```bash
+VDL_PYTHON=/path/to/python3.12 ./tests/run-all.sh --unit
+VDL_PYTHON=/path/to/python3.12 node --test tests/*.test.cjs
+VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py download-commands-feedback.spec.cjs history-actions.spec.cjs attempt-history.spec.cjs worker-recovery.spec.cjs live-updates.spec.cjs rename-feedback.spec.cjs duplicates.spec.cjs action-errors.spec.cjs
+VDL_TEST_BROWSER=firefox VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py download-commands-feedback.spec.cjs history-actions.spec.cjs attempt-history.spec.cjs worker-recovery.spec.cjs live-updates.spec.cjs rename-feedback.spec.cjs duplicates.spec.cjs action-errors.spec.cjs
+```
+
+Feature 0057 verified on 2026-11-09 for version `0.60.0`:
+
+- Python 3.12 unit gate: **683 tests, 9 skipped**; `vdl.py` line coverage
+  **92.6%** (6865/7410 executable lines; enforced minimum 90%). The 30 new
+  command tests cover correlated acceptance, independent revisions, every
+  serializer, concurrent replay, competing and stale attempts, receipt rollback,
+  authorization changes, shared quotas and retention, expired recovery behind
+  admitted work, unavailable media, and restart before dispatch, during cleanup,
+  after enqueueing, and before acknowledgement. Actual worker threads verify
+  that legacy Resume preserves a successor's accepted pause while the old
+  worker unwinds, and that Stop cancels that queued successor safely.
+- Node: **156 tests passed**, including 21 new production-interface checks for
+  status-only intents, strict acceptance decoding, immutable replay, independent
+  metadata, unsent-pause supersession, queued Stop, unknown finality, stale
+  generations, null generations after History cleanup, authentication fences,
+  and accepted receipts whose dispatch is still in progress. A mixed-domain
+  regression proves a metadata-only rename acknowledgement still installs its
+  canonical filename while explicit older worker snapshots remain fenced.
+- Chromium and Firefox: **25 new command scenarios passed in each browser**.
+  Controlled request gates verify feedback below 50 ms, explicit confirmed
+  worker status, SSE-free acceptance without collection reads, duplicate
+  guards, queued and unknown pause/Stop sequences, deliberate identical-attempt
+  replay, lost responses, malformed success, refusal, access loss, real account
+  switching, closed-surface recovery, stale actual controls and callbacks,
+  keyboard use, both themes, reduced motion, and one announcement per change.
+- Chromium: **605 distinct scenarios passed** across the broad regression run
+  and focused follow-ups. Firefox: **100 distinct scenarios passed** across
+  the affected suites and earlier focused regressions. Coverage includes
+  existing mutation adapters, History, duplicate views, playback and fullscreen,
+  rotation, assets, live updates and contention, uploads, authentication,
+  preferences, and extension settings. The final backend handoff fix also passed
+  all **31 command/worker browser checks in each browser**. Existing fixtures
+  now use canonical metadata and real command acceptances; helpers wait for
+  actual insertion animations without arbitrary sleeps or relaxed assertions.
+
+Download command delivery does not complete Features 0058–0067. New-download
+acceptance, upload transfers, playback sessions, leases, progress writes, and
+companion requests retain their specialized ownership and recovery contracts.
+Authentication fencing here covers the adopted commands and History callbacks.

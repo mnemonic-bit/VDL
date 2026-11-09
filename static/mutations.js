@@ -4,6 +4,7 @@
     const active = new Set(['queued', 'sending', 'unconfirmed', 'conflicted']);
     const validRevision = value => typeof value === 'string' && /^(0|[1-9]\d*)$/.test(value);
     const playlistAction = kind => kind.startsWith('playlist.');
+    const commandAction = kind => kind.startsWith('download.');
     const validActionRevision = (intent, value) => playlistAction(intent.kind) ? Number.isSafeInteger(value) && value >= 0 : validRevision(value);
     const playlistValues = value => !!value && typeof value.name === 'string' && Array.isArray(value.download_ids) && value.download_ids.every(id => typeof id === 'string' && !!id) && new Set(value.download_ids).size === value.download_ids.length && Object.keys(value).every(key => ['name', 'download_ids', 'download_id'].includes(key));
     const clone = value => JSON.parse(JSON.stringify(value));
@@ -14,6 +15,7 @@
     const equalPreferences = (left, right) => VDL.preferenceFields.every(key => left[key] === right[key]);
     // Only these descriptors can select a domain or encode a mutation route.
     const actions = Object.freeze({
+        ...Object.fromEntries(['pause', 'unpause', 'stop', 'retry', 'resume'].map(action => [`download.${action}`, Object.freeze({ domain: 'download-command', revision: 'command_revision', noun: 'download request', method: 'POST', route: action })])),
         'playlist.create': Object.freeze({ domain: 'playlist', revision: 'playlist_revision', noun: 'playlist', method: 'POST' }),
         'playlist.add': Object.freeze({ domain: 'playlist', revision: 'playlist_revision', noun: 'playlist add', method: 'POST' }),
         'playlist.delete': Object.freeze({ domain: 'playlist', revision: 'playlist_revision', noun: 'playlist deletion', method: 'DELETE' }),
@@ -119,6 +121,7 @@
             return true;
         }
         function snapshot(body, intent) {
+            if (commandAction(intent.kind)) return { id: intent.targetId, command_revision: body.command_revision, current_attempt_id: body.current_attempt_id };
             if (playlistAction(intent.kind)) return { id: intent.targetId, playlist: body, playlist_revision: body.revision };
             if (intent.kind === 'preference.set') return { id: intent.targetId, values: body.values, preferences_revision: body.preferences_revision };
             if (intent.kind === 'rename.set') return { id: intent.targetId, filename: body.filename, display_filename: body.display_filename, rename_revision: body.rename_revision };
@@ -136,6 +139,21 @@
         }
         function validResult(body, intent, committed) {
             const mutation = body?.mutation;
+            if (commandAction(intent.kind)) {
+                const attemptId = value => value === null || typeof value === 'string' && !!value;
+                const command = body?.command;
+                return !!mutation && mutation.id === intent.attempt.body.client_mutation_id
+                    && mutation.domain === 'download-command' && body.id === intent.targetId
+                    && validRevision(body.command_revision) && mutation.revision === body.command_revision
+                    && attemptId(body.current_attempt_id)
+                    && (committed ? mutation.outcome === 'accepted' && !!command && typeof command.id === 'string' && !!command.id
+                        && command.action === intent.kind && command.source_attempt_id === intent.attempt.body.expected_attempt_id
+                        && attemptId(command.attempt_id) && body.current_attempt_id === command.attempt_id
+                        && (['download.retry', 'download.resume'].includes(intent.kind) ? command.job_id === command.id && typeof command.attempt_id === 'string' && !!command.attempt_id && command.attempt_id !== command.source_attempt_id : command.job_id === null && command.attempt_id === command.source_attempt_id)
+                        && ['accepted', 'dispatching', 'dispatched', 'interrupted', 'finished', 'error', 'cancelled', 'superseded'].includes(command.status)
+                        && BigInt(body.command_revision) > BigInt(intent.attempt.body.expected_revision)
+                        : ['rejected', 'conflicted'].includes(mutation.outcome));
+            }
             if (intent.kind === 'playlist.delete' && committed) {
                 return !!mutation && mutation.id === intent.attempt.body.client_mutation_id && mutation.domain === 'playlist'
                     && body.id === intent.targetId.slice(9) && body.removed === true && body.membership_invalidated === true
@@ -223,7 +241,7 @@
                 if (intent.status === 'confirmed') {
                     if (playlistAction(intent.kind)) intent.acknowledgedRevision = body.revision;
                     emit(intent.kind, 'confirmed', intent, intent.sentAt);
-                    if (newerRemote && options.onNotice) {
+                    if (newerRemote && !commandAction(intent.kind) && options.onNotice) {
                         try { options.onNotice(Object.freeze({ targetId: intent.targetId, message: `Your save was confirmed. Newer ${descriptor(intent).noun} changes are now shown.` })); }
                         catch (_) { /* A view notification cannot undo a committed save. */ }
                     }
@@ -240,7 +258,7 @@
                     const fieldErrors = playlistAction(intent.kind) && body.field_errors && typeof body.field_errors === 'object'
                         ? Object.fromEntries(Object.entries(body.field_errors).filter(([key, value]) => ['name', 'download_ids', 'download_id'].includes(key) && typeof value === 'string')) : intent.kind === 'preference.set' && body.field_errors && typeof body.field_errors === 'object'
                         ? Object.fromEntries(Object.entries(body.field_errors).filter(([key, value]) => VDL.preferenceFields.includes(key) && typeof value === 'string')) : undefined;
-                    update(intent, { status, fieldErrors, message: playlistAction(intent.kind) ? status === 'conflicted' ? 'Playlist changed elsewhere. Review the current version before submitting a new request.' : `Could not ${intent.kind === 'playlist.add' ? 'add to' : intent.kind === 'playlist.delete' ? 'delete' : 'save'} playlist. ${typeof body.error === 'string' ? body.error : 'Review the current state before submitting again.'}` : intent.kind === 'preference.set'
+                    update(intent, { status, fieldErrors, message: commandAction(intent.kind) ? `${status === 'conflicted' ? 'Download changed. Review its current attempt before submitting another command.' : 'Request refused. ' + (typeof body.error === 'string' ? body.error : 'Review the current eligibility before trying again.')}` : playlistAction(intent.kind) ? status === 'conflicted' ? 'Playlist changed elsewhere. Review the current version before submitting a new request.' : `Could not ${intent.kind === 'playlist.add' ? 'add to' : intent.kind === 'playlist.delete' ? 'delete' : 'save'} playlist. ${typeof body.error === 'string' ? body.error : 'Review the current state before submitting again.'}` : intent.kind === 'preference.set'
                         ? status === 'conflicted' ? 'Settings changed elsewhere. Review the current values, then save your draft explicitly.'
                             : `Could not save settings. ${typeof body.error === 'string' ? body.error : 'Correct the retained draft and save again.'}`
                         : status === 'conflicted' ? `${descriptor(intent).noun} changed elsewhere. Check the current state, then retry or dismiss.` : intent.kind === 'rename.set' ? `Could not rename. ${typeof body.error === 'string' ? body.error : 'Correct the name or retry.'}` : `Could not save ${descriptor(intent).noun}. Retry or dismiss it.` });
@@ -256,7 +274,7 @@
         }
         function markUnknown(intent) {
             clearTimers(intent);
-            update(intent, { status: 'unconfirmed', message: intent.kind === 'playlist.add' ? 'Add not confirmed. Check its status before replaying.' : intent.kind === 'playlist.delete' ? 'Delete not confirmed. Check its status before replaying.' : intent.kind === 'rename.set' ? 'Rename not confirmed. Check its status before replaying.' : 'Save not confirmed. Check its status before retrying.', delayed: true });
+            update(intent, { status: 'unconfirmed', message: commandAction(intent.kind) ? 'Request not confirmed. Check its status before replaying.' : intent.kind === 'playlist.add' ? 'Add not confirmed. Check its status before replaying.' : intent.kind === 'playlist.delete' ? 'Delete not confirmed. Check its status before replaying.' : intent.kind === 'rename.set' ? 'Rename not confirmed. Check its status before replaying.' : 'Save not confirmed. Check its status before retrying.', delayed: true });
             emit(intent.kind, 'unconfirmed', intent, intent.sentAt);
         }
         async function transmit(intent, capturedEpoch) {
@@ -280,19 +298,24 @@
             if (!intent || intent.status !== 'queued') return;
             const confirmed = state.writer.confirmed(targetId);
             if (!validActionRevision(intent, confirmed?.[descriptor(intent).revision])) return;
+            if (commandAction(intent.kind) && confirmed.current_attempt_id !== intent.value.attempt_id) {
+                update(intent, { status: 'conflicted', message: 'Download changed. Review its current attempt before submitting another command.' });
+                emit(intent.kind, 'conflicted', intent, now());
+                return;
+            }
             const mutationId = `${Math.trunc(now() + timeOffset)}-${random()}`;
             if (!/^\d+-[a-f0-9]{32}$/.test(mutationId)) throw new Error('Invalid mutation identifier source');
             if (intent.kind === 'playlist.add') intent.basePlaylist = clone(confirmed.playlist);
             intent.attempt = Object.freeze({
                 url: playlistAction(intent.kind) ? intent.kind === 'playlist.create' ? '/api/playlists' : `/api/playlists/${encodeURIComponent(targetId.slice(9))}${intent.kind === 'playlist.add' ? '/items' : ''}` : intent.kind === 'preference.set' ? '/api/preferences' : `/api/${descriptor(intent).route}/${encodeURIComponent(targetId)}`,
                 method: descriptor(intent).method,
-                body: immutable(playlistAction(intent.kind) ? { ...intent.value, client_mutation_id: mutationId, ...(intent.kind === 'playlist.create' ? {} : { expected_revision: intent.kind === 'playlist.replace' ? intent.expectedRevision : confirmed.playlist_revision }) } : { [descriptor(intent).field]: intent.value, client_mutation_id: mutationId, expected_revision: confirmed[descriptor(intent).revision] }),
+                body: immutable(commandAction(intent.kind) ? { client_mutation_id: mutationId, expected_revision: confirmed.command_revision, expected_attempt_id: intent.value.attempt_id } : playlistAction(intent.kind) ? { ...intent.value, client_mutation_id: mutationId, ...(intent.kind === 'playlist.create' ? {} : { expected_revision: intent.kind === 'playlist.replace' ? intent.expectedRevision : confirmed.playlist_revision }) } : { [descriptor(intent).field]: intent.value, client_mutation_id: mutationId, expected_revision: confirmed[descriptor(intent).revision] }),
             });
             intent.sentAt = now();
             update(intent, { status: 'sending' });
             armWait(intent);
             const capturedEpoch = epoch;
-            Promise.resolve().then(() => { if (capturedEpoch === epoch && intents.has(intent.id)) return transmit(intent, capturedEpoch); });
+            Promise.resolve().then(() => { if (capturedEpoch === epoch && intents.has(intent.id)) { intent.transmitted = true; return transmit(intent, capturedEpoch); } });
         }
         function armWait(intent) {
             clearTimers(intent);
@@ -328,6 +351,7 @@
             if (capturedEpoch !== epoch || !intents.has(intent.id) || !state.isAvailable(intent.targetId)) return false;
             if (!authorizedReply(reply, intent)) return false;
             const body = reply.body;
+            if (commandAction(intent.kind)) return reply.status === 200 && body?.id === intent.targetId && validRevision(body.command_revision) && state.acceptDownload(body);
             if (reply.status !== 200 || !body || String(body.id) !== intent.targetId || !validRevision(body[descriptor(intent).revision]) || (intent.kind === 'preference.set' ? !VDL.validPreferenceValues(body.values) : intent.kind === 'favorite.set' ? typeof body.favorite !== 'boolean' : intent.kind === 'rename.set' ? !(body.filename === null || typeof body.filename === 'string') || !(body.display_filename === null || typeof body.display_filename === 'string') : !canonical(body))) return false;
             state.acceptDownload(body);
             return true;
@@ -345,7 +369,10 @@
             let tag;
             try {
                 if (input.kind === 'favorite.set' && typeof input.value !== 'boolean') throw new Error('Favorite must be true or false.');
-                if (playlistAction(input.kind)) {
+                if (commandAction(input.kind)) {
+                    if (!input.value || Object.keys(input.value).length !== 1 || !(input.value.attempt_id === null || typeof input.value.attempt_id === 'string' && input.value.attempt_id)) throw new Error('Capture the current download attempt before submitting a command.');
+                    tag = { key: 'download-command', name: immutable(clone(input.value)) };
+                } else if (playlistAction(input.kind)) {
                     if (!(input.kind === 'playlist.add' ? input.value && typeof input.value.download_id === 'string' && !!input.value.download_id && Object.keys(input.value).length === 1 : input.kind === 'playlist.delete' ? input.value && typeof input.value === 'object' && Object.keys(input.value).length === 0 : playlistValues(input.value)) || !targetId.startsWith('playlist:')) throw new Error('Capture the playlist name and ordered videos before saving.');
                     tag = { key: 'playlist', name: immutable(clone(input.value)) };
                 } else if (input.kind === 'preference.set') {
@@ -358,7 +385,22 @@
             }
             catch (error) { return { accepted: false, reason: 'validation', message: error.message }; }
             const domainKey = queueKey({ kind: input.kind, targetId });
-            const queue = queues.get(domainKey) || [];
+            let queue = queues.get(domainKey) || [];
+            if (commandAction(input.kind)) {
+                if (input.kind === 'download.stop') {
+                    for (const prior of Array.from(intents.values()).filter(intent => intent.targetId === targetId && intent.kind === 'download.pause' && !intent.transmitted && ['queued', 'sending'].includes(intent.status))) {
+                        release(prior);
+                        state.writer.remove(prior.id);
+                        intents.delete(prior.id);
+                    }
+                    queue = queues.get(domainKey) || [];
+                }
+                const existing = Array.from(intents.values()).filter(intent => intent.targetId === targetId && commandAction(intent.kind));
+                const duplicate = existing.find(intent => intent.kind === input.kind && intent.value.attempt_id === tag.name.attempt_id && !['rejected', 'conflicted'].includes(intent.status));
+                if (duplicate) return { accepted: true, intentId: duplicate.id, duplicate: true };
+                if (existing.length && !(input.kind === 'download.stop' && existing.every(intent => intent.kind === 'download.pause' && ['queued', 'sending', 'unconfirmed'].includes(intent.status)))) return { accepted: false, reason: 'unresolved', message: 'Resolve the current download request before submitting another command.' };
+                if (model.current_attempt_id !== tag.name.attempt_id) return { accepted: false, reason: 'unavailable', message: 'This is an older attempt. Review the current download before trying again.' };
+            }
             if (playlistAction(input.kind)) {
                 const existing = Array.from(intents.values()).find(intent => intent.targetId === targetId && playlistAction(intent.kind));
                 if (existing) return existing.kind === input.kind && JSON.stringify(existing.value) === JSON.stringify(tag.name) && !['rejected', 'conflicted'].includes(existing.status)
@@ -385,7 +427,7 @@
                     break;
                 }
             }
-            const satisfied = playlistAction(input.kind) ? false : input.kind === 'preference.set' ? equalPreferences(model.values, tag.name) : input.kind === 'rename.set' ? tag.name === String(model.display_filename || model.filename || '').split('/').pop().split('\\').pop() : input.kind === 'favorite.set' ? model.favorite === input.value : (input.kind === 'tag.add') === model.tag_items.some(item => item.key === tag.key);
+            const satisfied = commandAction(input.kind) || playlistAction(input.kind) ? false : input.kind === 'preference.set' ? equalPreferences(model.values, tag.name) : input.kind === 'rename.set' ? tag.name === String(model.display_filename || model.filename || '').split('/').pop().split('\\').pop() : input.kind === 'favorite.set' ? model.favorite === input.value : (input.kind === 'tag.add') === model.tag_items.some(item => item.key === tag.key);
             if (satisfied) return { accepted: true, intentId: null, settled: true };
             const unresolved = Array.from(intents.values()).filter(intent => intent.status !== 'confirmed' && intent.status !== 'resolved');
             if (unresolved.filter(intent => queueKey(intent) === domainKey).length >= 32 || unresolved.length >= 128) return { accepted: false, reason: 'limit', message: 'Too many pending edits. Resolve existing edits before adding more.' };
@@ -408,6 +450,7 @@
             const attempt = intent.attempt;
             const work = (async () => {
                 try {
+                    if (commandAction(intent.kind)) emit(intent.kind, 'reconciliation', intent, now());
                     const reply = await read({ url: `/api/mutations/${encodeURIComponent(intent.attempt.body.client_mutation_id)}`, method: 'GET' });
                     if (capturedEpoch !== epoch || intent.attempt !== attempt || !intents.has(id) || !state.isAvailable(intent.targetId)) return false;
                     if (!authorizedReply(reply, intent, true)) return false;
@@ -420,9 +463,9 @@
                     if (!recoveryOptions.automatic && !recoveryOptions.replay) await checkState(intent, capturedEpoch);
                     if (capturedEpoch !== epoch || intent.attempt !== attempt || !intents.has(id) || !state.isAvailable(intent.targetId)) return false;
                     const current = state.writer.confirmed(intent.targetId);
-                    if (!['rename.set', 'playlist.create'].includes(intent.kind) && current && BigInt(current[descriptor(intent).revision]) > BigInt(intent.attempt.body.expected_revision)) intent.safeToResolve = true;
+                    if (!commandAction(intent.kind) && !['rename.set', 'playlist.create'].includes(intent.kind) && current && BigInt(current[descriptor(intent).revision]) > BigInt(intent.attempt.body.expected_revision)) intent.safeToResolve = true;
                     if (recoveryOptions.replay && !reply.body?.final && now() + timeOffset - Number(intent.attempt.body.client_mutation_id.split('-')[0]) <= 86400000) {
-                        update(intent, { status: 'sending', message: 'Checking the original save…', delayed: false });
+                        update(intent, { status: 'sending', message: commandAction(intent.kind) ? 'Checking the original request…' : 'Checking the original save…', delayed: false });
                         armWait(intent);
                         transmit(intent, capturedEpoch);
                     }
@@ -438,7 +481,7 @@
             if (!intent || intent.status === 'sending') return false;
             if (intent.status === 'unconfirmed') {
                 const current = state.writer.confirmed(intent.targetId);
-                if (!intent.safeToResolve && !(!['rename.set', 'playlist.create'].includes(intent.kind) && current && BigInt(current[descriptor(intent).revision]) > BigInt(intent.attempt.body.expected_revision))) return false;
+                if (!intent.safeToResolve && !(!commandAction(intent.kind) && !['rename.set', 'playlist.create'].includes(intent.kind) && current && BigInt(current[descriptor(intent).revision]) > BigInt(intent.attempt.body.expected_revision))) return false;
             }
             release(intent);
             state.writer.remove(id);
@@ -449,7 +492,7 @@
         function retry(id) {
             const intent = intents.get(id);
             if (!intent || !['rejected', 'conflicted'].includes(intent.status) || intent.checking) return { accepted: false, reason: 'unconfirmed' };
-            if (intent.kind === 'preference.set' || playlistAction(intent.kind)) return { accepted: false, reason: 'review_required', message: 'Review current settings, then save the draft explicitly.' };
+            if (commandAction(intent.kind) || intent.kind === 'preference.set' || playlistAction(intent.kind)) return { accepted: false, reason: 'review_required', message: commandAction(intent.kind) ? 'Review the current download attempt before submitting a new command.' : 'Review current settings, then save the draft explicitly.' };
             const wasConflict = intent.status === 'conflicted';
             function enqueue() {
                 state.writer.transaction(() => {

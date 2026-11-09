@@ -52,6 +52,7 @@ def test_reset():
         # recovery records that production deliberately retains after deletion.
         connection.execute("DELETE FROM retired_download_ids")
         connection.execute("DELETE FROM mutation_receipts")
+        connection.execute("DELETE FROM download_commands")
         connection.execute("DELETE FROM rename_operations")
         connection.execute("DELETE FROM preferences")
     with vdl._cancel_lock:
@@ -123,7 +124,7 @@ def test_row():
             "status", "progress", "resolution", "filesize", "speed", "eta",
             "title", "finished_at", "formats", "requested_format",
             "downloaded_bytes", "total_bytes",
-            "duration_seconds", "media_metadata_probed",
+            "duration_seconds", "media_metadata_probed", "display_filename",
         }
     }
     if filename:
@@ -152,6 +153,18 @@ def test_row():
                 )
     if data.get("visibility") in ("public", "private"):
         vdl.db_set_download_visibility(download_id, data["visibility"])
+    if data.get("source_type") in ("upload", "download"):
+        with vdl._db_lock, vdl.db() as connection:
+            connection.execute(
+                "UPDATE downloads SET source_type = ? WHERE id = ?",
+                (data["source_type"], download_id),
+            )
+    if data.get("mounted_import") is True and filename:
+        with vdl._db_lock, vdl.db() as connection:
+            connection.execute(
+                "UPDATE downloads SET ingest_source_path = ? WHERE id = ?",
+                (filename, download_id),
+            )
     if data.get("browser_authenticated") is True:
         with vdl._db_lock, vdl.db() as connection:
             connection.execute(

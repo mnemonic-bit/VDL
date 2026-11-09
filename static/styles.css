@@ -2222,3 +2222,11 @@ body.history-open .create-playlist-button { display: none; }
 #playlistActionCurrent { white-space: pre-wrap; overflow-wrap: anywhere; }
 
 .playlist-chooser-entry, #playlistDeleteStatus, #playlistActionCurrent, #playlistDeleteDialog .playlist-recovery { margin-left: 16px; margin-right: 16px; overflow-wrap: anywhere; }
+
+.download-command-status:empty { display: none; }
+.download-command-status, .download-command-summary { color: var(--muted); font-size: .85rem; }
+.download-command-message, .download-command-summary-entry { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; }
+.download-command-status { margin-top: .5rem; }
+.download-command-summary { padding: .65rem; }
+.download-command-summary-entry + .download-command-summary-entry { margin-top: .5rem; }
+.download-command-message button { font: inherit; }

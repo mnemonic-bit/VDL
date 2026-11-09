@@ -821,6 +821,7 @@ def init_db():
             ("favorite_revision", "ALTER TABLE downloads ADD COLUMN favorite_revision INTEGER NOT NULL DEFAULT 0"),
             ("tags_revision", "ALTER TABLE downloads ADD COLUMN tags_revision INTEGER NOT NULL DEFAULT 0"),
             ("rename_revision", "ALTER TABLE downloads ADD COLUMN rename_revision INTEGER NOT NULL DEFAULT 0"),
+            ("command_revision", "ALTER TABLE downloads ADD COLUMN command_revision INTEGER NOT NULL DEFAULT 0"),
             # A view is an explicit preview activation. Keeping the counter
             # independent of media requests avoids counting range fetches,
             # downloads, and generated hover previews as watches.
@@ -1049,7 +1050,37 @@ def init_db():
             "SELECT 1 FROM download_tags WHERE tag_id = tags.id)"
         )
 
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS download_commands (
+                id TEXT PRIMARY KEY,
+                actor_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                mutation_id TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                actor_session_version INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                source_attempt_id TEXT,
+                attempt_id TEXT,
+                phase TEXT NOT NULL,
+                recorded_at REAL NOT NULL,
+                UNIQUE(actor_id, mutation_id)
+            );
+            CREATE INDEX IF NOT EXISTS download_commands_target ON download_commands(target_id, phase);
+        """)
         download_history.initialize(conn)
+        conn.executescript("""
+            CREATE TRIGGER IF NOT EXISTS download_attempt_delete_command_revision
+            AFTER DELETE ON download_attempts BEGIN
+                UPDATE downloads SET command_revision = command_revision + 1 WHERE id = OLD.work_id;
+            END;
+            CREATE TRIGGER IF NOT EXISTS download_attempt_command_revision
+            AFTER INSERT ON download_attempts BEGIN
+                UPDATE downloads SET command_revision = command_revision + 1 WHERE id = NEW.work_id;
+            END;
+        """)
+        # No previous-process thread survives. An accepted but undispatched job
+        # is interrupted too; restarting must never repeat filesystem effects.
+        conn.execute("UPDATE download_commands SET phase = 'interrupted' "
+                     "WHERE phase IN ('accepted', 'dispatching', 'dispatched')")
         AssetQueue.init_schema(conn)
 
         # Any download that was active when the app died is now orphaned.
@@ -1329,6 +1360,7 @@ def db_get_download(download_id):
         result = dict(row)
         result.update(_favorite_snapshot(conn, download_id, row))
         result.update(_rename_snapshot(conn, download_id, row))
+        result.update(_download_command_snapshot(conn, download_id, row))
         result["quality"] = classify_video_quality(result["resolution"])
         result.update(_tag_snapshot(conn, download_id, row))
         return result
@@ -1626,8 +1658,7 @@ def _execute_metadata_mutation(download_id, payload, method, domain):
                 return {'error': 'Mutation identifier already used', 'code': 'mutation_id_conflict'}, 409
             now = time.time()
             created = int(match.group(1)) / 1000
-            conn.execute('DELETE FROM mutation_receipts WHERE recorded_at < ?',
-                         (now - MUTATION_RETENTION_SECONDS,))
+            _prune_mutation_receipts(conn, now)
             counts = conn.execute(
                 'SELECT COUNT(*) AS total, '
                 'COALESCE(SUM(recorded_at > ?), 0) AS recent FROM mutation_receipts '
@@ -2083,7 +2114,7 @@ def _execute_rename_mutation(download_id, payload):
             else:
                 operation = None
                 now = time.time()
-                conn.execute('DELETE FROM mutation_receipts WHERE recorded_at < ?', (now - MUTATION_RETENTION_SECONDS,))
+                _prune_mutation_receipts(conn, now)
                 counts = conn.execute('SELECT COUNT(*) AS total, COALESCE(SUM(recorded_at > ?), 0) AS recent FROM mutation_receipts WHERE actor_id = ?', (now - 60, actor['id'])).fetchone()
                 active = conn.execute("SELECT COUNT(*) FROM rename_operations WHERE actor_id = ? AND (phase != 'done' OR NOT EXISTS (SELECT 1 FROM mutation_receipts r WHERE r.actor_id = rename_operations.actor_id AND r.mutation_id = rename_operations.mutation_id))", (actor['id'],)).fetchone()[0]
                 if counts['total'] + active >= MUTATION_ACTOR_RECEIPT_LIMIT or counts['recent'] + active >= MUTATION_ACTOR_MINUTE_LIMIT:
@@ -2480,7 +2511,7 @@ def db_list_downloads(user_id=None, is_admin=False, statuses=None):
             "filename, display_filename, resolution, filesize, speed, eta, title, finished_at, "
             "duration_seconds, media_metadata_probed, "
             "formats, requested_format, downloaded_bytes, total_bytes, favorite, "
-            "view_count, tags_revision, favorite_revision, rename_revision, "
+            "view_count, tags_revision, favorite_revision, rename_revision, command_revision, "
             "source_type, owner_user_id, visibility, browser_authenticated, "
             "(downloads.ingest_source_path IS NOT NULL) AS mounted_import, "
             "COALESCE(users.username, downloads.owner_username) "
@@ -2506,6 +2537,7 @@ def db_list_downloads(user_id=None, is_admin=False, statuses=None):
                 {"key": row["normalized_name"], "name": row["name"]}
             )
         for download in downloads:
+            download.update(_download_command_snapshot(conn, download["id"], download))
             download["rename_revision"] = str(download["rename_revision"])
             download.update(_serialize_favorite_state(
                 download['id'], download['favorite'], download['favorite_revision'],
@@ -4157,7 +4189,7 @@ def _execute_playlist_mutation(payload, playlist_id=None, action=None):
                         (actor['id'], mutation_id)).fetchone():
             return {'error': 'Mutation identifier already used', 'code': 'mutation_id_conflict'}, 409
         now = time.time()
-        conn.execute('DELETE FROM mutation_receipts WHERE recorded_at < ?', (now - MUTATION_RETENTION_SECONDS,))
+        _prune_mutation_receipts(conn, now)
         counts = conn.execute(
             'SELECT COUNT(*) AS total, COALESCE(SUM(recorded_at > ?), 0) AS recent '
             'FROM mutation_receipts WHERE actor_id = ?', (now - 60, actor['id']),
@@ -5788,8 +5820,6 @@ def background_download(url, download_id, cookie_bundle=None):
                 download_id, status='cancelled', finished_at=time.time(),
                 output_dir=os.path.abspath(db_get_preferences().get('download_dir', '.')),
             )
-            clear_cancel(download_id)
-            clear_pause(download_id)
             return
         db_update_download(download_id, progress='Preparing download')
         return _background_download(url, download_id, cookie_bundle)
@@ -5807,8 +5837,12 @@ def background_download(url, download_id, cookie_bundle=None):
             finished_at=time.time(),
         )
     finally:
-        clear_cancel(download_id)
-        clear_pause(download_id)
+        with _worker_condition:
+            # Legacy Continue can queue a newer attempt before this worker
+            # unwinds. Its newly accepted controls belong to that successor.
+            if not any(job['id'] == download_id and not job.get('ready') for job in _worker_queue):
+                clear_cancel(download_id)
+                clear_pause(download_id)
         _clear_progress_estimate(download_id)
         _clear_eta_estimate(download_id)
         # Fragment downloaders can retain their locked destination stream in a
@@ -7567,7 +7601,257 @@ def probe_url():
         return jsonify({"error": str(e)}), 400
 
 
+def _download_command_snapshot(conn, download_id, row=None):
+    if row is None:
+        row = conn.execute('SELECT command_revision FROM downloads WHERE id = ?', (download_id,)).fetchone()
+    latest = conn.execute('SELECT id FROM download_attempts WHERE work_id = ? '
+                          'ORDER BY started_at DESC, id DESC LIMIT 1', (download_id,)).fetchone()
+    return {'command_revision': str(row['command_revision']),
+            'current_attempt_id': latest['id'] if latest else None}
+
+
+def _prune_mutation_receipts(conn, now):
+    # A queued/running execution can outlive the replay window. All adapters
+    # share this cleanup boundary so unrelated edits cannot erase its receipt.
+    cutoff = now - MUTATION_RETENTION_SECONDS
+    conn.execute("DELETE FROM download_commands WHERE recorded_at < ? AND phase NOT IN ('accepted', 'dispatching') "
+                 "AND NOT EXISTS (SELECT 1 FROM download_attempts a WHERE a.id = download_commands.attempt_id "
+                 "AND a.status IN ('starting', 'downloading', 'paused'))", (cutoff,))
+    conn.execute('DELETE FROM mutation_receipts WHERE recorded_at < ? AND NOT EXISTS '
+                 '(SELECT 1 FROM download_commands c WHERE c.actor_id = mutation_receipts.actor_id '
+                 'AND c.mutation_id = mutation_receipts.mutation_id)', (cutoff,))
+
+
+def _command_receipt_state(conn, result):
+    command = result.get('command')
+    if command is None:
+        return result
+    record = conn.execute('SELECT * FROM download_commands WHERE id = ?', (command['id'],)).fetchone()
+    if record is not None:
+        attempt = conn.execute('SELECT status FROM download_attempts WHERE id = ?', (record['attempt_id'],)).fetchone()
+        command['status'] = (attempt['status'] if attempt and attempt['status'] in TERMINAL_STATUSES
+                             else record['phase'])
+    return result
+
+
+def _dispatch_download_command(command_id):
+    # Caller holds the same filesystem/scheduler boundary as legacy commands.
+    # Claim before external effects: neither replay nor restart repeats cleanup
+    # after an ambiguous crash. Startup reports interruption instead.
+    with _db_lock, db() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        record = conn.execute('SELECT * FROM download_commands WHERE id = ?', (command_id,)).fetchone()
+        if record is None or record['phase'] != 'accepted':
+            return
+        record = dict(record)
+        row = conn.execute('SELECT * FROM downloads WHERE id = ?', (record['target_id'],)).fetchone()
+        if row is None or _download_command_snapshot(conn, row['id'], row)['current_attempt_id'] != record['attempt_id']:
+            conn.execute("UPDATE download_commands SET phase = 'superseded' WHERE id = ?", (command_id,))
+            return
+        actor = _tag_actor(conn)
+        if (actor is None or actor['id'] != record['actor_id']
+                or actor['session_version'] != record['actor_session_version']
+                or _tag_visible_row(conn, row['id'], actor) is None):
+            conn.execute("UPDATE download_commands SET phase = 'interrupted' WHERE id = ?", (command_id,))
+            if record['action'] in ('retry', 'resume'):
+                conn.execute("UPDATE downloads SET status = 'interrupted', progress = 'Command interrupted before dispatch', finished_at = ? WHERE id = ?", (time.time(), row['id']))
+                download_history.record(conn, row['id'])
+            return
+        if record['action'] in ('pause', 'unpause', 'stop') and row['status'] in TERMINAL_STATUSES:
+            # Acceptance does not keep an execution alive. A worker may have
+            # completed since admission; never attach fresh flags to its result.
+            conn.execute("UPDATE download_commands SET phase = 'dispatched' WHERE id = ?", (command_id,))
+            return
+        conn.execute("UPDATE download_commands SET phase = 'dispatching' WHERE id = ?", (command_id,))
+        row = dict(row)
+    target, action = record['target_id'], record['action']
+    try:
+        if action == 'retry':
+            assets = _get_asset_queue()
+            with assets.publication_lock:
+                with _db_lock, db() as conn:
+                    assets.invalidate([target], conn=conn)
+                delete_download_artifacts(row, db_get_preferences().get('download_dir', '.'))
+                with _db_lock, db() as conn:
+                    conn.execute('UPDATE downloads SET filename = NULL, filesize = NULL WHERE id = ?', (target,))
+                    conn.execute('DELETE FROM asset_invalidations WHERE download_id = ?', (target,))
+        if action in ('retry', 'resume'):
+            clear_cancel(target)
+            clear_pause(target)
+            enqueue_download(row['url'], target)
+        elif action == 'pause':
+            # A Stop accepted earlier for this generation always wins.
+            if not is_cancel_requested(target):
+                request_pause(target)
+        elif action == 'unpause':
+            clear_pause(target)
+        elif action == 'stop':
+            request_cancel(target)
+            if (target not in _live_worker_ids and target not in _worker_hosts
+                    and not any(job['id'] == target for job in _worker_queue)):
+                current = db_get_download(target)
+                if current and current['status'] in download_history.ACTIVE:
+                    db_update_download(target, status='cancelled', finished_at=time.time())
+        if action in ('pause', 'unpause', 'stop'):
+            current = db_get_download(target)
+            if current and current['status'] in TERMINAL_STATUSES:
+                # Close the small race between the dispatch check and applying
+                # the flag, after the worker's own final cleanup has run.
+                clear_cancel(target)
+                clear_pause(target)
+        with _db_lock, db() as conn:
+            conn.execute("UPDATE download_commands SET phase = 'dispatched' WHERE id = ?", (command_id,))
+    except Exception:
+        # Acceptance is durable even when dispatch fails. Do not expose paths
+        # or turn an accepted job into an allegedly rejected HTTP request.
+        with _db_lock, db() as conn:
+            conn.execute("UPDATE download_commands SET phase = 'interrupted' WHERE id = ?", (command_id,))
+        if action in ('retry', 'resume'):
+            db_update_download(target, status='error', progress='Accepted command could not start; review the current download', finished_at=time.time())
+        app.logger.warning('mutation action=download.%s dispatch=failed', action)
+    _publish_metadata_change('download-command')
+
+
+def _execute_download_command(download_id, payload, action):
+    mutation_id = payload.get('client_mutation_id')
+    match = MUTATION_ID_PATTERN.fullmatch(mutation_id) if isinstance(mutation_id, str) else None
+    if match is None:
+        return {'error': 'Invalid mutation identifier'}, 400
+    expected = payload.get('expected_revision')
+    expected_attempt = payload.get('expected_attempt_id')
+    fingerprint = hashlib.sha256(json.dumps(
+        ['POST', 'download.' + action, download_id, payload], sort_keys=True,
+        ensure_ascii=True, separators=(',', ':'),
+    ).encode()).hexdigest()
+    dispatch_id = None
+    with _file_operation_lock, _worker_condition:
+        with _db_lock, db() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            actor = _tag_actor(conn)
+            if actor is None:
+                return {'error': 'Authentication required'}, 401
+            row = _tag_visible_row(conn, download_id, actor)
+            if row is None:
+                return {'error': 'Unknown download id'}, 404
+            receipt = conn.execute('SELECT * FROM mutation_receipts WHERE actor_id = ? AND mutation_id = ?',
+                                   (actor['id'], mutation_id)).fetchone()
+            if receipt is not None:
+                if receipt['fingerprint'] != fingerprint:
+                    return {'error': 'Mutation identifier already used', 'code': 'mutation_id_conflict'}, 409
+                result, status = _command_receipt_state(conn, json.loads(receipt['response'])), receipt['status']
+                if result.get('command'):
+                    dispatch_id = result['command']['id']
+            else:
+                if conn.execute("SELECT 1 FROM rename_operations WHERE actor_id = ? AND mutation_id = ? AND phase != 'done'",
+                                (actor['id'], mutation_id)).fetchone():
+                    return {'error': 'Mutation identifier already used', 'code': 'mutation_id_conflict'}, 409
+                now = time.time()
+                _prune_mutation_receipts(conn, now)
+                counts = conn.execute('SELECT COUNT(*) AS total, COALESCE(SUM(recorded_at > ?), 0) AS recent '
+                                      'FROM mutation_receipts WHERE actor_id = ?', (now - 60, actor['id'])).fetchone()
+                unresolved = conn.execute("SELECT COUNT(*) FROM rename_operations WHERE actor_id = ? AND (phase != 'done' OR NOT EXISTS "
+                                          "(SELECT 1 FROM mutation_receipts r WHERE r.actor_id = rename_operations.actor_id AND r.mutation_id = rename_operations.mutation_id))", (actor['id'],)).fetchone()[0]
+                if counts['total'] + unresolved >= MUTATION_ACTOR_RECEIPT_LIMIT or counts['recent'] + unresolved >= MUTATION_ACTOR_MINUTE_LIMIT:
+                    return {'error': 'Too many mutations; wait before submitting more', 'code': 'mutation_limit'}, 429
+                state = _download_command_snapshot(conn, download_id, row)
+                status, outcome, error = 202, 'accepted', None
+                created = int(match.group(1)) / 1000
+                if created < now - MUTATION_REPLAY_SECONDS or created > now + 300:
+                    status, outcome, error = 400, 'rejected', 'Mutation identifier expired or clock is incorrect'
+                elif not isinstance(expected, str) or not re.fullmatch(r'0|[1-9][0-9]{0,18}', expected):
+                    status, outcome, error = 400, 'rejected', 'Expected revision must be a decimal string'
+                elif 'expected_attempt_id' not in payload or (expected_attempt is not None and not isinstance(expected_attempt, str)):
+                    status, outcome, error = 400, 'rejected', 'Expected attempt identity is required'
+                elif set(payload) != {'client_mutation_id', 'expected_revision', 'expected_attempt_id'}:
+                    status, outcome, error = 400, 'rejected', 'Unsupported command fields'
+                elif expected != state['command_revision'] or expected_attempt != state['current_attempt_id']:
+                    status, outcome, error = 409, 'conflicted', 'Download attempt changed; review the current work'
+                elif conn.execute("SELECT 1 FROM download_commands WHERE target_id = ? AND phase IN ('accepted', 'dispatching')", (download_id,)).fetchone():
+                    status, outcome, error = 409, 'conflicted', 'An accepted command is still awaiting dispatch'
+                elif action in ('retry', 'resume') and (row['source_type'] != 'download' or row['browser_authenticated']):
+                    status, outcome, error = 409, 'rejected', 'Send this source again to start a new attempt'
+                elif action in ('retry', 'resume') and (row['status'] not in (TERMINAL_STATUSES if action == 'retry' else ('cancelled', 'interrupted')) or download_id in _live_worker_ids or download_id in _worker_hosts or any(job['id'] == download_id for job in _worker_queue)):
+                    status, outcome, error = 409, 'rejected', 'Wait until the current worker has stopped'
+                elif action == 'pause' and (row['status'] not in ('starting', 'downloading') or is_cancel_requested(download_id)):
+                    status, outcome, error = 409, 'rejected', 'Cannot pause the current worker'
+                elif action == 'unpause' and (row['status'] != 'paused' or is_cancel_requested(download_id)):
+                    status, outcome, error = 409, 'rejected', 'Cannot unpause the current worker'
+                if error is None and action == 'retry':
+                    try:
+                        _assert_no_pending_rename(dict(row))
+                    except OSError:
+                        status, outcome, error = 409, 'rejected', 'Resolve the pending file operation before retrying'
+                command = None
+                if error is None:
+                    if action in ('retry', 'resume'):
+                        conn.execute("UPDATE downloads SET status = 'starting', progress = '0%', finished_at = NULL, "
+                                     "downloaded_bytes = 0, total_bytes = NULL, speed = 0, eta = NULL WHERE id = ?", (download_id,))
+                        download_history.record(conn, download_id, new=True)
+                    else:
+                        conn.execute('UPDATE downloads SET command_revision = command_revision + 1 WHERE id = ?', (download_id,))
+                    state = _download_command_snapshot(conn, download_id)
+                    dispatch_id = uuid.uuid4().hex
+                    conn.execute('INSERT INTO download_commands(id,actor_id,mutation_id,target_id,actor_session_version,action,source_attempt_id,attempt_id,phase,recorded_at) '
+                                 "VALUES (?,?,?,?,?,?,?,?,'accepted',?)", (dispatch_id, actor['id'], mutation_id, download_id, actor['session_version'], action, expected_attempt, state['current_attempt_id'], now))
+                    command = {'id': dispatch_id, 'action': 'download.' + action, 'source_attempt_id': expected_attempt,
+                               'attempt_id': state['current_attempt_id'], 'job_id': dispatch_id if action in ('retry', 'resume') else None,
+                               'status': 'accepted'}
+                result = dict(state, id=download_id, command=command,
+                              mutation={'id': mutation_id, 'domain': 'download-command', 'revision': state['command_revision'], 'outcome': outcome},
+                              server_time=int(now * 1000))
+                if error:
+                    result['error'] = error
+                conn.execute('INSERT INTO mutation_receipts(actor_id,mutation_id,target_id,fingerprint,status,response,recorded_at) VALUES (?,?,?,?,?,?,?)',
+                             (actor['id'], mutation_id, download_id, fingerprint, status, json.dumps(result, separators=(',', ':')), now))
+        if dispatch_id:
+            _dispatch_download_command(dispatch_id)
+    return result, status
+
+
+def _download_command_route(action):
+    def decorate(function):
+        @wraps(function)
+        def wrapped(download_id):
+            payload = {}
+            if request.is_json:
+                payload, error = _read_json_body(4096)
+                if error is not None:
+                    return error
+                if any(field in payload for field in ('client_mutation_id', 'expected_revision')):
+                    result, status = _execute_download_command(download_id, payload, action)
+                    response = jsonify(result)
+                    response.status_code = status
+                    response.headers['Cache-Control'] = 'no-store'
+                    return response
+            # Legacy controls share command serialization and cannot race a
+            # durable generation hand-off or re-arm pause after cancellation.
+            with _file_operation_lock, _worker_condition:
+                with _db_lock, db() as conn:
+                    conn.execute('BEGIN IMMEDIATE')
+                    actor = _tag_actor(conn)
+                    if actor is None:
+                        return jsonify({'error': 'Authentication required'}), 401
+                    row = _tag_visible_row(conn, download_id, actor)
+                    if row is None:
+                        return jsonify({'error': 'Unknown download id'}), 404
+                    if 'expected_attempt_id' in payload and payload['expected_attempt_id'] != _download_command_snapshot(conn, download_id, row)['current_attempt_id']:
+                        return jsonify({'error': 'Download attempt changed; review the current work'}), 409
+                    if conn.execute("SELECT 1 FROM download_commands WHERE target_id = ? AND phase IN ('accepted', 'dispatching')", (download_id,)).fetchone():
+                        return jsonify({'error': 'An accepted command is still awaiting dispatch'}), 409
+                if action in ('pause', 'unpause') and is_cancel_requested(download_id):
+                    return jsonify({'error': 'Cannot pause a stopping worker'}), 409
+                result = function(download_id)
+                response = app.make_response(result)
+                if response.status_code < 300:
+                    with _db_lock, db() as conn:
+                        conn.execute('UPDATE downloads SET command_revision = command_revision + 1 WHERE id = ?', (download_id,))
+                return response
+        return wrapped
+    return decorate
+
+
 @app.route('/api/resume/<download_id>', methods=['POST'])
+@_download_command_route('resume')
 def resume_download(download_id):
     """Restart the worker for a cancelled or interrupted download, keeping the
     same id so yt-dlp's continuedl logic finds and reuses the existing .part
@@ -7577,6 +7861,8 @@ def resume_download(download_id):
         return jsonify({"error": "Unknown download id"}), 404
     if entry['status'] not in ('cancelled', 'interrupted'):
         return jsonify({"error": f"Cannot resume from status '{entry['status']}'"}), 409
+    if entry['source_type'] != 'download':
+        return jsonify({'error': 'Send this source again to start a new attempt'}), 409
     if entry.get('browser_authenticated'):
         return jsonify({
             "error": "Fresh browser cookies are required; re-send this page from Firefox",
@@ -7589,6 +7875,7 @@ def resume_download(download_id):
         claimed = db_claim_download_for_resume(download_id)
         if claimed:
             _cancel_flags.pop(download_id, None)
+            _pause_flags.pop(download_id, None)
     if not claimed:
         current = db_get_download(download_id)
         if current is None:
@@ -7601,6 +7888,7 @@ def resume_download(download_id):
 
 
 @app.route('/api/stop/<download_id>', methods=['POST'])
+@_download_command_route('stop')
 def stop_download(download_id):
     entry = _visible_download(download_id)
     if entry is None:
@@ -7626,6 +7914,7 @@ def stop_download(download_id):
 
 
 @app.route('/api/pause/<download_id>', methods=['POST'])
+@_download_command_route('pause')
 def pause_download(download_id):
     entry = _visible_download(download_id)
     if entry is None:
@@ -7637,6 +7926,7 @@ def pause_download(download_id):
 
 
 @app.route('/api/unpause/<download_id>', methods=['POST'])
+@_download_command_route('unpause')
 def unpause_download(download_id):
     """Wake a paused worker. Distinct from /api/resume, which restarts the
     worker thread for cancelled/interrupted rows -- here the worker is still
@@ -7765,12 +8055,17 @@ def get_history():
     except ValueError as exc:
         return jsonify({'error': str(exc)}), 400
     with db() as conn:
+        conn.execute('BEGIN')
+        actor = _tag_actor(conn)
+        if actor is None:
+            return jsonify({'error': 'Authentication required'}), 401
         result = download_history.page(
-            conn, g.current_user['id'], 'admin' in g.current_user['roles'],
+            conn, actor['id'], 'admin' in actor['roles'],
             _parse_history_filter(value), page, page_size,
         )
         for item in result['items']:
-            entry = _visible_download(item['download_id']) if item['download_id'] else None
+            entry = _tag_visible_row(conn, item['download_id'], actor) if item['download_id'] else None
+            entry = dict(entry) if entry is not None else None
             available = bool(entry and _playable_library_entry(entry))
             item['library_id'] = entry['id'] if available and item['status'] == 'finished' else None
             item['media_state'] = ('available' if item['library_id'] else
@@ -7782,6 +8077,8 @@ def get_history():
             ).fetchone()
             current = bool(latest and latest['id'] == item['id']
                            and entry and entry['id'] not in _live_worker_ids)
+            if entry:
+                item.update(_download_command_snapshot(conn, entry['id'], entry))
             item['can_resume'] = bool(current and entry and entry['status'] in ('cancelled', 'interrupted')
                                       and entry['source_type'] == 'download' and not entry['browser_authenticated'])
             item['can_retry'] = bool(current and entry and entry['status'] in TERMINAL_STATUSES
@@ -7807,6 +8104,7 @@ def clear_history():
 
 
 @app.route('/api/retry/<download_id>', methods=['POST'])
+@_download_command_route('retry')
 def retry_download(download_id):
     entry = _visible_download(download_id)
     if entry is None:
@@ -8665,7 +8963,7 @@ def record_download_view(download_id):
 @app.route('/api/client-capabilities', methods=['GET'])
 def client_capabilities():
     response = jsonify({
-        'mutation_protocol': 1, 'actions': ['tag.add', 'tag.remove', 'favorite.set', 'rename.set', 'preference.set', 'playlist.create', 'playlist.replace', 'playlist.add', 'playlist.delete'],
+        'mutation_protocol': 1, 'actions': ['tag.add', 'tag.remove', 'favorite.set', 'rename.set', 'preference.set', 'playlist.create', 'playlist.replace', 'playlist.add', 'playlist.delete', 'download.pause', 'download.unpause', 'download.stop', 'download.retry', 'download.resume'],
         'tag_identity_version': TAG_IDENTITY_VERSION,
         'server_time': int(time.time() * 1000),
     })
@@ -8686,6 +8984,7 @@ def editable_download_state(download_id):
         result = _tag_snapshot(conn, download_id, row)
         result.update(_favorite_snapshot(conn, download_id, row))
         result.update(_rename_snapshot(conn, download_id, row))
+        result.update(_download_command_snapshot(conn, download_id, row))
         result['permissions'] = {'tags': True, 'favorite': True, 'rename': row['status'] == 'finished'}
     response = jsonify(result)
     response.headers['Cache-Control'] = 'no-store'
@@ -8732,6 +9031,8 @@ def mutation_receipt(mutation_id):
                     match = MUTATION_ID_PATTERN.fullmatch(mutation_id)
                     final = bool(match and int(match.group(1)) / 1000 < time.time() - MUTATION_REPLAY_SECONDS)
                     return jsonify({'error': 'Mutation unavailable', 'final': final}), 404
+                if result.get('mutation', {}).get('domain') == 'download-command':
+                    result = _command_receipt_state(conn, result)
                 if result.get('mutation', {}).get('domain') == 'tags':
                     result['available_tags'] = _tag_vocabulary(conn, actor)
                 response = jsonify(result)
@@ -9283,7 +9584,7 @@ def _admit_preference_mutation(conn, payload, fingerprint, match):
                     (actor['id'], mutation_id)).fetchone():
         return {'reply': {'error': 'Mutation identifier already used', 'code': 'mutation_id_conflict'}, 'status': 409}
     now = time.time()
-    conn.execute('DELETE FROM mutation_receipts WHERE recorded_at < ?', (now - MUTATION_RETENTION_SECONDS,))
+    _prune_mutation_receipts(conn, now)
     counts = conn.execute('SELECT COUNT(*) AS total, COALESCE(SUM(recorded_at > ?), 0) AS recent FROM mutation_receipts WHERE actor_id = ?',
                           (now - 60, actor['id'])).fetchone()
     active = conn.execute("SELECT COUNT(*) FROM rename_operations WHERE actor_id = ? AND (phase != 'done' OR NOT EXISTS (SELECT 1 FROM mutation_receipts r WHERE r.actor_id = rename_operations.actor_id AND r.mutation_id = rename_operations.mutation_id))", (actor['id'],)).fetchone()[0]

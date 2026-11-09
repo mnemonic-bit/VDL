@@ -338,16 +338,10 @@ class DownloadLifecycleTest(AppCase):
     def test_simultaneous_resume_requests_start_exactly_one_worker(self):
         download_id = self.insert("race0001")
         vdl.db_update_download(download_id, status="cancelled")
-        read_barrier = threading.Barrier(2)
-        real_get = vdl.db_get_download
+        request_barrier = threading.Barrier(2)
+        clients = [self.authenticated_client(), self.authenticated_client()]
         real_thread = threading.Thread
         starts = []
-
-        def synchronized_get(candidate_id):
-            entry = real_get(candidate_id)
-            if candidate_id == download_id and entry and entry["status"] == "cancelled":
-                read_barrier.wait(timeout=2)
-            return entry
 
         class RecordingWorker:
             def __init__(self, target=None, args=(), **_kwargs):
@@ -360,15 +354,16 @@ class DownloadLifecycleTest(AppCase):
 
         responses = []
 
-        def resume():
-            with self.authenticated_client() as client:
-                responses.append(client.post(f"/api/resume/{download_id}").status_code)
+        def resume(index):
+            # Concurrent clients contend at the production route boundary;
+            # reads inside its serialization lock must remain serializable.
+            request_barrier.wait(timeout=2)
+            responses.append(clients[index].post(f"/api/resume/{download_id}").status_code)
 
         with (
-            mock.patch.object(vdl, "db_get_download", side_effect=synchronized_get),
             mock.patch.object(vdl.threading, "Thread", RecordingWorker),
         ):
-            requests = [real_thread(target=resume) for _ in range(2)]
+            requests = [real_thread(target=resume, args=(index,)) for index in range(2)]
             for request_thread in requests:
                 request_thread.start()
             for request_thread in requests:

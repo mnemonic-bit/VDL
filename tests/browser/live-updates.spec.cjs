@@ -14,7 +14,7 @@ test('SSE reconciliation renders Current metadata and moves finished rows to His
     const current = page.locator('#activeList [data-row-id="live0001"]');
     await expect(current).toBeVisible();
     await expect(current.locator('.status-row')).toHaveCount(0);
-    await expect(current).not.toContainText('Status:');
+    await expect(current.locator('.download-worker-status')).toHaveText('Downloading');
     await expect(current).not.toContainText('URL:');
     await expect(current).not.toContainText('https://fixture.invalid/video');
     await current.locator('.kebab-btn').click();
@@ -27,7 +27,7 @@ test('SSE reconciliation renders Current metadata and moves finished rows to His
     await expect(summaryRow).toContainText('Quality: 720p');
     await expect(summaryRow).toContainText('Downloaded: 25%');
     await expect(summaryRow.locator('.eta-right')).toContainText('12s');
-    await expect(current.locator(':scope > :last-child')).toHaveClass(/download-summary-row/);
+    await expect(current.locator(':scope > .download-summary-row + .download-command-status')).toHaveCount(1);
     const etaRightDelta = await summaryRow.evaluate(element => {
         const eta = element.querySelector('.eta-right');
         return Math.abs(element.getBoundingClientRect().right - eta.getBoundingClientRect().right);
@@ -127,7 +127,7 @@ test('paused download keeps progress around the Resume action', async ({ page })
     await expect(summaryRow).toContainText('Quality: 720p');
     await expect(summaryRow).toContainText('Downloaded: 40%');
     await expect(summaryRow.locator('.warn-icon')).toHaveCount(0);
-    await expect(row).not.toContainText('Status:');
+    await expect(row.locator('.download-worker-status')).toHaveText('Paused');
 
     await row.locator('.kebab-btn').click();
     await expect(row.getByRole('button', { name: 'Stop', exact: true }).locator('.action-progress-ring')).toHaveCount(0);
@@ -150,7 +150,7 @@ test('unknown-size download shows only the action progress track', async ({ page
     await openCurrent(page);
     const row = page.locator('[data-row-id="unknown1"]');
     await expect(row.locator('.status-row')).toHaveCount(0);
-    await expect(row).not.toContainText('Status:');
+    await expect(row.locator('.download-worker-status')).toHaveText('Downloading');
     await expect(row.locator('.download-summary-row')).toContainText('Quality: 720p · Downloaded: —');
     await expect(row).toContainText('Unknown length fixture');
     const icon = row.locator('.action-progress-icon');
@@ -334,18 +334,26 @@ test('pause, unpause, stop, and continue buttons call their dedicated endpoints'
     for (const action of ['pause', 'unpause', 'stop', 'resume']) {
         await page.route(`**/api/${action}/actions1`, async route => {
             calls.push(action);
-            await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' });
+            await route.continue();
         });
+    }
+    async function acceptedClick(button, action) {
+        const response = page.waitForResponse(reply =>
+            new URL(reply.url()).pathname === `/api/${action}/actions1`
+            && reply.request().method() === 'POST');
+        await button.click();
+        expect((await response).status()).toBe(202);
+        await expect.poll(() => page.evaluate(() => downloadCommandIntents('actions1').length)).toBe(0);
     }
     let row = page.locator('[data-row-id="actions1"]');
     await row.locator('.kebab-btn').click();
-    await row.getByRole('button', { name: 'Pause', exact: true }).click();
+    await acceptedClick(row.getByRole('button', { name: 'Pause', exact: true }), 'pause');
     await seed(page, { id: 'actions1', status: 'paused' });
     await refresh(page);
     row = page.locator('[data-row-id="actions1"]');
-    await row.getByRole('button', { name: 'Resume', exact: true }).click();
+    await acceptedClick(row.getByRole('button', { name: 'Resume', exact: true }), 'unpause');
     await row.locator('.kebab-btn').click();
-    await row.getByRole('button', { name: 'Stop', exact: true }).click();
+    await acceptedClick(row.getByRole('button', { name: 'Stop', exact: true }), 'stop');
     await seed(page, { id: 'actions1', status: 'cancelled' });
     await refresh(page);
     row = page.locator('[data-row-id="actions1"]');
@@ -361,9 +369,9 @@ test('pause, unpause, stop, and continue buttons call their dedicated endpoints'
     await expect(row.locator('.download-summary-row')).toContainText('Downloaded: 10%');
     await expect(row.locator('.download-summary-row .warn-icon')).toHaveCount(0);
     await expect(row).not.toContainText('URL:');
-    await expect(row).not.toContainText('Status:');
-    await continueButton.click();
-    expect(calls).toEqual(['pause', 'unpause', 'stop', 'resume']);
+    await expect(row.locator('.download-worker-status')).toHaveText('Cancelled');
+    await acceptedClick(continueButton, 'resume');
+    await expect.poll(() => calls).toEqual(['pause', 'unpause', 'stop', 'resume']);
 });
 
 test('Stop pressed during live reconciliation still requests cancellation', async ({ page }) => {

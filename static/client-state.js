@@ -50,6 +50,7 @@
         function acceptDownload(snapshot, context = {}) {
             if (!snapshot || snapshot.id == null || (context.epoch !== undefined && context.epoch !== epoch)) return false;
             if (snapshot.tags_revision !== undefined && (!revision(snapshot.tags_revision) || !Array.isArray(snapshot.tags) || !Array.isArray(snapshot.tag_items) || snapshot.tags.length !== snapshot.tag_items.length || snapshot.tag_items.some((tag, index) => !tag || typeof tag.key !== 'string' || typeof tag.name !== 'string' || tag.name !== snapshot.tags[index]) || new Set(snapshot.tag_items.map(tag => tag.key)).size !== snapshot.tag_items.length)) return false;
+            if (snapshot.command_revision !== undefined && (!revision(snapshot.command_revision) || !(snapshot.current_attempt_id === null || typeof snapshot.current_attempt_id === 'string' && snapshot.current_attempt_id))) return false;
             if (snapshot.favorite_revision !== undefined && (!revision(snapshot.favorite_revision) || typeof snapshot.favorite !== 'boolean')) return false;
             if (snapshot.rename_revision !== undefined && (!revision(snapshot.rename_revision) || !(snapshot.filename === null || typeof snapshot.filename === 'string') || !(snapshot.display_filename == null || typeof snapshot.display_filename === 'string'))) return false;
             if (snapshot.preferences_revision !== undefined && (String(snapshot.id) !== 'installation' || !revision(snapshot.preferences_revision) || !preferenceValues(snapshot.values))) return false;
@@ -72,6 +73,20 @@
                     // Equal revision with different data is a protocol violation, never a new truth.
                     return false;
                 }
+            }
+            if (old && revision(old.command_revision)) {
+                if (!revision(snapshot.command_revision) || BigInt(snapshot.command_revision) < BigInt(old.command_revision)) {
+                    next.command_revision = old.command_revision;
+                    next.current_attempt_id = old.current_attempt_id;
+                    // Worker fields from an earlier execution cannot re-enable
+                    // controls or replace the current generation's progress.
+                    if (Object.hasOwn(snapshot, 'current_attempt_id') && snapshot.current_attempt_id !== old.current_attempt_id) {
+                        for (const field of ['status', 'progress', 'speed', 'eta', 'downloaded_bytes', 'total_bytes', 'filesize', 'resolution', 'finished_at', 'filename', 'display_filename', 'title']) {
+                            if (Object.hasOwn(old, field)) next[field] = old[field];
+                            else delete next[field];
+                        }
+                    }
+                } else if (snapshot.command_revision === old.command_revision && snapshot.current_attempt_id !== old.current_attempt_id) return false;
             }
             if (old && revision(old.favorite_revision)) {
                 if (!revision(snapshot.favorite_revision) || BigInt(snapshot.favorite_revision) < BigInt(old.favorite_revision)) {
@@ -140,6 +155,7 @@
             const renameIntents = [];
             const preferenceIntents = [];
             const playlistIntents = [];
+            const commandIntents = [];
             let requestedFilename = null;
             const chips = new Map();
             for (const tag of download.tag_items || (download.tags || []).map(name => VDL.tagIdentity.normalize(name))) {
@@ -147,6 +163,7 @@
             }
             for (const intent of intents.values()) {
                 if (intent.targetId !== id) continue;
+                if (intent.kind.startsWith('download.')) { commandIntents.push(copy(intent)); continue; }
                 if (intent.kind.startsWith('playlist.')) { playlistIntents.push(copy(intent)); continue; }
                 if (intent.kind === 'preference.set') {
                     // Pending settings describe a request; only acknowledged values apply effects.
@@ -182,7 +199,7 @@
                 rows.sort((a, b) => a.name.localeCompare(b.name));
             }
             const effective = rows.filter(tag => tag.effective).map(tag => ({ key: tag.key, name: tag.name }));
-            return freeze(copy({ ...download, playlist_intents: playlistIntents, requested_filename: requestedFilename, rename_intents: renameIntents, preference_intents: preferenceIntents, favorite, favorite_intents: favoriteIntents, tags: effective.map(tag => tag.name), tag_items: effective, tag_chips: rows }));
+            return freeze(copy({ ...download, command_intents: commandIntents, playlist_intents: playlistIntents, requested_filename: requestedFilename, rename_intents: renameIntents, preference_intents: preferenceIntents, favorite, favorite_intents: favoriteIntents, tags: effective.map(tag => tag.name), tag_items: effective, tag_chips: rows }));
         }
         function fence(id) {
             id = String(id);

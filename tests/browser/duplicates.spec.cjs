@@ -4,8 +4,18 @@ const { reset, seed, refresh } = require('./support.cjs');
 test.beforeEach(async ({ page }) => reset(page));
 
 test('Duplicates shows confirmed members and links to their History items', async ({ page }) => {
-    await seed(page, { id: 'duplicate-one', status: 'finished', file: true, name: 'first.mp4' });
-    await seed(page, { id: 'duplicate-two', status: 'finished', file: true, name: 'second.mp4' });
+    // Grouping cannot overwrite adopted metadata without canonical revisions.
+    await seed(page, {
+        id: 'duplicate-one', status: 'finished', file: true,
+        name: 'first--a1b2c3d4e5f6.mp4', display_filename: 'source.mp4',
+        title: 'First video', source_type: 'upload', mounted_import: true,
+    });
+    await seed(page, {
+        id: 'duplicate-two', status: 'finished', file: true, name: 'second.mp4',
+        display_filename: 'other.mp4', title: 'Second video', source_type: 'upload',
+    });
+    expect((await page.request.post('/api/tags/duplicate-one', { data: { tag: 'Archive' } })).ok()).toBe(true);
+    expect((await page.request.post('/api/tags/duplicate-two', { data: { tag: 'Inbox' } })).ok()).toBe(true);
     await refresh(page);
     const entries = await (await page.request.get('/api/library')).json();
     const first = entries.find(entry => entry.id === 'duplicate-one');
@@ -15,13 +25,7 @@ test('Duplicates shows confirmed members and links to their History items', asyn
             groups: [{
                 byte_size: 100,
                 item_count: 2,
-                items: [
-                    { ...first, title: 'First video', display_filename: 'source.mp4',
-                        filename: 'first--a1b2c3d4e5f6.mp4', mounted_import: true,
-                        source_type: 'upload', tags: ['Archive'] },
-                    { ...second, title: 'Second video', display_filename: 'other.mp4',
-                        source_type: 'upload', tags: ['Inbox'] },
-                ],
+                items: [first, second],
             }],
             pending_count: 1,
             unavailable_count: 2,

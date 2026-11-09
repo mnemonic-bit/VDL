@@ -11,7 +11,7 @@ async function reject(page, path, message) {
     }));
 }
 
-test('failed Pause request reports the error and preserves the row', async ({ page }) => {
+test('unconfirmed Pause request reports uncertainty and preserves the row', async ({ page }) => {
     await seed(page, { id: 'failpause', status: 'downloading', progress: '25%' });
     await refresh(page);
     await openCurrent(page);
@@ -19,29 +19,29 @@ test('failed Pause request reports the error and preserves the row', async ({ pa
     const row = page.locator('[data-row-id="failpause"]');
     await row.locator('.kebab-btn').click();
     await row.getByRole('button', { name: 'Pause', exact: true }).click();
-    await expect(page.getByText('pause was rejected')).toBeVisible();
+    await expect(row.locator('[data-download-command-status]')).toContainText('Request not confirmed');
     await expect(row).toBeVisible();
 });
 
-test('failed Stop request reports the error and preserves the row', async ({ page }) => {
+test('unconfirmed Stop request reports uncertainty and preserves the row', async ({ page }) => {
     await seed(page, { id: 'failstop', status: 'downloading', progress: '25%' });
     await refresh(page);
     await openCurrent(page);
     await reject(page, '/api/stop/failstop', 'stop was rejected');
     const row = page.locator('[data-row-id="failstop"]');
     await row.getByRole('button', { name: 'Stop', exact: true }).click();
-    await expect(page.getByText('stop was rejected')).toBeVisible();
+    await expect(row.locator('[data-download-command-status]')).toContainText('Request not confirmed');
     await expect(row).toBeVisible();
 });
 
-test('failed Continue request reports the error and preserves the row', async ({ page }) => {
+test('unconfirmed Continue request reports uncertainty and preserves the row', async ({ page }) => {
     await seed(page, { id: 'failcontinue', status: 'cancelled', progress: 'Stopped' });
     await refresh(page);
     await openCurrent(page);
     await reject(page, '/api/resume/failcontinue', 'continue was rejected');
     const row = page.locator('[data-row-id="failcontinue"]');
     await row.getByRole('button', { name: 'Continue', exact: true }).click();
-    await expect(page.getByText('continue was rejected')).toBeVisible();
+    await expect(row.locator('[data-download-command-status]')).toContainText('Request not confirmed');
     await expect(row).toBeVisible();
 });
 
@@ -50,20 +50,21 @@ test('failed Delete request restores the row and reports the error', async ({ pa
     await refresh(page);
     await reject(page, '/api/remove/faildelete', 'delete was rejected');
     const row = page.locator('[data-row-id="faildelete"]');
+    await expect(row).not.toHaveClass(/item-fade-in/);
     await row.locator('.kebab-btn').click();
     await row.getByRole('button', { name: 'Delete', exact: true }).click();
     await expect(row).toBeVisible();
     await expect(page.getByText('delete was rejected')).toBeVisible();
 });
 
-test('failed Retry reports the error and preserves the attempt', async ({ page }) => {
+test('unconfirmed Retry reports uncertainty and preserves the attempt', async ({ page }) => {
     await seed(page, { id: 'failreload', status: 'error', progress: 'fixture error' });
     await page.locator('#accountMenuButton').click();
     await page.locator('#attemptHistoryButton').click();
     await reject(page, '/api/retry/failreload', 'retry was rejected');
     const row = page.locator('.attempt-row').filter({ hasText: 'fixture error' });
     await row.getByRole('button', { name: 'Retry', exact: true }).click();
-    await expect(page.getByText('retry was rejected')).toBeVisible();
+    await expect(row.locator('[data-download-command-status]')).toContainText('Request not confirmed');
     await expect(row).toBeVisible();
 });
 

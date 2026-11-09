@@ -1340,6 +1340,11 @@ const favoriteMutationMetrics = { ...tagMutationMetrics };
 const mutationMetrics = { ...tagMutationMetrics };
 const preferenceMutationMetrics = { ...tagMutationMetrics };
 const playlistMutationMetrics = { ...tagMutationMetrics };
+const downloadCommandMetrics = { ...tagMutationMetrics };
+VDL.downloadCommandMetrics = () => Object.freeze({ ...downloadCommandMetrics });
+const compatibilityCommands = new Map();
+const commandNotices = new Map();
+const commandAnnouncements = new Map();
 VDL.playlistMutationMetrics = () => Object.freeze({ ...playlistMutationMetrics });
 VDL.preferenceMutationMetrics = () => Object.freeze({ ...preferenceMutationMetrics });
 let preferenceSubmission = null;
@@ -1380,7 +1385,7 @@ const tagMutations = VDL.createMutations({
         return { status: response.status, body: await response.json().catch(() => null) };
     },
     onEvent: event => {
-        const domainMetrics = event.action.startsWith('playlist.') ? playlistMutationMetrics : event.action === 'preference.set' ? preferenceMutationMetrics : event.action === 'rename.set' ? renameMutationMetrics : event.action === 'favorite.set' ? favoriteMutationMetrics : tagMutationMetrics;
+        const domainMetrics = event.action.startsWith('download.') ? downloadCommandMetrics : event.action.startsWith('playlist.') ? playlistMutationMetrics : event.action === 'preference.set' ? preferenceMutationMetrics : event.action === 'rename.set' ? renameMutationMetrics : event.action === 'favorite.set' ? favoriteMutationMetrics : tagMutationMetrics;
         for (const metrics of [domainMetrics, mutationMetrics]) {
             if (event.outcome === 'presented') metrics.submissions++;
             if (event.outcome === 'confirmed') {
@@ -1394,6 +1399,10 @@ const tagMutations = VDL.createMutations({
         mutationMetrics.pending = event.pending;
         mutationMetrics.unconfirmed = event.unconfirmed;
         mutationMetrics.conflicted = event.conflicted;
+        if (event.action.startsWith('download.')) {
+            if (event.outcome === 'reconciliation') downloadCommandMetrics.reconciliationReads++;
+            handleDownloadCommandEvent(event);
+        }
         if (event.action === 'preference.set') handlePreferenceMutationEvent(event);
         if (event.action.startsWith('playlist.')) handlePlaylistMutationEvent(event);
         if (event.action === 'rename.set') {
@@ -1429,6 +1438,12 @@ const tagMutations = VDL.createMutations({
 
 function resetTagSession() {
     tagSessionEpoch += 1;
+    for (const entry of compatibilityCommands.values()) entry.timers.forEach(clearTimeout);
+    compatibilityCommands.clear(); commandNotices.clear(); commandAnnouncements.clear();
+    ++attemptRequest;
+    attemptRows.clear();
+    document.getElementById('attemptHistoryList').replaceChildren();
+    refreshDownloadCommandPresentations();
     resetPreferenceSession();
     resetPlaylistSession();
     tagMutations.reset();
@@ -1465,6 +1480,7 @@ function announceTagStatus(message) {
 }
 
 function updateTagMutationSummary() {
+    refreshDownloadCommandPresentations();
     for (const intentId of submittedTagIntents) {
         if (tagMutations.status(intentId) !== null) continue;
         submittedTagIntents.delete(intentId);
@@ -1506,7 +1522,7 @@ function updateTagMutationSummary() {
 function projectTagEntry(info) {
     const projected = tagState.selectDownload(String(info.id));
     if (!projected) return info;
-    return { ...info, filename: projected.filename, display_filename: projected.display_filename,
+    return { ...info, ...(info.current_attempt_id !== projected.current_attempt_id && typeof projected.command_revision === 'string' ? { status: projected.status, progress: projected.progress, speed: projected.speed, eta: projected.eta, downloaded_bytes: projected.downloaded_bytes, total_bytes: projected.total_bytes, finished_at: projected.finished_at } : {}), command_revision: projected.command_revision, current_attempt_id: projected.current_attempt_id, filename: projected.filename, display_filename: projected.display_filename,
         rename_revision: projected.rename_revision, requested_filename: ['sending', 'unconfirmed'].includes(compatibilityRenames.get(String(info.id))?.status) ? compatibilityRenames.get(String(info.id)).value : projected.requested_filename, rename_intents: projected.rename_intents, tags: projected.tags, tag_items: projected.tag_items,
         tags_revision: projected.tags_revision, tag_chips: projected.tag_chips,
         favorite: projected.favorite, favorite_revision: projected.favorite_revision, favorite_intents: projected.favorite_intents };
@@ -1556,6 +1572,9 @@ tagState.subscribe(ids => {
         }
         allLibraryEntries = allLibraryEntries.filter(info => String(info.id) !== String(id));
         clearCompatibilityRename(String(id));
+        clearCompatibilityCommand(String(id));
+        commandNotices.delete(String(id));
+        for (const [key, entry] of commandAnnouncements) if (entry.targetId === String(id)) commandAnnouncements.delete(key);
         renameDrafts.delete(String(id));
         renameEditPositions.delete(String(id));
         favoriteEditPositions.delete(String(id));
@@ -1566,6 +1585,13 @@ tagState.subscribe(ids => {
         tagEditPositions.delete(String(id));
         if (String(openInfoId) === String(id)) closeHistoryInfo();
     }
+    if (acceptingTagSnapshots) {
+        for (const id of ids) {
+            const notice = commandNotices.get(id);
+            if (notice && (tagState.selectDownload(id)?.current_attempt_id !== notice.attemptId || tagState.selectDownload(id)?.status !== notice.workerStatus)) commandNotices.delete(id);
+        }
+    }
+    refreshDownloadCommandPresentations();
     if (acceptingTagSnapshots || tagRenderScheduled) return;
     tagRenderScheduled = true;
     queueMicrotask(() => {
@@ -1587,7 +1613,7 @@ tagState.subscribe(ids => {
 });
 
 window.addEventListener('beforeunload', event => {
-    if (!playlistActions.size && !playlistSubmissions.size && !playlistRetainedDrafts.size && !(playlistEditorDraft && playlistEditorSnapshot() !== playlistEditorBaseline) && !preferenceDirty && !preferenceSubmission && !tagMutations.hasPending() && ![...tagDrafts.values()].some(value => value.trim()) && !renameDrafts.size && !compatibilityRenames.size) return;
+    if (!playlistActions.size && !playlistSubmissions.size && !playlistRetainedDrafts.size && !(playlistEditorDraft && playlistEditorSnapshot() !== playlistEditorBaseline) && !preferenceDirty && !preferenceSubmission && !tagMutations.hasPending() && ![...tagDrafts.values()].some(value => value.trim()) && !renameDrafts.size && !compatibilityRenames.size && !compatibilityCommands.size) return;
     event.preventDefault();
     event.returnValue = '';
 });
@@ -2251,7 +2277,7 @@ function bindTagEditors() {
     });
 }
 
-function stopDownload(id) {
+function stopDownload(id, attemptId) {
     closeAllMenus();
     const upload = droppedUploads.get(String(id));
     if (upload) {
@@ -2262,13 +2288,7 @@ function stopDownload(id) {
         stopDroppedUpload(upload).catch(() => {});
         return;
     }
-    const uploadRequest = activeUploadRequests.get(String(id));
-    apiAction('/api/stop/' + encodeURIComponent(id), { method: 'POST' })
-        .then(() => {
-            if (uploadRequest) uploadRequest.abort();
-            return fetchHistory();
-        })
-        .catch(() => fetchHistory());
+    submitDownloadCommand('stop', id, attemptId);
 }
 
 function hasRenameProtocol() {
@@ -2588,33 +2608,157 @@ document.addEventListener('click', event => {
     renderDownloadCollections();
 });
 
-function pauseDownload(id) {
-    closeAllMenus();
-    apiAction('/api/pause/' + encodeURIComponent(id), { method: 'POST' })
-        .then(() => fetchHistory())
-        .catch(() => fetchHistory());
-}
+function pauseDownload(id, attemptId) { closeAllMenus(); return submitDownloadCommand('pause', id, attemptId); }
+function unpauseDownload(id, attemptId) { closeAllMenus(); return submitDownloadCommand('unpause', id, attemptId); }
+function reloadDownload(id, url, attemptId) { closeAllMenus(); return submitDownloadCommand('retry', id, attemptId); }
+function continueDownload(id, url, attemptId) { closeAllMenus(); return submitDownloadCommand('resume', id, attemptId); }
 
-function unpauseDownload(id) {
-    closeAllMenus();
-    apiAction('/api/unpause/' + encodeURIComponent(id), { method: 'POST' })
-        .then(() => fetchHistory())
-        .catch(() => fetchHistory());
+function hasDownloadCommandProtocol(action) {
+    return tagCapabilities?.mutation_protocol === 1 && tagCapabilities.actions?.includes(`download.${action}`);
 }
-
-function reloadDownload(id, url) {
-    closeAllMenus();
-    apiAction('/api/retry/' + encodeURIComponent(id), { method: 'POST' })
-        .then(() => fetchHistory())
-        .catch(() => fetchHistory());
+function clearCompatibilityCommand(id) {
+    const entry = compatibilityCommands.get(id);
+    if (entry) entry.timers.forEach(clearTimeout);
+    compatibilityCommands.delete(id);
 }
-
-function continueDownload(id, url) {
-    closeAllMenus();
-    apiAction('/api/resume/' + encodeURIComponent(id), { method: 'POST' })
-        .then(() => fetchHistory())
-        .catch(() => fetchHistory());
+function downloadCommandIntents(id) {
+    return tagMutations.pending().filter(entry => entry.kind.startsWith('download.') && entry.targetId === String(id))
+        .concat(compatibilityCommands.has(String(id)) ? [compatibilityCommands.get(String(id))] : []);
 }
+function downloadCommandText(intent) {
+    if (intent.message) return intent.message;
+    const label = { 'download.pause': 'Pausing…', 'download.unpause': 'Resuming…', 'download.stop': 'Stopping…', 'download.retry': 'Starting…', 'download.resume': 'Starting…' }[intent.kind];
+    return intent.status === 'queued' ? `${label} Queued behind the previous request.` : label;
+}
+function announceDownloadCommand(entry, message) {
+    if (!entry || !message || commandAnnouncements.get(entry.id)?.message === message) return;
+    if (commandAnnouncements.size >= 256) commandAnnouncements.delete(commandAnnouncements.keys().next().value);
+    commandAnnouncements.set(entry.id, { targetId: entry.targetId, message });
+    // The existing live regions alternate with the native Current dialog:
+    // its inner region is exposed while the page region is inert, and vice versa.
+    announceTagStatus(message);
+}
+function downloadCommandStatusHtml(id, attemptId = null) {
+    const intents = downloadCommandIntents(id).filter(entry => attemptId === null || entry.value.attempt_id === attemptId);
+    const notice = commandNotices.get(String(id));
+    const action = (entry, mode, label) => `<button type="button" data-command-recovery="${mode}" data-intent-id="${escapeAttr(entry.id)}">${label}</button>`;
+    return intents.map(entry => `<div class="download-command-message" data-command-state="${entry.status}"><span>${escapeHtml(downloadCommandText(entry))}</span>${entry.status === 'unconfirmed' ? (entry.legacy ? action(entry, 'check', 'Check current state') : action(entry, 'check', 'Check request') + action(entry, 'replay', 'Recover request') + action(entry, 'dismiss', 'Use current state')) : ['rejected', 'conflicted'].includes(entry.status) ? action(entry, 'dismiss', 'Review current state') : entry.status === 'queued' ? action(entry, 'dismiss', 'Discard queued request') : ''}</div>`).join('')
+        || (notice && (attemptId === null || notice.attemptId === attemptId) ? `<span>${escapeHtml(notice.message)}</span>` : '');
+}
+function downloadCommandStatusSlot(id, attemptId = null) {
+    return `<div class="download-command-status" data-download-command-status="${escapeAttr(id)}"${attemptId === null ? '' : ` data-command-attempt="${escapeAttr(attemptId)}"`} role="status" aria-live="off" aria-atomic="true">${downloadCommandStatusHtml(id, attemptId)}</div>`;
+}
+function refreshDownloadCommandPresentations() {
+    const entries = tagMutations.pending().filter(entry => entry.kind.startsWith('download.')).concat([...compatibilityCommands.values()]);
+    for (const entry of entries) if (entry.status === 'sending' && entry.delayed) announceDownloadCommand(entry, downloadCommandText(entry));
+    for (const node of document.querySelectorAll('[data-download-command-status]')) {
+        const html = downloadCommandStatusHtml(node.dataset.downloadCommandStatus, node.dataset.commandAttempt || null);
+        if (node.innerHTML !== html) node.innerHTML = html;
+    }
+    for (const button of document.querySelectorAll('[data-download-command]')) {
+        const pending = downloadCommandIntents(button.dataset.downloadId);
+        const canQueueStop = button.dataset.downloadCommand === 'stop' && pending.every(entry => entry.kind === 'download.pause' && ['queued', 'sending', 'unconfirmed'].includes(entry.status));
+        button.disabled = pending.length > 0 && !canQueueStop;
+        button.setAttribute('aria-busy', String(pending.some(entry => entry.kind === `download.${button.dataset.downloadCommand}` && ['queued', 'sending'].includes(entry.status))));
+    }
+    for (const button of document.querySelectorAll('[data-attempt-action="resume"], [data-attempt-action="retry"]')) {
+        const info = attemptRows.get(button.dataset.attemptId)?.info;
+        if (info) { button.disabled = false; button.setAttribute('aria-disabled', String(downloadCommandIntents(info.download_id).length > 0)); }
+    }
+    const summary = document.getElementById('downloadCommandSummary');
+    if (summary) {
+        const groups = new Map(entries.map(entry => [JSON.stringify([entry.targetId, entry.value.attempt_id]), entry]));
+        const html = [...groups.values()].map(entry => {
+            const model = tagState.writer.confirmed(entry.targetId);
+            const label = model?.title || model?.display_filename || 'Download request';
+            return `<div class="download-command-summary-entry"><strong>${escapeHtml(label)}</strong>${downloadCommandStatusHtml(entry.targetId, entry.value.attempt_id)}</div>`;
+        }).join('');
+        if (summary.innerHTML !== html) summary.innerHTML = html;
+        summary.hidden = !entries.length;
+    }
+    downloadCommandMetrics.pending = entries.filter(entry => ['queued', 'sending', 'unconfirmed', 'conflicted'].includes(entry.status)).length;
+    downloadCommandMetrics.unconfirmed = entries.filter(entry => entry.status === 'unconfirmed').length;
+    downloadCommandMetrics.conflicted = entries.filter(entry => entry.status === 'conflicted').length;
+}
+function handleDownloadCommandEvent(event) {
+    const entry = tagMutations.status(event.intentId);
+    if (event.outcome === 'confirmed' && entry) {
+        if (commandNotices.size >= 128) commandNotices.delete(commandNotices.keys().next().value);
+        commandNotices.set(entry.targetId, { attemptId: entry.value.attempt_id, workerStatus: tagState.writer.confirmed(entry.targetId)?.status, message: 'Request accepted. Worker status updates separately.' });
+        if (entry.kind === 'download.stop') activeUploadRequests.get(entry.targetId)?.abort();
+        announceDownloadCommand(entry, 'Request accepted. Worker status updates separately.');
+    } else if (entry && event.outcome === 'presented') {
+        const queued = downloadCommandIntents(entry.targetId).some(other => other.id !== entry.id && ['queued', 'sending', 'unconfirmed', 'conflicted'].includes(other.status));
+        announceDownloadCommand(entry, downloadCommandText(queued ? entry : { ...entry, status: 'sending' }));
+    } else if (entry && ['rejected', 'conflicted', 'unconfirmed'].includes(event.outcome)) announceDownloadCommand(entry, downloadCommandText(entry));
+    refreshDownloadCommandPresentations();
+}
+function submitDownloadCommand(action, rawId, attemptId) {
+    const id = String(rawId);
+    const model = tagState.selectDownload(id);
+    if (!model) { announceTagStatus('This download is unavailable.'); return; }
+    const sourceAttempt = attemptId === undefined ? model.current_attempt_id : attemptId;
+    if (attemptId !== undefined && typeof model.command_revision === 'string' && sourceAttempt !== model.current_attempt_id) {
+        announceTagStatus('This is an older attempt. Review the current download before trying again.');
+        return { accepted: false, reason: 'unavailable' };
+    }
+    commandNotices.delete(id);
+    const started = performance.now();
+    if (hasDownloadCommandProtocol(action)) {
+        const result = tagMutations.submit({ kind: `download.${action}`, targetId: id, value: { attempt_id: sourceAttempt } });
+        if (!result.accepted) announceTagStatus(result.message || 'Resolve the current request first.');
+        refreshDownloadCommandPresentations();
+        downloadCommandMetrics.latestLocalFeedbackMs = Math.max(0, performance.now() - started);
+        mutationMetrics.latestLocalFeedbackMs = downloadCommandMetrics.latestLocalFeedbackMs;
+        return result;
+    }
+    // Legacy contracts can show delivery feedback, but cannot correlate an unknown request.
+    if (downloadCommandIntents(id).length || compatibilityCommands.size + tagMutations.pending().length >= 128) return;
+    const epoch = tagSessionEpoch;
+    const entry = { id: `legacy-command-${id}`, targetId: id, kind: `download.${action}`, value: { attempt_id: sourceAttempt ?? null }, status: 'sending', message: '', legacy: true, timers: [] };
+    compatibilityCommands.set(id, entry);
+    announceDownloadCommand(entry, downloadCommandText(entry));
+    for (const metrics of [downloadCommandMetrics, mutationMetrics]) metrics.submissions++;
+    refreshDownloadCommandPresentations();
+    downloadCommandMetrics.latestLocalFeedbackMs = Math.max(0, performance.now() - started);
+    mutationMetrics.latestLocalFeedbackMs = downloadCommandMetrics.latestLocalFeedbackMs;
+    const current = () => epoch === tagSessionEpoch && compatibilityCommands.get(id) === entry && tagState.isAvailable(id);
+    const unknown = () => { if (!current()) return; if (entry.status !== 'unconfirmed') for (const metrics of [downloadCommandMetrics, mutationMetrics]) metrics.unconfirmedOutcomes++; entry.status = 'unconfirmed'; entry.message = 'Request not confirmed. This server cannot safely replay it. Current worker status does not prove acceptance.'; refreshDownloadCommandPresentations(); announceDownloadCommand(entry, entry.message); };
+    entry.timers = [setTimeout(() => { if (current() && entry.status === 'sending') { entry.message = 'Still waiting for request confirmation.'; refreshDownloadCommandPresentations(); announceDownloadCommand(entry, entry.message); } }, 5000), setTimeout(unknown, 30000)];
+    apiFetch(`/api/${action}/${encodeURIComponent(id)}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ expected_attempt_id: sourceAttempt ?? null }) }).then(async response => {
+        const body = await response.json().catch(() => null);
+        if (!current()) return;
+        if ([401, 403, 404].includes(response.status)) { tagMutations.fence(id); return; }
+        if (response.ok && body?.id === id) {
+            if (commandNotices.size >= 128) commandNotices.delete(commandNotices.keys().next().value);
+            commandNotices.set(id, { attemptId: sourceAttempt, workerStatus: tagState.writer.confirmed(id)?.status, message: 'Request accepted. Worker status updates separately.' });
+            clearCompatibilityCommand(id);
+            announceDownloadCommand(entry, 'Request accepted. Worker status updates separately.');
+            for (const metrics of [downloadCommandMetrics, mutationMetrics]) { metrics.acknowledgements++; metrics.latestAcknowledgementMs = performance.now() - started; }
+            if (action === 'stop') activeUploadRequests.get(id)?.abort();
+        } else if ([400, 409, 410, 413, 422, 429].includes(response.status)) {
+            entry.status = 'rejected'; entry.message = `Request refused. ${typeof body?.error === 'string' ? body.error : 'Review current eligibility.'}`;
+            announceDownloadCommand(entry, entry.message);
+            for (const metrics of [downloadCommandMetrics, mutationMetrics]) metrics.rejectedOutcomes++;
+        } else unknown();
+        refreshDownloadCommandPresentations();
+    }).catch(unknown).finally(() => entry.timers.forEach(clearTimeout));
+}
+document.addEventListener('click', async event => {
+    const button = event.target.closest('[data-command-recovery]');
+    if (!button) return;
+    const mode = button.dataset.commandRecovery;
+    const id = button.dataset.intentId;
+    const legacy = [...compatibilityCommands.values()].find(entry => entry.id === id);
+    if (legacy) {
+        if (mode === 'check') { downloadCommandMetrics.reconciliationReads++; await checkTagAvailability(legacy.targetId); }
+        else if (legacy.status === 'rejected') { clearCompatibilityCommand(legacy.targetId); fetchHistory(); fetchAttemptHistory(); }
+    } else if (mode === 'check') await tagMutations.recover(id);
+    else if (mode === 'replay') await tagMutations.recover(id, { replay: true });
+    else if (!tagMutations.resolve(id)) announceTagStatus('The original request may still complete. Check its status before submitting another command.');
+    else { fetchHistory(); fetchAttemptHistory(); }
+    refreshDownloadCommandPresentations();
+});
 
 function deleteDownload(id) {
     closeHistoryInfo();
@@ -3269,10 +3413,10 @@ document.addEventListener('click', (ev) => {
                 openUrl(url);
                 break;
             case 'continue':
-                continueDownload(id, url);
+                continueDownload(id, url, Object.hasOwn(urlAction.dataset, 'commandAttempt') ? urlAction.dataset.commandAttempt || null : undefined);
                 break;
             case 'reload':
-                reloadDownload(id, url);
+                reloadDownload(id, url, Object.hasOwn(urlAction.dataset, 'commandAttempt') ? urlAction.dataset.commandAttempt || null : undefined);
                 break;
             case 'copy':
                 copyToClipboard(url, urlAction);
@@ -4280,7 +4424,7 @@ function renderHistoryCard(info) {
         menuItems.push(`<button data-file-download-action data-download-id="${escapeAttr(id)}"><svg class="menu-icon"><use href="#i-download"/></svg>Download</button>`);
     }
     if (!isFinished) {
-        menuItems.push(`<button data-url-action="reload" data-download-id="${escapeAttr(id)}" ${urlData}><svg class="menu-icon"><use href="#i-sync"/></svg>Reload</button>`);
+        menuItems.push(`<button data-download-command="retry" data-command-attempt="${escapeAttr(info.current_attempt_id || '')}" data-url-action="reload" data-download-id="${escapeAttr(id)}" ${urlData}><svg class="menu-icon"><use href="#i-sync"/></svg>Reload</button>`);
     }
     menuItems.push(`<button class="danger" onclick="deleteDownload('${id}')"><svg class="menu-icon"><use href="#i-trash"/></svg>Delete</button>`);
 
@@ -4412,6 +4556,7 @@ function renderHistoryCard(info) {
                             <div id="menu-${escapeAttr(id)}" class="kebab-menu">${menuItems.join('')}</div>
                         </div>
                     </div>
+                    ${downloadCommandStatusSlot(id)}
                     <div id="info-${escapeAttr(id)}" class="history-info-popover" role="dialog" aria-label="Download information">
                         <div class="history-info-content">
                             <div class="history-info-header">
@@ -4456,14 +4601,14 @@ function renderItem(info, inHistoryView = false) {
     const menuItems = [];
 
     if (isRunning) {
-        primary = `<button class="stop-btn icon-only" onclick="stopDownload('${id}')" aria-label="Stop" title="Stop">${renderActionProgressIcon('i-pause', info)}</button>`;
+        primary = `<button class="stop-btn icon-only" data-download-command="stop" data-command-attempt="${escapeAttr(info.current_attempt_id || '')}" data-download-id="${escapeAttr(id)}" onclick="stopDownload('${id}', this.dataset.commandAttempt || null)" aria-label="Stop" title="Stop">${renderActionProgressIcon('i-pause', info)}</button>`;
     } else if (isPaused) {
-        primary = `<button class="continue-btn" onclick="unpauseDownload('${id}')">${renderActionProgressIcon('i-play', info)}Resume</button>`;
+        primary = `<button class="continue-btn" data-download-command="unpause" data-command-attempt="${escapeAttr(info.current_attempt_id || '')}" data-download-id="${escapeAttr(id)}" onclick="unpauseDownload('${id}', this.dataset.commandAttempt || null)">${renderActionProgressIcon('i-play', info)}Resume</button>`;
     } else if (!isUpload && info.browser_authenticated
             && (isCancelled || info.status === 'interrupted')) {
         primary = '<span class="firefox-resend" title="Open the source page while signed in, then click the VDL Companion toolbar action.">Re-send from Firefox</span>';
     } else if (!isUpload && (isCancelled || info.status === 'interrupted')) {
-        primary = `<button class="continue-btn icon-only" data-url-action="continue" data-download-id="${id}" ${urlData} aria-label="Continue" title="Continue">${renderActionProgressIcon('i-play', info)}</button>`;
+        primary = `<button class="continue-btn icon-only" data-download-command="resume" data-command-attempt="${escapeAttr(info.current_attempt_id || '')}" data-url-action="continue" data-download-id="${id}" ${urlData} aria-label="Continue" title="Continue">${renderActionProgressIcon('i-play', info)}</button>`;
     }
 
     if (!isUpload) {
@@ -4471,16 +4616,16 @@ function renderItem(info, inHistoryView = false) {
     }
 
     if (isRunning && !isUpload) {
-        menuItems.push(`<button onclick="pauseDownload('${id}')"><svg class="menu-icon"><use href="#i-pause"/></svg>Pause</button>`);
+        menuItems.push(`<button data-download-command="pause" data-command-attempt="${escapeAttr(info.current_attempt_id || '')}" data-download-id="${escapeAttr(id)}" onclick="pauseDownload('${id}', this.dataset.commandAttempt || null)"><svg class="menu-icon"><use href="#i-pause"/></svg>Pause</button>`);
     }
 
     if (isPaused) {
-        menuItems.push(`<button onclick="stopDownload('${id}')"><svg class="menu-icon"><use href="#i-stop"/></svg>Stop</button>`);
+        menuItems.push(`<button data-download-command="stop" data-command-attempt="${escapeAttr(info.current_attempt_id || '')}" data-download-id="${escapeAttr(id)}" onclick="stopDownload('${id}', this.dataset.commandAttempt || null)"><svg class="menu-icon"><use href="#i-stop"/></svg>Stop</button>`);
     }
 
     if (isTerminal) {
         if (!isUpload && !isFinished && !isCancelled && info.status !== 'interrupted') {
-            menuItems.push(`<button data-url-action="reload" data-download-id="${id}" ${urlData}><svg class="menu-icon"><use href="#i-sync"/></svg>Reload</button>`);
+            menuItems.push(`<button data-download-command="retry" data-command-attempt="${escapeAttr(info.current_attempt_id || '')}" data-url-action="reload" data-download-id="${id}" ${urlData}><svg class="menu-icon"><use href="#i-sync"/></svg>Reload</button>`);
         }
         if (!isUpload) {
             menuItems.push(`<button data-url-action="copy" ${urlData}><svg class="menu-icon"><use href="#i-copy"/></svg>Copy URL</button>`);
@@ -4514,7 +4659,8 @@ function renderItem(info, inHistoryView = false) {
     const isCurrentRow = !inHistoryView && CURRENT_TAB_STATUSES.has(info.status);
     const etaStr = isRunning ? formatEta(info.eta) : '';
     const downloadedPercent = itemProgressPercent(info);
-    const downloadSummaryParts = [];
+    const workerStatusLabel = ({ starting: 'Starting', downloading: 'Downloading', paused: 'Paused', cancelled: 'Cancelled', interrupted: 'Interrupted', finished: 'Finished', error: 'Failed' })[info.status] || info.status;
+    const downloadSummaryParts = [`<strong>Status:</strong> <span class="download-worker-status">${escapeHtml(workerStatusLabel)}</span>`];
     if ((info.status === 'starting' && info.progress)
             || ((isRunning || isPaused) && String(info.progress).startsWith('Stopping download;'))) {
         downloadSummaryParts.push(escapeHtml(info.progress));
@@ -4617,6 +4763,7 @@ function renderItem(info, inHistoryView = false) {
                     ${tagRow}
                     ${bottom}
                     ${downloadSummaryRow}
+                    ${downloadCommandStatusSlot(id)}
                     ${errorBlock}
                 </div>
             `;
@@ -4709,6 +4856,7 @@ function attemptRowHtml(info) {
         <div class="attempt-timing">${escapeHtml(timing)}</div>
         <div class="attempt-result">${escapeHtml(result)}</div>
         <div class="attempt-actions">${info.library_id ? action('library', 'View in Library') : ''}${info.can_resume ? action('resume', 'Resume') : ''}${info.can_retry ? action('retry', 'Retry') : ''}${info.source_reference ? action('copy', 'Copy source URL') : ''}</div>
+        ${info.download_id ? downloadCommandStatusSlot(info.download_id, info.id) : ''}
         <details><summary>Details</summary><div class="attempt-details">${escapeHtml([info.source_reference, info.error_details].filter(Boolean).join('\n') || 'No additional details.')}</div></details>
     </div>`;
 }
@@ -4726,16 +4874,18 @@ function fetchAttemptHistory() {
 async function loadAttemptHistory() {
     if (!attemptHistoryOpen || libraryView === 'duplicates') return;
     const generation = attemptRequest;
+    const epoch = tagSessionEpoch;
     const filter = document.getElementById('attemptSearchInput').value;
     try {
         const response = await apiFetch(`/api/history?${new URLSearchParams({ filter, page: attemptPage, page_size: 20 })}`);
         if (!response.ok) throw new Error('Could not load download history.');
         const data = await response.json();
-        if (generation !== attemptRequest || !attemptHistoryOpen) return;
+        if (epoch !== tagSessionEpoch || generation !== attemptRequest || !attemptHistoryOpen) return;
         attemptPage = data.page;
         const list = document.getElementById('attemptHistoryList');
         const retained = new Set();
         for (const info of data.items) {
+            if (info.download_id && typeof info.command_revision === 'string') tagState.acceptDownload({ id: info.download_id, command_revision: info.command_revision, current_attempt_id: info.current_attempt_id });
             retained.add(info.id);
             let row = document.getElementById(`attempt-${info.id}`);
             if (!row) {
@@ -4781,8 +4931,9 @@ async function loadAttemptHistory() {
         document.getElementById('attemptPageInfo').textContent = `Page ${data.page} of ${Math.max(1, Math.ceil(data.total / data.page_size))} · ${data.total} attempts`;
         document.getElementById('attemptPagePrev').disabled = data.page <= 1;
         document.getElementById('attemptPageNext').disabled = data.page * data.page_size >= data.total;
+        refreshDownloadCommandPresentations();
     } catch (_error) {
-        if (generation === attemptRequest) document.getElementById('attemptHistoryStatus').textContent = 'Could not load download history. Try again.';
+        if (epoch === tagSessionEpoch && generation === attemptRequest) document.getElementById('attemptHistoryStatus').textContent = 'Could not load download history. Try again.';
     }
 }
 
@@ -4821,18 +4972,13 @@ document.getElementById('attemptPagePrev').addEventListener('click', () => { att
 document.getElementById('attemptPageNext').addEventListener('click', () => { attemptPage++; fetchAttemptHistory(); });
 document.getElementById('attemptHistoryList').addEventListener('click', async event => {
     const button = event.target.closest('[data-attempt-action]');
-    if (!button || button.disabled) return;
+    if (!button || button.disabled || button.getAttribute('aria-disabled') === 'true') return;
     const info = attemptRows.get(button.dataset.attemptId)?.info;
     if (!info) return;
     const action = button.dataset.attemptAction;
     if (action === 'copy') { copyToClipboard(info.source_reference, button); return; }
     if (action === 'library') { showDuplicateHistoryItem(info.library_id); return; }
-    button.disabled = true;
-    try {
-        await apiAction(`/api/${action}/${encodeURIComponent(info.download_id)}`, { method: 'POST' });
-        await fetchAttemptHistory();
-        fetchHistory();
-    } catch (_error) { button.disabled = false; }
+    submitDownloadCommand(action, info.download_id, info.id);
 });
 document.querySelector('#attemptHistoryPage [role="tablist"]').addEventListener('keydown', event => {
     if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
@@ -5322,12 +5468,17 @@ function checkMissingTagTargets(previous, next) {
         const id = String(entry.id);
         if (present.has(id)) continue;
         const model = tagState.selectDownload(id);
-        if (!model?.tag_chips.some(chip => chip.status !== 'confirmed') && !model?.favorite_intents.length && !model?.rename_intents.length && !compatibilityRenames.has(id) && !renameDrafts.has(id) && !editingTagIds.has(id)) continue;
+        if (!model?.tag_chips.some(chip => chip.status !== 'confirmed') && !model?.favorite_intents.length && !model?.rename_intents.length && !model?.command_intents.length && !compatibilityCommands.has(id) && !compatibilityRenames.has(id) && !renameDrafts.has(id) && !editingTagIds.has(id)) continue;
         checkTagAvailability(id);
     }
 }
 
 function recoverUnconfirmedTags() {
+    for (const entry of tagMutations.pending().filter(entry => entry.kind.startsWith('download.') && entry.status === 'unconfirmed')) {
+        if (recoveredTagIntents.has(entry.id)) continue;
+        recoveredTagIntents.add(entry.id);
+        tagMutations.recover(entry.id);
+    }
     for (const intentId of submittedTagIntents) {
         if (recoveredTagIntents.has(intentId)) continue;
         if (tagMutations.status(intentId)?.status !== 'unconfirmed') continue;
@@ -5523,6 +5674,7 @@ function renderDownloadCollections({ sortFavorites = false } = {}) {
     reconcileCards(document.getElementById('activeList'), active, info => renderItem(info, false), 'data-row-id');
     reconcileCards(document.getElementById('historyList'), pageItems, info => renderItem(info, true), 'data-row-id');
     updateAssetViewport();
+    refreshDownloadCommandPresentations();
 
     if (currentDrawerVisible) {
         newActiveIds.forEach(id => {

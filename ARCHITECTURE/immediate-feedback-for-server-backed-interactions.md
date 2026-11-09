@@ -1,6 +1,6 @@
 # Architecture: immediate feedback for server-backed interactions
 
-**Status:** Foundation, tags, favorites, rename, preferences, playlist editor saves, and playlist add/delete implemented; additional adapters remain proposed.\
+**Status:** Foundation, tags, favorites, rename, preferences, playlist editor saves, playlist add/delete, and download commands implemented; additional adapters remain proposed.\
 **Date:** 2026-11-09\
 **Requirements:** [Feature 0051](../FEATURES/feature-0051-immediate-feedback-for-server-backed-interactions.md)
 
@@ -20,7 +20,7 @@ the feature explicitly rather than silently contradicting it here.
 
 The implementation adds the shared modules, tag protocol, and independent
 `favorite.set`, `rename.set`, `preference.set`, `playlist.create`,
-`playlist.replace`, `playlist.add`, and `playlist.delete` adapters described
+`playlist.replace`, `playlist.add`, `playlist.delete`, and `download.*` adapters described
 below. Other actions still use handlers and collection snapshots in
 `static/app.js`, server routes and persistence in `vdl.py`, and SSE hints that
 trigger collection reads. The [rollout inventory](feature-0051-rollout.md) records
@@ -59,7 +59,7 @@ reconciliation may still use the existing batching delays.
 
 ## Module responsibilities and proposed placement
 
-The client modules below host tags, favorites, rename, preferences, and playlist actions. Additional action adapters
+The client modules below host tags, favorites, rename, preferences, playlist actions, and download commands. Additional action adapters
 remain staged. The client remains raw browser JavaScript;
 new scripts expose factory functions through one `window.VDL` namespace and load
 in dependency order before `app.js`. No bundler or runtime package is required.
@@ -299,6 +299,37 @@ Read adapters return values and revisions from one explicit read transaction.
 The ordinary `db()` helper's connection lifecycle alone is not a declaration
 that several SELECTs share the necessary read snapshot; the implementation must
 establish and test it. Preserve connection-per-call/thread conventions.
+
+### Download command acceptance and worker ownership
+
+The `download-command` domain registers pause, unpause, stop, retry, and resume
+as status-only intents. Its decimal-string command revision and current attempt
+identity form the conditional acceptance boundary. History submissions retain
+the clicked attempt identity rather than substituting the latest worker.
+Acknowledgements retire request delivery without projecting a worker transition
+or changing collection membership. Existing SSE reads reconcile actual progress.
+
+The server commits a durable command identity and actor-scoped receipt before
+dispatch. Retry and resume create their single linked attempt in that same
+transaction. Command dispatch shares the filesystem and scheduler serialization
+boundary with legacy controls and checks its accepted generation before effects.
+Retry cleanup runs outside the database write lock. A durable dispatch claim
+prevents replay from repeating ambiguous cleanup or launching another worker.
+Restart interrupts vanished work and unfinished dispatch rather than assuming a
+thread survived or starting a replacement. Authorized receipt lookup reports
+the command's current execution outcome separately from its recorded acceptance.
+Shared receipt pruning retains records still needed by active work.
+Worker cleanup and legacy Resume serialize flag ownership with the scheduler:
+old flags are cleared at handoff, and an unwinding worker cannot erase a pause
+accepted for its queued successor.
+
+The existing coordinator serializes contradictory commands per work item. Stop
+can wait visibly behind a transmitted pause, including an unknown pause; only
+safe outcome recovery releases it. The UI keeps pending/recovery status in
+Current, Library, History, and a compact summary. Legacy capability fallback has
+delivery feedback without receipt replay. Authentication and access fences cover
+command callbacks and History reads. Upload transfer, playback, and scheduling
+keep their specialized sequences.
 
 ### Rename filesystem recovery
 

@@ -1,8 +1,8 @@
 # Immediate feedback and durable download commands
 
 **Source:** Remaining Feature 0051 rollout item\
-**Status:** Proposed; not implemented\
-**Last refined:** 2026-11-08\
+**Status:** Implemented in version `0.60.0`\
+**Last refined:** 2026-11-09\
 **Extends:** [Feature 0051](feature-0051-immediate-feedback-for-server-backed-interactions.md), [Feature 0036, Attempt History](feature-0036-add-download-attempt-history.md)\
 **Rollout:** [Shared requirements and inventory](../ARCHITECTURE/feature-0051-rollout.md#shared-requirements-for-the-remaining-specs)
 
@@ -82,3 +82,43 @@ Matching worker status alone cannot correlate a particular lost command.
 5. Cover worker failure after acceptance, unavailable media, access loss,
    logout, keyboard status, and both themes. Preserve cancellation, progress,
    scheduling, and History regressions and complete shared verification.
+
+## Implementation contract
+
+The registered actions are `download.pause`, `download.unpause`,
+`download.stop`, `download.retry`, and `download.resume`, in the independent
+`download-command` domain. They retain the existing POST routes. Requests bind
+`client_mutation_id`, decimal-string `expected_revision`, and
+`expected_attempt_id` to the work item. Current and History controls capture
+the attempt they actually display; a newer attempt cannot inherit an old
+control's authority.
+
+The existing authenticated visibility permission remains authoritative for
+these controls. Admission and dispatch recheck the current account, session,
+target visibility, worker ownership, and action eligibility. Receipt lookup
+and replay recheck current authorization; a stored identity grants no access.
+
+Canonical responses carry `command_revision`, `current_attempt_id`, and the
+correlated mutation with outcome `accepted`. The `command` identifies its
+action, source attempt, accepted attempt, durable command identity, linked job,
+and current execution status. This response confirms acceptance only; it does
+not replace confirmed worker status, progress, playable identity, or collection
+membership. Authorized receipt checks report the recorded acceptance together
+with the command's current execution outcome.
+
+Acceptance and its receipt commit before dispatch. Retry and resume allocate
+one new attempt in that transaction. Dispatch is serialized with other command
+writers and fenced by the accepted attempt. A restart marks vanished work and
+unfinished dispatch interrupted; it does not launch a replacement thread or
+repeat retry cleanup. Replaying the frozen request returns the same acceptance.
+The command record remains available while its execution still needs it.
+Legacy Resume can retain its queued handoff while the old worker unwinds;
+scheduler-serialized cleanup preserves the successor's accepted pause/stop
+intent instead of clearing flags belonging to the newer attempt.
+
+The browser uses the shared store and coordinator for command status without
+projecting worker completion. Stop can queue behind a transmitted pause, but
+an unknown pause keeps that queue blocked until safe recovery or explicit
+resolution meets the shared finality requirements. Unsupported servers receive
+truthful pending feedback without receipt or replay guarantees. All pending
+and recovery presentation is in memory and fenced by authentication and access.
