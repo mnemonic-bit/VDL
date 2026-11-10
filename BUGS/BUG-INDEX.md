@@ -444,6 +444,16 @@ browser and operating system were not supplied. All 11 new regressions pass
 in Chromium and Firefox on Linux; the Python 3.12 unit gate passes 525 tests
 (9 skipped) with 92.7% `vdl.py` line coverage.
 
+Issue 82 has a repair in version `0.64.1`, pending hosted validation. The
+JavaScript suite now runs after Python dependency installation and explicitly
+selects the interpreter that received those dependencies. The actual-server
+tag identity parity test remains intact. A workflow regression checks the
+dependency order and interpreter selection; all 247 JavaScript tests pass
+with Python 3.12 and Node.js 24.8.0. The Python 3.12 unit gate passes with
+851 tests run, 9 skipped, and 92.6% `vdl.py` line coverage. The corrected hosted
+deterministic gate must pass and its workflow URL and commit SHA must be
+recorded before closure.
+
 ## Bug reports
 
 - [Bug 0001 — Merged downloads kept the deleted temporary audio filename](bug-0001-merged-downloads-kept-deleted-temporary-audio-filename.md)
@@ -527,6 +537,7 @@ in Chromium and Firefox on Linux; the Python 3.12 unit gate passes 525 tests
 - [Bug 0079 — Hover previews include unwanted first and last excerpts](bug-0079-hover-previews-include-unwanted-first-and-last-excerpts.md)
 - [Bug 0080 — Overlay Escape also exits Firefox macOS application fullscreen](bug-0080-overlay-escape-also-exits-firefox-macos-fullscreen.md)
 - [Bug 0081 — Overlay fullscreen shortcut is ignored after interacting with player controls](bug-0081-overlay-fullscreen-shortcut-ignored-after-control-interaction.md)
+- [Bug 0082 — Tag identity parity test runs before Python dependencies in GitHub Actions](bug-0082-tag-identity-parity-test-runs-before-python-dependencies.md)
 
 ## Accepted UI decisions
 
