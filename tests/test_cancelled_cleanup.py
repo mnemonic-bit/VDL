@@ -130,10 +130,10 @@ class CancelledDownloadCleanupTest(AppCase):
             output_dir=self.download_dir,
         )
 
-        with mock.patch.object(vdl.os, "remove", side_effect=PermissionError("read only")):
+        with mock.patch.object(vdl, "_rename_noreplace", side_effect=PermissionError("read only")):
             response = self.client.post(f"/api/remove/{download_id}")
 
-        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.status_code, 503)
         self.assertIsNotNone(vdl.db_get_download(download_id))
         self.assertTrue(os.path.exists(partial_path))
 

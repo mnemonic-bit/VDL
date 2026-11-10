@@ -45,7 +45,7 @@ test('unconfirmed Continue request reports uncertainty and preserves the row', a
     await expect(row).toBeVisible();
 });
 
-test('failed Delete request restores the row and reports the error', async ({ page }) => {
+test('unconfirmed Delete request retains the row and reports uncertainty', async ({ page }) => {
     await seed(page, { id: 'faildelete', status: 'finished', file: true });
     await refresh(page);
     await reject(page, '/api/remove/faildelete', 'delete was rejected');
@@ -54,7 +54,8 @@ test('failed Delete request restores the row and reports the error', async ({ pa
     await row.locator('.kebab-btn').click();
     await row.getByRole('button', { name: 'Delete', exact: true }).click();
     await expect(row).toBeVisible();
-    await expect(page.getByText('delete was rejected')).toBeVisible();
+    await expect(row.locator('[data-removal-status]')).toContainText('Removal not confirmed');
+    await expect(row).not.toHaveClass(/item-fade-out/);
 });
 
 test('unconfirmed Retry reports uncertainty and preserves the attempt', async ({ page }) => {

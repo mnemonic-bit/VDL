@@ -54,6 +54,7 @@ def test_reset():
         connection.execute("DELETE FROM retired_download_ids")
         connection.execute("DELETE FROM mutation_receipts")
         connection.execute("DELETE FROM download_commands")
+        connection.execute("DELETE FROM removal_operations")
         connection.execute("DELETE FROM rename_operations")
         connection.execute("DELETE FROM preferences")
     with vdl._cancel_lock:

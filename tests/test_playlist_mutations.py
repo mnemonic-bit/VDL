@@ -203,7 +203,7 @@ class PlaylistMutationProtocolTest(AppCase):
         self.assertEqual(added.json['revision'], 2)
         self.assertEqual(self.mutate(stale, target).status_code, 409)
         after_add = self.attempt('Another stale', ['one', 'two'], 2)
-        self.assertTrue(vdl.db_remove_download_if_inactive('two'))
+        self.assertEqual(self.client.post('/api/remove/two').status_code, 200)
         self.assertEqual(self.mutate(after_add, target).status_code, 409)
         self.assertEqual(self.client.get('/api/playlists/' + target).json['revision'], 3)
 

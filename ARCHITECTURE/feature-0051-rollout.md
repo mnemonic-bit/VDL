@@ -6,7 +6,7 @@ The shared coordinator registers `tag.add`, `tag.remove`, `favorite.set`,
 `rename.set`, `preference.set`, `playlist.create`, `playlist.replace`,
 `playlist.add`, `playlist.delete`, `download.pause`, `download.unpause`,
 `download.stop`, `download.retry`, `download.resume`, `download.submit`,
-`upload.register`, and `upload.cancel`.
+`upload.register`, `upload.cancel`, and `entry.remove`.
 An existing API call does not gain receipt recovery merely because the new
 scripts are loaded. Mutating requests are never retried by `apiFetch`'s GET
 contention recovery.
@@ -223,6 +223,35 @@ aggregates through the shared diagnostic seam. Upload recovery does not complete
 Features 0060–0067 or change playback, lease, asset-demand, worker, progress, or
 companion ownership.
 
+[Feature 0060: Entry removal](../FEATURES/feature-0060-immediate-feedback-and-safe-entry-removal.md)
+adds `entry.remove` in the independent `entry-removal` domain. Removing feedback
+is synchronous and retains the initiating row/card, position, and confirmed
+playback identity. Duplicate removal and contradictory writes are guarded per
+entry. Canonical acknowledgements remove the presentation without SSE or a
+collection read, preserve attempt History with truthful media-removed state,
+and install a terminal deletion fence against old reads and metadata callbacks.
+Filtering, pagination, and closed surfaces retain pending recovery status.
+
+The persistent decimal-string removal revision includes identity, worker,
+ownership, and visibility writers. The actor-bound frozen request captures its
+exact record-only or record-and-files scope. Filesystem discovery and effects
+run outside the database write lock; durable ownership, pinned hardlinks, and
+exclusive retirement protect unrelated replacement files. Database removal,
+playlist invalidation, and the terminal receipt commit together. Cleanup must
+finish before success is exposed; partial or ambiguous ownership remains
+unresolved. Restart and authorized receipt recovery resume the recorded
+operation, and legacy removal shares the same journal. Permanent retired IDs
+cannot be reused.
+
+Unknown outcomes permit actor-scoped checking and deliberate frozen-attempt
+replay under the shared quotas, retention, and serialized expired-absence
+finality rules. A missing live row does not discard an unresolved journal's
+recovery. Authentication and access fences reject obsolete callbacks.
+Unsupported servers retain pending feedback without invented receipt support
+or replay. `VDL.removalMutationMetrics()` exposes bounded, content-free
+aggregates. Entry removal does not complete Features 0061–0067 or change the
+specialized playback, lease, worker, upload, and companion contracts.
+
 ## Remaining action adapters
 
 The rows below are explicit migration work, not claims that the app-wide
@@ -231,12 +260,11 @@ remain in force. They need their own behavior and regression evidence before
 adopting automatic recovery.
 
 Each remaining row now has a proposed feature spec. These links allocate work;
-they do not mark any remaining adapter implemented. Features 0060–0067 inherit Feature
+they do not mark any remaining adapter implemented. Features 0061–0067 inherit Feature
 0051 and the shared requirements below.
 
 | Controls / production entry points in `static/app.js` | Existing mechanism | Required migration / recovery boundary | Feature spec |
 | --- | --- | --- | --- |
-| Entry removal: `deleteDownload` | Server remove request and collection refresh | Retain marked pending row until acknowledgement; prevent duplicate submission and fence authoritative deletion. Filesystem deletion needs operation-specific recovery. | [0060: Entry removal](../FEATURES/feature-0060-immediate-feedback-and-safe-entry-removal.md) |
 | Clear attempts/library: `clearHistory`, `clearLibrary` | Preview counts and explicit confirmation, then server request | Pending confirmation surface and duplicate guard; no claim of deletion before acknowledgement. | [0061: Bulk clear](../FEATURES/feature-0061-immediate-feedback-for-bulk-clear-actions.md) |
 | Visibility: `changeDownloadVisibility` | Explicit desired visibility; server permission checks | Display pending request beside confirmed security state. A pending grant must never enable authority. | [0062: Visibility](../FEATURES/feature-0062-immediate-feedback-for-visibility-changes.md) |
 | Pairing creation/invalidation: `createExtensionPairing`, `invalidateExtensionPairing` | Server response supplies or invalidates credential; current UI status | Pending controls and session-safe callbacks. Never persist recovery payloads containing credentials in browser storage. | [0063: Pairing](../FEATURES/feature-0063-immediate-feedback-for-extension-pairing.md) |
@@ -734,3 +762,78 @@ Upload delivery does not complete Features 0060–0067. Browser Files and write
 queues do not survive reload, and recovery never automatically resends media
 bytes. Playback, progress writes, leases, asset demand, worker scheduling, and
 companion transport retain their specialized ownership contracts.
+
+Entry-removal verification commands for Feature 0060:
+
+```bash
+VDL_PYTHON=/path/to/python3.12 ./tests/run-all.sh --unit
+node --test tests/*.test.cjs
+VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py \
+    entry-removal-feedback.spec.cjs action-errors.spec.cjs \
+    attempt-history.spec.cjs history-pagination.spec.cjs
+VDL_TEST_BROWSER=firefox VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py \
+    entry-removal-feedback.spec.cjs action-errors.spec.cjs \
+    attempt-history.spec.cjs history-pagination.spec.cjs
+```
+
+Feature 0060 verified on 2026-11-09 for version `0.63.0`:
+
+- Python 3.12 unit gate: **806 tests, 9 skipped**; `vdl.py` line coverage
+  **92.6%** (7535/8135 executable lines; enforced minimum 90%). The 35 new
+  protocol tests and 14 independent security checks cover explicit scope and
+  generation binding, simultaneous replay, fingerprint mismatches, shared
+  quotas and expiry, serialized finality, current authorization, and recovery
+  after the row is gone. Crash injection covers preparation, pinning, exclusive
+  retirement, database publication, and cleanup. Real filesystem checks retain
+  replacements, shared media, and symlink targets; inaccessible directories or
+  artifacts cannot masquerade as missing files. Startup cleans only committed
+  owned hidden bytes after account revocation or deletion, retaining ambiguous
+  ownership for intervention. Recent terminal receipts remain recoverable even
+  after a long-running journal completes.
+- Node: **220 tests passed**, including 23 new removal production-interface
+  checks for status-only intents, strict acknowledgement correlation, immutable
+  scopes, duplicate and conflicting-write guards, frozen replay, independent
+  entries, authentication/access fences, terminal deletion fences, and missing
+  receipt finality. Partial cleanup never loses recovery merely because a live
+  row is gone. Serialized final absence permits an authorized current-state
+  check and explicit resolution without claiming success or issuing a new
+  destructive request. The targeted adapter normalizes physical versus public
+  filename representation while preserving equal-revision identity validation.
+- Chromium and Firefox: **28 distinct new removal scenarios passed in each
+  browser**, plus **21 existing action-error, attempt-History, and pagination
+  regressions** in each. Controlled requests establish local feedback below
+  50 ms, retained row/card identity and order, duplicate and contradictory-write
+  guards, and canonical confirmation without SSE or collection reads. Checks
+  cover response loss, explicit receipt checks and frozen replay, conflicts,
+  definite refusals, partial/unknown outcomes, filtered absence, page-two
+  retention, closed-surface recovery, older collections and metadata callbacks,
+  real account switching, known access loss, reload without replay, and
+  unsupported servers. Active playback remains intact until confirmation;
+  already-open History updates its media-removed state without a read. Keyboard,
+  light/dark themes, reduced motion, narrow layouts, and deduplicated status
+  announcements are covered. Canonical rename followed immediately by removal
+  needs no collection GET. Serialized expired absence uses an authorized
+  current-state read and explicit resolution without a new removal request.
+- Broader regressions: **200 Chromium checks across 14 suites** and
+  **107 Firefox checks across 6 suites** passed across the full runs and
+  focused follow-ups. Coverage includes the existing mutation adapters,
+  authentication, extension settings, playback, playlist progress, rotation,
+  live refresh, asset demand, preview leases/handoff, uploads, and worker
+  ownership as applicable. These exclude the focused removal file and the
+  initial action-error/History/pagination group: totals are **249 distinct
+  Chromium checks** and **156 distinct Firefox checks**.
+
+The existing remove/resume concurrency regression now synchronizes requests
+before the shared serialization lock rather than waiting for a cached read
+that removal no longer performs. Its winner, worker-count, and row-state
+assertions remain intact. The capability inventory includes `entry.remove`.
+The final full gate passed after those fixture updates; no timing deadline was
+relaxed. Upload browser helpers activate optional status checks atomically
+because reconciliation may retire those controls between lookup and click;
+all required terminal-state assertions remain intact.
+
+Entry-removal delivery does not complete Features 0061–0067. Browser intents
+remain in memory, unknown results never create a fresh destructive request,
+and ambiguous filesystem ownership remains visible for intervention. Playback,
+progress writes, leases, asset demand, worker scheduling, and companion
+transport retain their specialized ownership contracts.

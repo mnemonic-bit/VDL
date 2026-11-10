@@ -101,7 +101,7 @@ class RenameMutationTest(AppCase):
         response = self.client.get('/api/file/renameproto')
         self.assertEqual(response.data, b'intended-video')
         response.close()
-        self.assertEqual(self.client.post('/api/remove/renameproto').status_code, 500)
+        self.assertEqual(self.client.post('/api/remove/renameproto').status_code, 503)
         self.assertEqual(self.mutate(self.attempt('Other')).status_code, 503)
         os.unlink(operation['destination'])
         self.assertEqual(self.receipt(payload).status_code, 200)

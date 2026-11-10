@@ -28,6 +28,22 @@ requirements explicit:
 ./tests/run-all.sh --all        # required retirement/release gate
 ```
 
+Entry-removal recovery has protocol, authorization, coordinator, and real-UI
+checks. Use Python 3.12 for parity with the coverage gate in CI:
+
+```bash
+python -m unittest tests.test_entry_removal tests.test_entry_removal_security -v
+node --test tests/removal-client.test.cjs
+python3 tests/browser/run.py entry-removal-feedback.spec.cjs
+VDL_TEST_BROWSER=firefox python3 tests/browser/run.py entry-removal-feedback.spec.cjs
+```
+
+These checks inject crashes at ownership and publication boundaries, preserve
+replacement files, and hold real requests to verify pending presentation and
+canonical confirmation. The [Feature 0051 rollout](../ARCHITECTURE/feature-0051-rollout.md)
+records the completion evidence; focused checks do not replace the full unit
+coverage gate.
+
 Preview-cache upgrades have deterministic fake-clock, publication-fault, and
 reader-lease tests. Run their browser checks with native Chromium or Firefox:
 

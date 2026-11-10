@@ -822,6 +822,7 @@ def init_db():
             ("tags_revision", "ALTER TABLE downloads ADD COLUMN tags_revision INTEGER NOT NULL DEFAULT 0"),
             ("rename_revision", "ALTER TABLE downloads ADD COLUMN rename_revision INTEGER NOT NULL DEFAULT 0"),
             ("command_revision", "ALTER TABLE downloads ADD COLUMN command_revision INTEGER NOT NULL DEFAULT 0"),
+            ("removal_revision", "ALTER TABLE downloads ADD COLUMN removal_revision INTEGER NOT NULL DEFAULT 0"),
             # A view is an explicit preview activation. Keeping the counter
             # independent of media requests avoids counting range fetches,
             # downloads, and generated hover previews as watches.
@@ -861,6 +862,28 @@ def init_db():
                 UPDATE downloads SET rename_revision = OLD.rename_revision + 1
                 WHERE id = NEW.id;
             END;
+            CREATE TRIGGER IF NOT EXISTS download_removal_revision
+            AFTER UPDATE OF filename, display_filename, status, command_revision, output_dir, source_type, owner_user_id, visibility ON downloads
+            WHEN NEW.filename IS NOT OLD.filename OR NEW.display_filename IS NOT OLD.display_filename
+              OR NEW.status IS NOT OLD.status OR NEW.command_revision IS NOT OLD.command_revision
+              OR NEW.output_dir IS NOT OLD.output_dir OR NEW.source_type IS NOT OLD.source_type
+              OR NEW.owner_user_id IS NOT OLD.owner_user_id OR NEW.visibility IS NOT OLD.visibility BEGIN
+                UPDATE downloads SET removal_revision = removal_revision + 1 WHERE id = NEW.id;
+            END;
+            CREATE TABLE IF NOT EXISTS removal_operations (
+                actor_id INTEGER NOT NULL,
+                mutation_id TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                actor_session_version INTEGER NOT NULL,
+                expected_revision TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                artifacts TEXT NOT NULL,
+                phase TEXT NOT NULL,
+                recorded_at REAL NOT NULL,
+                PRIMARY KEY(actor_id, mutation_id)
+            );
+            CREATE INDEX IF NOT EXISTS removal_operations_target ON removal_operations(target_id, phase);
             CREATE TABLE IF NOT EXISTS rename_operations (
                 actor_id INTEGER NOT NULL,
                 mutation_id TEXT NOT NULL,
@@ -1115,6 +1138,7 @@ def init_db():
         )
     _recover_upload_operations()
     _recover_rename_operations()
+    _recover_removal_operations()
     _reconcile_preference_runtime(restore_rotation=False)
     # The debug reloader's parent must not renew the shared deck alongside
     # its serving child. Ordinary WSGI imports still own their deadline timer.
@@ -1385,6 +1409,7 @@ def db_get_download(download_id):
         result.update(_favorite_snapshot(conn, download_id, row))
         result.update(_rename_snapshot(conn, download_id, row))
         result.update(_download_command_snapshot(conn, download_id, row))
+        result["removal_revision"] = str(row["removal_revision"])
         if row['source_type'] == 'upload':
             result['upload'] = _upload_snapshot(conn, download_id)
         result["quality"] = classify_video_quality(result["resolution"])
@@ -1737,12 +1762,12 @@ def _execute_metadata_mutation(download_id, payload, method, domain):
 
 def _rename_snapshot(conn, download_id, row=None):
     if row is None:
-        row = conn.execute('SELECT filename, display_filename, rename_revision FROM downloads WHERE id = ?', (download_id,)).fetchone()
+        row = conn.execute('SELECT filename, display_filename, rename_revision, removal_revision FROM downloads WHERE id = ?', (download_id,)).fetchone()
     if row is None:
         return None
     return {'id': download_id, 'filename': row['filename'],
             'display_filename': row['display_filename'],
-            'rename_revision': str(row['rename_revision'])}
+            'rename_revision': str(row['rename_revision']), 'removal_revision': str(row['removal_revision'])}
 
 
 def _rename_checkpoint(phase, operation):
@@ -1828,11 +1853,16 @@ def _rename_unresolved():
 def _assert_no_pending_rename(entry, exclude=None):
     with db() as conn:
         operations = conn.execute('SELECT * FROM rename_operations').fetchall()
+        removals = conn.execute("SELECT * FROM removal_operations WHERE phase NOT IN ('done', 'cleaned')").fetchall()
         upload = conn.execute('SELECT cleanup_pending FROM upload_operations WHERE id=?', (entry['id'],)).fetchone()
         if upload and upload['cleanup_pending']:
             raise OSError('Upload recovery requires intervention before another file operation')
     path = entry.get('filename')
     real = os.path.realpath(path) if path else None
+    for removal in removals:
+        if entry['id'] == removal['target_id'] or any(real == os.path.realpath(item['source'])
+                for item in json.loads(removal['artifacts'])):
+            raise OSError('Removal recovery requires intervention before another file operation')
     for operation in operations:
         if exclude == (operation['actor_id'], operation['mutation_id']):
             continue
@@ -2338,8 +2368,8 @@ def db_remove_download_tag(download_id, value):
     return tags, changed
 
 
-def delete_download_artifacts(entry, fallback_dir=None):
-    """Delete final and temporary files owned by one download row."""
+def _download_artifact_candidates(entry, fallback_dir=None, *, strict=False):
+    """Capture the existing cleanup scope without applying effects."""
     candidates = set()
     filename = entry.get("filename")
     if filename:
@@ -2378,8 +2408,11 @@ def delete_download_artifacts(entry, fallback_dir=None):
                             and (item.is_file(follow_symlinks=False)
                                  or item.is_symlink())):
                         candidates.add(item.path)
-        except OSError:
+        except FileNotFoundError:
             pass
+        except OSError:
+            if strict:
+                raise
 
     if filename:
         with db() as conn:
@@ -2387,8 +2420,13 @@ def delete_download_artifacts(entry, fallback_dir=None):
         if any(os.path.abspath(reference['filename']) == os.path.abspath(filename)
                and reference['id'] not in entry.get('_removing_ids', ()) for reference in references):
             candidates.discard(filename)
+    return candidates
+
+
+def delete_download_artifacts(entry, fallback_dir=None):
+    """Delete final and temporary files owned by one download row."""
     removed = 0
-    for path in candidates:
+    for path in _download_artifact_candidates(entry, fallback_dir):
         try:
             os.remove(path)
             removed += 1
@@ -2396,6 +2434,362 @@ def delete_download_artifacts(entry, fallback_dir=None):
             # A postprocessor may already have consumed a temporary file.
             pass
     return removed
+
+
+def _removal_checkpoint(phase, operation):
+    """Crash-injection seam after durable ownership boundaries."""
+
+
+def _removal_unresolved():
+    return {'error': 'Removal not confirmed. File recovery requires intervention.',
+            'code': 'removal_recovery_required'}, 503
+
+
+def _removal_response(download_id, mutation_id, revision, scope, *, removed=False,
+                      outcome='committed', error=None):
+    result = {'id': download_id, 'scope': scope, 'removed': removed,
+              'removal_revision': str(revision), 'server_time': int(time.time() * 1000),
+              'mutation': {'id': mutation_id, 'domain': 'entry-removal', 'action': 'entry.remove',
+                           'outcome': outcome, 'revision': str(revision)}}
+    if error:
+        result['error'] = error
+    return result
+
+
+def _removal_authorized(conn, operation, request_actor):
+    actor = (_tag_actor(conn) if request_actor else
+             _db_user(conn, 'id = ?', (operation['actor_id'],)))
+    if (actor is None or actor['id'] != operation['actor_id'] or actor['suspended']
+            or actor['password_hash'] is None
+            or actor['session_version'] != operation['actor_session_version']):
+        return None, None, 401
+    row = _tag_visible_row(conn, operation['target_id'], actor)
+    if row is None and operation['phase'] not in ('done', 'cleaned'):
+        return actor, None, 404
+    # Once removed, the actor-bound operation is the minimal authority record;
+    # it contains no former title, members, URL, or unrestricted client path.
+    return actor, row, 200
+
+
+def _removal_exists(path):
+    # EACCES and I/O failure are uncertainty, never evidence of missing bytes.
+    try:
+        os.lstat(path)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def _removal_identity(path):
+    info = os.lstat(path)
+    if stat.S_ISLNK(info.st_mode):
+        return {'device': info.st_dev, 'inode': info.st_ino, 'size': info.st_size,
+                'mtime': info.st_mtime_ns, 'ctime': info.st_ctime_ns,
+                'digest': hashlib.sha256(os.fsencode(os.readlink(path))).hexdigest(), 'symlink': True}
+    if not stat.S_ISREG(info.st_mode):
+        raise OSError('Unsupported cleanup identity')
+    return dict(_rename_identity(path), symlink=False)
+
+
+def _removal_matches(path, identity, *, pristine=False):
+    try:
+        current = _removal_identity(path)
+    except OSError:
+        return False
+    keys = ('device', 'inode', 'size', 'mtime', 'digest', 'symlink')
+    if pristine:
+        keys += ('ctime',)
+    return all(current[key] == identity[key] for key in keys)
+
+
+def _removal_phase(operation, phase):
+    with _db_lock, db() as conn:
+        conn.execute('UPDATE removal_operations SET phase = ? WHERE actor_id = ? AND mutation_id = ?',
+                     (phase, operation['actor_id'], operation['mutation_id']))
+    operation['phase'] = phase
+    _removal_checkpoint(phase, operation)
+
+
+def _restore_removal_sources(operation):
+    # A revoked actor cannot finish a deletion. Restore only the admitted inode
+    # to an empty name; replacements remain untouched and require intervention.
+    for item in json.loads(operation['artifacts']):
+        try:
+            if _removal_exists(item['source']):
+                continue
+        except OSError:
+            app.logger.warning('removal recovery outcome=intervention-required')
+            continue
+        for path in (item['anchor'], item['retired']):
+            try:
+                if _removal_matches(path, item['identity']):
+                    os.link(path, item['source'], follow_symlinks=False)
+                    _rename_sync(os.path.dirname(item['source']))
+                    break
+            except OSError:
+                app.logger.warning('removal recovery outcome=intervention-required')
+
+
+def _finish_removal_cleanup(operation):
+    for item in json.loads(operation['artifacts']):
+        for path in (item['retired'], item['anchor']):
+            if not _removal_exists(path):
+                continue
+            if not _removal_matches(path, item['identity']):
+                raise OSError('Cleanup identity changed')
+            os.unlink(path)
+            _rename_sync(os.path.dirname(path))
+            _removal_checkpoint('retired_removed' if path == item['retired'] else 'anchor_removed', operation)
+    _removal_phase(operation, 'cleaned')
+
+
+def _recover_removal_operation(operation, request_actor=False):
+    assets = _get_asset_queue()
+    with _file_operation_lock, assets.publication_lock, _worker_condition:
+        with db() as conn:
+            actor, row, status = _removal_authorized(conn, operation, request_actor)
+        if status != 200:
+            if operation['phase'] not in ('done', 'cleaned'):
+                _restore_removal_sources(operation)
+            return {'error': 'Authentication required' if status == 401 else 'Unknown download id'}, status
+        try:
+            if operation['phase'] not in ('done', 'cleaned'):
+                if (str(row['removal_revision']) != operation['expected_revision']
+                        or row['status'] in download_history.ACTIVE
+                        or row['id'] in _live_worker_ids or row['id'] in _worker_hosts
+                        or any(job['id'] == row['id'] for job in _worker_queue)):
+                    _restore_removal_sources(operation)
+                    return _removal_unresolved()
+                for item in json.loads(operation['artifacts']):
+                    source, anchor, retired, identity = item['source'], item['anchor'], item['retired'], item['identity']
+                    if not _removal_exists(anchor):
+                        if not _removal_matches(source, identity, pristine=True):
+                            return _removal_unresolved()
+                        os.link(source, anchor, follow_symlinks=False)
+                        _rename_sync(os.path.dirname(source))
+                        _removal_checkpoint('anchor_created', operation)
+                    if not _removal_matches(anchor, identity):
+                        return _removal_unresolved()
+                if operation['phase'] == 'prepared':
+                    _removal_phase(operation, 'anchored')
+                with _db_lock, db() as conn:
+                    conn.execute('BEGIN IMMEDIATE')
+                    actor, row, status = _removal_authorized(conn, operation, request_actor)
+                    if status != 200:
+                        raise _RenameAuthorizationLost(status)
+                    if str(row['removal_revision']) != operation['expected_revision']:
+                        raise OSError('Resource changed during removal')
+                    assets.invalidate([operation['target_id']], conn=conn)
+                for item in json.loads(operation['artifacts']):
+                    source, retired, identity = item['source'], item['retired'], item['identity']
+                    if _removal_exists(retired):
+                        if not _removal_matches(retired, identity):
+                            # A crash may precede the post-move identity check.
+                            # Put a raced replacement back at its empty name.
+                            try:
+                                _rename_noreplace(retired, source)
+                                _rename_sync(os.path.dirname(source))
+                            except OSError:
+                                pass
+                            return _removal_unresolved()
+                    elif _removal_exists(source):
+                        if not _removal_matches(source, identity):
+                            return _removal_unresolved()
+                        _removal_checkpoint('before_retire', dict(operation, source=source))
+                        _rename_noreplace(source, retired)
+                        _rename_sync(os.path.dirname(source))
+                        _removal_checkpoint('source_retired', operation)
+                        if not _removal_matches(retired, identity):
+                            try:
+                                _rename_noreplace(retired, source)
+                                _rename_sync(os.path.dirname(source))
+                            except OSError:
+                                pass
+                            return _removal_unresolved()
+                    # Once retirement is durable, a newly installed source is
+                    # an unrelated replacement and is never considered again.
+                _removal_phase(operation, 'retired')
+                with _db_lock, db() as conn:
+                    conn.execute('BEGIN IMMEDIATE')
+                    actor, row, status = _removal_authorized(conn, operation, request_actor)
+                    if status != 200:
+                        raise _RenameAuthorizationLost(status)
+                    if str(row['removal_revision']) != operation['expected_revision']:
+                        raise OSError('Resource changed during removal')
+                    result = _removal_response(operation['target_id'], operation['mutation_id'],
+                                               int(operation['expected_revision']) + 1, operation['scope'], removed=True)
+                    _db_remove_download_from_playlists(conn, operation['target_id'])
+                    conn.execute('DELETE FROM downloads WHERE id = ?', (operation['target_id'],))
+                    conn.execute('UPDATE mutation_receipts SET response = ?, status = 200, recorded_at = ? '
+                                 'WHERE actor_id = ? AND mutation_id = ?',
+                                 (json.dumps(result), time.time(), operation['actor_id'], operation['mutation_id']))
+                    conn.execute("UPDATE removal_operations SET phase = 'done', recorded_at = ? WHERE actor_id = ? AND mutation_id = ?",
+                                 (time.time(), operation['actor_id'], operation['mutation_id']))
+                operation['phase'] = 'done'
+                _removal_checkpoint('committed', operation)
+            if operation['phase'] == 'done':
+                _finish_removal_cleanup(operation)
+            with db() as conn:
+                actor, _row, status = _removal_authorized(conn, operation, request_actor)
+                if status != 200:
+                    return {'error': 'Authentication required'}, status
+                receipt = conn.execute('SELECT response, status FROM mutation_receipts WHERE actor_id = ? AND mutation_id = ?',
+                                       (operation['actor_id'], operation['mutation_id'])).fetchone()
+            _publish_metadata_change('entry-removal')
+            return json.loads(receipt['response']), receipt['status']
+        except _RenameAuthorizationLost as denied:
+            _restore_removal_sources(operation)
+            return {'error': 'Authentication required' if denied.status == 401 else 'Unknown download id'}, denied.status
+        except OSError:
+            if operation['phase'] not in ('done', 'cleaned'):
+                _restore_removal_sources(operation)
+            return _removal_unresolved()
+
+
+def _recover_removal_operations():
+    with _file_operation_lock, db() as conn:
+        operations = [dict(row) for row in conn.execute("SELECT * FROM removal_operations WHERE phase != 'cleaned'")]
+    for operation in operations:
+        if operation['phase'] == 'done':
+            # Publication already removed the row. Cleanup owns only its pinned
+            # hidden names, even if the original actor can no longer sign in.
+            # Request recovery still authorizes before returning any receipt.
+            try:
+                with _file_operation_lock:
+                    _finish_removal_cleanup(operation)
+            except OSError:
+                app.logger.warning('removal recovery outcome=cleanup-required')
+        else:
+            _recover_removal_operation(operation)
+
+
+def _execute_removal_mutation(download_id, payload):
+    protocol = any(key in payload for key in ('client_mutation_id', 'expected_revision', 'scope'))
+    if payload and not protocol:
+        return {'error': 'Unsupported removal fields'}, 400
+    mutation_id = payload.get('client_mutation_id') if protocol else str(int(time.time() * 1000)) + '-' + secrets.token_hex(16)
+    match = MUTATION_ID_PATTERN.fullmatch(mutation_id) if isinstance(mutation_id, str) else None
+    if match is None:
+        return {'error': 'Invalid mutation identifier'}, 400
+    assets = _get_asset_queue()
+    with _file_operation_lock, assets.publication_lock, _worker_condition:
+        with _db_lock, db() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            actor = _tag_actor(conn)
+            if actor is None:
+                return {'error': 'Authentication required'}, 401
+            operation = conn.execute('SELECT * FROM removal_operations WHERE actor_id = ? AND mutation_id = ?',
+                                     (actor['id'], mutation_id)).fetchone()
+            row = _tag_visible_row(conn, download_id, actor)
+            if row is None and operation is None:
+                return {'error': 'Unknown download id'}, 404
+            expected = payload.get('expected_revision') if protocol else str(row['removal_revision'])
+            scope = payload.get('scope') if protocol else 'entry-and-files'
+            fingerprint = hashlib.sha256(json.dumps(['POST', 'entry.remove', download_id, payload if protocol else
+                {'expected_revision': expected, 'scope': scope}], sort_keys=True,
+                ensure_ascii=True, separators=(',', ':')).encode()).hexdigest()
+            receipt = conn.execute('SELECT * FROM mutation_receipts WHERE actor_id = ? AND mutation_id = ?',
+                                   (actor['id'], mutation_id)).fetchone()
+            if receipt is not None:
+                if receipt['fingerprint'] != fingerprint or receipt['target_id'] != download_id:
+                    return {'error': 'Mutation identifier already used', 'code': 'mutation_id_conflict'}, 409
+                if operation is None:
+                    return json.loads(receipt['response']), receipt['status']
+                operation = dict(operation)
+            else:
+                if conn.execute('SELECT 1 FROM rename_operations WHERE actor_id = ? AND mutation_id = ?',
+                                (actor['id'], mutation_id)).fetchone():
+                    return {'error': 'Mutation identifier already used', 'code': 'mutation_id_conflict'}, 409
+                now = time.time()
+                _prune_mutation_receipts(conn, now)
+                counts = conn.execute('SELECT COUNT(*) AS total, COALESCE(SUM(recorded_at > ?), 0) AS recent '
+                                      'FROM mutation_receipts WHERE actor_id = ?', (now - 60, actor['id'])).fetchone()
+                active = conn.execute("SELECT COUNT(*) FROM rename_operations WHERE actor_id = ? AND (phase != 'done' OR NOT EXISTS "
+                                      "(SELECT 1 FROM mutation_receipts r WHERE r.actor_id = rename_operations.actor_id AND r.mutation_id = rename_operations.mutation_id))", (actor['id'],)).fetchone()[0]
+                error, status, outcome = None, 200, 'rejected'
+                if counts['total'] + active >= MUTATION_ACTOR_RECEIPT_LIMIT or counts['recent'] + active >= MUTATION_ACTOR_MINUTE_LIMIT:
+                    error, status = 'Too many mutations; wait before submitting more', 429
+                elif int(match.group(1)) / 1000 < now - MUTATION_REPLAY_SECONDS or int(match.group(1)) / 1000 > now + 300:
+                    error, status = 'Mutation identifier expired or clock is incorrect', 400
+                elif protocol and set(payload) != {'client_mutation_id', 'expected_revision', 'scope'}:
+                    error, status = 'Unsupported removal fields', 400
+                elif scope not in ('entry', 'entry-and-files'):
+                    error, status = 'Removal scope must be explicit', 400
+                elif not isinstance(expected, str) or not re.fullmatch(r'0|[1-9][0-9]{0,18}', expected):
+                    error, status = 'Expected revision must be a decimal string', 400
+                elif expected != str(row['removal_revision']):
+                    error, status, outcome = 'Entry changed; review the current state', 409, 'conflicted'
+                elif (row['status'] in download_history.ACTIVE or download_id in _live_worker_ids
+                      or download_id in _worker_hosts or any(job['id'] == download_id for job in _worker_queue)):
+                    error, status = 'Cannot remove a download until its worker has fully stopped.', 409
+                elif conn.execute("SELECT 1 FROM removal_operations WHERE target_id = ? AND phase NOT IN ('done','cleaned')", (download_id,)).fetchone():
+                    error, status = 'Resolve the pending removal first', 409
+                if error is not None:
+                    result = _removal_response(download_id, mutation_id, row['removal_revision'], scope,
+                                               outcome=outcome, error=error)
+                    if status != 429:
+                        conn.execute('INSERT INTO mutation_receipts(actor_id, mutation_id, target_id, fingerprint, status, response, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                                     (actor['id'], mutation_id, download_id, fingerprint, status, json.dumps(result), now))
+                    return result, status
+                row = dict(row)
+                operation = None
+        if operation is not None:
+            return _recover_removal_operation(operation, request_actor=True)
+        try:
+            _assert_no_pending_rename(row)
+            artifacts = []
+            if scope == 'entry-and-files':
+                for path in sorted(_download_artifact_candidates(row, row.get('output_dir') or DEFAULT_DOWNLOAD_DIR, strict=True)):
+                    path = os.path.abspath(path)
+                    # Symlinks themselves may be retired, never their targets.
+                    if not _is_allowed_download_path(os.path.dirname(path)):
+                        raise OSError('Cleanup directory is unavailable')
+                    try:
+                        identity = _removal_identity(path)
+                    except FileNotFoundError:
+                        continue
+                    prefix = os.path.join(os.path.dirname(path), '.vdl-remove-' + secrets.token_hex(16))
+                    artifacts.append({'source': path, 'anchor': prefix + '.anchor', 'retired': prefix + '.retired', 'identity': identity})
+            operation = dict(actor_id=actor['id'], mutation_id=mutation_id, target_id=download_id,
+                             fingerprint=fingerprint, actor_session_version=actor['session_version'],
+                             expected_revision=expected, scope=scope, artifacts=json.dumps(artifacts),
+                             phase='prepared', recorded_at=time.time())
+            with _db_lock, db() as conn:
+                conn.execute('BEGIN IMMEDIATE')
+                current = _tag_actor(conn)
+                latest = _tag_visible_row(conn, download_id, current) if current else None
+                if current is None:
+                    return {'error': 'Authentication required'}, 401
+                if latest is None:
+                    return {'error': 'Unknown download id'}, 404
+                # Filesystem discovery deliberately ran outside the write lock;
+                # every admission condition is checked again at this boundary.
+                counts = conn.execute('SELECT COUNT(*) AS total, COALESCE(SUM(recorded_at > ?), 0) AS recent '
+                                      'FROM mutation_receipts WHERE actor_id = ?', (time.time() - 60, current['id'])).fetchone()
+                active = conn.execute("SELECT COUNT(*) FROM rename_operations WHERE actor_id = ? AND (phase != 'done' OR NOT EXISTS "
+                                      "(SELECT 1 FROM mutation_receipts r WHERE r.actor_id = rename_operations.actor_id AND r.mutation_id = rename_operations.mutation_id))", (current['id'],)).fetchone()[0]
+                error, status, outcome = None, 200, 'rejected'
+                if conn.execute('SELECT 1 FROM mutation_receipts WHERE actor_id = ? AND mutation_id = ?', (current['id'], mutation_id)).fetchone():
+                    return {'error': 'Mutation identifier already used', 'code': 'mutation_id_conflict'}, 409
+                if counts['total'] + active >= MUTATION_ACTOR_RECEIPT_LIMIT or counts['recent'] + active >= MUTATION_ACTOR_MINUTE_LIMIT:
+                    error, status = 'Too many mutations; wait before submitting more', 429
+                elif int(match.group(1)) / 1000 < time.time() - MUTATION_REPLAY_SECONDS or int(match.group(1)) / 1000 > time.time() + 300:
+                    error, status = 'Mutation identifier expired or clock is incorrect', 400
+                elif str(latest['removal_revision']) != expected:
+                    error, status, outcome = 'Entry changed; review the current state', 409, 'conflicted'
+                if error:
+                    return _removal_response(download_id, mutation_id, latest['removal_revision'], scope, outcome=outcome, error=error), status
+                conn.execute('INSERT INTO removal_operations(' + ','.join(operation) + ') VALUES (' + ','.join('?' for _ in operation) + ')', tuple(operation.values()))
+                unknown, _status = _removal_unresolved()
+                conn.execute('INSERT INTO mutation_receipts(actor_id, mutation_id, target_id, fingerprint, status, response, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                             (actor['id'], mutation_id, download_id, fingerprint, 503, json.dumps(unknown), time.time()))
+            _removal_checkpoint('prepared', operation)
+            result, status = _recover_removal_operation(operation, request_actor=True)
+            if not protocol and status == 200:
+                return {'message': 'Removed', 'id': download_id}, status
+            return result, status
+        except OSError:
+            return _removal_unresolved()
 
 
 def _db_remove_download_from_playlists(conn, download_id):
@@ -2461,32 +2855,6 @@ def _db_remove_download_from_playlists(conn, download_id):
     return len(affected)
 
 
-def db_remove_download_if_inactive(download_id, fallback_dir=None):
-    """Keep file ownership stable while allowing unrelated database writes."""
-    with _file_operation_lock:
-        assets = _get_asset_queue()
-        with assets.publication_lock, _worker_condition:
-            with db() as conn:
-                row = conn.execute('SELECT * FROM downloads WHERE id = ?', (download_id,)).fetchone()
-            entry = dict(row) if row else None
-            if (entry is None or entry['status'] in ('starting', 'downloading', 'paused')
-                    or download_id in _live_worker_ids):
-                return entry, False
-            _assert_no_pending_rename(entry)
-            with _db_lock, db() as conn:
-                assets.invalidate([download_id], conn=conn)
-            delete_download_artifacts(entry, fallback_dir)
-            with _db_lock, db() as conn:
-                current = conn.execute('SELECT status, filename FROM downloads WHERE id = ?', (download_id,)).fetchone()
-                if current is None or current['status'] in ('starting', 'downloading', 'paused') or current['filename'] != entry['filename']:
-                    return entry, False
-                _db_remove_download_from_playlists(conn, download_id)
-                removed = conn.execute('DELETE FROM downloads WHERE id = ?', (download_id,)).rowcount == 1
-        if removed:
-            event_bus.publish('change', {'reason': 'delete', 'id': download_id})
-        return entry, removed
-
-
 def db_clear_library():
     with _file_operation_lock:
         placeholders = ','.join('?' for _ in HISTORY_STATUSES)
@@ -2540,7 +2908,7 @@ def db_list_downloads(user_id=None, is_admin=False, statuses=None):
             "filename, display_filename, resolution, filesize, speed, eta, title, finished_at, "
             "duration_seconds, media_metadata_probed, "
             "formats, requested_format, downloaded_bytes, total_bytes, favorite, "
-            "view_count, tags_revision, favorite_revision, rename_revision, command_revision, "
+            "view_count, tags_revision, favorite_revision, rename_revision, command_revision, removal_revision, "
             "source_type, owner_user_id, visibility, browser_authenticated, "
             "(downloads.ingest_source_path IS NOT NULL) AS mounted_import, "
             "COALESCE(users.username, downloads.owner_username) "
@@ -2570,6 +2938,7 @@ def db_list_downloads(user_id=None, is_admin=False, statuses=None):
             if download["source_type"] == "upload":
                 download["upload"] = _upload_snapshot(conn, download["id"])
                 download["can_manage_upload"] = bool(user_id is not None and download["owner_user_id"] == user_id and conn.execute('SELECT 1 FROM upload_operations WHERE id=? AND actor_id=?', (download["id"], user_id)).fetchone())
+            download["removal_revision"] = str(download["removal_revision"])
             download["rename_revision"] = str(download["rename_revision"])
             download.update(_serialize_favorite_state(
                 download['id'], download['favorite'], download['favorite_revision'],
@@ -7403,6 +7772,9 @@ def _authorized_upload(conn, download_id, actor):
 def _upload_result(conn, download_id, mutation_id=None, action=None):
     snapshot = _upload_snapshot(conn, download_id)
     result = {'id': download_id, 'upload': snapshot}
+    resource = conn.execute('SELECT removal_revision FROM downloads WHERE id = ?', (download_id,)).fetchone()
+    if resource is not None:
+        result['removal_revision'] = str(resource['removal_revision'])
     if snapshot and snapshot['phase'] == 'published':
         row = dict(conn.execute('SELECT * FROM downloads WHERE id=?', (download_id,)).fetchone())
         public = _public_download_entry(row)
@@ -7419,6 +7791,7 @@ def _upload_result(conn, download_id, mutation_id=None, action=None):
         result['download'].update(_favorite_snapshot(conn, download_id, row))
         result['download'].update(_rename_snapshot(conn, download_id, row))
         result['download'].update(_download_command_snapshot(conn, download_id, row))
+        result['download']['removal_revision'] = str(row['removal_revision'])
         result['download']['quality'] = classify_video_quality(row['resolution'])
         result['download']['filename'] = public['filename']
         result['download']['upload'] = snapshot
@@ -7712,7 +8085,8 @@ def _cancel_upload(download_id, payload):
                 _finish_upload_failure(download_id, 'cancelled', 'Cancelled')
                 clear_cancel(download_id)
         with db() as conn:
-            result['upload'] = _upload_snapshot(conn, download_id)
+            latest = _upload_result(conn, download_id)
+            result.update(latest)
             if mutation_id:
                 result['mutation']['revision'] = result['upload']['revision']
     _publish_metadata_change('upload')
@@ -7944,14 +8318,14 @@ def probe_url():
 
 def _download_command_snapshot(conn, download_id, row=None):
     if row is None:
-        row = conn.execute('SELECT command_revision FROM downloads WHERE id = ?', (download_id,)).fetchone()
+        row = conn.execute('SELECT command_revision, removal_revision FROM downloads WHERE id = ?', (download_id,)).fetchone()
     latest = conn.execute('SELECT id FROM download_attempts WHERE work_id = ? '
                           'ORDER BY started_at DESC, id DESC LIMIT 1', (download_id,)).fetchone()
     attempt_id = latest['id'] if latest else None
     job = conn.execute("SELECT id FROM download_commands WHERE target_id = ? AND attempt_id = ? "
                        "AND action IN ('submit', 'retry', 'resume') ORDER BY recorded_at DESC, id DESC LIMIT 1",
                        (download_id, attempt_id)).fetchone()
-    return {'command_revision': str(row['command_revision']),
+    return {'command_revision': str(row['command_revision']), 'removal_revision': str(row['removal_revision']),
             'current_attempt_id': attempt_id, 'job_id': job['id'] if job else None}
 
 
@@ -7962,7 +8336,12 @@ def _prune_mutation_receipts(conn, now):
     conn.execute("DELETE FROM download_commands WHERE recorded_at < ? AND phase NOT IN ('accepted', 'dispatching') "
                  "AND NOT EXISTS (SELECT 1 FROM download_attempts a WHERE a.id = download_commands.attempt_id "
                  "AND a.status IN ('starting', 'downloading', 'paused'))", (cutoff,))
+    conn.execute("DELETE FROM removal_operations WHERE recorded_at < ? AND phase = 'cleaned' AND NOT EXISTS "
+                 "(SELECT 1 FROM mutation_receipts r WHERE r.actor_id = removal_operations.actor_id "
+                 "AND r.mutation_id = removal_operations.mutation_id AND r.recorded_at >= ?)", (cutoff, cutoff))
     conn.execute('DELETE FROM mutation_receipts WHERE recorded_at < ? AND NOT EXISTS '
+                 "(SELECT 1 FROM removal_operations m WHERE m.actor_id = mutation_receipts.actor_id "
+                 "AND m.mutation_id = mutation_receipts.mutation_id AND m.phase != 'cleaned') AND NOT EXISTS "
                  '(SELECT 1 FROM download_commands c WHERE c.actor_id = mutation_receipts.actor_id '
                  'AND c.mutation_id = mutation_receipts.mutation_id) AND NOT EXISTS '
                  '(SELECT 1 FROM upload_operations u WHERE u.actor_id = mutation_receipts.actor_id '
@@ -8211,6 +8590,8 @@ def _execute_download_command(download_id, payload, action):
                     status, outcome, error = 400, 'rejected', 'Unsupported command fields'
                 elif expected != state['command_revision'] or expected_attempt != state['current_attempt_id']:
                     status, outcome, error = 409, 'conflicted', 'Download attempt changed; review the current work'
+                elif conn.execute("SELECT 1 FROM removal_operations WHERE target_id = ? AND phase NOT IN ('done','cleaned')", (download_id,)).fetchone():
+                    status, outcome, error = 409, 'rejected', 'Resolve the pending removal before controlling this download'
                 elif conn.execute("SELECT 1 FROM download_commands WHERE target_id = ? AND phase IN ('accepted', 'dispatching')", (download_id,)).fetchone():
                     status, outcome, error = 409, 'conflicted', 'An accepted command is still awaiting dispatch'
                 elif action in ('pause', 'unpause') and row['source_type'] == 'upload':
@@ -8283,6 +8664,8 @@ def _download_command_route(action):
                     row = _tag_visible_row(conn, download_id, actor)
                     if row is None:
                         return jsonify({'error': 'Unknown download id'}), 404
+                    if conn.execute("SELECT 1 FROM removal_operations WHERE target_id = ? AND phase NOT IN ('done','cleaned')", (download_id,)).fetchone():
+                        return jsonify({'error': 'Resolve the pending removal before controlling this download'}), 409
                     if 'expected_attempt_id' in payload and payload['expected_attempt_id'] != _download_command_snapshot(conn, download_id, row)['current_attempt_id']:
                         return jsonify({'error': 'Download attempt changed; review the current work'}), 409
                     if conn.execute("SELECT 1 FROM download_commands WHERE target_id = ? AND phase IN ('accepted', 'dispatching')", (download_id,)).fetchone():
@@ -8406,21 +8789,18 @@ def rename_download(download_id):
 
 @app.route('/api/remove/<download_id>', methods=['POST'])
 def remove_download(download_id):
-    entry = _visible_download(download_id)
-    if entry is None:
-        return jsonify({"error": "Unknown download id"}), 404
-    fallback_dir = db_get_preferences().get("download_dir", ".")
-    try:
-        entry, removed = db_remove_download_if_inactive(download_id, fallback_dir)
-    except OSError as exc:
-        return jsonify({"error": f"Cleanup failed: {exc}"}), 500
-    if entry is None:
-        return jsonify({"error": "Unknown download id"}), 404
-    if not removed:
-        return jsonify({
-            "error": "Cannot remove a download until its worker has fully stopped."
-        }), 409
-    return jsonify({"message": "Removed", "id": download_id})
+    payload = {}
+    if request.is_json:
+        payload, error = _read_json_body(4096)
+        if error is not None:
+            return error
+    elif request.content_length:
+        return jsonify({'error': 'Removal requires a JSON object'}), 400
+    result, status = _execute_removal_mutation(download_id, payload)
+    response = jsonify(result)
+    response.status_code = status
+    response.headers['Cache-Control'] = 'no-store'
+    return response
 
 
 @app.route('/api/library/clear/preview', methods=['GET'])
@@ -9419,8 +9799,8 @@ def record_download_view(download_id):
 @app.route('/api/client-capabilities', methods=['GET'])
 def client_capabilities():
     response = jsonify({
-        'mutation_protocol': 1, 'actions': ['tag.add', 'tag.remove', 'favorite.set', 'rename.set', 'preference.set', 'playlist.create', 'playlist.replace', 'playlist.add', 'playlist.delete', 'download.pause', 'download.unpause', 'download.stop', 'download.retry', 'download.resume', 'download.submit', 'upload.register', 'upload.cancel'],
-        'upload_recovery': 1,
+        'mutation_protocol': 1, 'actions': ['tag.add', 'tag.remove', 'favorite.set', 'rename.set', 'preference.set', 'playlist.create', 'playlist.replace', 'playlist.add', 'playlist.delete', 'download.pause', 'download.unpause', 'download.stop', 'download.retry', 'download.resume', 'download.submit', 'upload.register', 'upload.cancel', 'entry.remove'],
+        'upload_recovery': 1, 'entry_removal': 1,
         'tag_identity_version': TAG_IDENTITY_VERSION,
         'server_time': int(time.time() * 1000),
     })
@@ -9442,6 +9822,7 @@ def editable_download_state(download_id):
         result.update(_favorite_snapshot(conn, download_id, row))
         result.update(_rename_snapshot(conn, download_id, row))
         result.update(_download_command_snapshot(conn, download_id, row))
+        result['removal_revision'] = str(row['removal_revision'])
         result['permissions'] = {'tags': True, 'favorite': True, 'rename': row['status'] == 'finished'}
     response = jsonify(result)
     response.headers['Cache-Control'] = 'no-store'
@@ -9451,6 +9832,15 @@ def editable_download_state(download_id):
 @app.route('/api/mutations/<mutation_id>', methods=['GET'])
 def mutation_receipt(mutation_id):
     with _file_operation_lock:
+        with db() as lookup:
+            removal = lookup.execute('SELECT * FROM removal_operations WHERE actor_id = ? AND mutation_id = ?',
+                                     (session.get('user_id'), mutation_id)).fetchone()
+        if removal is not None:
+            result, status = _recover_removal_operation(dict(removal), request_actor=True)
+            response = jsonify(result)
+            response.status_code = status
+            response.headers['Cache-Control'] = 'no-store'
+            return response
         with db() as lookup:
             pending = lookup.execute("SELECT * FROM rename_operations WHERE actor_id = ? AND mutation_id = ?",
                                      (session.get('user_id'), mutation_id)).fetchone()
@@ -9633,6 +10023,16 @@ def _is_allowed_download_path(path, allowed_bases=None):
 def _rename_playback_path(entry):
     path = os.path.abspath(entry['filename']) if entry.get('filename') else None
     with db() as conn:
+        removals = conn.execute("SELECT * FROM removal_operations WHERE phase NOT IN ('done','cleaned')").fetchall()
+        for operation in removals:
+            for item in json.loads(operation['artifacts']):
+                if path != item['source']:
+                    continue
+                if _removal_matches(item['anchor'], item['identity']):
+                    return item['anchor']
+                if operation['phase'] == 'prepared' and _removal_matches(path, item['identity'], pristine=True):
+                    return path
+                return None
         operations = conn.execute('SELECT * FROM rename_operations WHERE target_id = ? OR source = ? OR destination = ? ORDER BY recorded_at',
                                   (entry['id'], path, path)).fetchall()
     for operation in operations:

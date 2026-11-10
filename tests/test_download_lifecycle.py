@@ -376,16 +376,10 @@ class DownloadLifecycleTest(AppCase):
     def test_resume_remove_race_has_one_consistent_winner(self):
         download_id = self.insert("remove-race")
         vdl.db_update_download(download_id, status="cancelled")
-        read_barrier = threading.Barrier(2)
-        real_get = vdl.db_get_download
+        request_barrier = threading.Barrier(2)
+        clients = {name: self.authenticated_client() for name in ("resume", "remove")}
         real_thread = threading.Thread
         starts = []
-
-        def synchronized_get(candidate_id):
-            entry = real_get(candidate_id)
-            if candidate_id == download_id and entry and entry["status"] == "cancelled":
-                read_barrier.wait(timeout=2)
-            return entry
 
         class RecordingWorker:
             def __init__(self, target=None, args=(), **_kwargs):
@@ -398,11 +392,13 @@ class DownloadLifecycleTest(AppCase):
         responses = {}
 
         def post(name, path):
-            with self.authenticated_client() as client:
-                responses[name] = client.post(path).status_code
+            # Both routes now authorize and read under the file-operation lock.
+            # Contend at request entry; a barrier inside those serialized reads
+            # would require an impossible second reader and deadlock the test.
+            request_barrier.wait(timeout=2)
+            responses[name] = clients[name].post(path).status_code
 
         with (
-            mock.patch.object(vdl, "db_get_download", side_effect=synchronized_get),
             mock.patch.object(vdl.threading, "Thread", RecordingWorker),
         ):
             requests = [

@@ -72,7 +72,9 @@ async function finishCancellation(page, id, surface) {
     }).toBe('cancelled');
     // An independent collection read may already have observed the terminal
     // phase and retired the transfer's recovery controls.
-    if (await check(surface).count()) await check(surface).click();
+    // Reconciliation can retire this optional button between a locator count
+    // and a separate click. Check and activate in one browser turn.
+    await check(surface).evaluateAll(buttons => buttons[0]?.click());
 }
 
 test.beforeEach(async ({ page }) => { await reset(page); await ready(page); });

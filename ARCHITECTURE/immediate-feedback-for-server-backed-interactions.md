@@ -1,6 +1,6 @@
 # Architecture: immediate feedback for server-backed interactions
 
-**Status:** Foundation, tags, favorites, rename, preferences, playlist editor saves, playlist add/delete, download commands, new-download acceptance, and uploads implemented; additional adapters remain proposed.\
+**Status:** Foundation, tags, favorites, rename, preferences, playlist editor saves, playlist add/delete, download commands, new-download acceptance, uploads, and entry removal implemented; additional adapters remain proposed.\
 **Date:** 2026-11-09\
 **Requirements:** [Feature 0051](../FEATURES/feature-0051-immediate-feedback-for-server-backed-interactions.md)
 
@@ -21,7 +21,7 @@ the feature explicitly rather than silently contradicting it here.
 The implementation adds the shared modules, tag protocol, and independent
 `favorite.set`, `rename.set`, `preference.set`, `playlist.create`,
 `playlist.replace`, `playlist.add`, `playlist.delete`, `download.*`,
-`upload.register`, and `upload.cancel` adapters described
+`upload.register`, `upload.cancel`, and `entry.remove` adapters described
 below. Other actions still use handlers and collection snapshots in
 `static/app.js`, server routes and persistence in `vdl.py`, and SSE hints that
 trigger collection reads. The [rollout inventory](feature-0051-rollout.md) records
@@ -60,7 +60,7 @@ reconciliation may still use the existing batching delays.
 
 ## Module responsibilities and proposed placement
 
-The client modules below host tags, favorites, rename, preferences, playlist actions, download commands, new-download submissions, and discrete upload requests. Additional action adapters
+The client modules below host tags, favorites, rename, preferences, playlist actions, download commands, new-download submissions, discrete upload requests, and entry removal. Additional action adapters
 remain staged. The client remains raw browser JavaScript;
 new scripts expose factory functions through one `window.VDL` namespace and load
 in dependency order before `app.js`. No bundler or runtime package is required.
@@ -400,6 +400,45 @@ receipt support. Authentication reset clears local files, transfer presentation,
 and old callbacks. Diagnostics use bounded content-free aggregates through the
 shared seam. Playback, asset demand, worker scheduling, progress sequences,
 leases, and companion transport keep their existing ownership contracts.
+
+### Entry removal ownership and recovery
+
+Feature 0060 registers `entry.remove` in the `entry-removal` domain. The client
+retains the confirmed row, card, and playback target with a status-only pending
+intent. Duplicate removal and contradictory writes are guarded per target;
+other entries remain usable. Canonical deletion installs a terminal identity
+fence and invalidates collection and attempt-History reads before retiring the
+presentation. Filtered or paginated absence cannot establish a removal outcome.
+
+The server serializes removal with file operations, asset publication, and
+worker ownership. The persistent decimal-string `removal_revision` covers
+identity, status, command generation, output directory, source type, ownership,
+and visibility writers through a database trigger. Scope and revision belong
+to the frozen request fingerprint in the shared actor-scoped receipt namespace.
+The existing permanent retired-ID registry prevents resource identity reuse.
+
+The `removal_operations` journal captures artifact identities and owned anchor
+and retirement paths before effects. Hardlinks pin the admitted inode;
+exclusive retirement claims the source name before checking its identity again.
+Recovery preserves unrelated replacements. Authorized database publication
+removes playlist membership and the entry while retaining attempt snapshots,
+and records the terminal receipt in the same transaction. Owned-byte cleanup
+finishes before acknowledgement or receipt exposure reports success. Partial
+or ambiguous cleanup remains unresolved and protects its receipt from pruning.
+Startup and authorized recovery resume the same journal. Before database
+publication, revoked authorization restores owned source links where that can
+be done without overwriting a file. After committed deletion, startup may clean
+the operation's identity-checked hidden artifacts even if the originating
+account was revoked; receipt access still requires current authorization.
+
+After row removal, current account authorization and actor-bound operation
+ownership permit minimal outcome recovery without returning deleted metadata.
+An unknown request keeps its recovery status even if a live entry read returns
+404. Checking or deliberately replaying the original frozen attempt uses the
+shared quotas, retention, and serialized expired-absence finality. Legacy
+requests use the same server journal; unsupported clients retain conservative
+pending feedback without receipt replay. `VDL.removalMutationMetrics()` reports
+bounded content-free aggregates through the shared diagnostic seam.
 
 ### Rename filesystem recovery
 

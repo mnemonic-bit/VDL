@@ -254,7 +254,7 @@ class UploadRecoveryTest(AppCase):
         self.assertTrue(operation['cleanup_pending'])
         with open(operation['temporary_path'],'rb') as stored:
             self.assertEqual(stored.read(), b'unrelated')
-        self.assertEqual(self.client.post('/api/remove/'+payload['id']).status_code, 500)
+        self.assertEqual(self.client.post('/api/remove/'+payload['id']).status_code, 503)
         self.assertIsNotNone(vdl.db_get_download(payload['id']))
         vdl.init_db()
         self.assertTrue(self.operation(payload['id'])['cleanup_pending'])

@@ -694,10 +694,11 @@ function acceptUploadReply(upload, data, { settle = true } = {}) {
     const known = tagState.selectDownload(upload.info.id);
     // Byte counts can advance within one phase revision. Skip unchanged
     // render reconciliation so a store notification cannot feed itself.
-    const merge = !known?.upload || BigInt(snapshot.revision) > BigInt(known.upload.revision)
+    const removalRevision = typeof data.removal_revision === 'string' && /^(0|[1-9]\d*)$/.test(data.removal_revision) ? data.removal_revision : null;
+    const merge = removalRevision !== null && (!known?.removal_revision || BigInt(removalRevision) > BigInt(known.removal_revision)) || !known?.upload || BigInt(snapshot.revision) > BigInt(known.upload.revision)
         || snapshot.revision === known.upload.revision && (settle || snapshot.downloaded_bytes > known.upload.downloaded_bytes)
         || data.download && !known.filename;
-    if (merge && !tagState.acceptDownload({ ...(data.download || {}), id: upload.info.id, upload_revision: snapshot.revision, upload: snapshot })) return false;
+    if (merge && !tagState.acceptDownload({ ...(data.download || {}), ...(removalRevision === null ? {} : { removal_revision: removalRevision }), id: upload.info.id, upload_revision: snapshot.revision, upload: snapshot })) return false;
     const canonical = tagState.selectDownload(upload.info.id)?.upload;
     if (!canonical) return false;
     upload.registered = true;
@@ -1768,6 +1769,12 @@ const playlistMutationMetrics = { ...tagMutationMetrics };
 const downloadCommandMetrics = { ...tagMutationMetrics };
 const downloadSubmissionMetrics = { ...tagMutationMetrics };
 const uploadMutationMetrics = { ...tagMutationMetrics };
+const removalMutationMetrics = { ...tagMutationMetrics };
+const compatibilityRemovals = new Map();
+const removalPositions = new Map();
+const removalAnnouncements = new Map();
+VDL.removalMutationMetrics = () => Object.freeze({ ...removalMutationMetrics });
+VDL.entryRemovalMetrics = VDL.removalMutationMetrics;
 VDL.uploadMutationMetrics = () => Object.freeze({ ...uploadMutationMetrics });
 VDL.downloadSubmissionMetrics = () => Object.freeze({ ...downloadSubmissionMetrics });
 VDL.downloadCommandMetrics = () => Object.freeze({ ...downloadCommandMetrics });
@@ -1814,7 +1821,7 @@ const tagMutations = VDL.createMutations({
         return { status: response.status, body: await response.json().catch(() => null) };
     },
     onEvent: event => {
-        const domainMetrics = event.action.startsWith('upload.') ? uploadMutationMetrics : event.action === 'download.submit' ? downloadSubmissionMetrics : event.action.startsWith('download.') ? downloadCommandMetrics : event.action.startsWith('playlist.') ? playlistMutationMetrics : event.action === 'preference.set' ? preferenceMutationMetrics : event.action === 'rename.set' ? renameMutationMetrics : event.action === 'favorite.set' ? favoriteMutationMetrics : tagMutationMetrics;
+        const domainMetrics = event.action === 'entry.remove' ? removalMutationMetrics : event.action.startsWith('upload.') ? uploadMutationMetrics : event.action === 'download.submit' ? downloadSubmissionMetrics : event.action.startsWith('download.') ? downloadCommandMetrics : event.action.startsWith('playlist.') ? playlistMutationMetrics : event.action === 'preference.set' ? preferenceMutationMetrics : event.action === 'rename.set' ? renameMutationMetrics : event.action === 'favorite.set' ? favoriteMutationMetrics : tagMutationMetrics;
         for (const metrics of [domainMetrics, mutationMetrics]) {
             if (event.outcome === 'presented') metrics.submissions++;
             if (event.outcome === 'confirmed') {
@@ -1828,6 +1835,7 @@ const tagMutations = VDL.createMutations({
         mutationMetrics.pending = event.pending;
         mutationMetrics.unconfirmed = event.unconfirmed;
         mutationMetrics.conflicted = event.conflicted;
+        if (event.action === 'entry.remove') handleRemovalMutationEvent(event);
         if (event.action.startsWith('upload.')) handleUploadMutationEvent(event);
         if (event.action === 'download.submit') handleDownloadSubmissionEvent(event);
         else if (event.action.startsWith('download.')) {
@@ -1869,6 +1877,8 @@ const tagMutations = VDL.createMutations({
 
 function resetTagSession() {
     tagSessionEpoch += 1;
+    for (const id of compatibilityRemovals.keys()) clearCompatibilityRemoval(id);
+    removalPositions.clear(); removalAnnouncements.clear();
     for (const upload of droppedUploads.values()) upload.timers.forEach(clearTimeout);
     droppedUploads.clear();
     for (const request of activeUploadRequests.values()) request.abort();
@@ -1919,12 +1929,13 @@ function announceTagStatus(message) {
 
 function updateTagMutationSummary() {
     refreshDownloadCommandPresentations();
+    refreshRemovalPresentations();
     for (const intentId of submittedTagIntents) {
         if (tagMutations.status(intentId) !== null) continue;
         submittedTagIntents.delete(intentId);
         recoveredTagIntents.delete(intentId);
     }
-    const allIntents = tagMutations.pending().concat(uploadDiagnosticIntents()).concat(downloadSubmission?.legacy ? [{ ...downloadSubmission.legacy, kind: 'download.submit' }] : []).concat(preferenceSubmission?.legacy ? [{ ...preferenceSubmission.legacy, kind: 'preference.set' }] : []).concat([...playlistSubmissions.values()].filter(entry => entry.legacy).map(entry => ({ ...entry.legacy, kind: entry.kind })));
+    const allIntents = tagMutations.pending().concat([...compatibilityRemovals.values()]).concat(uploadDiagnosticIntents()).concat(downloadSubmission?.legacy ? [{ ...downloadSubmission.legacy, kind: 'download.submit' }] : []).concat(preferenceSubmission?.legacy ? [{ ...preferenceSubmission.legacy, kind: 'preference.set' }] : []).concat([...playlistSubmissions.values()].filter(entry => entry.legacy).map(entry => ({ ...entry.legacy, kind: entry.kind })));
     const intents = allIntents.filter(intent => intent.kind.startsWith('tag.'));
     const favoriteIntents = allIntents.filter(intent => intent.kind === 'favorite.set');
     updateFavoriteMutationSummary(favoriteIntents);
@@ -1961,7 +1972,7 @@ function projectTagEntry(info) {
     const projected = tagState.selectDownload(String(info.id));
     if (!projected) return info;
     return { ...info, ...(projected.upload && (!info.upload || BigInt(info.upload.revision) < BigInt(projected.upload.revision)) ? { status: projected.upload.download_status, downloaded_bytes: projected.upload.downloaded_bytes, total_bytes: projected.upload.total_bytes, upload: projected.upload, upload_revision: projected.upload_revision } : {}), ...(info.current_attempt_id !== projected.current_attempt_id && typeof projected.command_revision === 'string' ? { status: projected.status, progress: projected.progress, speed: projected.speed, eta: projected.eta, downloaded_bytes: projected.downloaded_bytes, total_bytes: projected.total_bytes, finished_at: projected.finished_at } : {}), command_revision: projected.command_revision, current_attempt_id: projected.current_attempt_id, job_id: projected.job_id, filename: projected.filename, display_filename: projected.display_filename,
-        rename_revision: projected.rename_revision, requested_filename: ['sending', 'unconfirmed'].includes(compatibilityRenames.get(String(info.id))?.status) ? compatibilityRenames.get(String(info.id)).value : projected.requested_filename, rename_intents: projected.rename_intents, tags: projected.tags, tag_items: projected.tag_items,
+        removal_revision: projected.removal_revision, removal_intents: projected.removal_intents, rename_revision: projected.rename_revision, requested_filename: ['sending', 'unconfirmed'].includes(compatibilityRenames.get(String(info.id))?.status) ? compatibilityRenames.get(String(info.id)).value : projected.requested_filename, rename_intents: projected.rename_intents, tags: projected.tags, tag_items: projected.tag_items,
         tags_revision: projected.tags_revision, tag_chips: projected.tag_chips,
         favorite: projected.favorite, favorite_revision: projected.favorite_revision, favorite_intents: projected.favorite_intents };
 }
@@ -2021,6 +2032,8 @@ tagState.subscribe(ids => {
         allLibraryEntries = allLibraryEntries.filter(info => String(info.id) !== String(id));
         clearCompatibilityRename(String(id));
         clearCompatibilityCommand(String(id));
+        clearCompatibilityRemoval(String(id));
+        removalPositions.delete(String(id));
         commandNotices.delete(String(id));
         for (const [key, entry] of commandAnnouncements) if (entry.targetId === String(id)) commandAnnouncements.delete(key);
         renameDrafts.delete(String(id));
@@ -2062,7 +2075,7 @@ tagState.subscribe(ids => {
 });
 
 window.addEventListener('beforeunload', event => {
-    if (![...droppedUploads.values()].some(upload => !upload.settled || upload.unknown || uploadIntent(upload)) && !playlistActions.size && !playlistSubmissions.size && !playlistRetainedDrafts.size && !(playlistEditorDraft && playlistEditorSnapshot() !== playlistEditorBaseline) && !preferenceDirty && !preferenceSubmission && !tagMutations.hasPending() && ![...tagDrafts.values()].some(value => value.trim()) && !renameDrafts.size && !compatibilityRenames.size && !compatibilityCommands.size && !downloadSubmission?.legacy && !urlInput.value.trim()) return;
+    if (![...droppedUploads.values()].some(upload => !upload.settled || upload.unknown || uploadIntent(upload)) && !playlistActions.size && !playlistSubmissions.size && !playlistRetainedDrafts.size && !(playlistEditorDraft && playlistEditorSnapshot() !== playlistEditorBaseline) && !preferenceDirty && !preferenceSubmission && !tagMutations.hasPending() && ![...tagDrafts.values()].some(value => value.trim()) && !renameDrafts.size && !compatibilityRenames.size && !compatibilityCommands.size && !compatibilityRemovals.size && !downloadSubmission?.legacy && !urlInput.value.trim()) return;
     event.preventDefault();
     event.returnValue = '';
 });
@@ -2568,6 +2581,7 @@ function tagEditStop(id) {
 function tagCommit(id, explicitTag) {
     const startedAt = performance.now();
     const tagId = String(id);
+    if (removalBlocksWrites(tagId)) { announceTagStatus('Resolve the removal before changing this entry.'); return; }
     const input = document.querySelector(`.tag-editor-shell[data-tag-id="${CSS.escape(tagId)}"] .tag-entry-input`);
     const tag = explicitTag === undefined ? ((input && input.value) || '') : explicitTag;
     if (!tag.trim()) return;
@@ -2618,6 +2632,7 @@ function compatibilityTagMutation(id, tag, method, input) {
 }
 
 function tagRemove(id, tag) {
+    if (removalBlocksWrites(id)) { announceTagStatus('Resolve the removal before changing this entry.'); return; }
     if (!hasTagProtocol()) return compatibilityTagMutation(String(id), tag, 'DELETE');
     const result = tagMutations.submit({ kind: 'tag.remove', targetId: String(id), value: tag, viewToken: tagEditorTokens.get(String(id)) });
     if (!result.accepted) announceTagStatus(result.message || 'Could not remove tag');
@@ -2875,6 +2890,7 @@ function renameCancel(id) {
 }
 
 function renameCommit(id) {
+    if (removalBlocksWrites(id)) { announceTagStatus('Resolve the removal before changing this entry.'); return; }
     const startedAt = performance.now();
     id = String(id);
     const draft = renameDrafts.get(id);
@@ -3140,6 +3156,7 @@ function handleDownloadCommandEvent(event) {
 }
 function submitDownloadCommand(action, rawId, attemptId) {
     const id = String(rawId);
+    if (removalBlocksWrites(id)) { announceTagStatus('Resolve the removal before changing this entry.'); return { accepted: false, reason: 'unresolved' }; }
     const model = tagState.selectDownload(id);
     if (!model) { announceTagStatus('This download is unavailable.'); return; }
     const sourceAttempt = attemptId === undefined ? model.current_attempt_id : attemptId;
@@ -3205,13 +3222,119 @@ document.addEventListener('click', async event => {
     refreshDownloadCommandPresentations();
 });
 
-function deleteDownload(id) {
-    closeHistoryInfo();
+function hasRemovalProtocol() {
+    return tagCapabilities?.mutation_protocol === 1 && tagCapabilities.entry_removal === 1 && tagCapabilities.actions?.includes('entry.remove');
+}
+function removalIntent(id) {
+    return tagMutations.pending().find(entry => entry.kind === 'entry.remove' && entry.targetId === String(id)) || compatibilityRemovals.get(String(id)) || null;
+}
+function removalBlocksWrites(id) {
+    const intent = removalIntent(id);
+    return !!intent && intent.status !== 'rejected';
+}
+function clearCompatibilityRemoval(id) {
+    const entry = compatibilityRemovals.get(String(id));
+    if (entry) entry.timers.forEach(clearTimeout);
+    compatibilityRemovals.delete(String(id));
+}
+function removalText(entry) {
+    return entry.message || (entry.status === 'unconfirmed' ? 'Removal not confirmed.' : 'Removing…');
+}
+function removalStatusHtml(id) {
+    const entry = removalIntent(id);
+    if (!entry) return '';
+    const action = (mode, label) => `<button type="button" data-removal-action="${mode}" data-intent-id="${escapeAttr(entry.id)}">${label}</button>`;
+    const controls = entry.status === 'unconfirmed'
+        ? entry.legacy ? action('check', 'Check current entry')
+            : action('check', 'Check removal') + (!entry.replayExpired ? action('replay', 'Recover removal') : '') + (entry.canResolve ? action('resolve', 'Use current state') : '')
+        : ['rejected', 'conflicted'].includes(entry.status) ? action('resolve', 'Review current entry') : '';
+    return `<div class="download-command-message" data-removal-state="${escapeAttr(entry.status)}">${['queued', 'sending'].includes(entry.status) && !entry.delayed ? '<span class="options-spinner" aria-hidden="true"></span>' : ''}<span>${escapeHtml(removalText(entry))}</span>${controls}</div>`;
+}
+function removalStatusSlot(id) {
+    return `<div class="download-command-status entry-removal-status" data-removal-status="${escapeAttr(id)}" aria-live="off">${removalStatusHtml(id)}</div>`;
+}
+function refreshRemovalPresentations() {
+    const entries = tagMutations.pending().filter(entry => entry.kind === 'entry.remove').concat([...compatibilityRemovals.values()]);
+    for (const [id] of removalPositions) if (!removalIntent(id)) removalPositions.delete(id);
+    for (const node of document.querySelectorAll('[data-removal-status]')) {
+        const html = removalStatusHtml(node.dataset.removalStatus);
+        if (node.innerHTML !== html) node.innerHTML = html;
+    }
+    for (const entry of entries) {
+        const message = removalText(entry);
+        if (removalAnnouncements.get(entry.id) !== message) {
+            removalAnnouncements.set(entry.id, message);
+            announceTagStatus(message);
+        }
+    }
+    for (const id of removalAnnouncements.keys()) if (!entries.some(entry => entry.id === id)) removalAnnouncements.delete(id);
+    for (const row of document.querySelectorAll('[data-row-id]')) {
+        const blocked = removalBlocksWrites(row.dataset.rowId);
+        row.classList.toggle('entry-removal-pending', blocked);
+        row.setAttribute('aria-busy', String(blocked));
+        for (const control of row.querySelectorAll('[data-entry-remove], [data-favorite-action], [data-download-command], .rename-btn.confirm, .tag-chip-remove, [data-remove-tag], [data-suggest-tag], .history-visibility-select')) {
+            if (blocked) {
+                if (control.dataset.removalDisabled === undefined) control.dataset.removalDisabled = String(control.disabled);
+                control.disabled = true;
+            } else if (control.dataset.removalDisabled !== undefined) {
+                control.disabled = control.dataset.removalDisabled === 'true';
+                delete control.dataset.removalDisabled;
+            }
+        }
+    }
+    for (const button of document.querySelectorAll('[data-attempt-action="resume"], [data-attempt-action="retry"]')) {
+        const info = attemptRows.get(button.dataset.attemptId)?.info;
+        if (info) button.setAttribute('aria-disabled', String(removalBlocksWrites(info.download_id) || downloadCommandIntents(info.download_id).length > 0));
+    }
+    const summary = document.getElementById('removal-mutation-summary');
+    if (summary) {
+        const html = entries.map(entry => `<div class="download-command-summary-entry"><strong>${escapeHtml(tagState.writer.confirmed(entry.targetId)?.title || 'Entry removal')}</strong>${removalStatusHtml(entry.targetId)}</div>`).join('');
+        if (summary.innerHTML !== html) summary.innerHTML = html;
+        summary.hidden = !entries.length;
+    }
+    for (const [field, statuses] of [['pending', ['queued', 'sending', 'unconfirmed', 'conflicted']], ['unconfirmed', ['unconfirmed']], ['conflicted', ['conflicted']]]) removalMutationMetrics[field] = entries.filter(entry => statuses.includes(entry.status)).length;
+}
+function finishRemovalPresentation(id) {
+    removalPositions.delete(String(id));
+    invalidateLibraryOrder();
+    // Playback stays intact while delivery is unresolved. Only a correlated
+    // deletion result retires a player that still points at the removed media.
+    if (endlessPlayback.currentDownloadId === String(id)) closePlayer();
+    ++attemptRequest;
+    for (const record of attemptRows.values()) if (String(record.info.download_id) === String(id)) {
+        record.info.media_state = 'removed';
+        record.info.library_id = null;
+        record.info.can_resume = false;
+        record.info.can_retry = false;
+        record.html = attemptRowHtml(record.info);
+        const node = document.getElementById(`attempt-${record.info.id}`);
+        if (!node) continue;
+        const opened = node.querySelector('details')?.open;
+        const hadFocus = node.contains(document.activeElement);
+        node.innerHTML = record.html;
+        if (node.querySelector('details')) node.querySelector('details').open = Boolean(opened);
+        if (hadFocus) node.focus({ preventScroll: true });
+    }
+    announceTagStatus('Entry removed.');
+    renderDownloadCollections();
+    renderUploadRecovery();
+    refreshRemovalPresentations();
+}
+function handleRemovalMutationEvent(event) {
+    const entry = tagMutations.status(event.intentId);
+    if (event.outcome === 'reconciliation') removalMutationMetrics.reconciliationReads++;
+    if (event.outcome === 'confirmed' && entry) finishRemovalPresentation(entry.targetId);
+    else refreshRemovalPresentations();
+}
+function deleteDownload(rawId) {
+    const id = String(rawId);
     closeAllMenus();
-    const upload = droppedUploads.get(String(id));
+    const existing = removalIntent(id);
+    if (existing) { announceTagStatus(removalText(existing)); return; }
+    const upload = droppedUploads.get(id);
     if (upload && !upload.registered && upload.settled && !upload.unknown && !uploadIntent(upload)) {
-        droppedUploads.delete(String(id));
-        tagMutations.fence(String(id));
+        droppedUploads.delete(id);
+        tagMutations.fence(id);
         renderDroppedUploads();
         return;
     }
@@ -3219,25 +3342,68 @@ function deleteDownload(id) {
         announceTagStatus('Check upload status and wait for its confirmed outcome before removing it.');
         return;
     }
-    const row = document.querySelector(`[data-row-id="${id}"]`);
-    if (row) {
-        row.classList.add('item-fade-out');
-        row.addEventListener('animationend', () => row.remove(), { once: true });
+    const model = tagState.selectDownload(id);
+    if (!model || unavailableTagIds.has(id)) return;
+    if (tagMutations.pending().some(entry => entry.targetId === id && !['rejected', 'conflicted'].includes(entry.status)) || compatibilityCommands.has(id) || compatibilityRenames.has(id) || compatibilityFavorites.has(id) || pendingTagCommits.has(id)) {
+        announceTagStatus('Resolve pending changes before removing this entry.');
+        return;
     }
-    apiAction('/api/remove/' + encodeURIComponent(id), { method: 'POST' })
-        .then(() => {
-            tagMutations.fence(String(id));
-            droppedUploads.delete(String(id));
-            collectionSnapshots.current = collectionSnapshots.current.filter(info => String(info.id) !== String(id));
-            renderDroppedUploads();
-            return fetchHistory();
-        })
-        .catch(() => {
-            if (upload && !uploadIsCurrent(upload)) return;
-            renderDroppedUploads();
-            return fetchHistory();
-        });
+    const started = performance.now();
+    removalPositions.set(id, historyPageItems.findIndex(info => String(info.id) === id));
+    if (hasRemovalProtocol()) {
+        const result = tagMutations.submit({ kind: 'entry.remove', targetId: id, value: { scope: 'entry-and-files' } });
+        if (!result.accepted) { removalPositions.delete(id); announceTagStatus(result.message || 'Removal could not be submitted.'); }
+        renderDownloadCollections();
+        removalMutationMetrics.latestLocalFeedbackMs = Math.max(0, performance.now() - started);
+        mutationMetrics.latestLocalFeedbackMs = removalMutationMetrics.latestLocalFeedbackMs;
+        return result;
+    }
+    if (compatibilityRemovals.size + tagMutations.pending().length >= 128) { removalPositions.delete(id); announceTagStatus('Resolve existing requests before removing another entry.'); return; }
+    const epoch = tagSessionEpoch;
+    const entry = { id: `legacy-removal-${id}`, targetId: id, kind: 'entry.remove', value: { scope: 'entry-and-files' }, status: 'sending', message: '', legacy: true, timers: [] };
+    compatibilityRemovals.set(id, entry);
+    const current = () => epoch === tagSessionEpoch && compatibilityRemovals.get(id) === entry && tagState.isAvailable(id);
+    const unknown = () => {
+        if (!current()) return;
+        if (entry.status !== 'unconfirmed') for (const metrics of [removalMutationMetrics, mutationMetrics]) metrics.unconfirmedOutcomes++;
+        entry.status = 'unconfirmed'; entry.message = 'Removal not confirmed. This server cannot safely replay it. Check the current entry before doing anything else.';
+        refreshRemovalPresentations();
+    };
+    entry.timers = [setTimeout(() => { if (current() && entry.status === 'sending') { entry.delayed = true; entry.message = 'Still waiting for removal confirmation.'; refreshRemovalPresentations(); } }, 5000), setTimeout(unknown, 30000)];
+    for (const metrics of [removalMutationMetrics, mutationMetrics]) metrics.submissions++;
+    renderDownloadCollections();
+    removalMutationMetrics.latestLocalFeedbackMs = Math.max(0, performance.now() - started);
+    mutationMetrics.latestLocalFeedbackMs = removalMutationMetrics.latestLocalFeedbackMs;
+    apiFetch(`/api/remove/${encodeURIComponent(id)}`, { method: 'POST' }).then(async response => {
+        const body = await response.json().catch(() => null);
+        if (!current()) return;
+        if ([401, 403, 404].includes(response.status)) { tagMutations.fence(id); return; }
+        if (response.ok && body?.id === id && (body.message === 'Removed' || body.removed === true)) {
+            clearCompatibilityRemoval(id);
+            tagMutations.fence(id, true);
+            for (const metrics of [removalMutationMetrics, mutationMetrics]) { metrics.acknowledgements++; metrics.latestAcknowledgementMs = Math.max(0, performance.now() - started); }
+            finishRemovalPresentation(id);
+        } else if ([400, 409, 410, 413, 422, 429].includes(response.status)) {
+            entry.status = 'rejected'; entry.message = `Removal refused. ${typeof body?.error === 'string' ? body.error : 'Review current eligibility before trying again.'}`;
+            for (const metrics of [removalMutationMetrics, mutationMetrics]) metrics.rejectedOutcomes++;
+            refreshRemovalPresentations();
+        } else unknown();
+    }).catch(unknown).finally(() => entry.timers.forEach(clearTimeout));
 }
+document.addEventListener('click', async event => {
+    const button = event.target.closest('[data-removal-action]');
+    if (!button) return;
+    const mode = button.dataset.removalAction;
+    const intentId = button.dataset.intentId;
+    const legacy = [...compatibilityRemovals.values()].find(entry => entry.id === intentId);
+    if (legacy) {
+        if (mode === 'check') { removalMutationMetrics.reconciliationReads++; await checkTagAvailability(legacy.targetId); }
+        else if (legacy.status === 'rejected') { clearCompatibilityRemoval(legacy.targetId); removalPositions.delete(legacy.targetId); }
+    } else if (mode === 'check') await tagMutations.recover(intentId);
+    else if (mode === 'replay') await tagMutations.recover(intentId, { replay: true });
+    else if (!tagMutations.resolve(intentId)) announceTagStatus('The original removal may still complete. Check its status before submitting another removal.');
+    renderDownloadCollections();
+});
 
 function hasFavoriteProtocol() {
     return tagCapabilities?.mutation_protocol === 1 && tagCapabilities.actions?.includes('favorite.set');
@@ -3296,6 +3462,7 @@ function renderFavoriteControl(info, inline = false) {
 function toggleFavorite(button) {
     if (button.disabled) return;
     const id = String(button.dataset.downloadId);
+    if (removalBlocksWrites(id)) return;
     const model = tagState.selectDownload(id);
     if (!model || unavailableTagIds.has(id)) return;
     const favorite = !model.favorite;
@@ -3367,6 +3534,7 @@ for (const eventName of ['focusout', 'pointerout']) document.addEventListener(ev
 function changeDownloadVisibility(select) {
     if (select.disabled) return;
     const id = select.dataset.downloadId;
+    if (removalBlocksWrites(id)) return;
     const previous = select.dataset.current;
     const visibility = select.value;
     select.disabled = true;
@@ -4873,7 +5041,7 @@ function renderHistoryCard(info) {
     if (!isFinished) {
         menuItems.push(`<button data-download-command="retry" data-command-attempt="${escapeAttr(info.current_attempt_id || '')}" data-url-action="reload" data-download-id="${escapeAttr(id)}" ${urlData}><svg class="menu-icon"><use href="#i-sync"/></svg>Reload</button>`);
     }
-    menuItems.push(`<button class="danger" onclick="deleteDownload('${id}')"><svg class="menu-icon"><use href="#i-trash"/></svg>Delete</button>`);
+    menuItems.push(`<button class="danger" data-entry-remove data-download-id="${escapeAttr(id)}" onclick="deleteDownload('${id}')"${removalBlocksWrites(id) ? ' disabled' : ''}><svg class="menu-icon"><use href="#i-trash"/></svg>Delete</button>`);
 
     const favoriteButton = renderFavoriteControl(info);
     const viewCount = Math.max(0, Number.parseInt(info.view_count, 10) || 0);
@@ -5005,6 +5173,7 @@ function renderHistoryCard(info) {
                     </div>
                     ${uploadStatusSlot(id)}
                     ${downloadCommandStatusSlot(id)}
+                    ${removalStatusSlot(id)}
                     <div id="info-${escapeAttr(id)}" class="history-info-popover" role="dialog" aria-label="Download information">
                         <div class="history-info-content">
                             <div class="history-info-header">
@@ -5078,7 +5247,7 @@ function renderItem(info, inHistoryView = false) {
         if (!isUpload) {
             menuItems.push(`<button data-url-action="copy" ${urlData}><svg class="menu-icon"><use href="#i-copy"/></svg>Copy URL</button>`);
         }
-        menuItems.push(`<button class="danger" onclick="deleteDownload('${id}')"><svg class="menu-icon"><use href="#i-trash"/></svg>Delete</button>`);
+        menuItems.push(`<button class="danger" data-entry-remove data-download-id="${escapeAttr(id)}" onclick="deleteDownload('${id}')"${removalBlocksWrites(id) ? ' disabled' : ''}><svg class="menu-icon"><use href="#i-trash"/></svg>Delete</button>`);
     } else if (!isUpload) {
         menuItems.push(`<button data-url-action="copy" ${urlData}><svg class="menu-icon"><use href="#i-copy"/></svg>Copy URL</button>`);
     }
@@ -5213,6 +5382,7 @@ function renderItem(info, inHistoryView = false) {
                     ${downloadSummaryRow}
                     ${uploadStatusSlot(id)}
                     ${downloadCommandStatusSlot(id)}
+                    ${removalStatusSlot(id)}
                     ${errorBlock}
                 </div>
             `;
@@ -5915,7 +6085,7 @@ function checkMissingTagTargets(previous, next) {
     }
     for (const entry of previous) {
         const id = String(entry.id);
-        if (present.has(id)) continue;
+        if (present.has(id) || removalIntent(id)) continue;
         const model = tagState.selectDownload(id);
         if (!model?.tag_chips.some(chip => chip.status !== 'confirmed') && !model?.favorite_intents.length && !model?.rename_intents.length && !model?.command_intents.length && !compatibilityCommands.has(id) && !compatibilityRenames.has(id) && !renameDrafts.has(id) && !editingTagIds.has(id)) continue;
         checkTagAvailability(id);
@@ -5923,7 +6093,7 @@ function checkMissingTagTargets(previous, next) {
 }
 
 function recoverUnconfirmedTags() {
-    for (const entry of tagMutations.pending().filter(entry => entry.kind.startsWith('download.') && entry.status === 'unconfirmed')) {
+    for (const entry of tagMutations.pending().filter(entry => (entry.kind.startsWith('download.') || entry.kind === 'entry.remove') && entry.status === 'unconfirmed')) {
         if (recoveredTagIntents.has(entry.id)) continue;
         recoveredTagIntents.add(entry.id);
         tagMutations.recover(entry.id);
@@ -5954,14 +6124,14 @@ function fetchDownloadCollection(key) {
             if (key === 'library') {
                 const changed = libraryOrder.kind !== snapshot.order.kind
                     || libraryOrder.generation_id !== snapshot.order.generation_id;
-                if (changed && (historyRefreshBlocked() || renameDrafts.size || renameEditPositions.size || editingTagIds.size || favoriteEditPositions.size)) {
+                if (changed && (historyRefreshBlocked() || renameDrafts.size || renameEditPositions.size || editingTagIds.size || favoriteEditPositions.size || removalPositions.size)) {
                     historyFetchDeferred = true;
                     return;
                 }
                 const complete = snapshot.order.kind === 'rotation'
                     ? await readCollection('/api/library-catalog') : data;
                 if (authEpoch !== tagSessionEpoch || requestEpoch !== libraryRequestEpoch) return;
-                if (changed && (historyRefreshBlocked() || renameDrafts.size || renameEditPositions.size || editingTagIds.size || favoriteEditPositions.size)) {
+                if (changed && (historyRefreshBlocked() || renameDrafts.size || renameEditPositions.size || editingTagIds.size || favoriteEditPositions.size || removalPositions.size)) {
                     historyFetchDeferred = true;
                     return;
                 }
@@ -6013,7 +6183,13 @@ function fetchDownloadCollection(key) {
 function renderDownloadCollections({ sortFavorites = false } = {}) {
     updateTagMutationSummary();
     updateDurationSearchFeedback();
-    const data = uploadCollectionData().filter(info => !unavailableTagIds.has(String(info.id))).map(projectTagEntry);
+    const collectionData = uploadCollectionData();
+    const existingIds = new Set(collectionData.map(info => String(info.id)));
+    for (const id of removalPositions.keys()) {
+        const confirmed = tagState.writer.confirmed(id);
+        if (confirmed && !existingIds.has(id)) collectionData.push(confirmed);
+    }
+    const data = collectionData.filter(info => !unavailableTagIds.has(String(info.id)) && !tagState.isFenced(String(info.id))).map(projectTagEntry);
     const itemCount = document.getElementById('itemCount');
     itemCount.textContent = `${data.length} ${data.length === 1 ? 'item' : 'items'}`;
     if (historyRefreshBlocked()) {
@@ -6026,13 +6202,13 @@ function renderDownloadCollections({ sortFavorites = false } = {}) {
     let historyEntries = data.filter(i => HISTORY_TAB_STATUSES.has(i.status));
     if (libraryOrder.kind === 'rotation') {
         const members = new Set(collectionSnapshots.library.map(info => String(info.id)));
-        historyEntries = historyEntries.filter(info => members.has(String(info.id)));
+        historyEntries = historyEntries.filter(info => members.has(String(info.id)) || removalPositions.has(String(info.id)));
     }
     libraryEntries = libraryOrder.kind === 'rotation' ? allLibraryEntries.filter(info => !unavailableTagIds.has(String(info.id))).map(projectTagEntry) : historyEntries.slice();
     renderPlaylists();
     if (libraryOrder.kind === 'rotation') {
         const byId = new Map(historyEntries.map(info => [String(info.id), info]));
-        historyEntries = collectionSnapshots.library.map(info => byId.get(String(info.id))).filter(Boolean);
+        historyEntries = collectionSnapshots.library.map(info => byId.get(String(info.id))).filter(Boolean).concat(historyEntries.filter(info => !collectionSnapshots.library.some(member => String(member.id) === String(info.id)) && removalPositions.has(String(info.id))));
     } else if (sortFavorites) {
         historyOrdering = 'favorites_first';
         // The API is newest-first, and modern stable sorting preserves
@@ -6052,8 +6228,8 @@ function renderDownloadCollections({ sortFavorites = false } = {}) {
     }
     historyOrderIds = historyEntries.map(info => String(info.id));
     refreshAvailableTags(historyEntries);
-    const done = historyEntries.filter(info => matchesSearchFilter(info) || editingTagIds.has(String(info.id)) || renameEditPositions.has(String(info.id)) || favoriteEditPositions.has(String(info.id)));
-    for (const [id, position] of new Map([...tagEditPositions, ...renameEditPositions, ...favoriteEditPositions])) {
+    const done = historyEntries.filter(info => matchesSearchFilter(info) || editingTagIds.has(String(info.id)) || renameEditPositions.has(String(info.id)) || favoriteEditPositions.has(String(info.id)) || removalPositions.has(String(info.id)));
+    for (const [id, position] of new Map([...tagEditPositions, ...renameEditPositions, ...favoriteEditPositions, ...removalPositions])) {
         const index = done.findIndex(info => String(info.id) === id);
         if (index < 0 || position < 0) continue;
         const [entry] = done.splice(index, 1);
@@ -6131,6 +6307,7 @@ function renderDownloadCollections({ sortFavorites = false } = {}) {
     reconcileCards(document.getElementById('historyList'), pageItems, info => renderItem(info, true), 'data-row-id');
     updateAssetViewport();
     refreshDownloadCommandPresentations();
+    refreshRemovalPresentations();
 
     if (currentDrawerVisible) {
         newActiveIds.forEach(id => {

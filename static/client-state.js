@@ -35,6 +35,7 @@
         const downloads = new Map();
         const intents = new Map();
         const fences = new Map();
+        const removed = new Set();
         const collections = new Map();
         const editOrders = new Map();
         const listeners = new Set();
@@ -60,6 +61,7 @@
         function acceptDownload(snapshot, context = {}) {
             if (!snapshot || snapshot.id == null || (context.epoch !== undefined && context.epoch !== epoch)) return false;
             if (snapshot.tags_revision !== undefined && (!revision(snapshot.tags_revision) || !Array.isArray(snapshot.tags) || !Array.isArray(snapshot.tag_items) || snapshot.tags.length !== snapshot.tag_items.length || snapshot.tag_items.some((tag, index) => !tag || typeof tag.key !== 'string' || typeof tag.name !== 'string' || tag.name !== snapshot.tags[index]) || new Set(snapshot.tag_items.map(tag => tag.key)).size !== snapshot.tag_items.length)) return false;
+            if (snapshot.removal_revision !== undefined && !revision(snapshot.removal_revision)) return false;
             if (snapshot.command_revision !== undefined && (!revision(snapshot.command_revision) || !(snapshot.current_attempt_id === null || typeof snapshot.current_attempt_id === 'string' && snapshot.current_attempt_id))) return false;
             if (Object.hasOwn(snapshot, 'job_id') && !(snapshot.job_id === null || typeof snapshot.job_id === 'string' && snapshot.job_id)) return false;
             if (snapshot.favorite_revision !== undefined && (!revision(snapshot.favorite_revision) || typeof snapshot.favorite !== 'boolean')) return false;
@@ -68,6 +70,7 @@
             if (snapshot.submission_revision !== undefined && (!revision(snapshot.submission_revision) || !String(snapshot.id).startsWith('submission:') || !(snapshot.submission === null || snapshot.submission && typeof snapshot.submission.id === 'string' && snapshot.submission.job?.download_id === snapshot.submission.id && typeof snapshot.submission.job.id === 'string' && typeof snapshot.submission.job.attempt_id === 'string'))) return false;
             if (snapshot.upload_revision !== undefined && (!revision(snapshot.upload_revision) || !(snapshot.upload === null && snapshot.upload_revision === '0' || validUploadState(snapshot.upload) && snapshot.upload.id === String(snapshot.id) && snapshot.upload.revision === snapshot.upload_revision))) return false;
             const id = String(snapshot.id);
+            if (removed.has(id)) return false;
             const fence = fences.get(id);
             if (fence !== undefined) {
                 if (!context.authoritative || context.generation === undefined || context.generation < fence) return false;
@@ -76,6 +79,7 @@
             const old = downloads.get(id);
             if (snapshot.playlist_revision !== undefined && (!Number.isSafeInteger(snapshot.playlist_revision) || snapshot.playlist_revision < 0 || !snapshot.playlist || !Array.isArray(snapshot.playlist.items))) return false;
             const next = { ...(old || {}), ...copy(snapshot), id };
+            if (old && revision(old.removal_revision) && (!revision(snapshot.removal_revision) || BigInt(snapshot.removal_revision) < BigInt(old.removal_revision))) next.removal_revision = old.removal_revision;
             if (old && revision(old.upload_revision)) {
                 if (!revision(snapshot.upload_revision) || BigInt(snapshot.upload_revision) < BigInt(old.upload_revision)) {
                     next.upload_revision = old.upload_revision;
@@ -195,6 +199,7 @@
             const commandIntents = [];
             const submissionIntents = [];
             const uploadIntents = [];
+            const removalIntents = [];
             let requestedFilename = null;
             const chips = new Map();
             for (const tag of download.tag_items || (download.tags || []).map(name => VDL.tagIdentity.normalize(name))) {
@@ -202,6 +207,7 @@
             }
             for (const intent of intents.values()) {
                 if (intent.targetId !== id) continue;
+                if (intent.kind === 'entry.remove') { removalIntents.push(copy(intent)); continue; }
                 if (intent.kind.startsWith('upload.')) { uploadIntents.push(copy(intent)); continue; }
                 if (intent.kind === 'download.submit') { submissionIntents.push(copy(intent)); continue; }
                 if (intent.kind.startsWith('download.')) { commandIntents.push(copy(intent)); continue; }
@@ -240,12 +246,14 @@
                 rows.sort((a, b) => a.name.localeCompare(b.name));
             }
             const effective = rows.filter(tag => tag.effective).map(tag => ({ key: tag.key, name: tag.name }));
-            return freeze(copy({ ...download, upload_intents: uploadIntents, submission_intents: submissionIntents, command_intents: commandIntents, playlist_intents: playlistIntents, requested_filename: requestedFilename, rename_intents: renameIntents, preference_intents: preferenceIntents, favorite, favorite_intents: favoriteIntents, tags: effective.map(tag => tag.name), tag_items: effective, tag_chips: rows }));
+            return freeze(copy({ ...download, removal_intents: removalIntents, upload_intents: uploadIntents, submission_intents: submissionIntents, command_intents: commandIntents, playlist_intents: playlistIntents, requested_filename: requestedFilename, rename_intents: renameIntents, preference_intents: preferenceIntents, favorite, favorite_intents: favoriteIntents, tags: effective.map(tag => tag.name), tag_items: effective, tag_chips: rows }));
         }
-        function fence(id) {
+        function fence(id, terminal = false) {
             id = String(id);
             for (const [key, value] of downloads) if (key !== id && value.submission?.id === id) fence(key);
+            if (terminal) removed.add(id);
             fences.set(id, ++generation);
+            for (const collection of collections.values()) if (collection.ids) collection.ids = collection.ids.filter(member => member !== id);
             downloads.delete(id);
             editOrders.delete(id);
             for (const [key, intent] of intents) if (intent.targetId === id) intents.delete(key);
@@ -285,9 +293,9 @@
                 return freeze(token);
             },
             acceptCollection(token, snapshots) {
-                if (token.epoch !== epoch || collections.get(token.scope)?.request !== token.request) return false;
+                if (token.epoch !== epoch || token.generation !== generation || collections.get(token.scope)?.request !== token.request) return false;
                 transaction(() => snapshots.forEach(snapshot => acceptDownload(snapshot, token)));
-                collections.set(token.scope, { request: token.request, ids: snapshots.map(item => String(item.id)) });
+                collections.set(token.scope, { request: token.request, ids: snapshots.map(item => String(item.id)).filter(id => downloads.has(id) && !fences.has(id)) });
                 return true;
             },
             collectionIds(scope) { return Object.freeze([...(collections.get(scope)?.ids || [])]); },
@@ -295,7 +303,7 @@
                 const ids = Array.from(downloads.keys());
                 epoch++;
                 generation++;
-                downloads.clear(); intents.clear(); fences.clear(); collections.clear(); editOrders.clear();
+                downloads.clear(); intents.clear(); fences.clear(); removed.clear(); collections.clear(); editOrders.clear();
                 transaction(() => ids.forEach(notify));
             },
             // Only coordinator and authorized snapshot adapters use this write seam.
