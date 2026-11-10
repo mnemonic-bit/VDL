@@ -673,11 +673,11 @@
                                 <strong>Download history</strong>
                                 <span>Remove terminal attempt records. Library videos and files are kept.</span>
                             </div>
-                            <button class="clear-btn" type="button" onclick="clearHistory()">Clear History</button>
+                            <button class="clear-btn" type="button" data-bulk-clear="history" onclick="clearHistory()">Clear History</button>
                         </div>
                         <div class="setting-item settings-history-row" data-setting-keywords="delete remove library videos files">
                             <div class="setting-copy"><strong>Library media</strong><span>Delete completed and failed Library items and their files. Attempt records are kept.</span></div>
-                            <button class="clear-btn" type="button" onclick="clearLibrary()">Delete Library media</button>
+                            <button class="clear-btn" type="button" data-bulk-clear="library" onclick="clearLibrary()">Delete Library media</button>
                         </div>
                     </section>
                     {% endif %}
@@ -1022,6 +1022,7 @@
     <p id="favoriteMutationSummary" class="tag-mutation-summary" hidden></p>
     <div id="uploadRecoverySummary" class="download-command-summary" role="status" aria-live="off" aria-atomic="true" hidden></div>
     <div id="downloadSubmissionSummary" class="download-command-summary download-command-message" role="status" aria-live="polite" aria-atomic="true" hidden></div>
+    <div id="bulk-clear-summary" class="download-command-summary" hidden aria-live="off"></div>
     <div id="removal-mutation-summary" class="download-command-summary" hidden aria-live="off"></div>
     <div id="downloadCommandSummary" class="download-command-summary" hidden aria-live="off"></div>
     <p id="tagMutationSummary" class="tag-mutation-summary" hidden></p>

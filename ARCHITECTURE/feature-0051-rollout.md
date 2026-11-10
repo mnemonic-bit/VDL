@@ -6,7 +6,8 @@ The shared coordinator registers `tag.add`, `tag.remove`, `favorite.set`,
 `rename.set`, `preference.set`, `playlist.create`, `playlist.replace`,
 `playlist.add`, `playlist.delete`, `download.pause`, `download.unpause`,
 `download.stop`, `download.retry`, `download.resume`, `download.submit`,
-`upload.register`, `upload.cancel`, and `entry.remove`.
+`upload.register`, `upload.cancel`, `entry.remove`, `history.clear`, and
+`library.clear`.
 An existing API call does not gain receipt recovery merely because the new
 scripts are loaded. Mutating requests are never retried by `apiFetch`'s GET
 contention recovery.
@@ -252,6 +253,32 @@ or replay. `VDL.removalMutationMetrics()` exposes bounded, content-free
 aggregates. Entry removal does not complete Features 0061–0067 or change the
 specialized playback, lease, worker, upload, and companion contracts.
 
+[Feature 0061: Bulk clear](../FEATURES/feature-0061-immediate-feedback-for-bulk-clear-actions.md)
+adds `history.clear` and `library.clear` in the `bulk-clear` domain. Preview
+counts and explicit confirmation remain separate from execution. Confirmation
+shows immediate scope-level pending feedback, guards duplicate requests, and
+retains confirmed rows and playback. Settings and a persistent in-memory
+summary expose pending and recovery status across navigation. Canonical results
+update loaded views directly and fence confirmed removals without SSE or a
+collection read.
+
+Actor/session-bound preview scopes freeze the target set before confirmation.
+History deletion and its receipt commit atomically, preserving active attempts
+and all media. Library acceptance persists one stable child removal per target,
+using Feature 0060's ownership journal outside the database write lock. Changed
+target generations and later arrivals cannot broaden recovery. Results report
+actual removed, retained, failed, and pending counts; accepted unfinished work
+does not claim completion. Library removal retains attempt snapshots.
+
+Original execution, child filesystem publication, and receipt recovery recheck
+current administrator authorization. Shared receipt quotas, retention, replay
+expiry, and serialized final-absence checks apply. Active bulk operations retain
+their parent and child recovery records. Unknown outcomes allow explicit checks
+and deliberate replay of the same frozen request, without automatic writes or
+a persistent browser queue. Unsupported servers retain conservative feedback
+without invented recovery support. `VDL.bulkClearMetrics()` exposes bounded,
+content-free aggregate diagnostics. Features 0062–0067 remain separate work.
+
 ## Remaining action adapters
 
 The rows below are explicit migration work, not claims that the app-wide
@@ -260,12 +287,11 @@ remain in force. They need their own behavior and regression evidence before
 adopting automatic recovery.
 
 Each remaining row now has a proposed feature spec. These links allocate work;
-they do not mark any remaining adapter implemented. Features 0061–0067 inherit Feature
+they do not mark any remaining adapter implemented. Features 0062–0067 inherit Feature
 0051 and the shared requirements below.
 
 | Controls / production entry points in `static/app.js` | Existing mechanism | Required migration / recovery boundary | Feature spec |
 | --- | --- | --- | --- |
-| Clear attempts/library: `clearHistory`, `clearLibrary` | Preview counts and explicit confirmation, then server request | Pending confirmation surface and duplicate guard; no claim of deletion before acknowledgement. | [0061: Bulk clear](../FEATURES/feature-0061-immediate-feedback-for-bulk-clear-actions.md) |
 | Visibility: `changeDownloadVisibility` | Explicit desired visibility; server permission checks | Display pending request beside confirmed security state. A pending grant must never enable authority. | [0062: Visibility](../FEATURES/feature-0062-immediate-feedback-for-visibility-changes.md) |
 | Pairing creation/invalidation: `createExtensionPairing`, `invalidateExtensionPairing` | Server response supplies or invalidates credential; current UI status | Pending controls and session-safe callbacks. Never persist recovery payloads containing credentials in browser storage. | [0063: Pairing](../FEATURES/feature-0063-immediate-feedback-for-extension-pairing.md) |
 | Connection revocation: `revokeExtensionConnection` | Confirmation, then server response and connection refresh | Pending state beside confirmed connection; no revoked announcement until acknowledgement. | [0064: Connection revocation](../FEATURES/feature-0064-immediate-feedback-for-connection-revocation.md) |
@@ -837,3 +863,64 @@ remain in memory, unknown results never create a fresh destructive request,
 and ambiguous filesystem ownership remains visible for intervention. Playback,
 progress writes, leases, asset demand, worker scheduling, and companion
 transport retain their specialized ownership contracts.
+
+Bulk-clear verification commands for Feature 0061:
+
+```bash
+VDL_PYTHON=/path/to/python3.12 ./tests/run-all.sh --unit
+node --test tests/*.test.cjs
+VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py \
+    bulk-clear-feedback.spec.cjs history-actions.spec.cjs \
+    action-errors.spec.cjs attempt-history.spec.cjs entry-removal-feedback.spec.cjs
+VDL_TEST_BROWSER=firefox VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py \
+    bulk-clear-feedback.spec.cjs action-errors.spec.cjs \
+    attempt-history.spec.cjs entry-removal-feedback.spec.cjs
+```
+
+Feature 0061 verified on 2026-11-10 for version `0.64.0`:
+
+- Python 3.12 unit gate: **851 tests, 9 skipped**; `vdl.py` line coverage
+  **92.6%** (7787/8412 executable lines; enforced minimum 90%). The 45 new
+  protocol and independent audit/security checks cover fixed preview scopes,
+  atomic History receipt rollback, simultaneous replay and fingerprints,
+  shared quotas and receipt retention, serialized expired-absence finality,
+  post-commit response loss, and restart at parent acceptance, target result,
+  and child filesystem boundaries. Real filesystem tests preserve shared media,
+  later aliases, unrelated replacements, and ambiguous ownership. Current
+  administrator, session, suspension, and account checks gate recovery and
+  publication; revoked actors cannot obtain private receipts or continue
+  uncommitted removal. Preview storage is bounded and identical snapshots
+  are reused. Filesystem work releases the SQLite write lock.
+- Node: **246 tests passed**, including 26 new production-interface checks for
+  synchronous status-only presentation, independent clear scopes, duplicate
+  guards, frozen request replay, strict canonical counts and correlation,
+  accepted partial results, monotonic progress, scope-aware revisions,
+  authentication/access fences, and serialized expired-absence resolution.
+  Expired unknown outcomes require an authorized state read before explicit
+  resolution. Failed, malformed, or obsolete reads cannot release the intent;
+  a newer view or successful collection read requires another check.
+- Chromium: **103 distinct scenarios passed** across the full run and focused
+  follow-ups. Firefox: **78 distinct scenarios passed** across the full run and
+  focused follow-ups. All **39 new bulk-clear scenarios passed in each browser**.
+  Controlled request gates
+  establish local feedback below 50 ms, retained rows and playback, duplicate
+  and preview cancellation guards, and canonical confirmation without SSE or
+  collection reads. Coverage includes fixed preview scopes and later arrivals,
+  response loss, explicit receipt checks and frozen replay, partial real file
+  cleanup, actual account changes, access denial and restoration, old reads,
+  closed views, unknown outcomes, definite refusals, scope conflicts, legacy
+  fallback, keyboard controls, both themes, reduced motion, narrow layouts,
+  and deduplicated announcements. Existing regressions cover single-entry
+  removal, action errors, attempt History, and Chromium's Library controls.
+  History page totals explicitly request refresh after a direct clear rather
+  than presenting obsolete counts as current. Eight expiry/freshness scenarios
+  cover authorized scope reads, failed checks, authentication reset during a
+  read, and newer views or snapshots invalidating a checked result before
+  explicit resolution. The final expiry, attempt-History, and entry-removal
+  regression group passed **41 checks in each browser** after those changes.
+  No assertion deadline was relaxed.
+
+Bulk-clear delivery does not complete Features 0062–0067. Browser intents remain
+in memory, and recovery never creates a new destructive scope or automatically
+replays a POST. Playback, progress writes, leases, asset demand, workers,
+uploads, and companion transport retain their specialized ownership contracts.

@@ -23,6 +23,17 @@ vdl.ffprobe_resolution = lambda _path: "360p"
 vdl.generate_video_thumbnail = lambda *_: False
 upload_inspection_gate = threading.Event()
 upload_inspection_gate.set()
+bulk_clear_failure_ids = set()
+original_removal_checkpoint = vdl._removal_checkpoint
+
+
+def removal_checkpoint(phase, operation):
+    if phase == "prepared" and operation["target_id"] in bulk_clear_failure_ids:
+        raise OSError("Fixture cleanup unavailable")
+    original_removal_checkpoint(phase, operation)
+
+
+vdl._removal_checkpoint = removal_checkpoint
 
 
 def inspect_uploaded_video(_path):
@@ -41,10 +52,13 @@ if initial_admin is not None:
 @vdl.app.post("/__test__/reset")
 def test_reset():
     upload_inspection_gate.set()
+    bulk_clear_failure_ids.clear()
     for row in vdl.db_list_downloads():
         if row["status"] in ("starting", "downloading", "paused"):
             vdl.request_cancel(row["id"])
     with vdl._file_operation_lock, vdl._db_lock, vdl.db() as connection:
+        connection.execute("DELETE FROM bulk_clear_targets")
+        connection.execute("DELETE FROM bulk_clear_scopes")
         connection.execute("DELETE FROM playlists")
         connection.execute("DELETE FROM upload_operations")
         connection.execute("DELETE FROM downloads")
@@ -65,6 +79,16 @@ def test_reset():
     vdl.init_db()
     vdl._bandwidth.configure("0")
     FakeYoutubeDL.reset()
+    return jsonify({"ok": True})
+
+
+@vdl.app.post("/__test__/bulk-clear-failure")
+def test_bulk_clear_failure():
+    data = request.get_json() or {}
+    if data.get("enabled"):
+        bulk_clear_failure_ids.add(data["id"])
+    else:
+        bulk_clear_failure_ids.discard(data["id"])
     return jsonify({"ok": True})
 
 

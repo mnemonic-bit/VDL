@@ -69,14 +69,14 @@ test('unconfirmed Retry reports uncertainty and preserves the attempt', async ({
     await expect(row).toBeVisible();
 });
 
-test('failed Clear reports the error and preserves History', async ({ page }) => {
+test('unconfirmed Clear reports uncertainty and preserves History', async ({ page }) => {
     await seed(page, { id: 'failclear', status: 'finished', file: true });
     await openSettings(page);
     await refresh(page);
     await reject(page, '/api/clear', 'clear was rejected');
     page.once('dialog', dialog => dialog.accept());
     await page.getByRole('button', { name: 'Clear History', exact: true }).click();
-    await expect(page.getByText('clear was rejected')).toBeVisible();
+    await expect(page.locator('[data-bulk-clear-status="history"]')).toContainText('Clear request not confirmed');
     await page.getByRole('button', { name: 'Back to videos', exact: true }).click();
     await expect(page.locator('[data-row-id="failclear"]')).toBeVisible();
 });

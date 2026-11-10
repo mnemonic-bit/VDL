@@ -884,6 +884,33 @@ def init_db():
                 PRIMARY KEY(actor_id, mutation_id)
             );
             CREATE INDEX IF NOT EXISTS removal_operations_target ON removal_operations(target_id, phase);
+            CREATE TABLE IF NOT EXISTS bulk_clear_scopes (
+                id TEXT PRIMARY KEY,
+                actor_id INTEGER NOT NULL,
+                actor_session_version INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                mutation_id TEXT,
+                fingerprint TEXT,
+                revision INTEGER NOT NULL DEFAULT 0,
+                phase TEXT NOT NULL DEFAULT 'preview',
+                created_at REAL NOT NULL,
+                recorded_at REAL NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS bulk_clear_mutation
+                ON bulk_clear_scopes(actor_id, mutation_id);
+            CREATE INDEX IF NOT EXISTS bulk_clear_actor_phase
+                ON bulk_clear_scopes(actor_id, phase);
+            CREATE TABLE IF NOT EXISTS bulk_clear_targets (
+                scope_id TEXT NOT NULL REFERENCES bulk_clear_scopes(id) ON DELETE CASCADE,
+                target_id TEXT NOT NULL,
+                expected_revision TEXT NOT NULL,
+                child_mutation_id TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'pending',
+                files_deleted INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(scope_id, target_id)
+            );
+            CREATE INDEX IF NOT EXISTS bulk_clear_child
+                ON bulk_clear_targets(child_mutation_id, scope_id);
             CREATE TABLE IF NOT EXISTS rename_operations (
                 actor_id INTEGER NOT NULL,
                 mutation_id TEXT NOT NULL,
@@ -1139,6 +1166,7 @@ def init_db():
     _recover_upload_operations()
     _recover_rename_operations()
     _recover_removal_operations()
+    _recover_bulk_clear_operations()
     _reconcile_preference_runtime(restore_rotation=False)
     # The debug reloader's parent must not renew the shared deck alongside
     # its serving child. Ordinary WSGI imports still own their deadline timer.
@@ -2463,6 +2491,13 @@ def _removal_authorized(conn, operation, request_actor):
             or actor['password_hash'] is None
             or actor['session_version'] != operation['actor_session_version']):
         return None, None, 401
+    parent = conn.execute('SELECT s.* FROM bulk_clear_scopes s JOIN bulk_clear_targets t ON t.scope_id = s.id '
+                          'WHERE s.actor_id = ? AND t.child_mutation_id = ?',
+                          (operation['actor_id'], operation['mutation_id'])).fetchone()
+    if parent is not None:
+        _actor, status = _bulk_clear_actor(conn, parent, request_actor)
+        if status != 200:
+            return None, None, status
     row = _tag_visible_row(conn, operation['target_id'], actor)
     if row is None and operation['phase'] not in ('done', 'cleaned'):
         return actor, None, 404
@@ -2663,7 +2698,7 @@ def _recover_removal_operations():
             _recover_removal_operation(operation)
 
 
-def _execute_removal_mutation(download_id, payload):
+def _execute_removal_mutation(download_id, payload, *, _bulk=None):
     protocol = any(key in payload for key in ('client_mutation_id', 'expected_revision', 'scope'))
     if payload and not protocol:
         return {'error': 'Unsupported removal fields'}, 400
@@ -2675,7 +2710,7 @@ def _execute_removal_mutation(download_id, payload):
     with _file_operation_lock, assets.publication_lock, _worker_condition:
         with _db_lock, db() as conn:
             conn.execute('BEGIN IMMEDIATE')
-            actor = _tag_actor(conn)
+            actor = _bulk_clear_actor(conn, _bulk, has_request_context())[0] if _bulk else _tag_actor(conn)
             if actor is None:
                 return {'error': 'Authentication required'}, 401
             operation = conn.execute('SELECT * FROM removal_operations WHERE actor_id = ? AND mutation_id = ?',
@@ -2709,7 +2744,7 @@ def _execute_removal_mutation(download_id, payload):
                 error, status, outcome = None, 200, 'rejected'
                 if counts['total'] + active >= MUTATION_ACTOR_RECEIPT_LIMIT or counts['recent'] + active >= MUTATION_ACTOR_MINUTE_LIMIT:
                     error, status = 'Too many mutations; wait before submitting more', 429
-                elif int(match.group(1)) / 1000 < now - MUTATION_REPLAY_SECONDS or int(match.group(1)) / 1000 > now + 300:
+                elif not _bulk and (int(match.group(1)) / 1000 < now - MUTATION_REPLAY_SECONDS or int(match.group(1)) / 1000 > now + 300):
                     error, status = 'Mutation identifier expired or clock is incorrect', 400
                 elif protocol and set(payload) != {'client_mutation_id', 'expected_revision', 'scope'}:
                     error, status = 'Unsupported removal fields', 400
@@ -2734,7 +2769,7 @@ def _execute_removal_mutation(download_id, payload):
                 row = dict(row)
                 operation = None
         if operation is not None:
-            return _recover_removal_operation(operation, request_actor=True)
+            return _recover_removal_operation(operation, request_actor=has_request_context())
         try:
             _assert_no_pending_rename(row)
             artifacts = []
@@ -2756,7 +2791,7 @@ def _execute_removal_mutation(download_id, payload):
                              phase='prepared', recorded_at=time.time())
             with _db_lock, db() as conn:
                 conn.execute('BEGIN IMMEDIATE')
-                current = _tag_actor(conn)
+                current = _bulk_clear_actor(conn, _bulk, has_request_context())[0] if _bulk else _tag_actor(conn)
                 latest = _tag_visible_row(conn, download_id, current) if current else None
                 if current is None:
                     return {'error': 'Authentication required'}, 401
@@ -2773,7 +2808,7 @@ def _execute_removal_mutation(download_id, payload):
                     return {'error': 'Mutation identifier already used', 'code': 'mutation_id_conflict'}, 409
                 if counts['total'] + active >= MUTATION_ACTOR_RECEIPT_LIMIT or counts['recent'] + active >= MUTATION_ACTOR_MINUTE_LIMIT:
                     error, status = 'Too many mutations; wait before submitting more', 429
-                elif int(match.group(1)) / 1000 < time.time() - MUTATION_REPLAY_SECONDS or int(match.group(1)) / 1000 > time.time() + 300:
+                elif not _bulk and (int(match.group(1)) / 1000 < time.time() - MUTATION_REPLAY_SECONDS or int(match.group(1)) / 1000 > time.time() + 300):
                     error, status = 'Mutation identifier expired or clock is incorrect', 400
                 elif str(latest['removal_revision']) != expected:
                     error, status, outcome = 'Entry changed; review the current state', 409, 'conflicted'
@@ -2784,12 +2819,323 @@ def _execute_removal_mutation(download_id, payload):
                 conn.execute('INSERT INTO mutation_receipts(actor_id, mutation_id, target_id, fingerprint, status, response, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
                              (actor['id'], mutation_id, download_id, fingerprint, 503, json.dumps(unknown), time.time()))
             _removal_checkpoint('prepared', operation)
-            result, status = _recover_removal_operation(operation, request_actor=True)
+            result, status = _recover_removal_operation(operation, request_actor=has_request_context())
             if not protocol and status == 200:
                 return {'message': 'Removed', 'id': download_id}, status
             return result, status
         except OSError:
             return _removal_unresolved()
+
+
+def _bulk_clear_checkpoint(phase, operation):
+    """Crash-injection seam after durable bulk acceptance and target results."""
+
+
+def _bulk_clear_actor(conn, operation=None, request_actor=True):
+    actor = (_tag_actor(conn) if request_actor else
+             _db_user(conn, 'id = ?', (operation['actor_id'],)))
+    if (actor is None or actor['suspended'] or actor['password_hash'] is None
+            or (operation is not None and (actor['id'] != operation['actor_id']
+                or actor['session_version'] != operation['actor_session_version']))):
+        return None, 401
+    if 'admin' not in actor['roles']:
+        return None, 403
+    return actor, 200
+
+
+def _bulk_clear_denied(status):
+    return {'error': 'Authentication required' if status == 401 else 'Administrator access required'}, status
+
+
+def _create_bulk_clear_scope(kind):
+    with _db_lock, db() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        actor, status = _bulk_clear_actor(conn)
+        if actor is None:
+            return _bulk_clear_denied(status)
+        now = time.time()
+        conn.execute("DELETE FROM bulk_clear_scopes WHERE phase='preview' AND created_at < ?",
+                     (now - MUTATION_REPLAY_SECONDS,))
+        if kind == 'history':
+            targets = conn.execute("SELECT id, '0' AS revision, 0 AS with_file FROM download_attempts "
+                                   "WHERE status NOT IN ('starting','downloading','paused') ORDER BY id LIMIT 10001").fetchall()
+        else:
+            targets = conn.execute("SELECT id, removal_revision AS revision, filename IS NOT NULL AS with_file "
+                                   "FROM downloads WHERE status IN ('finished','error') ORDER BY id LIMIT 10001").fetchall()
+        if len(targets) > 10000:
+            return {'error': 'Clear scope exceeds the 10000-record limit'}, 413
+        previews = conn.execute("SELECT id FROM bulk_clear_scopes WHERE actor_id=? AND actor_session_version=? "
+                                "AND kind=? AND phase='preview'", (actor['id'], actor['session_version'], kind)).fetchall()
+        signature = [(row['id'], str(row['revision'])) for row in targets]
+        for preview in previews:
+            captured = [(row['target_id'], row['expected_revision']) for row in conn.execute(
+                'SELECT target_id,expected_revision FROM bulk_clear_targets WHERE scope_id=? ORDER BY target_id', (preview['id'],))]
+            if captured == signature:
+                return {'scope_id': preview['id'], 'revision': '0', 'entries': len(targets),
+                        'with_files': sum(row['with_file'] for row in targets)}, 200
+        if conn.execute("SELECT COUNT(*) FROM bulk_clear_scopes WHERE actor_id=? AND phase='preview'",
+                        (actor['id'],)).fetchone()[0] >= 16:
+            return {'error': 'Too many unconfirmed clear previews; reuse a preview or wait'}, 429
+        scope_id = secrets.token_hex(16)
+        conn.execute('INSERT INTO bulk_clear_scopes(id,actor_id,actor_session_version,kind,created_at,recorded_at) '
+                     'VALUES (?,?,?,?,?,?)', (scope_id, actor['id'], actor['session_version'], kind, now, now))
+        conn.executemany('INSERT INTO bulk_clear_targets(scope_id,target_id,expected_revision,child_mutation_id) '
+                         'VALUES (?,?,?,?)', [(scope_id, row['id'], str(row['revision']),
+                             str(int(now * 1000)) + '-' + secrets.token_hex(16)) for row in targets])
+        return {'scope_id': scope_id, 'revision': '0', 'entries': len(targets),
+                'with_files': sum(row['with_file'] for row in targets)}, 200
+
+
+def _bulk_clear_preview_response(kind):
+    if request.args.get('include_scope') == 'true':
+        result, status = _create_bulk_clear_scope(kind)
+    else:
+        with db() as conn:
+            actor, status = _bulk_clear_actor(conn)
+            if actor is None:
+                result, status = _bulk_clear_denied(status)
+            elif kind == 'history':
+                count = conn.execute("SELECT COUNT(*) FROM download_attempts WHERE status NOT IN "
+                                     "('starting','downloading','paused')").fetchone()[0]
+                result = {'entries': count, 'with_files': 0}
+            else:
+                counts = conn.execute("SELECT COUNT(*), COUNT(filename) FROM downloads WHERE status IN ('finished','error')").fetchone()
+                result = {'entries': counts[0], 'with_files': counts[1]}
+    response = jsonify(result)
+    response.status_code = status
+    response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+def _bulk_clear_result(conn, operation, *, outcome=None, error=None):
+    targets = conn.execute('SELECT target_id,state,files_deleted FROM bulk_clear_targets WHERE scope_id=? ORDER BY target_id',
+                           (operation['id'],)).fetchall()
+    counts = {state: sum(row['state'] == state for row in targets) for state in ('removed','retained','failed','pending')}
+    revision = str(operation['revision'])
+    result = {'scope': operation['kind'], 'scope_id': operation['id'], 'operation_id': operation['id'],
+              'revision': revision, 'total': len(targets), **counts,
+              'files_deleted': sum(row['files_deleted'] for row in targets),
+              'removed_ids': [row['target_id'] for row in targets if row['state'] == 'removed'],
+              'server_time': int(time.time() * 1000),
+              'mutation': {'id': operation['mutation_id'], 'domain': 'bulk-clear',
+                           'action': operation['kind'] + '.clear', 'entity_id': operation['kind'],
+                           'revision': revision, 'outcome': outcome or ('accepted' if counts['pending'] else 'committed')}}
+    if error:
+        result['error'] = error
+    return result
+
+
+def _save_bulk_clear_result(conn, operation):
+    operation = dict(operation)
+    operation['revision'] += 1
+    pending = conn.execute("SELECT 1 FROM bulk_clear_targets WHERE scope_id=? AND state='pending' LIMIT 1",
+                           (operation['id'],)).fetchone()
+    operation['phase'] = 'pending' if pending else 'completed'
+    conn.execute('UPDATE bulk_clear_scopes SET revision=?,phase=?,recorded_at=? WHERE id=?',
+                 (operation['revision'], operation['phase'], time.time(), operation['id']))
+    result = _bulk_clear_result(conn, operation)
+    conn.execute('UPDATE mutation_receipts SET response=?,status=200,recorded_at=? WHERE actor_id=? AND mutation_id=?',
+                 (json.dumps(result), time.time(), operation['actor_id'], operation['mutation_id']))
+    return operation, result
+
+
+def _recover_bulk_clear_operation(operation, request_actor=True):
+    # Match single-entry removal's file/scheduler boundary. SQLite transactions
+    # only cover admission/results; discovery and all file effects run outside.
+    with _file_operation_lock:
+        with _db_lock, db() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            current = conn.execute('SELECT * FROM bulk_clear_scopes WHERE id=?', (operation['id'],)).fetchone()
+            actor, status = _bulk_clear_actor(conn, operation, request_actor)
+            if actor is None:
+                return _bulk_clear_denied(status)
+            if current is None:
+                receipt = conn.execute('SELECT response,status FROM mutation_receipts WHERE actor_id=? AND mutation_id=?',
+                                       (operation['actor_id'], operation['mutation_id'])).fetchone()
+                if receipt is not None:
+                    return json.loads(receipt['response']), receipt['status']
+                match = MUTATION_ID_PATTERN.fullmatch(operation['mutation_id'])
+                return {'error': 'Mutation unavailable', 'final': bool(match and int(match.group(1))/1000 < time.time()-MUTATION_REPLAY_SECONDS)}, 404
+            operation = dict(current)
+            actor, status = _bulk_clear_actor(conn, operation, request_actor)
+            if actor is None:
+                return _bulk_clear_denied(status)
+            if operation['phase'] == 'completed':
+                receipt = conn.execute('SELECT response,status FROM mutation_receipts WHERE actor_id=? AND mutation_id=?',
+                                       (operation['actor_id'], operation['mutation_id'])).fetchone()
+                return (json.loads(receipt['response']), receipt['status']) if receipt else (_bulk_clear_result(conn, operation), 200)
+            targets = [dict(row) for row in conn.execute("SELECT * FROM bulk_clear_targets WHERE scope_id=? AND state='pending' ORDER BY target_id", (operation['id'],))]
+        for target in targets:
+            with db() as conn:
+                actor, status = _bulk_clear_actor(conn, operation, request_actor)
+                if actor is None:
+                    return _bulk_clear_denied(status)
+                child = conn.execute('SELECT * FROM removal_operations WHERE actor_id=? AND mutation_id=?',
+                                     (actor['id'], target['child_mutation_id'])).fetchone()
+                row = conn.execute('SELECT removal_revision,status FROM downloads WHERE id=?', (target['target_id'],)).fetchone()
+            state, files_deleted = 'pending', 0
+            if child is None and (row is None or str(row['removal_revision']) != target['expected_revision']
+                                  or row['status'] not in HISTORY_STATUSES):
+                state = 'retained'
+            else:
+                payload = {'client_mutation_id': target['child_mutation_id'],
+                           'expected_revision': target['expected_revision'], 'scope': 'entry-and-files'}
+                result, status = _execute_removal_mutation(target['target_id'], payload, _bulk=operation)
+                if status in (401, 403):
+                    return _bulk_clear_denied(status)
+                if status == 429:
+                    # The accepted set survives shared admission limits. A later
+                    # deliberate check continues it without choosing new targets.
+                    break
+                if status == 200 and result.get('removed') is True:
+                    state = 'removed'
+                    with db() as conn:
+                        child = conn.execute('SELECT artifacts FROM removal_operations WHERE actor_id=? AND mutation_id=?',
+                                             (operation['actor_id'], target['child_mutation_id'])).fetchone()
+                    files_deleted = len(json.loads(child['artifacts'])) if child else 0
+                elif status in (400, 404, 409):
+                    state = 'retained' if result.get('mutation', {}).get('outcome') == 'conflicted' else 'failed'
+            if state != 'pending':
+                with _db_lock, db() as conn:
+                    conn.execute('BEGIN IMMEDIATE')
+                    actor, status = _bulk_clear_actor(conn, operation, request_actor)
+                    if actor is None:
+                        return _bulk_clear_denied(status)
+                    conn.execute('UPDATE bulk_clear_targets SET state=?,files_deleted=? WHERE scope_id=? AND target_id=?',
+                                 (state, files_deleted, operation['id'], target['target_id']))
+                    operation['revision'] += 1
+                    conn.execute('UPDATE bulk_clear_scopes SET revision=?,recorded_at=? WHERE id=?',
+                                 (operation['revision'], time.time(), operation['id']))
+                _bulk_clear_checkpoint('target_completed', operation)
+        with _db_lock, db() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            actor, status = _bulk_clear_actor(conn, operation, request_actor)
+            if actor is None:
+                return _bulk_clear_denied(status)
+            operation, result = _save_bulk_clear_result(conn, operation)
+        _bulk_clear_checkpoint('completed' if operation['phase'] == 'completed' else 'pending', operation)
+        _publish_metadata_change('bulk-clear')
+        return result, 200
+
+
+def _recover_bulk_clear_operations():
+    with db() as conn:
+        operations = [dict(row) for row in conn.execute("SELECT * FROM bulk_clear_scopes WHERE phase='pending'")]
+    for operation in operations:
+        _recover_bulk_clear_operation(operation, request_actor=False)
+
+
+def _execute_bulk_clear(kind, payload):
+    mutation_id = payload.get('client_mutation_id')
+    match = MUTATION_ID_PATTERN.fullmatch(mutation_id) if isinstance(mutation_id, str) else None
+    if (set(payload) != {'client_mutation_id','scope_id','expected_revision'} or match is None
+            or not isinstance(payload.get('scope_id'), str)
+            or not re.fullmatch('[0-9a-f]{32}', payload['scope_id'])):
+        return {'error': 'Invalid clear request; use a confirmed scope'}, 400
+    fingerprint = hashlib.sha256(json.dumps([kind + '.clear', payload], sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    with _file_operation_lock:
+        with _db_lock, db() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            actor, status = _bulk_clear_actor(conn)
+            if actor is None:
+                return _bulk_clear_denied(status)
+            receipt = conn.execute('SELECT * FROM mutation_receipts WHERE actor_id=? AND mutation_id=?',
+                                   (actor['id'], mutation_id)).fetchone()
+            if receipt is not None and receipt['fingerprint'] != fingerprint:
+                return {'error': 'Mutation identifier already used', 'code': 'mutation_id_conflict'}, 409
+            operation = conn.execute('SELECT * FROM bulk_clear_scopes WHERE id=? AND actor_id=? AND kind=?',
+                                     (payload['scope_id'], actor['id'], kind)).fetchone()
+            if operation is None:
+                return {'error': 'Clear scope unavailable; preview again'}, 409
+            operation = dict(operation)
+            actor, status = _bulk_clear_actor(conn, operation)
+            if actor is None:
+                return _bulk_clear_denied(status)
+            if receipt is not None and not operation['mutation_id']:
+                return json.loads(receipt['response']), receipt['status']
+            if operation['mutation_id']:
+                if operation['mutation_id'] != mutation_id or operation['fingerprint'] != fingerprint:
+                    return {'error': 'Clear scope already accepted', 'code': 'mutation_id_conflict'}, 409
+            else:
+                now = time.time()
+                _prune_mutation_receipts(conn, now)
+                if conn.execute('SELECT 1 FROM rename_operations WHERE actor_id=? AND mutation_id=?', (actor['id'], mutation_id)).fetchone():
+                    return {'error': 'Mutation identifier already used', 'code': 'mutation_id_conflict'}, 409
+                counts = conn.execute('SELECT COUNT(*), COALESCE(SUM(recorded_at > ?),0) FROM mutation_receipts WHERE actor_id=?',
+                                      (now - 60, actor['id'])).fetchone()
+                active = conn.execute("SELECT COUNT(*) FROM rename_operations WHERE actor_id=? AND (phase != 'done' OR NOT EXISTS "
+                                      '(SELECT 1 FROM mutation_receipts r WHERE r.actor_id=rename_operations.actor_id AND r.mutation_id=rename_operations.mutation_id))', (actor['id'],)).fetchone()[0]
+                required = 1 + (conn.execute('SELECT COUNT(*) FROM bulk_clear_targets WHERE scope_id=?', (operation['id'],)).fetchone()[0] if kind == 'library' else 0)
+                reserved = conn.execute("SELECT COUNT(*) FROM bulk_clear_targets t JOIN bulk_clear_scopes s ON s.id=t.scope_id "
+                                        "WHERE s.actor_id=? AND s.phase='pending' AND t.state='pending' AND NOT EXISTS "
+                                        '(SELECT 1 FROM mutation_receipts r WHERE r.actor_id=s.actor_id AND r.mutation_id=t.child_mutation_id)',
+                                        (actor['id'],)).fetchone()[0]
+                if counts[0] + active + reserved + required > MUTATION_ACTOR_RECEIPT_LIMIT or counts[1] + active >= MUTATION_ACTOR_MINUTE_LIMIT:
+                    limited = dict(operation, mutation_id=mutation_id)
+                    return _bulk_clear_result(conn, limited, outcome='rejected', error='Too many mutations; wait before submitting more'), 429
+                outcome, error, status = None, None, 200
+                if (int(match.group(1))/1000 < now - MUTATION_REPLAY_SECONDS or int(match.group(1))/1000 > now + 300
+                        or operation['created_at'] < now - MUTATION_REPLAY_SECONDS):
+                    outcome, error, status = 'rejected', 'Clear request expired; review a new preview', 400
+                elif not isinstance(payload['expected_revision'], str) or not re.fullmatch(r'0|[1-9][0-9]{0,18}', payload['expected_revision']):
+                    outcome, error, status = 'rejected', 'Expected revision must be a decimal string', 400
+                elif payload['expected_revision'] != '0':
+                    outcome, error, status = 'conflicted', 'Clear scope changed; review a new preview', 409
+                if error:
+                    operation.update(mutation_id=mutation_id, fingerprint=fingerprint, phase='completed')
+                    conn.execute("UPDATE bulk_clear_scopes SET mutation_id=?,fingerprint=?,phase='completed',recorded_at=? WHERE id=?",
+                                 (mutation_id, fingerprint, now, operation['id']))
+                    result = _bulk_clear_result(conn, operation, outcome=outcome, error=error)
+                    conn.execute('INSERT INTO mutation_receipts VALUES (?,?,?,?,?,?,?)',
+                                 (actor['id'], mutation_id, 'bulk:' + kind, fingerprint, status, json.dumps(result), now))
+                    return result, status
+                operation.update(mutation_id=mutation_id, fingerprint=fingerprint, revision=1, phase='pending')
+                conn.execute("UPDATE bulk_clear_scopes SET mutation_id=?,fingerprint=?,revision=1,phase='pending',recorded_at=? WHERE id=?",
+                             (mutation_id, fingerprint, now, operation['id']))
+                if kind == 'history':
+                    targets = conn.execute('SELECT target_id FROM bulk_clear_targets WHERE scope_id=?', (operation['id'],)).fetchall()
+                    for target in targets:
+                        removed = conn.execute("DELETE FROM download_attempts WHERE id=? AND status NOT IN ('starting','downloading','paused')", (target['target_id'],)).rowcount
+                        conn.execute('UPDATE bulk_clear_targets SET state=? WHERE scope_id=? AND target_id=?',
+                                     ('removed' if removed else 'retained', operation['id'], target['target_id']))
+                    operation['phase'] = 'completed'
+                    conn.execute("UPDATE bulk_clear_scopes SET phase='completed' WHERE id=?", (operation['id'],))
+                result = _bulk_clear_result(conn, operation)
+                conn.execute('INSERT INTO mutation_receipts VALUES (?,?,?,?,?,?,?)',
+                             (actor['id'], mutation_id, 'bulk:' + kind, fingerprint, 200, json.dumps(result), now))
+        _bulk_clear_checkpoint('accepted', operation)
+        if kind == 'history':
+            _publish_metadata_change('bulk-clear')
+        return _recover_bulk_clear_operation(operation)
+
+
+def _bulk_clear_route(kind):
+    if request.content_length:
+        if not request.is_json:
+            return jsonify({'error': 'Clear requires a JSON object'}), 400
+        payload, error = _read_json_body(4096)
+        if error is not None:
+            return error
+        legacy = False
+    else:
+        legacy = True
+        preview, status = _create_bulk_clear_scope(kind)
+        if status != 200:
+            return jsonify(preview), status
+        payload = {'scope_id': preview['scope_id'], 'expected_revision': preview['revision'],
+                   'client_mutation_id': str(int(time.time() * 1000)) + '-' + secrets.token_hex(16)}
+    result, status = _execute_bulk_clear(kind, payload)
+    if legacy and status == 200:
+        if result.get('pending') or result.get('failed'):
+            result, status = {'error': 'Clear not confirmed; file recovery requires intervention'}, 500
+        else:
+            result = {'removed': result['removed'], 'files_deleted': result['files_deleted']}
+            if kind == 'library':
+                result['message'] = 'Cleared'
+    response = jsonify(result)
+    response.status_code = status
+    response.headers['Cache-Control'] = 'no-store'
+    return response
 
 
 def _db_remove_download_from_playlists(conn, download_id):
@@ -8333,13 +8679,21 @@ def _prune_mutation_receipts(conn, now):
     # A queued/running execution can outlive the replay window. All adapters
     # share this cleanup boundary so unrelated edits cannot erase its receipt.
     cutoff = now - MUTATION_RETENTION_SECONDS
+    conn.execute("DELETE FROM bulk_clear_scopes WHERE phase = 'completed' AND recorded_at < ?", (cutoff,))
     conn.execute("DELETE FROM download_commands WHERE recorded_at < ? AND phase NOT IN ('accepted', 'dispatching') "
                  "AND NOT EXISTS (SELECT 1 FROM download_attempts a WHERE a.id = download_commands.attempt_id "
                  "AND a.status IN ('starting', 'downloading', 'paused'))", (cutoff,))
     conn.execute("DELETE FROM removal_operations WHERE recorded_at < ? AND phase = 'cleaned' AND NOT EXISTS "
                  "(SELECT 1 FROM mutation_receipts r WHERE r.actor_id = removal_operations.actor_id "
-                 "AND r.mutation_id = removal_operations.mutation_id AND r.recorded_at >= ?)", (cutoff, cutoff))
+                 "AND r.mutation_id = removal_operations.mutation_id AND r.recorded_at >= ?) "
+                 "AND NOT EXISTS (SELECT 1 FROM bulk_clear_targets t JOIN bulk_clear_scopes s ON s.id=t.scope_id "
+                 "WHERE t.child_mutation_id=removal_operations.mutation_id AND s.actor_id=removal_operations.actor_id "
+                 "AND s.phase != 'completed')", (cutoff, cutoff))
     conn.execute('DELETE FROM mutation_receipts WHERE recorded_at < ? AND NOT EXISTS '
+                 '(SELECT 1 FROM bulk_clear_scopes s WHERE s.actor_id = mutation_receipts.actor_id '
+                 "AND s.phase != 'completed' AND (s.mutation_id = mutation_receipts.mutation_id OR EXISTS "
+                 '(SELECT 1 FROM bulk_clear_targets t WHERE t.scope_id=s.id '
+                 'AND t.child_mutation_id=mutation_receipts.mutation_id))) AND NOT EXISTS '
                  "(SELECT 1 FROM removal_operations m WHERE m.actor_id = mutation_receipts.actor_id "
                  "AND m.mutation_id = mutation_receipts.mutation_id AND m.phase != 'cleaned') AND NOT EXISTS "
                  '(SELECT 1 FROM download_commands c WHERE c.actor_id = mutation_receipts.actor_id '
@@ -8806,23 +9160,13 @@ def remove_download(download_id):
 @app.route('/api/library/clear/preview', methods=['GET'])
 @admin_required
 def clear_library_preview():
-    placeholders = ",".join("?" * len(HISTORY_STATUSES))
-    with db() as conn:
-        rows = conn.execute(
-            f"SELECT COUNT(*), COUNT(filename) FROM downloads WHERE status IN ({placeholders})",
-            HISTORY_STATUSES,
-        ).fetchone()
-    return jsonify({"entries": rows[0], "with_files": rows[1]})
+    return _bulk_clear_preview_response('library')
 
 
 @app.route('/api/library/clear', methods=['POST'])
 @admin_required
 def clear_library():
-    try:
-        removed, files_deleted = db_clear_library()
-    except OSError as exc:
-        return jsonify({"error": f"Cleanup failed: {exc}"}), 500
-    return jsonify({"message": "Cleared", "removed": removed, "files_deleted": files_deleted})
+    return _bulk_clear_route('library')
 
 
 def _visible_playable_library_entries(user_id, is_admin):
@@ -8925,18 +9269,13 @@ def get_history():
 @app.route('/api/clear/preview', methods=['GET'])
 @admin_required
 def clear_history_preview():
-    with db() as conn:
-        count = conn.execute("SELECT COUNT(*) FROM download_attempts WHERE status NOT IN ('starting', 'downloading', 'paused')").fetchone()[0]
-    return jsonify({'entries': count, 'with_files': 0})
+    return _bulk_clear_preview_response('history')
 
 
 @app.route('/api/clear', methods=['POST'])
 @admin_required
 def clear_history():
-    with _db_lock, db() as conn:
-        count = conn.execute("DELETE FROM download_attempts WHERE status NOT IN ('starting', 'downloading', 'paused')").rowcount
-    event_bus.publish('change', {'reason': 'clear-attempts', 'count': count})
-    return jsonify({'removed': count, 'files_deleted': 0})
+    return _bulk_clear_route('history')
 
 
 @app.route('/api/retry/<download_id>', methods=['POST'])
@@ -9799,8 +10138,8 @@ def record_download_view(download_id):
 @app.route('/api/client-capabilities', methods=['GET'])
 def client_capabilities():
     response = jsonify({
-        'mutation_protocol': 1, 'actions': ['tag.add', 'tag.remove', 'favorite.set', 'rename.set', 'preference.set', 'playlist.create', 'playlist.replace', 'playlist.add', 'playlist.delete', 'download.pause', 'download.unpause', 'download.stop', 'download.retry', 'download.resume', 'download.submit', 'upload.register', 'upload.cancel', 'entry.remove'],
-        'upload_recovery': 1, 'entry_removal': 1,
+        'mutation_protocol': 1, 'actions': ['tag.add', 'tag.remove', 'favorite.set', 'rename.set', 'preference.set', 'playlist.create', 'playlist.replace', 'playlist.add', 'playlist.delete', 'download.pause', 'download.unpause', 'download.stop', 'download.retry', 'download.resume', 'download.submit', 'upload.register', 'upload.cancel', 'entry.remove', 'history.clear', 'library.clear'],
+        'upload_recovery': 1, 'entry_removal': 1, 'bulk_clear': 1,
         'tag_identity_version': TAG_IDENTITY_VERSION,
         'server_time': int(time.time() * 1000),
     })
@@ -9832,6 +10171,15 @@ def editable_download_state(download_id):
 @app.route('/api/mutations/<mutation_id>', methods=['GET'])
 def mutation_receipt(mutation_id):
     with _file_operation_lock:
+        with db() as lookup:
+            bulk = lookup.execute('SELECT * FROM bulk_clear_scopes WHERE actor_id = ? AND mutation_id = ?',
+                                  (session.get('user_id'), mutation_id)).fetchone()
+        if bulk is not None:
+            result, status = _recover_bulk_clear_operation(dict(bulk), request_actor=True)
+            response = jsonify(result)
+            response.status_code = status
+            response.headers['Cache-Control'] = 'no-store'
+            return response
         with db() as lookup:
             removal = lookup.execute('SELECT * FROM removal_operations WHERE actor_id = ? AND mutation_id = ?',
                                      (session.get('user_id'), mutation_id)).fetchone()

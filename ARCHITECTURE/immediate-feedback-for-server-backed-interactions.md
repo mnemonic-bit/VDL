@@ -1,7 +1,7 @@
 # Architecture: immediate feedback for server-backed interactions
 
-**Status:** Foundation, tags, favorites, rename, preferences, playlist editor saves, playlist add/delete, download commands, new-download acceptance, uploads, and entry removal implemented; additional adapters remain proposed.\
-**Date:** 2026-11-09\
+**Status:** Foundation, tags, favorites, rename, preferences, playlist editor saves, playlist add/delete, download commands, new-download acceptance, uploads, entry removal, and bulk clear implemented; additional adapters remain proposed.\
+**Date:** 2026-11-10\
 **Requirements:** [Feature 0051](../FEATURES/feature-0051-immediate-feedback-for-server-backed-interactions.md)
 
 ## Purpose and document ownership
@@ -21,7 +21,8 @@ the feature explicitly rather than silently contradicting it here.
 The implementation adds the shared modules, tag protocol, and independent
 `favorite.set`, `rename.set`, `preference.set`, `playlist.create`,
 `playlist.replace`, `playlist.add`, `playlist.delete`, `download.*`,
-`upload.register`, `upload.cancel`, and `entry.remove` adapters described
+`upload.register`, `upload.cancel`, `entry.remove`, `history.clear`, and
+`library.clear` adapters described
 below. Other actions still use handlers and collection snapshots in
 `static/app.js`, server routes and persistence in `vdl.py`, and SSE hints that
 trigger collection reads. The [rollout inventory](feature-0051-rollout.md) records
@@ -439,6 +440,34 @@ shared quotas, retention, and serialized expired-absence finality. Legacy
 requests use the same server journal; unsupported clients retain conservative
 pending feedback without receipt replay. `VDL.removalMutationMetrics()` reports
 bounded content-free aggregates through the shared diagnostic seam.
+
+### Bulk clear scope and child recovery
+
+Feature 0061 registers `history.clear` and `library.clear` in the independent
+`bulk-clear` domain. Their installation-wide controls require current
+administrator authorization. The client keeps confirmed rows and playback
+separate from scope-level pending status, with an in-memory summary across
+navigation. Canonical results update exact removed identities and invalidate
+older membership reads; they never replace a whole collection with an empty
+optimistic snapshot.
+
+Opt-in preview creates an actor/session-bound `bulk_clear_scopes` snapshot and
+fixed `bulk_clear_targets`. Confirmation binds that scope, its decimal-string
+revision, and the immutable mutation ID. History deletion and its actual-count
+receipt commit together. Library acceptance persists stable child removal
+identities and captured removal revisions before effects. Children enter the
+Feature 0060 journal; parent administrator authorization also gates their
+filesystem recovery and database publication. Filesystem effects stay outside
+the database write lock. Target results persist independently, so restart or
+recovery cannot rerun eligibility queries and sweep in later arrivals.
+
+Acknowledgements distinguish accepted unfinished work from terminal counts.
+Receipt checks and deliberate replay recover only the original scope, using
+shared quotas, retention, and serialized expired-absence finality. Active parent
+and child records remain protected from unrelated receipt cleanup. Preview
+storage and admission are bounded. Legacy endpoints share the safe server
+boundary; unsupported servers retain truthful pending feedback without replay.
+Authentication reset clears private client state and ignores obsolete callbacks.
 
 ### Rename filesystem recovery
 

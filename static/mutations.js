@@ -4,6 +4,7 @@
     const active = new Set(['queued', 'sending', 'unconfirmed', 'conflicted']);
     const validRevision = value => typeof value === 'string' && /^(0|[1-9]\d*)$/.test(value);
     const removalAction = kind => kind === 'entry.remove';
+    const bulkAction = kind => kind === 'history.clear' || kind === 'library.clear';
     const uploadAction = kind => kind.startsWith('upload.');
     const playlistAction = kind => kind.startsWith('playlist.');
     const submissionAction = kind => kind === 'download.submit';
@@ -19,6 +20,8 @@
     const equalPreferences = (left, right) => VDL.preferenceFields.every(key => left[key] === right[key]);
     // Only these descriptors can select a domain or encode a mutation route.
     const actions = Object.freeze({
+        'history.clear': Object.freeze({ domain: 'bulk-clear', revision: 'bulk_revision', noun: 'history clear', method: 'POST', route: '/api/clear' }),
+        'library.clear': Object.freeze({ domain: 'bulk-clear', revision: 'bulk_revision', noun: 'library clear', method: 'POST', route: '/api/library/clear' }),
         'entry.remove': Object.freeze({ domain: 'entry-removal', revision: 'removal_revision', noun: 'removal', method: 'POST', route: 'remove' }),
         'upload.register': Object.freeze({ domain: 'upload', revision: 'upload_revision', noun: 'upload registration', method: 'POST' }),
         'upload.cancel': Object.freeze({ domain: 'upload', revision: 'upload_revision', noun: 'upload cancellation', method: 'POST' }),
@@ -62,7 +65,7 @@
         }
         setCapabilities(options.capabilities || null);
         function supported(kind) {
-            return !!actions[kind] && (!removalAction(kind) || capabilities?.entry_removal === 1) && (!uploadAction(kind) || capabilities?.upload_recovery === 1) && capabilities?.mutation_protocol === 1 && (!kind.startsWith('tag.') || capabilities.tag_identity_version === VDL.tagIdentity.version) && capabilities.actions?.includes(kind);
+            return !!actions[kind] && (!bulkAction(kind) || capabilities?.bulk_clear === 1) && (!removalAction(kind) || capabilities?.entry_removal === 1) && (!uploadAction(kind) || capabilities?.upload_recovery === 1) && capabilities?.mutation_protocol === 1 && (!kind.startsWith('tag.') || capabilities.tag_identity_version === VDL.tagIdentity.version) && capabilities.actions?.includes(kind);
         }
         function emit(action, outcome, intent, startedAt) {
             if (!options.onEvent) return;
@@ -84,8 +87,9 @@
                 id: intent.id, targetId: intent.targetId, kind: intent.kind, key: intent.key,
                 value: intent.value, status: intent.status, message: intent.message || '',
                 delayed: !!intent.delayed, viewToken: intent.viewToken || null,
+                ...(intent.bulkResult ? { bulkResult: intent.bulkResult } : {}),
                 ...(intent.acceptedJob ? { acceptedJob: intent.acceptedJob } : {}),
-                ...(uploadAction(intent.kind) || removalAction(intent.kind) ? { canResolve: !!intent.safeToResolve, replayExpired: !!intent.attempt && now() + timeOffset - Number(intent.attempt.body.client_mutation_id.split('-')[0]) > 86400000 } : {}),
+                ...(bulkAction(intent.kind) || uploadAction(intent.kind) || removalAction(intent.kind) ? { canResolve: !!intent.safeToResolve, replayExpired: !!intent.attempt && now() + timeOffset - Number(intent.attempt.body.client_mutation_id.split('-')[0]) > 86400000 } : {}),
                 ...(intent.fieldErrors ? { fieldErrors: intent.fieldErrors } : {}),
             };
         }
@@ -134,6 +138,7 @@
             return true;
         }
         function snapshot(body, intent) {
+            if (bulkAction(intent.kind)) return { id: intent.targetId, bulk_revision: body.revision, bulk_scope: body.scope_id };
             if (removalAction(intent.kind)) return { id: intent.targetId, removal_revision: body.removal_revision };
             if (uploadAction(intent.kind)) return { ...(body.download || {}), ...(validRevision(body.removal_revision) ? { removal_revision: body.removal_revision } : {}), id: intent.targetId, upload_revision: body.upload?.revision ?? '0', upload: body.upload ?? null };
             if (submissionAction(intent.kind)) return { id: intent.targetId, submission_revision: body.submission_revision, submission: body.job ? { id: body.id, job: body.job } : null };
@@ -158,6 +163,21 @@
         }
         function validResult(body, intent, committed) {
             const mutation = body?.mutation;
+            if (bulkAction(intent.kind)) {
+                const counts = ['removed', 'files_deleted', 'retained', 'failed', 'pending'];
+                const scope = intent.kind.split('.')[0];
+                return !!mutation && mutation.id === intent.attempt.body.client_mutation_id
+                    && mutation.domain === 'bulk-clear' && mutation.action === intent.kind && mutation.entity_id === scope
+                    && body.scope === scope && body.scope_id === intent.value.scope_id && body.operation_id === body.scope_id
+                    && validRevision(body.revision) && mutation.revision === body.revision
+                    && (committed ? ['committed', 'accepted'].includes(mutation.outcome) && BigInt(body.revision) > 0n
+                        && counts.every(key => Number.isSafeInteger(body[key]) && body[key] >= 0) && body.total === intent.value.entries
+                        && body.removed + body.retained + body.failed + body.pending === body.total
+                        && Array.isArray(body.removed_ids) && body.removed_ids.length === body.removed
+                        && body.removed_ids.every(id => typeof id === 'string' && !!id) && new Set(body.removed_ids).size === body.removed_ids.length
+                        && (mutation.outcome === 'accepted' ? body.pending > 0 : body.pending === 0)
+                        : ['rejected', 'conflicted'].includes(mutation.outcome));
+            }
             if (removalAction(intent.kind)) {
                 return !!mutation && mutation.id === intent.attempt.body.client_mutation_id
                     && mutation.domain === 'entry-removal' && mutation.action === intent.kind
@@ -274,6 +294,20 @@
                 if (submissionAction(intent.kind) && state.isFenced(body.id)) { fence(intent.targetId); return; }
                 const before = state.writer.confirmed(intent.targetId);
                 const newerRemote = before && BigInt(before[descriptor(intent).revision]) > BigInt(body.mutation.revision);
+                if (bulkAction(intent.kind)) {
+                    if (intent.bulkResult && BigInt(body.revision) < BigInt(intent.bulkResult.revision)) return;
+                    if (intent.bulkResult && body.revision === intent.bulkResult.revision && (['removed', 'files_deleted', 'retained', 'failed', 'pending'].some(key => body[key] !== intent.bulkResult[key]) || body.mutation.outcome !== intent.bulkResult.mutation.outcome)) { markUnknown(intent); return; }
+                    if (intent.bulkResult && intent.bulkResult.removed_ids.some(id => !body.removed_ids.includes(id))) { markUnknown(intent); return; }
+                    intent.bulkResult = immutable(clone(body));
+                    if (body.mutation.outcome === 'accepted') {
+                        clearTimers(intent);
+                        intent.autoChecked = true;
+                        state.acceptDownload(snapshot(body, intent));
+                        update(intent, { status: 'unconfirmed', message: `Library clear accepted: ${body.removed} items removed, ${body.files_deleted} files deleted, ${body.retained} retained, ${body.failed} failed, ${body.pending} pending. Check the original clear to recover pending items.`, delayed: true });
+                        emit(intent.kind, 'accepted', intent, intent.sentAt);
+                        return;
+                    }
+                }
                 if (submissionAction(intent.kind)) intent.acceptedJob = immutable(clone(body.job));
                 state.writer.transaction(() => {
                     if (removalAction(intent.kind)) {
@@ -301,7 +335,7 @@
                 if (intent.status === 'confirmed') {
                     if (playlistAction(intent.kind)) intent.acknowledgedRevision = body.revision;
                     emit(intent.kind, 'confirmed', intent, intent.sentAt);
-                    if (newerRemote && !removalAction(intent.kind) && !commandAction(intent.kind) && options.onNotice) {
+                    if (newerRemote && !bulkAction(intent.kind) && !removalAction(intent.kind) && !commandAction(intent.kind) && options.onNotice) {
                         try { options.onNotice(Object.freeze({ targetId: intent.targetId, message: `Your save was confirmed. Newer ${descriptor(intent).noun} changes are now shown.` })); }
                         catch (_) { /* A view notification cannot undo a committed save. */ }
                     }
@@ -318,7 +352,7 @@
                     const fieldErrors = playlistAction(intent.kind) && body.field_errors && typeof body.field_errors === 'object'
                         ? Object.fromEntries(Object.entries(body.field_errors).filter(([key, value]) => ['name', 'download_ids', 'download_id'].includes(key) && typeof value === 'string')) : intent.kind === 'preference.set' && body.field_errors && typeof body.field_errors === 'object'
                         ? Object.fromEntries(Object.entries(body.field_errors).filter(([key, value]) => VDL.preferenceFields.includes(key) && typeof value === 'string')) : undefined;
-                    update(intent, { status, fieldErrors, message: removalAction(intent.kind) ? `${status === 'conflicted' ? 'Entry changed. Review the current entry before removing it.' : 'Removal refused. ' + (typeof body.error === 'string' ? body.error : 'Review current eligibility before trying again.')}` : uploadAction(intent.kind) ? `Upload request refused. ${typeof body.error === 'string' ? body.error : 'Review its status before trying again.'}` : submissionAction(intent.kind) ? `Download request refused. ${typeof body.error === 'string' ? body.error : 'Review the retained input before submitting again.'}` : commandAction(intent.kind) ? `${status === 'conflicted' ? 'Download changed. Review its current attempt before submitting another command.' : 'Request refused. ' + (typeof body.error === 'string' ? body.error : 'Review the current eligibility before trying again.')}` : playlistAction(intent.kind) ? status === 'conflicted' ? 'Playlist changed elsewhere. Review the current version before submitting a new request.' : `Could not ${intent.kind === 'playlist.add' ? 'add to' : intent.kind === 'playlist.delete' ? 'delete' : 'save'} playlist. ${typeof body.error === 'string' ? body.error : 'Review the current state before submitting again.'}` : intent.kind === 'preference.set'
+                    update(intent, { status, fieldErrors, message: bulkAction(intent.kind) ? `Clear request ${status === 'conflicted' ? 'changed. Review a new preview before confirming again.' : 'refused. ' + (typeof body.error === 'string' ? body.error : 'Review current eligibility before trying again.')}` : removalAction(intent.kind) ? `${status === 'conflicted' ? 'Entry changed. Review the current entry before removing it.' : 'Removal refused. ' + (typeof body.error === 'string' ? body.error : 'Review current eligibility before trying again.')}` : uploadAction(intent.kind) ? `Upload request refused. ${typeof body.error === 'string' ? body.error : 'Review its status before trying again.'}` : submissionAction(intent.kind) ? `Download request refused. ${typeof body.error === 'string' ? body.error : 'Review the retained input before submitting again.'}` : commandAction(intent.kind) ? `${status === 'conflicted' ? 'Download changed. Review its current attempt before submitting another command.' : 'Request refused. ' + (typeof body.error === 'string' ? body.error : 'Review the current eligibility before trying again.')}` : playlistAction(intent.kind) ? status === 'conflicted' ? 'Playlist changed elsewhere. Review the current version before submitting a new request.' : `Could not ${intent.kind === 'playlist.add' ? 'add to' : intent.kind === 'playlist.delete' ? 'delete' : 'save'} playlist. ${typeof body.error === 'string' ? body.error : 'Review the current state before submitting again.'}` : intent.kind === 'preference.set'
                         ? status === 'conflicted' ? 'Settings changed elsewhere. Review the current values, then save your draft explicitly.'
                             : `Could not save settings. ${typeof body.error === 'string' ? body.error : 'Correct the retained draft and save again.'}`
                         : status === 'conflicted' ? `${descriptor(intent).noun} changed elsewhere. Check the current state, then retry or dismiss.` : intent.kind === 'rename.set' ? `Could not rename. ${typeof body.error === 'string' ? body.error : 'Correct the name or retry.'}` : `Could not save ${descriptor(intent).noun}. Retry or dismiss it.` });
@@ -334,7 +368,7 @@
         }
         function markUnknown(intent) {
             clearTimers(intent);
-            update(intent, { status: 'unconfirmed', message: removalAction(intent.kind) ? 'Removal not confirmed. Check its status before recovering the original removal.' : uploadAction(intent.kind) ? 'Upload request not confirmed. Check upload status before recovering the original request.' : submissionAction(intent.kind) ? 'Download request not confirmed. Check its status before recovering the original request.' : commandAction(intent.kind) ? 'Request not confirmed. Check its status before replaying.' : intent.kind === 'playlist.add' ? 'Add not confirmed. Check its status before replaying.' : intent.kind === 'playlist.delete' ? 'Delete not confirmed. Check its status before replaying.' : intent.kind === 'rename.set' ? 'Rename not confirmed. Check its status before replaying.' : 'Save not confirmed. Check its status before retrying.', delayed: true });
+            update(intent, { status: 'unconfirmed', message: bulkAction(intent.kind) ? 'Clear request not confirmed. Check its status before recovering the original clear.' : removalAction(intent.kind) ? 'Removal not confirmed. Check its status before recovering the original removal.' : uploadAction(intent.kind) ? 'Upload request not confirmed. Check upload status before recovering the original request.' : submissionAction(intent.kind) ? 'Download request not confirmed. Check its status before recovering the original request.' : commandAction(intent.kind) ? 'Request not confirmed. Check its status before replaying.' : intent.kind === 'playlist.add' ? 'Add not confirmed. Check its status before replaying.' : intent.kind === 'playlist.delete' ? 'Delete not confirmed. Check its status before replaying.' : intent.kind === 'rename.set' ? 'Rename not confirmed. Check its status before replaying.' : 'Save not confirmed. Check its status before retrying.', delayed: true });
             emit(intent.kind, 'unconfirmed', intent, intent.sentAt);
         }
         async function transmit(intent, capturedEpoch) {
@@ -367,9 +401,9 @@
             if (!/^\d+-[a-f0-9]{32}$/.test(mutationId)) throw new Error('Invalid mutation identifier source');
             if (intent.kind === 'playlist.add') intent.basePlaylist = clone(confirmed.playlist);
             intent.attempt = Object.freeze({
-                url: uploadAction(intent.kind) ? intent.kind === 'upload.register' ? '/api/upload' : `/api/upload/${encodeURIComponent(targetId)}/cancel` : submissionAction(intent.kind) ? '/api/download' : playlistAction(intent.kind) ? intent.kind === 'playlist.create' ? '/api/playlists' : `/api/playlists/${encodeURIComponent(targetId.slice(9))}${intent.kind === 'playlist.add' ? '/items' : ''}` : intent.kind === 'preference.set' ? '/api/preferences' : `/api/${descriptor(intent).route}/${encodeURIComponent(targetId)}`,
+                url: bulkAction(intent.kind) ? descriptor(intent).route : uploadAction(intent.kind) ? intent.kind === 'upload.register' ? '/api/upload' : `/api/upload/${encodeURIComponent(targetId)}/cancel` : submissionAction(intent.kind) ? '/api/download' : playlistAction(intent.kind) ? intent.kind === 'playlist.create' ? '/api/playlists' : `/api/playlists/${encodeURIComponent(targetId.slice(9))}${intent.kind === 'playlist.add' ? '/items' : ''}` : intent.kind === 'preference.set' ? '/api/preferences' : `/api/${descriptor(intent).route}/${encodeURIComponent(targetId)}`,
                 method: descriptor(intent).method,
-                body: immutable(removalAction(intent.kind) ? { scope: intent.value.scope, client_mutation_id: mutationId, expected_revision: confirmed.removal_revision } : uploadAction(intent.kind) ? { ...intent.value, ...(intent.kind === 'upload.register' ? { id: targetId } : {}), client_mutation_id: mutationId } : submissionAction(intent.kind) ? { ...intent.value, client_mutation_id: mutationId } : commandAction(intent.kind) ? { client_mutation_id: mutationId, expected_revision: confirmed.command_revision, expected_attempt_id: intent.value.attempt_id } : playlistAction(intent.kind) ? { ...intent.value, client_mutation_id: mutationId, ...(intent.kind === 'playlist.create' ? {} : { expected_revision: intent.kind === 'playlist.replace' ? intent.expectedRevision : confirmed.playlist_revision }) } : { [descriptor(intent).field]: intent.value, client_mutation_id: mutationId, expected_revision: confirmed[descriptor(intent).revision] }),
+                body: immutable(bulkAction(intent.kind) ? { scope_id: intent.value.scope_id, expected_revision: intent.value.revision, client_mutation_id: mutationId } : removalAction(intent.kind) ? { scope: intent.value.scope, client_mutation_id: mutationId, expected_revision: confirmed.removal_revision } : uploadAction(intent.kind) ? { ...intent.value, ...(intent.kind === 'upload.register' ? { id: targetId } : {}), client_mutation_id: mutationId } : submissionAction(intent.kind) ? { ...intent.value, client_mutation_id: mutationId } : commandAction(intent.kind) ? { client_mutation_id: mutationId, expected_revision: confirmed.command_revision, expected_attempt_id: intent.value.attempt_id } : playlistAction(intent.kind) ? { ...intent.value, client_mutation_id: mutationId, ...(intent.kind === 'playlist.create' ? {} : { expected_revision: intent.kind === 'playlist.replace' ? intent.expectedRevision : confirmed.playlist_revision }) } : { [descriptor(intent).field]: intent.value, client_mutation_id: mutationId, expected_revision: confirmed[descriptor(intent).revision] }),
             });
             intent.sentAt = now();
             update(intent, { status: 'sending' });
@@ -403,6 +437,28 @@
             // A missing live row cannot resolve a journal that may still own files.
             // After serialized expired absence, an authorized read can instead
             // establish current availability without confirming that removal.
+            if (bulkAction(intent.kind)) {
+                if (!intent.expiredAbsence) return false;
+                const scope = intent.kind.split('.')[0];
+                const view = options.currentBulkView?.(scope) || {};
+                const page = Number.isSafeInteger(view.page) && view.page > 0 ? view.page : 1;
+                const filter = typeof view.filter === 'string' ? view.filter : '';
+                emit(intent.kind, 'reconciliation', intent, now());
+                const reply = await read({ url: scope === 'history' ? `/api/history?page=${page}&page_size=20&filter=${encodeURIComponent(filter)}` : '/api/library?include_order=true', method: 'GET' });
+                if (capturedEpoch !== epoch || !intents.has(intent.id) || !state.isAvailable(intent.targetId) || !authorizedReply(reply, intent)) return false;
+                const body = reply.body;
+                if (reply.status !== 200 || !body || !Array.isArray(body.items) || body.items.some(item => !item || typeof item.id !== 'string' || !item.id) || new Set(body.items.map(item => item.id)).size !== body.items.length) return false;
+                if (scope === 'history' ? !Number.isSafeInteger(body.total) || body.total < 0 || !Number.isSafeInteger(body.page) || body.page < 1 || body.page_size !== 20 : !body.order || !['library', 'rotation'].includes(body.order.kind)) return false;
+                let current = body;
+                if (scope === 'library' && body.order.kind === 'rotation') {
+                    emit(intent.kind, 'reconciliation', intent, now());
+                    const catalog = await read({ url: '/api/library-catalog', method: 'GET' });
+                    if (capturedEpoch !== epoch || !intents.has(intent.id) || !state.isAvailable(intent.targetId) || !authorizedReply(catalog, intent)) return false;
+                    if (catalog.status !== 200 || !Array.isArray(catalog.body) || catalog.body.some(item => !item || typeof item.id !== 'string' || !item.id)) return false;
+                    current = { ...body, catalog: catalog.body };
+                }
+                return !options.onBulkCurrentState || options.onBulkCurrentState(Object.freeze({ scope, intentId: intent.id, snapshot: immutable(clone(current)) })) === true;
+            }
             if (removalAction(intent.kind) && !intent.expiredAbsence || submissionAction(intent.kind) || uploadAction(intent.kind)) return false;
             if (playlistAction(intent.kind)) {
                 const id = state.writer.confirmed(intent.targetId)?.playlist?.id;
@@ -437,6 +493,7 @@
             if (!supported(input.kind)) return { accepted: false, reason: 'unsupported', message: 'Refresh this page to use immediate saving.' };
             const startedAt = now();
             const targetId = String(input.targetId);
+            if (bulkAction(input.kind) && targetId !== `bulk:${input.kind.split('.')[0]}`) return { accepted: false, reason: 'unavailable', message: 'This clear scope is unavailable.' };
             if (input.kind === 'preference.set' && targetId !== 'installation') return { accepted: false, reason: 'unavailable', message: 'This settings scope is unavailable.' };
             const model = state.selectDownload(targetId);
             if (!model || model.permissions?.[actions[input.kind].domain] === false) return { accepted: false, reason: 'unavailable', message: 'This entry is unavailable.' };
@@ -446,7 +503,10 @@
             let tag;
             try {
                 if (input.kind === 'favorite.set' && typeof input.value !== 'boolean') throw new Error('Favorite must be true or false.');
-                if (removalAction(input.kind)) {
+                if (bulkAction(input.kind)) {
+                    if (!input.value || typeof input.value.scope_id !== 'string' || !input.value.scope_id || !validRevision(input.value.revision) || !Number.isSafeInteger(input.value.entries) || input.value.entries < 1 || Object.keys(input.value).some(key => !['scope_id', 'revision', 'entries'].includes(key))) throw new Error('Capture the confirmed preview before clearing.');
+                    tag = { key: 'bulk-clear', name: immutable(clone(input.value)) };
+                } else if (removalAction(input.kind)) {
                     if (!input.value || !['entry', 'entry-and-files'].includes(input.value.scope) || Object.keys(input.value).length !== 1) throw new Error('Capture the exact removal scope before submitting.');
                     tag = { key: 'entry-removal', name: immutable(clone(input.value)) };
                 } else if (uploadAction(input.kind)) {
@@ -480,6 +540,13 @@
             catch (error) { return { accepted: false, reason: 'validation', message: error.message }; }
             const domainKey = queueKey({ kind: input.kind, targetId });
             let queue = queues.get(domainKey) || [];
+            if (bulkAction(input.kind)) {
+                const existing = Array.from(intents.values()).find(intent => intent.targetId === targetId && bulkAction(intent.kind));
+                if (existing) return JSON.stringify(existing.value) === JSON.stringify(tag.name) && !['rejected', 'conflicted'].includes(existing.status)
+                    ? { accepted: true, intentId: existing.id, duplicate: true }
+                    : { accepted: false, reason: 'unresolved', message: 'Resolve the original clear before confirming another.' };
+                if (tag.name.scope_id !== model.bulk_scope || tag.name.revision !== model.bulk_revision) return { accepted: false, reason: 'unavailable', message: 'Review the current bound preview before confirming a clear.' };
+            }
             if (removalAction(input.kind)) {
                 const existing = Array.from(intents.values()).find(intent => intent.targetId === targetId && removalAction(intent.kind));
                 if (existing) return existing.value.scope === tag.name.scope && !['rejected', 'conflicted'].includes(existing.status)
@@ -542,7 +609,7 @@
                     break;
                 }
             }
-            const satisfied = removalAction(input.kind) || uploadAction(input.kind) || submissionAction(input.kind) || commandAction(input.kind) || playlistAction(input.kind) ? false : input.kind === 'preference.set' ? equalPreferences(model.values, tag.name) : input.kind === 'rename.set' ? tag.name === String(model.display_filename || model.filename || '').split('/').pop().split('\\').pop() : input.kind === 'favorite.set' ? model.favorite === input.value : (input.kind === 'tag.add') === model.tag_items.some(item => item.key === tag.key);
+            const satisfied = bulkAction(input.kind) || removalAction(input.kind) || uploadAction(input.kind) || submissionAction(input.kind) || commandAction(input.kind) || playlistAction(input.kind) ? false : input.kind === 'preference.set' ? equalPreferences(model.values, tag.name) : input.kind === 'rename.set' ? tag.name === String(model.display_filename || model.filename || '').split('/').pop().split('\\').pop() : input.kind === 'favorite.set' ? model.favorite === input.value : (input.kind === 'tag.add') === model.tag_items.some(item => item.key === tag.key);
             if (satisfied) return { accepted: true, intentId: null, settled: true };
             const unresolved = Array.from(intents.values()).filter(intent => intent.status !== 'confirmed' && intent.status !== 'resolved');
             if (unresolved.filter(intent => queueKey(intent) === domainKey).length >= 32 || unresolved.length >= 128) return { accepted: false, reason: 'limit', message: 'Too many pending edits. Resolve existing edits before adding more.' };
@@ -565,7 +632,7 @@
             const attempt = intent.attempt;
             const work = (async () => {
                 try {
-                    if (removalAction(intent.kind) || uploadAction(intent.kind) || submissionAction(intent.kind) || commandAction(intent.kind)) emit(intent.kind, 'reconciliation', intent, now());
+                    if (bulkAction(intent.kind) || removalAction(intent.kind) || uploadAction(intent.kind) || submissionAction(intent.kind) || commandAction(intent.kind)) emit(intent.kind, 'reconciliation', intent, now());
                     const reply = await read({ url: `/api/mutations/${encodeURIComponent(intent.attempt.body.client_mutation_id)}`, method: 'GET' });
                     if (capturedEpoch !== epoch || intent.attempt !== attempt || !intents.has(id) || !state.isAvailable(intent.targetId)) return false;
                     if (!authorizedReply(reply, intent, true)) return false;
@@ -574,7 +641,16 @@
                         return intent.status === 'confirmed' || intent.status === 'rejected' || intent.status === 'conflicted';
                     }
                     if (reply.body?.error !== 'Mutation unavailable' || typeof reply.body.final !== 'boolean') return false;
-                    if (removalAction(intent.kind) && reply.body.final === true) {
+                    if (bulkAction(intent.kind) && reply.body.final === true) {
+                        intent.expiredAbsence = true;
+                        intent.safeToResolve = false;
+                        update(intent, { message: 'Clear outcome unavailable after expiry. Checking the current authorized state before resolution…' });
+                        const checked = await checkState(intent, capturedEpoch);
+                        if (capturedEpoch === epoch && intents.has(id)) {
+                            intent.safeToResolve = checked;
+                            update(intent, { message: checked ? 'Clear outcome unavailable after expiry. Current authorized state checked; review it before explicitly using the current state. This does not confirm the clear.' : 'Clear outcome unavailable after expiry. Could not check the current authorized state. Check again before resolving this request.' });
+                        }
+                    } else if (removalAction(intent.kind) && reply.body.final === true) {
                         intent.expiredAbsence = true;
                         const checked = await checkState(intent, capturedEpoch);
                         if (checked && capturedEpoch === epoch && intents.has(id)) {
@@ -587,9 +663,9 @@
                     }
                     if (capturedEpoch !== epoch || intent.attempt !== attempt || !intents.has(id) || !state.isAvailable(intent.targetId)) return false;
                     const current = state.writer.confirmed(intent.targetId);
-                    if (!removalAction(intent.kind) && !uploadAction(intent.kind) && !commandAction(intent.kind) && !['rename.set', 'playlist.create', 'download.submit'].includes(intent.kind) && current && BigInt(current[descriptor(intent).revision]) > BigInt(intent.attempt.body.expected_revision)) intent.safeToResolve = true;
+                    if (!bulkAction(intent.kind) && !removalAction(intent.kind) && !uploadAction(intent.kind) && !commandAction(intent.kind) && !['rename.set', 'playlist.create', 'download.submit'].includes(intent.kind) && current && BigInt(current[descriptor(intent).revision]) > BigInt(intent.attempt.body.expected_revision)) intent.safeToResolve = true;
                     if (recoveryOptions.replay && !reply.body?.final && now() + timeOffset - Number(intent.attempt.body.client_mutation_id.split('-')[0]) <= 86400000) {
-                        update(intent, { status: 'sending', message: removalAction(intent.kind) ? 'Checking the original removal…' : submissionAction(intent.kind) || commandAction(intent.kind) ? 'Checking the original request…' : 'Checking the original save…', delayed: false });
+                        update(intent, { status: 'sending', message: bulkAction(intent.kind) ? 'Checking the original clear…' : removalAction(intent.kind) ? 'Checking the original removal…' : submissionAction(intent.kind) || commandAction(intent.kind) ? 'Checking the original request…' : 'Checking the original save…', delayed: false });
                         armWait(intent);
                         transmit(intent, capturedEpoch);
                     }
@@ -605,7 +681,12 @@
             if (!intent || intent.status === 'sending') return false;
             if (intent.status === 'unconfirmed') {
                 const current = state.writer.confirmed(intent.targetId);
-                if (!intent.safeToResolve && !(!removalAction(intent.kind) && !uploadAction(intent.kind) && !commandAction(intent.kind) && !['rename.set', 'playlist.create', 'download.submit'].includes(intent.kind) && current && BigInt(current[descriptor(intent).revision]) > BigInt(intent.attempt.body.expected_revision))) return false;
+                if (!intent.safeToResolve && !(!bulkAction(intent.kind) && !removalAction(intent.kind) && !uploadAction(intent.kind) && !commandAction(intent.kind) && !['rename.set', 'playlist.create', 'download.submit'].includes(intent.kind) && current && BigInt(current[descriptor(intent).revision]) > BigInt(intent.attempt.body.expected_revision))) return false;
+            }
+            if (bulkAction(intent.kind) && intent.status === 'unconfirmed' && options.canResolveBulkState && options.canResolveBulkState(intent.id) !== true) {
+                intent.safeToResolve = false;
+                update(intent, { message: 'The current view changed after the authorized check. Check the clear again before using the current state.' });
+                return false;
             }
             release(intent);
             state.writer.remove(id);
@@ -616,7 +697,7 @@
         function retry(id) {
             const intent = intents.get(id);
             if (!intent || !['rejected', 'conflicted'].includes(intent.status) || intent.checking) return { accepted: false, reason: 'unconfirmed' };
-            if (removalAction(intent.kind) || uploadAction(intent.kind) || submissionAction(intent.kind) || commandAction(intent.kind) || intent.kind === 'preference.set' || playlistAction(intent.kind)) return { accepted: false, reason: 'review_required', message: commandAction(intent.kind) ? 'Review the current download attempt before submitting a new command.' : 'Review current settings, then save the draft explicitly.' };
+            if (bulkAction(intent.kind) || removalAction(intent.kind) || uploadAction(intent.kind) || submissionAction(intent.kind) || commandAction(intent.kind) || intent.kind === 'preference.set' || playlistAction(intent.kind)) return { accepted: false, reason: 'review_required', message: commandAction(intent.kind) ? 'Review the current download attempt before submitting a new command.' : 'Review current settings, then save the draft explicitly.' };
             const wasConflict = intent.status === 'conflicted';
             function enqueue() {
                 state.writer.transaction(() => {

@@ -61,6 +61,7 @@
         function acceptDownload(snapshot, context = {}) {
             if (!snapshot || snapshot.id == null || (context.epoch !== undefined && context.epoch !== epoch)) return false;
             if (snapshot.tags_revision !== undefined && (!revision(snapshot.tags_revision) || !Array.isArray(snapshot.tags) || !Array.isArray(snapshot.tag_items) || snapshot.tags.length !== snapshot.tag_items.length || snapshot.tag_items.some((tag, index) => !tag || typeof tag.key !== 'string' || typeof tag.name !== 'string' || tag.name !== snapshot.tags[index]) || new Set(snapshot.tag_items.map(tag => tag.key)).size !== snapshot.tag_items.length)) return false;
+            if (snapshot.bulk_revision !== undefined && (!revision(snapshot.bulk_revision) || !['bulk:history', 'bulk:library'].includes(String(snapshot.id)) || typeof snapshot.bulk_scope !== 'string')) return false;
             if (snapshot.removal_revision !== undefined && !revision(snapshot.removal_revision)) return false;
             if (snapshot.command_revision !== undefined && (!revision(snapshot.command_revision) || !(snapshot.current_attempt_id === null || typeof snapshot.current_attempt_id === 'string' && snapshot.current_attempt_id))) return false;
             if (Object.hasOwn(snapshot, 'job_id') && !(snapshot.job_id === null || typeof snapshot.job_id === 'string' && snapshot.job_id)) return false;
@@ -78,6 +79,10 @@
             }
             const old = downloads.get(id);
             if (snapshot.playlist_revision !== undefined && (!Number.isSafeInteger(snapshot.playlist_revision) || snapshot.playlist_revision < 0 || !snapshot.playlist || !Array.isArray(snapshot.playlist.items))) return false;
+            if (old && revision(old.bulk_revision) && snapshot.bulk_revision !== undefined) {
+                if (snapshot.bulk_scope !== old.bulk_scope && context.bulkPreview !== true) return false;
+                if (snapshot.bulk_scope === old.bulk_scope && BigInt(snapshot.bulk_revision) < BigInt(old.bulk_revision)) return false;
+            }
             const next = { ...(old || {}), ...copy(snapshot), id };
             if (old && revision(old.removal_revision) && (!revision(snapshot.removal_revision) || BigInt(snapshot.removal_revision) < BigInt(old.removal_revision))) next.removal_revision = old.removal_revision;
             if (old && revision(old.upload_revision)) {
@@ -200,6 +205,7 @@
             const submissionIntents = [];
             const uploadIntents = [];
             const removalIntents = [];
+            const bulkIntents = [];
             let requestedFilename = null;
             const chips = new Map();
             for (const tag of download.tag_items || (download.tags || []).map(name => VDL.tagIdentity.normalize(name))) {
@@ -207,6 +213,7 @@
             }
             for (const intent of intents.values()) {
                 if (intent.targetId !== id) continue;
+                if (intent.kind === 'history.clear' || intent.kind === 'library.clear') { bulkIntents.push(copy(intent)); continue; }
                 if (intent.kind === 'entry.remove') { removalIntents.push(copy(intent)); continue; }
                 if (intent.kind.startsWith('upload.')) { uploadIntents.push(copy(intent)); continue; }
                 if (intent.kind === 'download.submit') { submissionIntents.push(copy(intent)); continue; }
@@ -246,7 +253,7 @@
                 rows.sort((a, b) => a.name.localeCompare(b.name));
             }
             const effective = rows.filter(tag => tag.effective).map(tag => ({ key: tag.key, name: tag.name }));
-            return freeze(copy({ ...download, removal_intents: removalIntents, upload_intents: uploadIntents, submission_intents: submissionIntents, command_intents: commandIntents, playlist_intents: playlistIntents, requested_filename: requestedFilename, rename_intents: renameIntents, preference_intents: preferenceIntents, favorite, favorite_intents: favoriteIntents, tags: effective.map(tag => tag.name), tag_items: effective, tag_chips: rows }));
+            return freeze(copy({ ...download, bulk_intents: bulkIntents, removal_intents: removalIntents, upload_intents: uploadIntents, submission_intents: submissionIntents, command_intents: commandIntents, playlist_intents: playlistIntents, requested_filename: requestedFilename, rename_intents: renameIntents, preference_intents: preferenceIntents, favorite, favorite_intents: favoriteIntents, tags: effective.map(tag => tag.name), tag_items: effective, tag_chips: rows }));
         }
         function fence(id, terminal = false) {
             id = String(id);
@@ -272,6 +279,11 @@
                 return model ? freeze(copy({ ...model.playlist, playlist_intents: model.playlist_intents })) : null;
             },
             selectDownload,
+            acceptBulkPreview(scope, preview) {
+                if (!['history', 'library'].includes(scope) || !preview || preview.revision !== '0' || typeof preview.scope_id !== 'string' || !preview.scope_id) return false;
+                if ([...intents.values()].some(intent => intent.targetId === `bulk:${scope}`)) return false;
+                return acceptDownload({ id: `bulk:${scope}`, bulk_revision: preview.revision, bulk_scope: preview.scope_id }, { bulkPreview: true, authoritative: true, epoch, generation });
+            },
             acceptPreferences(snapshot, context = {}) {
                 if (!snapshot || snapshot.id !== undefined && snapshot.id !== 'installation') return false;
                 return acceptDownload({ ...snapshot, id: 'installation' }, context);

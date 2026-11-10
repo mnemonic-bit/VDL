@@ -2249,3 +2249,11 @@ body.history-open .create-playlist-button { display: none; }
 .entry-removal-status:empty { display: none; }
 .entry-removal-status .options-spinner { width: 14px; height: 14px; flex-shrink: 0; }
 .entry-removal-pending { outline: 1px solid var(--border-soft); }
+
+#bulk-clear-summary[hidden] { display: none; }
+#bulk-clear-summary [data-bulk-clear-status] + [data-bulk-clear-status] { margin-top: .5rem; }
+#bulk-clear-summary [data-bulk-clear-state="unconfirmed"],
+#bulk-clear-summary [data-bulk-clear-state="rejected"],
+#bulk-clear-summary [data-bulk-clear-state="conflicted"] { color: var(--error-fg); }
+#bulk-clear-summary button:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
+#bulk-clear-summary .options-spinner { width: 14px; height: 14px; flex-shrink: 0; }
