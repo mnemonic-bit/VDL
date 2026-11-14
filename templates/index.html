@@ -633,6 +633,8 @@
                             </div>
                             <div class="extension-pairing-controls">
                                 <button id="extensionCreatePairing" type="button" onclick="createExtensionPairing()">Create pairing string</button>
+                                <button id="extensionCheckPairing" type="button" onclick="recoverExtensionPairing()" hidden>Check pairing request</button>
+                                <button id="extensionInvalidatePairing" type="button" onclick="invalidateExtensionPairing()" hidden>Invalidate pairing string</button>
                             </div>
                         </div>
                         <div class="extension-connections" data-setting-keywords="connections paired devices revoke token sign out">
@@ -713,45 +715,50 @@
                 </button>
             </div>
             <p id="extensionPairingInstructions">The pairing string connects this Firefox profile without sharing your VDL password.</p>
-            <div class="extension-pairing-ready" role="status">
-                <svg aria-hidden="true"><use href="#i-check-circle"/></svg>
-                <div>
-                    <strong>Pairing string ready</strong>
-                    <span>It can be used once.</span>
+            <p id="extensionPairingConfirmedStatus" class="extension-pairing-operation"></p>
+            <p id="extensionPairingOperationStatus" class="extension-pairing-operation" role="status" aria-live="polite" aria-atomic="true"></p>
+            <div id="extensionPairingCredential" hidden>
+                <div class="extension-pairing-ready" role="status">
+                    <svg aria-hidden="true"><use href="#i-check-circle"/></svg>
+                    <div>
+                        <strong>Pairing string ready</strong>
+                        <span>It can be used once.</span>
+                    </div>
+                    <span id="extensionPairingExpiry"></span>
                 </div>
-                <span id="extensionPairingExpiry"></span>
+                <ol class="extension-pairing-steps">
+                    <li>
+                        <span class="extension-step-number" aria-hidden="true">1</span>
+                        <div class="extension-step-content">
+                            <strong>Copy the pairing string</strong>
+                            <span>You will paste it into the extension in the next step.</span>
+                            <button id="extensionCopyPairing" type="button" class="extension-copy-primary" onclick="copyExtensionPairing()">
+                                <svg class="btn-icon" aria-hidden="true"><use href="#i-copy"/></svg>
+                                <span class="extension-copy-label">Copy pairing string</span>
+                            </button>
+                            <p id="extensionPairingFeedback" class="extension-pairing-feedback" role="status" aria-live="polite"></p>
+                        </div>
+                    </li>
+                    <li>
+                        <span class="extension-step-number" aria-hidden="true">2</span>
+                        <div class="extension-step-content">
+                            <strong>Finish in VDL Companion</strong>
+                            <span>Open the extension from the Firefox toolbar, paste the string, then choose <em>Pair with this VDL</em>.</span>
+                        </div>
+                    </li>
+                </ol>
+                <details id="extensionPairingDetails" class="extension-pairing-details">
+                    <summary>
+                        <span>Show pairing string</span>
+                        <svg aria-hidden="true"><use href="#i-chevron"/></svg>
+                    </summary>
+                    <label for="extensionPairingString">Pairing string</label>
+                    <textarea id="extensionPairingString" readonly spellcheck="false"></textarea>
+                </details>
             </div>
-            <ol class="extension-pairing-steps">
-                <li>
-                    <span class="extension-step-number" aria-hidden="true">1</span>
-                    <div class="extension-step-content">
-                        <strong>Copy the pairing string</strong>
-                        <span>You will paste it into the extension in the next step.</span>
-                        <button id="extensionCopyPairing" type="button" class="extension-copy-primary" onclick="copyExtensionPairing()">
-                            <svg class="btn-icon" aria-hidden="true"><use href="#i-copy"/></svg>
-                            <span class="extension-copy-label">Copy pairing string</span>
-                        </button>
-                        <p id="extensionPairingFeedback" class="extension-pairing-feedback" role="status" aria-live="polite"></p>
-                    </div>
-                </li>
-                <li>
-                    <span class="extension-step-number" aria-hidden="true">2</span>
-                    <div class="extension-step-content">
-                        <strong>Finish in VDL Companion</strong>
-                        <span>Open the extension from the Firefox toolbar, paste the string, then choose <em>Pair with this VDL</em>.</span>
-                    </div>
-                </li>
-            </ol>
-            <details id="extensionPairingDetails" class="extension-pairing-details">
-                <summary>
-                    <span>Show pairing string</span>
-                    <svg aria-hidden="true"><use href="#i-chevron"/></svg>
-                </summary>
-                <label for="extensionPairingString">Pairing string</label>
-                <textarea id="extensionPairingString" readonly spellcheck="false"></textarea>
-            </details>
             <div class="user-dialog-actions extension-pairing-actions">
-                <button type="button" class="danger extension-invalidate-button" onclick="invalidateExtensionPairing()">Invalidate pairing string</button>
+                <button id="extensionPairingCheck" type="button" onclick="recoverExtensionPairing()" hidden>Check pairing request</button>
+                <button id="extensionPairingInvalidate" type="button" class="danger extension-invalidate-button" onclick="invalidateExtensionPairing()">Invalidate pairing string</button>
                 <button type="button" onclick="closeExtensionPairingDialog()">Done</button>
             </div>
         </div>
@@ -1017,6 +1024,13 @@
         </div>
     </div>
 
+    <div id="extensionPairingSummary" class="download-command-summary" hidden aria-live="off">
+        <span></span>
+        <button type="button" data-pairing-recovery="check" onclick="recoverExtensionPairing()">Check pairing request</button>
+        <button type="button" data-pairing-recovery="replay" onclick="recoverExtensionPairing('replay')">Recover original pairing request</button>
+        <button type="button" data-pairing-recovery="resolve" onclick="recoverExtensionPairing('resolve')">Use current pairing state</button>
+        <button type="button" data-pairing-recovery="invalidate" onclick="recoverExtensionPairing('invalidate')">Invalidate pairing generation</button>
+    </div>
     <p id="renameMutationSummary" class="tag-mutation-summary" hidden></p>
     <p id="preferenceMutationSummary" class="tag-mutation-summary" role="status" aria-live="polite" hidden><span></span> <button type="button" onclick="openSettings()">Open Settings</button></p>
     <div id="visibilityMutationSummary" class="download-command-summary" hidden aria-live="off"></div>
@@ -1050,6 +1064,7 @@
     <script src="{{ url_for('static', filename='tag-identity.js', v=ui_version) }}"></script>
     <script src="{{ url_for('static', filename='client-state.js', v=ui_version) }}"></script>
     <script src="{{ url_for('static', filename='mutations.js', v=ui_version) }}"></script>
+    <script src="{{ url_for('static', filename='extension-pairing.js', v=ui_version) }}"></script>
     <script src="{{ url_for('static', filename='app.js', v=ui_version) }}"></script>
 </body>
 </html>

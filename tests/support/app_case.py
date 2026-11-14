@@ -40,8 +40,6 @@ class AppCase(unittest.TestCase):
             vdl._active_worker_count = 0
             vdl._worker_hosts.clear()
             vdl._live_worker_ids.clear()
-        with vdl._pairing_lock:
-            vdl._pairing_codes.clear()
         with vdl._companion_rate_lock:
             vdl._failed_pair_rates.clear()
             vdl._failed_pair_global.clear()
@@ -86,8 +84,6 @@ class AppCase(unittest.TestCase):
             vdl._active_worker_count = 0
             vdl._worker_hosts.clear()
             vdl._live_worker_ids.clear()
-        with vdl._pairing_lock:
-            vdl._pairing_codes.clear()
         with vdl._companion_rate_lock:
             vdl._failed_pair_rates.clear()
             vdl._failed_pair_global.clear()

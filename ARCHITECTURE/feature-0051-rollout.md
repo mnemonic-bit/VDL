@@ -7,7 +7,7 @@ The shared coordinator registers `tag.add`, `tag.remove`, `favorite.set`,
 `playlist.add`, `playlist.delete`, `download.pause`, `download.unpause`,
 `download.stop`, `download.retry`, `download.resume`, `download.submit`,
 `upload.register`, `upload.cancel`, `entry.remove`, `history.clear`,
-`library.clear`, and `visibility.set`.
+`library.clear`, `visibility.set`, `pairing.create`, and `pairing.invalidate`.
 An existing API call does not gain receipt recovery merely because the new
 scripts are loaded. Mutating requests are never retried by `apiFetch`'s GET
 contention recovery.
@@ -307,6 +307,33 @@ replays or survives reload in browser storage. Authentication reset clears
 private pending values. `VDL.visibilityMutationMetrics()` exposes bounded,
 content-free aggregates. Features 0063–0067 remain separate work.
 
+[Feature 0063: Pairing](../FEATURES/feature-0063-immediate-feedback-for-extension-pairing.md)
+adds `pairing.create` and `pairing.invalidate` to the actor-scoped
+`extension-pairing` domain. The shared coordinator and state store carry only
+non-secret status. The dialog immediately shows pending feedback and guards
+duplicates and contradictory actions. Canonical responses confirm without SSE.
+Credential presentation is scoped to the originating view token and
+authentication epoch; closing the dialog clears its secret. A late response
+cannot reopen the dialog, restore a discarded credential, or steal focus.
+
+The additive `extension_pairing_state` table commits the generation, verifier,
+revision, status, and non-secret receipt together. Legacy creation and
+invalidation, companion consumption, expiry, access loss, and startup share the
+same revision boundary. Startup interrupts unused pairings and clears their
+verifiers. Generation-bound invalidation and receipt replay cannot revoke a
+replacement. Every management and recovery operation rechecks current session
+authorization.
+
+Only the original successful creation response carries the pairing credential.
+Authorized receipt recovery returns the original outcome and current status;
+it cannot recover a secret or mint a second credential. Explicit invalidation
+and a separate deliberate creation resolve a lost credential response. Missing
+receipts retain uncertainty, and writes never replay automatically. Unsupported
+servers retain pending feedback through the legacy contract without invented
+recovery guarantees. Plaintext credentials remain outside SQLite, browser
+storage, generic client snapshots, diagnostics, and SSE. Connection revocation
+and the companion extension's separate transport remain separate work.
+
 ## Remaining action adapters
 
 The rows below are explicit migration work, not claims that the app-wide
@@ -315,12 +342,11 @@ remain in force. They need their own behavior and regression evidence before
 adopting automatic recovery.
 
 Each remaining row now has a proposed feature spec. These links allocate work;
-they do not mark any remaining adapter implemented. Features 0063–0067 inherit Feature
+they do not mark any remaining adapter implemented. Features 0064–0067 inherit Feature
 0051 and the shared requirements below.
 
 | Controls / production entry points in `static/app.js` | Existing mechanism | Required migration / recovery boundary | Feature spec |
 | --- | --- | --- | --- |
-| Pairing creation/invalidation: `createExtensionPairing`, `invalidateExtensionPairing` | Server response supplies or invalidates credential; current UI status | Pending controls and session-safe callbacks. Never persist recovery payloads containing credentials in browser storage. | [0063: Pairing](../FEATURES/feature-0063-immediate-feedback-for-extension-pairing.md) |
 | Connection revocation: `revokeExtensionConnection` | Confirmation, then server response and connection refresh | Pending state beside confirmed connection; no revoked announcement until acknowledgement. | [0064: Connection revocation](../FEATURES/feature-0064-immediate-feedback-for-connection-revocation.md) |
 | User creation/update/suspension/removal: `addUser`, `updateUser`, `setUserSuspended`, removal-dialog close handler | Local edit draft, server authorization and delete confirmation | Pending controls, duplicate guards, draft/epoch safety; pending role changes cannot authorize new actions. | [0065: User administration](../FEATURES/feature-0065-immediate-feedback-for-user-administration.md) |
 | Duplicate-index refresh button | Disabled initiating button, server acceptance, background status | Keep acceptance separate from indexing completion; no automatic replay of an unknown job request. | [0066: Duplicate-index refresh](../FEATURES/feature-0066-immediate-feedback-for-duplicate-index-refresh.md) |
@@ -992,3 +1018,42 @@ Visibility delivery does not complete Features 0063–0067. Pending requests
 remain in memory, and recovery never automatically replays a write. Playback,
 progress writes, leases, asset demand, workers, uploads, and companion transport
 retain their specialized ownership contracts.
+
+### Pairing verification
+
+Pairing verification commands for Feature 0063:
+
+```bash
+TMPDIR=/dev/shm VDL_PYTHON=/path/to/python3.12 ./tests/run-all.sh --unit
+VDL_PYTHON=/path/to/python3.12 node --test tests/*.test.cjs
+VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py extension-pairing-feedback.spec.cjs extension-settings.spec.cjs tags.spec.cjs live-updates.spec.cjs
+VDL_TEST_BROWSER=firefox VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py extension-pairing-feedback.spec.cjs extension-settings.spec.cjs tags.spec.cjs live-updates.spec.cjs
+```
+
+Feature 0063 verified on 2026-11-14 for version `0.66.0`:
+
+- Python 3.12.14 unit gate: **passed**, 900 tests, 9 skipped; `vdl.py` line
+  coverage **92.7%** (7954/8582; enforced minimum 90%). The 15 pairing protocol
+  tests cover atomic verifier/receipt commit and rollback, simultaneous replay,
+  response loss, generation replacement, expiry, consumption, restart,
+  actor/session authorization, token issuance, shared quotas, retention,
+  validation, and secret-free recovery and SSE.
+- Node: **passed**, 306 tests, including 27 pairing module checks. Controlled
+  transport and clocks cover pending feedback, immutable replay, missing and
+  expired receipts, response loss, generation replacement, shared page limits,
+  diagnostics, authorization, and view lifecycle fences.
+- Chromium and Firefox: **passed**, 53 distinct scenarios per browser across
+  focused runs, including 25 pairing cases and 28 companion settings, tag, and
+  live-update regressions. Held requests verify duplicate suppression,
+  SSE-independent confirmation, explicit invalidate-then-create recovery,
+  non-secret snapshots and diagnostics, native close and actual logout,
+  keyboard copying, delayed clipboard callbacks, and legacy fallback.
+- Idle local feedback: **passed** the 50 ms requirement in both themes.
+  Chromium measured 17.3 ms in light and 11.3 ms in dark; Firefox measured
+  10 ms in light and 8 ms in dark. Unchanged repeated renders produced zero
+  text mutations in the pairing live regions. Final timing checks ran after
+  the CPU-intensive Python coverage process exited.
+
+Pairing delivery does not complete Features 0064–0067. Credentials remain scoped
+to the authorized in-memory view lifecycle. Recovery never automatically replays
+a write, and the companion extension retains its own transport contract.

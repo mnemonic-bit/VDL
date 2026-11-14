@@ -2277,3 +2277,6 @@ body.history-open .create-playlist-button { display: none; }
     padding: 0.2rem 0.4rem;
     cursor: pointer;
 }
+
+.extension-pairing-operation { margin: 12px 22px; color: var(--fg); }
+.extension-pairing-controls button:disabled, .extension-pairing-actions button:disabled { cursor: default; opacity: 0.6; }

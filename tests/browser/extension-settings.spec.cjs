@@ -94,6 +94,7 @@ test('Browser Extension settings allow operator-approved private HTTP pairing', 
     await expect(page.locator('#extensionStatus')).toHaveText('Pairing string invalidated.');
     await page.locator('#extensionCreatePairing').click();
     await expect(pairingDialog).toBeVisible();
+    await expect(page.locator('#extensionPairingString')).toHaveValue(/^vdl-pair-v1:/);
     await page.evaluate(() => {
         extensionPairingExpiresAt = Date.now() / 1000 - 1;
         updatePairingExpiry();

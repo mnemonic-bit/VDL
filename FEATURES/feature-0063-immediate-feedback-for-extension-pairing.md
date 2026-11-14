@@ -1,8 +1,8 @@
 # Immediate feedback for extension pairing
 
 **Source:** Remaining Feature 0051 rollout item\
-**Status:** Proposed; not implemented\
-**Last refined:** 2026-11-08\
+**Status:** Implemented in version 0.66.0\
+**Last refined:** 2026-11-14\
 **Extends:** [Feature 0051](feature-0051-immediate-feedback-for-server-backed-interactions.md), [Feature 0026, Firefox companion](feature-0026-download-authenticated-pages-with-firefox.md)\
 **Rollout:** [Shared requirements and inventory](../ARCHITECTURE/feature-0051-rollout.md#shared-requirements-for-the-remaining-specs)
 
@@ -77,3 +77,56 @@ inherit the page's receipt or retry guarantees.
    An old attempt cannot invalidate a new pairing or leak private status.
 5. Inspect responses, storage, logs, and SSE for secret leakage; test keyboard
    status, copy controls, both themes, companion regressions, and shared gates.
+
+## Implementation contract
+
+The `pairing.create` and `pairing.invalidate` actions share the actor-scoped
+`extension-pairing` conflict domain. The page uses the shared state store and
+mutation coordinator for non-secret status. Credential presentation belongs to
+the originating view token and authentication epoch, outside coordinator
+snapshots. Closing the dialog discards its credential and advances the view
+token. Pending and uncertain request status remains available across navigation.
+
+The authenticated `extension_pairing: 1` capability enables the protocol.
+`POST /api/extension/pairing-codes` accepts `client_mutation_id` and
+`expected_revision`. `DELETE /api/extension/pairing-codes/current` additionally
+binds `generation`. `GET /api/extension/pairing-codes/current` returns only the
+current generation, status, expiry, and decimal-string revision. Existing
+clients retain the legacy endpoints.
+
+The server commits the credential verifier, generation, revision, and non-secret
+receipt in one serialized database transaction. Creation, replacement,
+invalidation, expiry, consumption, and restart share the same revision boundary.
+Startup clears unused verifiers and reports interruption, preserving the
+existing rule that unused pairing codes do not survive restart. Original
+execution, replay, status reads, and receipt recovery recheck current session
+authorization. Generation-bound invalidation cannot revoke a replacement.
+
+Only the first successful creation response supplies the credential. Receipt
+lookup and identical-attempt replay return non-secret outcomes and current
+status. A committed creation whose credential response was lost requires an
+explicit invalidation followed by a separate creation. Recovery never mints a
+second credential or automatically replays a write. Plaintext credentials do
+not enter SQLite, generic client snapshots, browser storage, diagnostics, or SSE.
+
+`VDL.extensionPairingMetrics()` and the aggregate `VDL.mutationMetrics()` expose
+bounded, content-free timing, outcome, pending, and reconciliation counters.
+The pairing coordinator shares the page's 128-intent admission limit with other
+mutations. Local credential expiry performs one bounded authorized status read
+before releasing an available-generation fence; no status polling is added.
+
+## Verification
+
+Verified on 2026-11-14 for version `0.66.0`:
+
+- Python 3.12.14: `./tests/run-all.sh --unit` **passed**, 900 tests with
+  9 skipped; `vdl.py` line coverage **92.7%** (7954/8582; minimum 90%).
+- `node --test tests/*.test.cjs` **passed**, 306 tests, including 27 pairing
+  module checks.
+- Chromium and Firefox: **passed**, 53 distinct scenarios per browser,
+  including 25 pairing cases and 28 companion settings, tag, and live-update
+  regressions. Idle light/dark feedback measured 8–17.3 ms against the 50 ms
+  requirement. Unchanged renders produced no repeated live-region text updates.
+
+The [rollout verification record](../ARCHITECTURE/feature-0051-rollout.md#pairing-verification)
+contains commands and the covered recovery, authorization, and lifecycle cases.

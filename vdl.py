@@ -97,10 +97,7 @@ EXTENSION_NO_STORE_ENDPOINTS = COMPANION_ENDPOINTS | {
     'extension_connections', 'extension_connection',
 }
 
-# Pairing codes deliberately disappear on restart. The bounded rate windows
-# have the same process lifetime and never retain request bodies or credentials.
-_pairing_codes = {}
-_pairing_lock = threading.Lock()
+# Rate windows have process lifetime and never retain credentials or bodies.
 _companion_rate_lock = threading.Lock()
 _failed_pair_rates = {}
 _failed_pair_global = []
@@ -743,6 +740,28 @@ def init_db():
         """)
         # New tables are additive, so retained database volumes need no rebuild.
         conn.executescript("""
+            CREATE TABLE IF NOT EXISTS extension_pairing_state (
+                actor_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                actor_session_version INTEGER NOT NULL,
+                generation TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                origin TEXT NOT NULL,
+                expires_at REAL NOT NULL,
+                verifier BLOB
+            );
+            UPDATE extension_pairing_state
+                SET status = 'interrupted', verifier = NULL, revision = revision + 1
+                WHERE status = 'available';
+            CREATE TRIGGER IF NOT EXISTS invalidate_pairing_on_access_loss
+            AFTER UPDATE OF suspended, session_version, password_hash ON users
+            WHEN NEW.suspended = 1 OR NEW.password_hash IS NULL
+                OR NEW.session_version != OLD.session_version
+            BEGIN
+                UPDATE extension_pairing_state
+                    SET status = 'interrupted', verifier = NULL, revision = revision + 1
+                    WHERE actor_id = NEW.id AND status = 'available';
+            END;
             CREATE TABLE IF NOT EXISTS library_storage_snapshot (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 measured_at REAL,
@@ -5417,27 +5436,129 @@ def _token_rate_limited(token_id, request_id):
         return False
 
 
-def _new_pairing_code(user_id, origin):
+def _pairing_snapshot(conn, actor):
+    record = conn.execute('SELECT * FROM extension_pairing_state WHERE actor_id = ?',
+                          (actor['id'],)).fetchone()
+    if record is None:
+        return {'generation': None, 'status': 'none', 'expires_at': None, 'revision': '0'}
+    # Expiry and access loss share the same revision boundary as explicit writes.
+    if record['status'] == 'available' and (
+            record['expires_at'] <= time.time() or actor['suspended']
+            or record['actor_session_version'] != actor['session_version']):
+        status = ('expired' if record['expires_at'] <= time.time() else 'interrupted')
+        conn.execute('UPDATE extension_pairing_state SET status = ?, verifier = NULL, '
+                     'revision = revision + 1 WHERE actor_id = ?', (status, actor['id']))
+        record = conn.execute('SELECT * FROM extension_pairing_state WHERE actor_id = ?',
+                              (actor['id'],)).fetchone()
+    return {'generation': record['generation'], 'status': record['status'],
+            'expires_at': int(record['expires_at']), 'revision': str(record['revision'])}
+
+
+def _create_pairing_code(conn, actor, origin, state):
     now = time.time()
-    # Keep the established 16-byte code shape so older companions can still
-    # pair. New companions recognize the format byte and creation time, while
-    # 88 unpredictable bits remain ample for a five-minute rate-limited code.
-    payload = (
-        bytes((COMPANION_PAIRING_CODE_FORMAT,))
-        + int(now).to_bytes(4, 'big')
-        + secrets.token_bytes(11)
-    )
+    # Preserve the companion's established format and five-minute lifetime.
+    payload = (bytes((COMPANION_PAIRING_CODE_FORMAT,))
+               + int(now).to_bytes(4, 'big') + secrets.token_bytes(11))
     raw = 'VDL1-' + _b64url(payload)
-    record = {
-        'verifier': _credential_verifier(raw),
-        'user_id': user_id,
-        'origin': origin,
-        'created_at': now,
-        'expires_at': now + 300,
-    }
-    with _pairing_lock:
-        _pairing_codes[user_id] = record
-    return raw, record['expires_at']
+    generation = uuid.uuid4().hex
+    conn.execute('INSERT INTO extension_pairing_state '
+                 '(actor_id,actor_session_version,generation,revision,status,origin,expires_at,verifier) '
+                 "VALUES (?,?,?,?,'available',?,?,?) ON CONFLICT(actor_id) DO UPDATE SET "
+                 'actor_session_version=excluded.actor_session_version,generation=excluded.generation,'
+                 "revision=excluded.revision,status='available',origin=excluded.origin,"
+                 'expires_at=excluded.expires_at,verifier=excluded.verifier',
+                 (actor['id'], actor['session_version'], generation, int(state['revision']) + 1,
+                  origin, now + 300, _credential_verifier(raw)))
+    return raw
+
+
+def _authorized_pairing_receipt(conn, receipt, actor):
+    # A new login after session invalidation cannot recover an old session's status.
+    if receipt['target_id'] != 'pairing:' + str(actor['session_version']):
+        return None
+    result = json.loads(receipt['response'])
+    result['pairing'] = _pairing_snapshot(conn, actor)
+    result['server_time'] = int(time.time() * 1000)
+    return result
+
+
+def _execute_pairing_mutation(payload, action, origin=None):
+    protocol = 'client_mutation_id' in payload
+    mutation_id = payload.get('client_mutation_id')
+    match = MUTATION_ID_PATTERN.fullmatch(mutation_id) if isinstance(mutation_id, str) else None
+    if protocol and match is None:
+        return {'error': 'Invalid mutation identifier'}, 400
+    fingerprint = hashlib.sha256(json.dumps(
+        [action, origin, payload], sort_keys=True, ensure_ascii=True, separators=(',', ':'),
+    ).encode()).hexdigest()
+    with _db_lock, db() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        actor = _tag_actor(conn)
+        if actor is None:
+            return {'error': 'Authentication required'}, 401
+        state = _pairing_snapshot(conn, actor)
+        if protocol:
+            receipt = conn.execute('SELECT * FROM mutation_receipts WHERE actor_id = ? AND mutation_id = ?',
+                                   (actor['id'], mutation_id)).fetchone()
+            if receipt is not None:
+                if receipt['fingerprint'] != fingerprint:
+                    return {'error': 'Mutation identifier already used', 'code': 'mutation_id_conflict'}, 409
+                result = _authorized_pairing_receipt(conn, receipt, actor)
+                if result is None:
+                    return {'error': 'Mutation unavailable'}, 404
+                return result, receipt['status']
+            if conn.execute("SELECT 1 FROM rename_operations WHERE actor_id = ? AND mutation_id = ? AND phase != 'done'",
+                            (actor['id'], mutation_id)).fetchone():
+                return {'error': 'Mutation identifier already used', 'code': 'mutation_id_conflict'}, 409
+            now = time.time()
+            _prune_mutation_receipts(conn, now)
+            counts = conn.execute('SELECT COUNT(*) AS total, COALESCE(SUM(recorded_at > ?),0) AS recent '
+                                  'FROM mutation_receipts WHERE actor_id = ?', (now - 60, actor['id'])).fetchone()
+            active = conn.execute("SELECT COUNT(*) FROM rename_operations WHERE actor_id = ? AND (phase != 'done' OR NOT EXISTS "
+                                  '(SELECT 1 FROM mutation_receipts r WHERE r.actor_id = rename_operations.actor_id '
+                                  'AND r.mutation_id = rename_operations.mutation_id))', (actor['id'],)).fetchone()[0]
+            if counts['total'] + active >= MUTATION_ACTOR_RECEIPT_LIMIT or counts['recent'] + active >= MUTATION_ACTOR_MINUTE_LIMIT:
+                return {'error': 'Too many mutations; wait before submitting more', 'code': 'mutation_limit'}, 429
+        status, outcome, error, code = 200, 'committed', None, None
+        if protocol:
+            expected = payload.get('expected_revision')
+            created = int(match.group(1)) / 1000
+            allowed = {'client_mutation_id', 'expected_revision'} | ({'generation'} if action == 'pairing.invalidate' else set())
+            if created < now - MUTATION_REPLAY_SECONDS or created > now + 300:
+                status, outcome, error = 400, 'rejected', 'Mutation identifier expired or clock is incorrect'
+            elif set(payload) - allowed:
+                status, outcome, error = 400, 'rejected', 'Unsupported pairing fields'
+            elif not isinstance(expected, str) or not re.fullmatch(r'0|[1-9][0-9]{0,18}', expected):
+                status, outcome, error = 400, 'rejected', 'Expected revision must be a decimal string'
+            elif action == 'pairing.invalidate' and (not isinstance(payload.get('generation'), str)
+                    or not re.fullmatch(r'[0-9a-f]{32}', payload['generation'])):
+                status, outcome, error = 400, 'rejected', 'Pairing generation is required'
+            elif expected != state['revision'] or (action == 'pairing.invalidate' and payload['generation'] != state['generation']):
+                status, outcome, error = 409, 'conflicted', 'Pairing changed; review current status before continuing'
+        if error is None:
+            if action == 'pairing.create':
+                code = _create_pairing_code(conn, actor, origin, state)
+                status = 201
+            elif state['status'] == 'available':
+                conn.execute("UPDATE extension_pairing_state SET status='invalidated',verifier=NULL,revision=revision+1 WHERE actor_id=?",
+                             (actor['id'],))
+            state = _pairing_snapshot(conn, actor)
+        result = {'pairing': state, 'server_time': int(time.time() * 1000)}
+        if protocol:
+            result['mutation'] = {'id': mutation_id, 'domain': 'extension-pairing',
+                                  'revision': state['revision'], 'outcome': outcome}
+            if action == 'pairing.create' and code:
+                result['created_generation'] = state['generation']
+            if error:
+                result['error'] = error
+            # Commit verifier and non-secret receipt together. Plaintext belongs
+            # only to the first response; neither recovery nor replay stores it.
+            conn.execute('INSERT INTO mutation_receipts(actor_id,mutation_id,target_id,fingerprint,status,response,recorded_at) '
+                         'VALUES (?,?,?,?,?,?,?)', (actor['id'], mutation_id, 'pairing:' + str(actor['session_version']),
+                          fingerprint, status, json.dumps(result, separators=(',', ':')), now))
+        if code:
+            result.update(code=code, expires_at=state['expires_at'])
+    return result, status
 
 
 def _consume_pairing_code(code, origin):
@@ -5445,28 +5566,32 @@ def _consume_pairing_code(code, origin):
             or not re.fullmatch(r'VDL1-[A-Za-z0-9_-]{22}', code)):
         return None
     verifier = _credential_verifier(code)
-    now = time.time()
-    with _pairing_lock:
-        matched_user_id = None
-        for user_id, record in list(_pairing_codes.items()):
-            if record['expires_at'] <= now:
-                _pairing_codes.pop(user_id, None)
-                continue
-            if (record['origin'] == origin
-                    and hmac.compare_digest(record['verifier'], verifier)):
-                matched_user_id = user_id
-        if matched_user_id is None:
+    with _db_lock, db() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        record = conn.execute("SELECT * FROM extension_pairing_state WHERE status='available' AND verifier=? AND origin=?",
+                              (verifier, origin)).fetchone()
+        if record is None:
             return None
-        # Consume before the database write so even a lost/error response can
-        # never replay the credential.
-        _pairing_codes.pop(matched_user_id, None)
-        return matched_user_id
+        actor = _db_user(conn, 'id = ?', (record['actor_id'],))
+        state = _pairing_snapshot(conn, actor)
+        if (state['status'] != 'available' or actor['suspended']
+                or actor['password_hash'] is None):
+            return None
+        # Consume before token issuance so lost responses cannot reuse a code.
+        conn.execute("UPDATE extension_pairing_state SET status='consumed',verifier=NULL,revision=revision+1 WHERE actor_id=?",
+                     (actor['id'],))
+        return actor
 
 
 def _new_companion_token(user, device_label, extension_version):
     token_id = _b64url(secrets.token_bytes(16))
     token = f'vdlx_{token_id}.{_b64url(secrets.token_bytes(32))}'
     with _db_lock, db() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        current = _db_user(conn, 'id = ?', (user['id'],))
+        if (current is None or current['suspended'] or current['password_hash'] is None
+                or current['session_version'] != user['session_version']):
+            return None, None
         conn.execute(
             "INSERT INTO extension_tokens("
             "id, user_id, token_verifier, device_label, extension_version, "
@@ -7782,17 +7907,38 @@ def extension_pairing_codes():
             'error': 'Pairing requires HTTPS or an allowed private HTTP network',
             'code': 'pairing_transport_not_allowed',
         }), 403
-    code, expires_at = _new_pairing_code(g.current_user['id'], origin)
-    response = jsonify({'code': code, 'expires_at': int(expires_at)})
-    response.headers['Cache-Control'] = 'no-store'
-    return response, 201
+    if request.content_length is not None and request.content_length > 4096:
+        return _read_json_body(4096)[1]
+    payload = {}
+    if request.get_data():
+        payload, invalid = _read_json_body(4096)
+        if invalid is not None:
+            return invalid
+    result, status = _execute_pairing_mutation(payload, 'pairing.create', origin)
+    return jsonify(result), status
 
 
-@app.route('/api/extension/pairing-codes/current', methods=['DELETE'])
+@app.route('/api/extension/pairing-codes/current', methods=['GET', 'DELETE'])
 def extension_current_pairing_code():
-    with _pairing_lock:
-        _pairing_codes.pop(g.current_user['id'], None)
-    return '', 204
+    if request.method == 'GET':
+        with _db_lock, db() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            actor = _tag_actor(conn)
+            if actor is None:
+                return jsonify({'error': 'Authentication required'}), 401
+            result = {'pairing': _pairing_snapshot(conn, actor), 'server_time': int(time.time() * 1000)}
+        return jsonify(result)
+    if request.content_length is not None and request.content_length > 4096:
+        return _read_json_body(4096)[1]
+    payload = {}
+    if request.get_data():
+        payload, invalid = _read_json_body(4096)
+        if invalid is not None:
+            return invalid
+    result, status = _execute_pairing_mutation(payload, 'pairing.invalidate')
+    if status == 200 and 'client_mutation_id' not in payload:
+        return '', 204
+    return jsonify(result), status
 
 
 @app.route('/api/extension/connections', methods=['GET'])
@@ -7881,14 +8027,15 @@ def extension_pair():
         _record_failed_pair(request.remote_addr)
         return _companion_error(400, 'invalid_request', 'Invalid pairing request')
 
-    user_id = _consume_pairing_code(data.get('code'), origin)
-    user = db_get_user_by_id(user_id) if user_id is not None else None
+    user = _consume_pairing_code(data.get('code'), origin)
     if (user is None or user['suspended'] or user['password_hash'] is None):
         _record_failed_pair(request.remote_addr)
         return _companion_error(
             401, 'companion_auth_failed', 'Companion authentication failed'
         )
     token_id, token = _new_companion_token(user, label, extension_version)
+    if token is None:
+        return _companion_error(401, 'companion_auth_failed', 'Companion authentication failed')
     return jsonify({
         'token': token,
         'connection_id': token_id,
@@ -10183,8 +10330,8 @@ def record_download_view(download_id):
 @app.route('/api/client-capabilities', methods=['GET'])
 def client_capabilities():
     response = jsonify({
-        'mutation_protocol': 1, 'actions': ['tag.add', 'tag.remove', 'favorite.set', 'visibility.set', 'rename.set', 'preference.set', 'playlist.create', 'playlist.replace', 'playlist.add', 'playlist.delete', 'download.pause', 'download.unpause', 'download.stop', 'download.retry', 'download.resume', 'download.submit', 'upload.register', 'upload.cancel', 'entry.remove', 'history.clear', 'library.clear'],
-        'upload_recovery': 1, 'entry_removal': 1, 'bulk_clear': 1,
+        'mutation_protocol': 1, 'actions': ['tag.add', 'tag.remove', 'favorite.set', 'visibility.set', 'rename.set', 'preference.set', 'playlist.create', 'playlist.replace', 'playlist.add', 'playlist.delete', 'download.pause', 'download.unpause', 'download.stop', 'download.retry', 'download.resume', 'download.submit', 'upload.register', 'upload.cancel', 'entry.remove', 'history.clear', 'library.clear', 'pairing.create', 'pairing.invalidate'],
+        'upload_recovery': 1, 'entry_removal': 1, 'bulk_clear': 1, 'extension_pairing': 1,
         'tag_identity_version': TAG_IDENTITY_VERSION,
         'server_time': int(time.time() * 1000),
     })
@@ -10261,6 +10408,11 @@ def mutation_receipt(mutation_id):
                         return jsonify({'error': 'Mutation unavailable'}), 404
                     result.update(_upload_result(conn, receipt['target_id']))
                     result['mutation']['revision'] = result['upload']['revision']
+                pairing_receipt = result.get('mutation', {}).get('domain') == 'extension-pairing'
+                if pairing_receipt:
+                    result = _authorized_pairing_receipt(conn, receipt, actor)
+                    if result is None:
+                        return jsonify({'error': 'Mutation unavailable'}), 404
                 preference_receipt = result.get('mutation', {}).get('domain') == 'preferences' and receipt['target_id'] == 'installation'
                 playlist_receipt = result.get('mutation', {}).get('domain') == 'playlist'
                 submission_rejection = (result.get('mutation', {}).get('domain') == 'download-submission'
@@ -10276,7 +10428,7 @@ def mutation_receipt(mutation_id):
                         response.status_code = 404
                         response.headers['Cache-Control'] = 'no-store'
                         return response
-                if not preference_receipt and not playlist_receipt and not submission_rejection and _tag_visible_row(conn, receipt['target_id'], actor) is None:
+                if not pairing_receipt and not preference_receipt and not playlist_receipt and not submission_rejection and _tag_visible_row(conn, receipt['target_id'], actor) is None:
                     match = MUTATION_ID_PATTERN.fullmatch(mutation_id)
                     final = bool(match and int(match.group(1)) / 1000 < time.time() - MUTATION_REPLAY_SECONDS)
                     return jsonify({'error': 'Mutation unavailable', 'final': final}), 404

@@ -14,6 +14,13 @@
         && revision(value.visibility_revision) && typeof value.can_manage_visibility === 'boolean'
         && typeof value.can_delete === 'boolean' && !!value.permissions
         && ['tags', 'favorite', 'rename', 'visibility'].every(key => typeof value.permissions[key] === 'boolean');
+    const validPairingState = value => !!value && revision(value.revision)
+        && ['none', 'available', 'invalidated', 'expired', 'consumed', 'interrupted'].includes(value.status)
+        && (value.generation === null || typeof value.generation === 'string' && !!value.generation)
+        && (value.expires_at === null || Number.isSafeInteger(value.expires_at))
+        && (value.status === 'none' ? value.generation === null : value.generation !== null)
+        && (value.status !== 'available' || value.expires_at > 0)
+        && Object.keys(value).every(key => ['generation', 'status', 'expires_at', 'revision'].includes(key));
     const uploadPhases = new Set(['registered', 'transferring', 'processing', 'published', 'cancelled', 'failed']);
     const validUploadState = value => !!value && typeof value.id === 'string' && !!value.id
         && revision(value.revision) && BigInt(value.revision) > 0n && uploadPhases.has(value.phase)
@@ -66,6 +73,7 @@
         function acceptDownload(snapshot, context = {}) {
             if (!snapshot || snapshot.id == null || (context.epoch !== undefined && context.epoch !== epoch)) return false;
             if (snapshot.tags_revision !== undefined && (!revision(snapshot.tags_revision) || !Array.isArray(snapshot.tags) || !Array.isArray(snapshot.tag_items) || snapshot.tags.length !== snapshot.tag_items.length || snapshot.tag_items.some((tag, index) => !tag || typeof tag.key !== 'string' || typeof tag.name !== 'string' || tag.name !== snapshot.tags[index]) || new Set(snapshot.tag_items.map(tag => tag.key)).size !== snapshot.tag_items.length)) return false;
+            if (snapshot.pairing_revision !== undefined && (String(snapshot.id) !== 'pairing' || !validPairingState(snapshot.pairing) || snapshot.pairing.revision !== snapshot.pairing_revision)) return false;
             if (snapshot.bulk_revision !== undefined && (!revision(snapshot.bulk_revision) || !['bulk:history', 'bulk:library'].includes(String(snapshot.id)) || typeof snapshot.bulk_scope !== 'string')) return false;
             if (snapshot.removal_revision !== undefined && !revision(snapshot.removal_revision)) return false;
             if (snapshot.command_revision !== undefined && (!revision(snapshot.command_revision) || !(snapshot.current_attempt_id === null || typeof snapshot.current_attempt_id === 'string' && snapshot.current_attempt_id))) return false;
@@ -90,6 +98,11 @@
                 if (snapshot.bulk_scope === old.bulk_scope && BigInt(snapshot.bulk_revision) < BigInt(old.bulk_revision)) return false;
             }
             const next = { ...(old || {}), ...copy(snapshot), id };
+            if (old && revision(old.pairing_revision)) {
+                if (!revision(snapshot.pairing_revision) || BigInt(snapshot.pairing_revision) < BigInt(old.pairing_revision)) {
+                    next.pairing_revision = old.pairing_revision; next.pairing = old.pairing;
+                } else if (snapshot.pairing_revision === old.pairing_revision && ['generation', 'status', 'expires_at', 'revision'].some(key => snapshot.pairing[key] !== old.pairing[key])) return false;
+            }
             if (old && revision(old.removal_revision) && (!revision(snapshot.removal_revision) || BigInt(snapshot.removal_revision) < BigInt(old.removal_revision))) next.removal_revision = old.removal_revision;
             if (old && revision(old.upload_revision)) {
                 if (!revision(snapshot.upload_revision) || BigInt(snapshot.upload_revision) < BigInt(old.upload_revision)) {
@@ -233,6 +246,7 @@
             const uploadIntents = [];
             const removalIntents = [];
             const bulkIntents = [];
+            const pairingIntents = [];
             let requestedFilename = null;
             const chips = new Map();
             for (const tag of download.tag_items || (download.tags || []).map(name => VDL.tagIdentity.normalize(name))) {
@@ -240,6 +254,7 @@
             }
             for (const intent of intents.values()) {
                 if (intent.targetId !== id) continue;
+                if (intent.kind.startsWith('pairing.')) { pairingIntents.push(copy(intent)); continue; }
                 if (intent.kind === 'history.clear' || intent.kind === 'library.clear') { bulkIntents.push(copy(intent)); continue; }
                 if (intent.kind === 'entry.remove') { removalIntents.push(copy(intent)); continue; }
                 if (intent.kind.startsWith('upload.')) { uploadIntents.push(copy(intent)); continue; }
@@ -281,7 +296,7 @@
                 rows.sort((a, b) => a.name.localeCompare(b.name));
             }
             const effective = rows.filter(tag => tag.effective).map(tag => ({ key: tag.key, name: tag.name }));
-            return freeze(copy({ ...download, bulk_intents: bulkIntents, removal_intents: removalIntents, upload_intents: uploadIntents, submission_intents: submissionIntents, command_intents: commandIntents, playlist_intents: playlistIntents, requested_filename: requestedFilename, rename_intents: renameIntents, preference_intents: preferenceIntents, favorite, favorite_intents: favoriteIntents, visibility_intents: visibilityIntents, tags: effective.map(tag => tag.name), tag_items: effective, tag_chips: rows }));
+            return freeze(copy({ ...download, pairing_intents: pairingIntents, bulk_intents: bulkIntents, removal_intents: removalIntents, upload_intents: uploadIntents, submission_intents: submissionIntents, command_intents: commandIntents, playlist_intents: playlistIntents, requested_filename: requestedFilename, rename_intents: renameIntents, preference_intents: preferenceIntents, favorite, favorite_intents: favoriteIntents, visibility_intents: visibilityIntents, tags: effective.map(tag => tag.name), tag_items: effective, tag_chips: rows }));
         }
         function fence(id, terminal = false) {
             id = String(id);
@@ -374,6 +389,7 @@
             }),
         });
     }
+    VDL.validPairingState = validPairingState;
     VDL.validVisibilityState = validVisibilityState;
     VDL.validUploadState = validUploadState;
     VDL.createClientState = createClientState;

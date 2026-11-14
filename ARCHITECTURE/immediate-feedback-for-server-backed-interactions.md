@@ -1,6 +1,6 @@
 # Architecture: immediate feedback for server-backed interactions
 
-**Status:** Foundation, tags, favorites, rename, preferences, playlist editor saves, playlist add/delete, download commands, new-download acceptance, uploads, entry removal, bulk clear, and visibility changes implemented; additional adapters remain proposed.\
+**Status:** Foundation, tags, favorites, rename, preferences, playlist editor saves, playlist add/delete, download commands, new-download acceptance, uploads, entry removal, bulk clear, visibility changes, and extension pairing implemented; additional adapters remain proposed.\
 **Date:** 2026-11-14\
 **Requirements:** [Feature 0051](../FEATURES/feature-0051-immediate-feedback-for-server-backed-interactions.md)
 
@@ -22,7 +22,7 @@ The implementation adds the shared modules, tag protocol, and independent
 `favorite.set`, `rename.set`, `preference.set`, `playlist.create`,
 `playlist.replace`, `playlist.add`, `playlist.delete`, `download.*`,
 `upload.register`, `upload.cancel`, `entry.remove`, `history.clear`,
-`library.clear`, and `visibility.set` adapters described
+`library.clear`, `visibility.set`, `pairing.create`, and `pairing.invalidate` adapters described
 below. Other actions still use handlers and collection snapshots in
 `static/app.js`, server routes and persistence in `vdl.py`, and SSE hints that
 trigger collection reads. The [rollout inventory](feature-0051-rollout.md) records
@@ -597,6 +597,33 @@ resource identity. Entry hints check current authorization at delivery; a hint
 for an inaccessible or deleted entry retains only its generic reason.
 Playback selection, playlist redaction, rotation membership,
 and storage totals retain their existing authorization rules.
+
+### Pairing credentials and non-secret recovery
+
+Feature 0063 adds `pairing.create` and `pairing.invalidate` to the independent,
+actor-scoped `extension-pairing` domain. The shared store and coordinator own
+non-secret pairing snapshots, pending status, immutable attempts, and receipt
+recovery. A separate credential presentation seam handles the original secret
+response before the coordinator receives the sanitized result. Only the
+originating view token and authentication epoch may display that credential.
+Closing the surface clears its secret; late callbacks cannot reopen the surface
+or restore focus. Pending and unknown status remains available in memory.
+
+The additive `extension_pairing_state` table holds the current generation,
+revision, expiry, status, actor session version, and credential verifier.
+Creation and invalidation commit their state and non-secret receipts together.
+Legacy management routes and companion consumption use the same serialized
+revision boundary. Startup invalidates unused verifiers and records interruption,
+so a stored verifier does not extend a code's lifetime across restart.
+
+`extension_pairing: 1` advertises the complete protocol. Authorized status reads,
+receipt lookup, and replay return no credential. A replay preserves the original
+attempt outcome and supplies current non-secret status. Invalidation binds a
+specific generation; an old attempt cannot revoke a replacement. Lost creation
+responses require explicit invalidation followed by a separate deliberate
+creation. The page never automatically rotates a credential or replays a write.
+Authentication reset clears credentials before obsolete callbacks can execute.
+The companion extension retains its separate transport and token lifecycle.
 
 ## Bootstrap, compatibility, and deployment
 

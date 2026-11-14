@@ -1800,10 +1800,15 @@ let preferenceMessage = '';
 let preferenceReviewVisible = false;
 let preferenceSavedTimer = null;
 VDL.favoriteMutationMetrics = () => Object.freeze({ ...favoriteMutationMetrics });
-VDL.mutationMetrics = () => Object.freeze({ ...mutationMetrics });
+VDL.mutationMetrics = () => {
+    const pairing = extensionPairing.metrics();
+    return Object.freeze({ ...mutationMetrics, pending: mutationMetrics.pending + pairing.pending,
+        unconfirmed: mutationMetrics.unconfirmed + pairing.unconfirmed, conflicted: mutationMetrics.conflicted + pairing.conflicted });
+};
 const tagState = VDL.createClientState();
 const tagMutations = VDL.createMutations({
     state: tagState,
+    additionalPendingCount: () => extensionPairing.pendingCount(),
     transport: async ({ url, method, body }) => {
         if (method === 'POST' && url === '/api/playlists' || method === 'PUT' && /^\/api\/playlists\/[^/]+$/.test(url)) {
             const submission = [...playlistSubmissions.values()].find(entry => !entry.legacy && (method === 'POST' ? entry.kind === 'playlist.create' && !entry.mutationId : entry.key === decodeURIComponent(url.split('/')[3])));
@@ -1916,6 +1921,10 @@ const tagMutations = VDL.createMutations({
 
 function resetTagSession() {
     tagSessionEpoch += 1;
+    extensionPairing.reset();
+    extensionPairingAllowed = false;
+    const pairingDialog = document.getElementById('extensionPairingDialog');
+    if (pairingDialog.open) pairingDialog.close();
     for (const record of bulkClears.values()) (record.timers || []).forEach(clearTimeout);
     bulkClears.clear(); bulkRemovedAttemptIds.clear();
     refreshBulkClearPresentations();
@@ -2044,6 +2053,8 @@ async function loadTagCapabilities() {
         if (epoch !== tagSessionEpoch) return;
         tagCapabilities = capabilities;
         tagMutations.setCapabilities(tagCapabilities);
+        extensionPairing.setCapabilities(tagCapabilities);
+        extensionPairing.refresh();
         adoptServerUploads(collectionSnapshots.current);
         renderDroppedUploads();
     } catch (_) {
@@ -2146,7 +2157,7 @@ tagState.subscribe(ids => {
 });
 
 window.addEventListener('beforeunload', event => {
-    if (![...droppedUploads.values()].some(upload => !upload.settled || upload.unknown || uploadIntent(upload)) && !playlistActions.size && !playlistSubmissions.size && !playlistRetainedDrafts.size && !(playlistEditorDraft && playlistEditorSnapshot() !== playlistEditorBaseline) && !preferenceDirty && !preferenceSubmission && !tagMutations.hasPending() && ![...tagDrafts.values()].some(value => value.trim()) && !renameDrafts.size && !compatibilityVisibility.size && !compatibilityRenames.size && !compatibilityCommands.size && !compatibilityRemovals.size && ![...bulkClears.values()].some(entry => !['confirmed', 'rejected'].includes(bulkClearEntry(entry).status)) && !downloadSubmission?.legacy && !urlInput.value.trim()) return;
+    if (![...droppedUploads.values()].some(upload => !upload.settled || upload.unknown || uploadIntent(upload)) && !playlistActions.size && !playlistSubmissions.size && !playlistRetainedDrafts.size && !(playlistEditorDraft && playlistEditorSnapshot() !== playlistEditorBaseline) && !preferenceDirty && !preferenceSubmission && !tagMutations.hasPending() && !extensionPairing.hasPending() && ![...tagDrafts.values()].some(value => value.trim()) && !renameDrafts.size && !compatibilityVisibility.size && !compatibilityRenames.size && !compatibilityCommands.size && !compatibilityRemovals.size && ![...bulkClears.values()].some(entry => !['confirmed', 'rejected'].includes(bulkClearEntry(entry).status)) && !downloadSubmission?.legacy && !urlInput.value.trim()) return;
     event.preventDefault();
     event.returnValue = '';
 });
@@ -9862,11 +9873,13 @@ function isPairableVdlLocation(value, privateHttpAllowed = false) {
 }
 
 function extensionStatus(message) {
-    document.getElementById('extensionStatus').textContent = message || '';
+    const status = document.getElementById('extensionStatus');
+    if (status.textContent !== (message || '')) status.textContent = message || '';
 }
 
 function extensionPairingFeedback(message) {
-    document.getElementById('extensionPairingFeedback').textContent = message || '';
+    const status = document.getElementById('extensionPairingFeedback');
+    if (status.textContent !== (message || '')) status.textContent = message || '';
 }
 
 function setExtensionPairingCopied(copied) {
@@ -9877,26 +9890,117 @@ function setExtensionPairingCopied(copied) {
         ? 'Copied' : 'Copy pairing string';
 }
 
-function clearExtensionPairing() {
+const extensionPairing = VDL.createExtensionPairing({
+    additionalPendingCount: () => tagMutations.pending().length,
+    transport: async ({ url, method, body }) => {
+        const response = await apiFetch(url, { method,
+            ...(body === undefined ? {} : { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
+        });
+        return { status: response.status, body: await response.json().catch(() => null) };
+    },
+    onAuthLoss: resetTagSession,
+    onClearSecret: clearExtensionPairingPresentation,
+    onSecret: ({ code, expires_at }) => {
+        const dialog = document.getElementById('extensionPairingDialog');
+        if (!dialog.open) return;
+        document.getElementById('extensionPairingString').value = pairingString(window.location.origin, code);
+        document.getElementById('extensionPairingCredential').hidden = false;
+        document.getElementById('extensionCopyPairing').disabled = false;
+        extensionPairingExpiresAt = expires_at;
+        updatePairingExpiry();
+        if (extensionPairingTimer) clearInterval(extensionPairingTimer);
+        extensionPairingTimer = setInterval(updatePairingExpiry, 1000);
+        if (document.activeElement === dialog.querySelector('.extension-pairing-close')) {
+            document.getElementById('extensionCopyPairing').focus();
+        }
+    },
+    onChange: renderExtensionPairing,
+    onEvent: event => {
+        if (event.outcome === 'presented') { mutationMetrics.submissions++; mutationMetrics.latestLocalFeedbackMs = event.elapsedMs; }
+        if (event.outcome === 'confirmed') { mutationMetrics.acknowledgements++; mutationMetrics.latestAcknowledgementMs = event.elapsedMs; }
+        if (event.outcome === 'rejected') mutationMetrics.rejectedOutcomes++;
+        if (event.outcome === 'unconfirmed') mutationMetrics.unconfirmedOutcomes++;
+        if (event.outcome === 'conflicted') mutationMetrics.conflicts++;
+        if (event.outcome === 'reconciliation') mutationMetrics.reconciliationReads++;
+    },
+});
+VDL.extensionPairingMetrics = () => extensionPairing.metrics();
+
+function pairingOperationMessage(model) {
+    const intent = model.intent;
+    if (!intent) return model.message;
+    if (intent.status === 'queued' || intent.status === 'sending') {
+        const action = intent.kind === 'pairing.create' ? 'Creating pairing…' : 'Invalidating pairing…';
+        return action + (intent.delayed ? ' Still waiting for server confirmation. Closing this dialog does not cancel the request.' : '');
+    }
+    return intent.message || model.message;
+}
+
+function renderExtensionPairing() {
+    const model = extensionPairing.snapshot();
+    const dialog = document.getElementById('extensionPairingDialog');
+    document.getElementById('extensionStatus').setAttribute('aria-live', dialog.open ? 'off' : 'polite');
+    const sending = model.intent && ['queued', 'sending'].includes(model.intent.status);
+    const message = pairingOperationMessage(model);
+    const create = document.getElementById('extensionCreatePairing');
+    create.disabled = !extensionPairingAllowed || !model.canCreate;
+    create.textContent = sending && model.intent.kind === 'pairing.create' ? 'Creating pairing…' : 'Create pairing string';
+    create.setAttribute('aria-busy', String(!!sending && model.intent.kind === 'pairing.create'));
+    document.getElementById('extensionCopyPairing').disabled = !!model.intent || !model.hasSecret;
+    const labels = { none: 'No pairing string is available.', available: 'Last confirmed status: a one-time pairing string is available.',
+        invalidated: 'Last confirmed status: pairing string invalidated.', expired: 'Last confirmed status: pairing string expired.',
+        consumed: 'Last confirmed status: pairing string used.', interrupted: 'Last confirmed status: pairing string interrupted.' };
+    const confirmed = labels[model.pairing?.status] || '';
+    document.getElementById('extensionPairingConfirmedStatus').textContent = confirmed;
+    const operationStatus = document.getElementById('extensionPairingOperationStatus');
+    if (operationStatus.textContent !== message) operationStatus.textContent = message;
+    if (message) extensionStatus(message);
+    for (const id of ['extensionPairingInvalidate', 'extensionInvalidatePairing']) {
+        const button = document.getElementById(id);
+        button.disabled = !model.canInvalidate;
+        button.hidden = !model.hasSecret && !model.recoveryGeneration && !model.pairing?.generation;
+        button.textContent = sending && model.intent.kind === 'pairing.invalidate' ? 'Invalidating pairing…' : 'Invalidate pairing string';
+        button.setAttribute('aria-busy', String(!!sending && model.intent.kind === 'pairing.invalidate'));
+    }
+    const recoverable = model.intent?.status === 'unconfirmed';
+    for (const id of ['extensionCheckPairing', 'extensionPairingCheck']) {
+        const button = document.getElementById(id);
+        button.hidden = (!recoverable && model.ready) || !model.supported;
+        button.disabled = model.checking;
+    }
+    for (const button of document.querySelectorAll('[data-pairing-recovery]')) {
+        const action = button.dataset.pairingRecovery;
+        button.hidden = action === 'invalidate' ? !model.canInvalidate : action === 'check' || action === 'replay' ? !recoverable || !model.supported : action === 'resolve' ? !model.intent || !['unconfirmed', 'rejected', 'conflicted'].includes(model.intent.status) : false;
+        button.disabled = model.checking;
+    }
+    const summary = document.getElementById('extensionPairingSummary');
+    summary.hidden = !model.intent && !(model.recoveryGeneration && !model.hasSecret);
+    summary.querySelector('span').textContent = message || (model.checking ? 'Checking pairing status…'
+        : model.recoveryGeneration && !model.hasSecret ? 'The pairing code is no longer displayed. Invalidate this generation before deliberately creating another.' : '');
+    if (!model.intent && message === 'Pairing string invalidated.') {
+        const dialog = document.getElementById('extensionPairingDialog');
+        if (dialog.open) dialog.close();
+    }
+}
+
+function clearExtensionPairingPresentation() {
     if (extensionPairingTimer) clearInterval(extensionPairingTimer);
     extensionPairingTimer = null;
     extensionPairingExpiresAt = 0;
-    const field = document.getElementById('extensionPairingString');
-    if (field) field.value = '';
-    const output = document.getElementById('extensionPairingOutput');
-    if (output) output.hidden = true;
-    const details = document.getElementById('extensionPairingDetails');
-    if (details) details.open = false;
+    document.getElementById('extensionPairingString').value = '';
+    document.getElementById('extensionPairingCredential').hidden = true;
+    document.getElementById('extensionPairingDetails').open = false;
     setExtensionPairingCopied(false);
     extensionPairingFeedback('');
-    const dialog = document.getElementById('extensionPairingDialog');
-    if (dialog && dialog.open) dialog.close();
 }
 
-function closeExtensionPairingDialog() {
+function clearExtensionPairing() {
+    extensionPairing.close();
     const dialog = document.getElementById('extensionPairingDialog');
     if (dialog.open) dialog.close();
 }
+
+function closeExtensionPairingDialog() { clearExtensionPairing(); }
 
 function pairingString(origin, code) {
     const bytes = new TextEncoder().encode(JSON.stringify({ origin, code }));
@@ -9907,61 +10011,65 @@ function pairingString(origin, code) {
 
 function updatePairingExpiry() {
     const remaining = Math.max(0, Math.ceil(extensionPairingExpiresAt - Date.now() / 1000));
-    const label = document.getElementById('extensionPairingExpiry');
     if (!remaining) {
-        clearExtensionPairing();
+        extensionPairing.expire();
+        const dialog = document.getElementById('extensionPairingDialog');
+        if (dialog.open) dialog.close();
         extensionStatus('');
         return;
     }
-    label.textContent = `${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, '0')} remaining`;
+    document.getElementById('extensionPairingExpiry').textContent = `${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, '0')} remaining`;
 }
 
 function createExtensionPairing() {
-    if (!extensionPairingAllowed) return;
-    apiAction('/api/extension/pairing-codes', { method: 'POST' })
-        .then(response => response.json()).then(response => {
-        document.getElementById('extensionPairingString').value = pairingString(
-            window.location.origin, response.code,
-        );
-        document.getElementById('extensionPairingOutput').hidden = false;
-        extensionPairingExpiresAt = response.expires_at;
-        updatePairingExpiry();
-        if (extensionPairingTimer) clearInterval(extensionPairingTimer);
-        extensionPairingTimer = setInterval(updatePairingExpiry, 1000);
-        const dialog = document.getElementById('extensionPairingDialog');
-        document.getElementById('extensionPairingDetails').open = false;
-        setExtensionPairingCopied(false);
-        extensionPairingFeedback('');
-        dialog.showModal();
-        document.getElementById('extensionCopyPairing').focus();
-        extensionStatus('Pairing string created. Copy it to continue in VDL Companion.');
-    }).catch(() => {});
+    if (!extensionPairingAllowed || !extensionPairing.snapshot().canCreate) return;
+    const dialog = document.getElementById('extensionPairingDialog');
+    document.getElementById('extensionPairingOutput').hidden = false;
+    const result = extensionPairing.create();
+    if (result.accepted && !dialog.open) dialog.showModal();
+    renderExtensionPairing();
 }
 
 async function copyExtensionPairing() {
+    const model = extensionPairing.snapshot();
     const field = document.getElementById('extensionPairingString');
+    if (!model.hasSecret || model.intent || !field.value) return;
+    const epoch = tagSessionEpoch;
+    const secret = field.value;
+    const current = () => epoch === tagSessionEpoch && extensionPairing.snapshot().hasSecret
+        && !extensionPairing.snapshot().intent && field.value === secret
+        && document.getElementById('extensionPairingDialog').open;
     try {
-        await navigator.clipboard.writeText(field.value);
+        await navigator.clipboard.writeText(secret);
+        if (!current()) return;
         setExtensionPairingCopied(true);
         extensionPairingFeedback('Copied. Continue in VDL Companion.');
         extensionStatus('Pairing string copied.');
     } catch (_) {
+        if (!current()) return;
         document.getElementById('extensionPairingDetails').open = true;
-        field.focus();
-        field.select();
+        field.focus(); field.select();
         setExtensionPairingCopied(false);
         extensionPairingFeedback('Copy was blocked. The pairing string is shown and selected below.');
         extensionStatus('Copy was blocked. The pairing string is selected for manual copying.');
     }
 }
 
-function invalidateExtensionPairing() {
-    apiAction('/api/extension/pairing-codes/current', { method: 'DELETE' })
-        .then(() => {
-            clearExtensionPairing();
-            extensionStatus('Pairing string invalidated.');
-        }).catch(() => {});
+function invalidateExtensionPairing() { extensionPairing.invalidate(); renderExtensionPairing(); }
+async function recoverExtensionPairing(action = 'check') {
+    if (action === 'invalidate') invalidateExtensionPairing();
+    else if (action === 'resolve') {
+        if (!extensionPairing.resolve()) extensionStatus('Pairing request remains uncertain. Check the original request before resolving it.');
+        renderExtensionPairing();
+    } else await extensionPairing.recover(action === 'replay');
 }
+
+document.getElementById('extensionPairingDialog').addEventListener('cancel', event => {
+    event.preventDefault(); closeExtensionPairingDialog();
+});
+document.getElementById('extensionPairingDialog').addEventListener('close', event => {
+    if (!event.target.open) extensionPairing.close();
+});
 
 function extensionPackageAction() {
     if (!bundledExtension) return;
@@ -10010,14 +10118,18 @@ function renderExtensionConnection(connection) {
 }
 
 function loadExtensionConnections() {
+    const epoch = tagSessionEpoch;
     const create = document.getElementById('extensionCreatePairing');
     create.disabled = true;
     return apiFetch('/api/extension/connections').then(response => response.json()).then(data => {
+        if (epoch !== tagSessionEpoch) return;
         extensionPairingAllowed = isPairableVdlLocation(
             window.location, Boolean(data.http_pairing_allowed),
         );
+        extensionPairing.setCapabilities(tagCapabilities);
+        extensionPairing.refresh();
         const localHttp = window.location.protocol === 'http:' && extensionPairingAllowed;
-        create.disabled = !extensionPairingAllowed;
+        renderExtensionPairing();
         document.getElementById('extensionHttpsStatus').textContent = localHttp
             ? 'This private HTTP origin is enabled by the VDL operator. Traffic is not encrypted.'
             : extensionPairingAllowed

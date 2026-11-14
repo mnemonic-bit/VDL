@@ -1,7 +1,7 @@
 # Immediate feedback for server-backed interactions
 
 **Source:** User-requested design specification\
-**Status:** Foundation, tags, and Features 0052–0062 favorites, rename, preferences, playlist editor saves, playlist add/delete, download commands, new-download acceptance, uploads, entry removal, bulk clear, and visibility changes implemented; remaining actions staged\
+**Status:** Foundation, tags, and Features 0052–0063 favorites, rename, preferences, playlist editor saves, playlist add/delete, download commands, new-download acceptance, uploads, entry removal, bulk clear, visibility changes, and extension pairing implemented; remaining actions staged\
 **Last refined:** 2026-11-14\
 **Architecture:** [Module responsibilities and implementation design](../ARCHITECTURE/immediate-feedback-for-server-backed-interactions.md)\
 **Extends:** [Feature 0001, Tags](feature-0001-add-tags-to-entries.md)\
