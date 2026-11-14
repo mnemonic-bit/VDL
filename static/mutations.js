@@ -34,6 +34,7 @@
         'tag.add': Object.freeze({ domain: 'tags', revision: 'tags_revision', noun: 'tags', method: 'POST', route: 'tags', field: 'tag' }),
         'tag.remove': Object.freeze({ domain: 'tags', revision: 'tags_revision', noun: 'tags', method: 'DELETE', route: 'tags', field: 'tag' }),
         'rename.set': Object.freeze({ domain: 'rename', revision: 'rename_revision', noun: 'rename', method: 'POST', route: 'rename', field: 'filename' }),
+        'visibility.set': Object.freeze({ domain: 'visibility', revision: 'visibility_revision', noun: 'visibility change', method: 'POST', route: 'visibility', field: 'visibility' }),
         'favorite.set': Object.freeze({ domain: 'favorite', revision: 'favorite_revision', noun: 'favorite', method: 'POST', route: 'favorite', field: 'favorite' }),
         'preference.set': Object.freeze({ domain: 'preferences', revision: 'preferences_revision', noun: 'settings', method: 'POST', route: 'preferences', field: 'values' }),
     });
@@ -87,6 +88,7 @@
                 id: intent.id, targetId: intent.targetId, kind: intent.kind, key: intent.key,
                 value: intent.value, status: intent.status, message: intent.message || '',
                 delayed: !!intent.delayed, viewToken: intent.viewToken || null,
+                ...(intent.kind === 'visibility.set' ? { canResolve: !!intent.safeToResolve || !!intent.attempt && BigInt(state.writer.confirmed(intent.targetId)?.visibility_revision || '0') > BigInt(intent.attempt.body.expected_revision), replayExpired: !!intent.expiredAbsence || !!intent.attempt && now() + timeOffset - Number(intent.attempt.body.client_mutation_id.split('-')[0]) > 86400000 } : {}),
                 ...(intent.bulkResult ? { bulkResult: intent.bulkResult } : {}),
                 ...(intent.acceptedJob ? { acceptedJob: intent.acceptedJob } : {}),
                 ...(bulkAction(intent.kind) || uploadAction(intent.kind) || removalAction(intent.kind) ? { canResolve: !!intent.safeToResolve, replayExpired: !!intent.attempt && now() + timeOffset - Number(intent.attempt.body.client_mutation_id.split('-')[0]) > 86400000 } : {}),
@@ -149,6 +151,7 @@
             if (playlistAction(intent.kind)) return { id: intent.targetId, playlist: body, playlist_revision: body.revision };
             if (intent.kind === 'preference.set') return { id: intent.targetId, values: body.values, preferences_revision: body.preferences_revision };
             if (intent.kind === 'rename.set') return { id: intent.targetId, ...(validRevision(body.removal_revision) ? { removal_revision: body.removal_revision } : {}), filename: body.filename, display_filename: body.display_filename, rename_revision: body.rename_revision };
+            if (intent.kind === 'visibility.set') return { id: intent.targetId, visibility: body.visibility, visibility_revision: body.visibility_revision, can_manage_visibility: body.can_manage_visibility, can_delete: body.can_delete, permissions: body.permissions };
             if (intent.kind === 'favorite.set') return { id: intent.targetId, favorite: body.favorite, favorite_revision: body.mutation?.revision ?? body.favorite_revision };
             return {
                 id: intent.targetId, tags: body.tags, tag_items: body.tag_items,
@@ -266,6 +269,15 @@
                     && (body.display_filename === null || typeof body.display_filename === 'string')
                     && (committed ? mutation.outcome === 'committed' : ['rejected', 'conflicted'].includes(mutation.outcome));
             }
+            if (intent.kind === 'visibility.set') {
+                return !!mutation && mutation.id === intent.attempt.body.client_mutation_id
+                    && mutation.domain === 'visibility' && body.id === intent.targetId
+                    && validRevision(mutation.revision) && VDL.validVisibilityState(body)
+                    && BigInt(body.visibility_revision) >= BigInt(mutation.revision)
+                    && (committed ? mutation.outcome === 'committed'
+                        && (BigInt(body.visibility_revision) > BigInt(mutation.revision) || body.visibility === intent.value)
+                        : ['rejected', 'conflicted'].includes(mutation.outcome));
+            }
             if (intent.kind === 'favorite.set') {
                 return !!mutation && mutation.id === intent.attempt.body.client_mutation_id
                     && mutation.domain === 'favorite' && String(body.id) === intent.targetId
@@ -285,6 +297,16 @@
             if (!reply || typeof reply.status !== 'number') { markUnknown(intent); return; }
             if (!authorizedReply(reply, intent)) return;
             const body = reply.body;
+            if (intent.kind === 'visibility.set' && reply.status === 429 && body?.code === 'mutation_limit' && typeof body.error === 'string') {
+                state.writer.transaction(() => {
+                    clearTimers(intent);
+                    release(intent);
+                    update(intent, { status: 'rejected', message: body.error });
+                });
+                emit(intent.kind, 'rejected', intent, intent.sentAt);
+                dispatch(queueKey(intent), intent.targetId);
+                return;
+            }
             if (intent.kind === 'rename.set' && reply.status === 503 && body?.code === 'rename_recovery_required') {
                 markUnknown(intent);
                 update(intent, { message: 'Rename not confirmed. File recovery needs intervention. Check again after the file state is repaired.' });
@@ -324,7 +346,7 @@
                     }
                     const merged = state.acceptDownload(snapshot(body, intent));
                     const confirmed = state.writer.confirmed(intent.targetId);
-                    if (!merged && confirmed?.[descriptor(intent).revision] === body.mutation.revision) {
+                    if (!merged && confirmed?.[descriptor(intent).revision] === snapshot(body, intent)[descriptor(intent).revision]) {
                         markUnknown(intent);
                         return;
                     }
@@ -368,7 +390,7 @@
         }
         function markUnknown(intent) {
             clearTimers(intent);
-            update(intent, { status: 'unconfirmed', message: bulkAction(intent.kind) ? 'Clear request not confirmed. Check its status before recovering the original clear.' : removalAction(intent.kind) ? 'Removal not confirmed. Check its status before recovering the original removal.' : uploadAction(intent.kind) ? 'Upload request not confirmed. Check upload status before recovering the original request.' : submissionAction(intent.kind) ? 'Download request not confirmed. Check its status before recovering the original request.' : commandAction(intent.kind) ? 'Request not confirmed. Check its status before replaying.' : intent.kind === 'playlist.add' ? 'Add not confirmed. Check its status before replaying.' : intent.kind === 'playlist.delete' ? 'Delete not confirmed. Check its status before replaying.' : intent.kind === 'rename.set' ? 'Rename not confirmed. Check its status before replaying.' : 'Save not confirmed. Check its status before retrying.', delayed: true });
+            update(intent, { status: 'unconfirmed', message: intent.kind === 'visibility.set' ? 'Visibility change not confirmed. Requested and last confirmed visibility are retained; check the original request.' : bulkAction(intent.kind) ? 'Clear request not confirmed. Check its status before recovering the original clear.' : removalAction(intent.kind) ? 'Removal not confirmed. Check its status before recovering the original removal.' : uploadAction(intent.kind) ? 'Upload request not confirmed. Check upload status before recovering the original request.' : submissionAction(intent.kind) ? 'Download request not confirmed. Check its status before recovering the original request.' : commandAction(intent.kind) ? 'Request not confirmed. Check its status before replaying.' : intent.kind === 'playlist.add' ? 'Add not confirmed. Check its status before replaying.' : intent.kind === 'playlist.delete' ? 'Delete not confirmed. Check its status before replaying.' : intent.kind === 'rename.set' ? 'Rename not confirmed. Check its status before replaying.' : 'Save not confirmed. Check its status before retrying.', delayed: true });
             emit(intent.kind, 'unconfirmed', intent, intent.sentAt);
         }
         async function transmit(intent, capturedEpoch) {
@@ -467,7 +489,7 @@
                 if (capturedEpoch !== epoch || !intents.has(intent.id) || !state.isAvailable(intent.targetId) || !authorizedReply(reply, intent)) return false;
                 return reply.status === 200 && reply.body?.id === id && state.acceptPlaylist(reply.body, {}, intent.targetId.slice(9));
             }
-            if (removalAction(intent.kind)) emit(intent.kind, 'reconciliation', intent, now());
+            if (removalAction(intent.kind) || intent.kind === 'visibility.set') emit(intent.kind, 'reconciliation', intent, now());
             const reply = await read({ url: intent.kind === 'preference.set' ? '/api/preferences' : `/api/downloads/${encodeURIComponent(intent.targetId)}/editable-state`, method: 'GET' });
             if (capturedEpoch !== epoch || !intents.has(intent.id) || !state.isAvailable(intent.targetId)) return false;
             if (!authorizedReply(reply, intent)) return false;
@@ -484,7 +506,8 @@
                 return state.acceptDownload(current);
             }
             if (commandAction(intent.kind)) return reply.status === 200 && body?.id === intent.targetId && validRevision(body.command_revision) && state.acceptDownload(body);
-            if (reply.status !== 200 || !body || String(body.id) !== intent.targetId || !validRevision(body[descriptor(intent).revision]) || (intent.kind === 'preference.set' ? !VDL.validPreferenceValues(body.values) : intent.kind === 'favorite.set' ? typeof body.favorite !== 'boolean' : intent.kind === 'rename.set' ? !(body.filename === null || typeof body.filename === 'string') || !(body.display_filename === null || typeof body.display_filename === 'string') : !canonical(body))) return false;
+            if (reply.status !== 200 || !body || String(body.id) !== intent.targetId || !validRevision(body[descriptor(intent).revision]) || (intent.kind === 'preference.set' ? !VDL.validPreferenceValues(body.values) : intent.kind === 'visibility.set' ? !VDL.validVisibilityState(body) : intent.kind === 'favorite.set' ? typeof body.favorite !== 'boolean' : intent.kind === 'rename.set' ? !(body.filename === null || typeof body.filename === 'string') || !(body.display_filename === null || typeof body.display_filename === 'string') : !canonical(body))) return false;
+            if (intent.kind === 'visibility.set') return state.acceptDownload(snapshot(body, intent));
             state.acceptDownload(body);
             return true;
         }
@@ -498,10 +521,12 @@
             const model = state.selectDownload(targetId);
             if (!model || model.permissions?.[actions[input.kind].domain] === false) return { accepted: false, reason: 'unavailable', message: 'This entry is unavailable.' };
             if (!removalAction(input.kind) && Array.from(intents.values()).some(intent => intent.targetId === targetId && removalAction(intent.kind) && intent.status !== 'rejected')) return { accepted: false, reason: 'unresolved', message: 'Resolve the removal before changing this entry.' };
+            if (input.kind === 'visibility.set' && model.can_manage_visibility !== true) return { accepted: false, reason: 'unavailable', message: 'Only the downloader or an administrator can change visibility.' };
             if (input.kind === 'rename.set' && (typeof model.filename !== 'string' || !model.filename || (model.status !== undefined && model.status !== 'finished'))) return { accepted: false, reason: 'unavailable', message: 'Only finished files can be renamed.' };
             if (!validActionRevision(input, model[actions[input.kind].revision]) || (input.kind.startsWith('tag.') && model.tag_identity_version !== VDL.tagIdentity.version)) return { accepted: false, reason: 'unsupported', message: `Refresh this page before saving ${actions[input.kind].noun}.` };
             let tag;
             try {
+                if (input.kind === 'visibility.set' && !['public', 'private'].includes(input.value)) throw new Error('Visibility must be public or private.');
                 if (input.kind === 'favorite.set' && typeof input.value !== 'boolean') throw new Error('Favorite must be true or false.');
                 if (bulkAction(input.kind)) {
                     if (!input.value || typeof input.value.scope_id !== 'string' || !input.value.scope_id || !validRevision(input.value.revision) || !Number.isSafeInteger(input.value.entries) || input.value.entries < 1 || Object.keys(input.value).some(key => !['scope_id', 'revision', 'entries'].includes(key))) throw new Error('Capture the confirmed preview before clearing.');
@@ -535,7 +560,8 @@
                 } else if (input.kind === 'rename.set') {
                     if (typeof input.value !== 'string' || !input.value.trim() || /[/\\\x00]/.test(input.value) || ['.', '..'].includes(input.value.trim())) throw new Error('Enter a filename without path separators.');
                     tag = { key: 'rename', name: input.value.trim() };
-                } else tag = input.kind === 'favorite.set' ? { key: 'favorite', name: input.value } : VDL.tagIdentity.normalize(input.value);
+                } else if (input.kind === 'visibility.set') tag = { key: 'visibility', name: input.value };
+                else tag = input.kind === 'favorite.set' ? { key: 'favorite', name: input.value } : VDL.tagIdentity.normalize(input.value);
             }
             catch (error) { return { accepted: false, reason: 'validation', message: error.message }; }
             const domainKey = queueKey({ kind: input.kind, targetId });
@@ -595,6 +621,12 @@
                     ? { accepted: true, intentId: existing.id, duplicate: true }
                     : { accepted: false, reason: 'unresolved', message: 'Resolve the current settings save before submitting another draft.' };
             }
+            if (input.kind === 'visibility.set') {
+                const existing = Array.from(intents.values()).find(intent => intent.targetId === targetId && intent.kind === input.kind);
+                if (existing) return existing.value === tag.name && !['rejected', 'conflicted'].includes(existing.status)
+                    ? { accepted: true, intentId: existing.id, duplicate: true }
+                    : { accepted: false, reason: 'unresolved', message: 'Review and resolve the current visibility change before submitting another.' };
+            }
             if (input.kind === 'rename.set') {
                 const existing = Array.from(intents.values()).find(intent => intent.targetId === targetId && intent.kind === 'rename.set');
                 if (existing) return existing.value === tag.name && !['rejected', 'conflicted'].includes(existing.status)
@@ -609,7 +641,7 @@
                     break;
                 }
             }
-            const satisfied = bulkAction(input.kind) || removalAction(input.kind) || uploadAction(input.kind) || submissionAction(input.kind) || commandAction(input.kind) || playlistAction(input.kind) ? false : input.kind === 'preference.set' ? equalPreferences(model.values, tag.name) : input.kind === 'rename.set' ? tag.name === String(model.display_filename || model.filename || '').split('/').pop().split('\\').pop() : input.kind === 'favorite.set' ? model.favorite === input.value : (input.kind === 'tag.add') === model.tag_items.some(item => item.key === tag.key);
+            const satisfied = input.kind === 'visibility.set' ? model.visibility === input.value : bulkAction(input.kind) || removalAction(input.kind) || uploadAction(input.kind) || submissionAction(input.kind) || commandAction(input.kind) || playlistAction(input.kind) ? false : input.kind === 'preference.set' ? equalPreferences(model.values, tag.name) : input.kind === 'rename.set' ? tag.name === String(model.display_filename || model.filename || '').split('/').pop().split('\\').pop() : input.kind === 'favorite.set' ? model.favorite === input.value : (input.kind === 'tag.add') === model.tag_items.some(item => item.key === tag.key);
             if (satisfied) return { accepted: true, intentId: null, settled: true };
             const unresolved = Array.from(intents.values()).filter(intent => intent.status !== 'confirmed' && intent.status !== 'resolved');
             if (unresolved.filter(intent => queueKey(intent) === domainKey).length >= 32 || unresolved.length >= 128) return { accepted: false, reason: 'limit', message: 'Too many pending edits. Resolve existing edits before adding more.' };
@@ -632,7 +664,7 @@
             const attempt = intent.attempt;
             const work = (async () => {
                 try {
-                    if (bulkAction(intent.kind) || removalAction(intent.kind) || uploadAction(intent.kind) || submissionAction(intent.kind) || commandAction(intent.kind)) emit(intent.kind, 'reconciliation', intent, now());
+                    if (intent.kind === 'visibility.set' || bulkAction(intent.kind) || removalAction(intent.kind) || uploadAction(intent.kind) || submissionAction(intent.kind) || commandAction(intent.kind)) emit(intent.kind, 'reconciliation', intent, now());
                     const reply = await read({ url: `/api/mutations/${encodeURIComponent(intent.attempt.body.client_mutation_id)}`, method: 'GET' });
                     if (capturedEpoch !== epoch || intent.attempt !== attempt || !intents.has(id) || !state.isAvailable(intent.targetId)) return false;
                     if (!authorizedReply(reply, intent, true)) return false;
@@ -649,6 +681,14 @@
                         if (capturedEpoch === epoch && intents.has(id)) {
                             intent.safeToResolve = checked;
                             update(intent, { message: checked ? 'Clear outcome unavailable after expiry. Current authorized state checked; review it before explicitly using the current state. This does not confirm the clear.' : 'Clear outcome unavailable after expiry. Could not check the current authorized state. Check again before resolving this request.' });
+                        }
+                    } else if (intent.kind === 'visibility.set' && reply.body.final === true) {
+                        intent.expiredAbsence = true;
+                        intent.safeToResolve = false;
+                        const checked = await checkState(intent, capturedEpoch);
+                        if (checked && capturedEpoch === epoch && intents.has(id)) {
+                            intent.safeToResolve = true;
+                            update(intent, { message: 'Visibility change not confirmed. Current authorized visibility checked after expiry. Review it before using the current state.' });
                         }
                     } else if (removalAction(intent.kind) && reply.body.final === true) {
                         intent.expiredAbsence = true;
@@ -697,7 +737,7 @@
         function retry(id) {
             const intent = intents.get(id);
             if (!intent || !['rejected', 'conflicted'].includes(intent.status) || intent.checking) return { accepted: false, reason: 'unconfirmed' };
-            if (bulkAction(intent.kind) || removalAction(intent.kind) || uploadAction(intent.kind) || submissionAction(intent.kind) || commandAction(intent.kind) || intent.kind === 'preference.set' || playlistAction(intent.kind)) return { accepted: false, reason: 'review_required', message: commandAction(intent.kind) ? 'Review the current download attempt before submitting a new command.' : 'Review current settings, then save the draft explicitly.' };
+            if (bulkAction(intent.kind) || removalAction(intent.kind) || uploadAction(intent.kind) || submissionAction(intent.kind) || commandAction(intent.kind) || ['preference.set', 'visibility.set'].includes(intent.kind) || playlistAction(intent.kind)) return { accepted: false, reason: 'review_required', message: commandAction(intent.kind) ? 'Review the current download attempt before submitting a new command.' : 'Review current settings, then save the draft explicitly.' };
             const wasConflict = intent.status === 'conflicted';
             function enqueue() {
                 state.writer.transaction(() => {

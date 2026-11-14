@@ -1,7 +1,7 @@
 # Architecture: immediate feedback for server-backed interactions
 
-**Status:** Foundation, tags, favorites, rename, preferences, playlist editor saves, playlist add/delete, download commands, new-download acceptance, uploads, entry removal, and bulk clear implemented; additional adapters remain proposed.\
-**Date:** 2026-11-10\
+**Status:** Foundation, tags, favorites, rename, preferences, playlist editor saves, playlist add/delete, download commands, new-download acceptance, uploads, entry removal, bulk clear, and visibility changes implemented; additional adapters remain proposed.\
+**Date:** 2026-11-14\
 **Requirements:** [Feature 0051](../FEATURES/feature-0051-immediate-feedback-for-server-backed-interactions.md)
 
 ## Purpose and document ownership
@@ -21,8 +21,8 @@ the feature explicitly rather than silently contradicting it here.
 The implementation adds the shared modules, tag protocol, and independent
 `favorite.set`, `rename.set`, `preference.set`, `playlist.create`,
 `playlist.replace`, `playlist.add`, `playlist.delete`, `download.*`,
-`upload.register`, `upload.cancel`, `entry.remove`, `history.clear`, and
-`library.clear` adapters described
+`upload.register`, `upload.cancel`, `entry.remove`, `history.clear`,
+`library.clear`, and `visibility.set` adapters described
 below. Other actions still use handlers and collection snapshots in
 `static/app.js`, server routes and persistence in `vdl.py`, and SSE hints that
 trigger collection reads. The [rollout inventory](feature-0051-rollout.md) records
@@ -556,6 +556,47 @@ the shelf retains its pending card until canonical deletion installs a removal
 fence. Unsupported actions use their legacy endpoints with pending feedback
 and no replay. Authentication reset clears editors, recovery state, and prior
 callbacks.
+
+### Visibility transactions and conservative presentation
+
+Feature 0062 registers `visibility.set` in the independent `visibility` domain.
+Its projection retains the last confirmed visibility and permissions, with the
+requested visibility represented only as pending text. The UI guards a second
+visibility request while metadata in other domains remains usable. Pending and
+unknown status remains accessible after Info closes.
+
+The persistent decimal-string `visibility_revision` advances through a database
+trigger for actual visibility changes, including legacy and direct SQL writers.
+The shared metadata executor resolves current actor/session/role and ownership,
+checks the expected revision, writes visibility, and records its receipt in one
+serialized transaction. Legacy requests use the same authorization boundary.
+Collection, targeted, and upload serializers expose visibility and permissions
+from a consistent authorized snapshot. Collection and cached storage reads
+resolve current authorization within their read transactions.
+
+Receipt lookup and replay reauthorize both target access and visibility
+management. The response retains the original `mutation.revision` and outcome,
+while top-level `visibility_revision`, visibility, and permissions describe the
+current authorized security snapshot. The current snapshot revision cannot be
+older than the receipt revision. Client merging preserves newer security state
+and known access fences. Worker-derived rename eligibility follows worker state
+independently of the visibility revision.
+
+Targeted availability reads normalize filenames to the collection display
+representation unless the store already holds a physical identity from a rename
+acknowledgement. An availability read arriving before the first collection must
+not make later equal-revision collections reject fresh tags or security state.
+
+Recovery uses actor-scoped checks and deliberate identical-attempt replay.
+Unknown outcomes retain requested and last confirmed values without claiming
+either is the current server state. A newer conditional-write revision or a
+serialized expired-absence result with a valid authorized state check permits
+explicit resolution. Authentication reset and access denial clear private
+presentation and fence obsolete callbacks. Visibility SSE hints contain no
+resource identity. Entry hints check current authorization at delivery; a hint
+for an inaccessible or deleted entry retains only its generic reason.
+Playback selection, playlist redaction, rotation membership,
+and storage totals retain their existing authorization rules.
 
 ## Bootstrap, compatibility, and deployment
 

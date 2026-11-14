@@ -340,7 +340,7 @@ def companion_response_headers(response):
     """Apply the narrow CORS and cache boundary to companion responses."""
     if request.endpoint in ('library_storage', 'client_capabilities',
                             'editable_download_state', 'mutation_receipt', 'download_tags',
-                            'set_download_favorite', 'preferences', 'start_video_upload', 'upload_status', 'cancel_video_upload', 'receive_video_upload'):
+                            'set_download_favorite', 'set_download_visibility', 'preferences', 'start_video_upload', 'upload_status', 'cancel_video_upload', 'receive_video_upload'):
         response.headers['Cache-Control'] = 'no-store'
     if request.endpoint not in EXTENSION_NO_STORE_ENDPOINTS:
         return response
@@ -819,6 +819,7 @@ def init_db():
             # user choice rather than something inferred during migration.
             ("favorite", "ALTER TABLE downloads ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0"),
             ("favorite_revision", "ALTER TABLE downloads ADD COLUMN favorite_revision INTEGER NOT NULL DEFAULT 0"),
+            ("visibility_revision", "ALTER TABLE downloads ADD COLUMN visibility_revision INTEGER NOT NULL DEFAULT 0"),
             ("tags_revision", "ALTER TABLE downloads ADD COLUMN tags_revision INTEGER NOT NULL DEFAULT 0"),
             ("rename_revision", "ALTER TABLE downloads ADD COLUMN rename_revision INTEGER NOT NULL DEFAULT 0"),
             ("command_revision", "ALTER TABLE downloads ADD COLUMN command_revision INTEGER NOT NULL DEFAULT 0"),
@@ -928,6 +929,11 @@ def init_db():
                 PRIMARY KEY(actor_id, mutation_id)
             );
             CREATE INDEX IF NOT EXISTS rename_operations_target ON rename_operations(target_id, phase);
+            CREATE TRIGGER IF NOT EXISTS download_visibility_revision
+            AFTER UPDATE OF visibility ON downloads WHEN NEW.visibility IS NOT OLD.visibility BEGIN
+                UPDATE downloads SET visibility_revision = OLD.visibility_revision + 1
+                WHERE id = NEW.id;
+            END;
             CREATE TRIGGER IF NOT EXISTS download_favorite_revision
             AFTER UPDATE OF favorite ON downloads WHEN NEW.favorite != OLD.favorite BEGIN
                 UPDATE downloads SET favorite_revision = OLD.favorite_revision + 1
@@ -1438,6 +1444,7 @@ def db_get_download(download_id):
         result.update(_rename_snapshot(conn, download_id, row))
         result.update(_download_command_snapshot(conn, download_id, row))
         result["removal_revision"] = str(row["removal_revision"])
+        result["visibility_revision"] = str(row["visibility_revision"])
         if row['source_type'] == 'upload':
             result['upload'] = _upload_snapshot(conn, download_id)
         result["quality"] = classify_video_quality(result["resolution"])
@@ -1462,9 +1469,7 @@ def db_set_download_visibility(download_id, visibility):
                 (visibility, download_id),
             )
     if changed:
-        event_bus.publish(
-            'change', {'reason': 'visibility', 'id': download_id}
-        )
+        _publish_metadata_change('visibility')
     return changed
 
 
@@ -1641,6 +1646,33 @@ def _serialize_favorite_state(download_id, favorite, revision):
     return {'id': download_id, 'favorite': bool(favorite), 'favorite_revision': str(revision)}
 
 
+def _visibility_snapshot(conn, download_id, row=None, actor=None):
+    if row is None:
+        row = conn.execute('SELECT * FROM downloads WHERE id = ?', (download_id,)).fetchone()
+    if row is None:
+        return None
+    actor = actor if actor is not None else _tag_actor(conn) if has_request_context() else None
+    can_manage = bool(actor and (row['owner_user_id'] == actor['id'] or 'admin' in actor['roles']))
+    return {
+        'id': download_id, 'visibility': row['visibility'],
+        'visibility_revision': str(row['visibility_revision']),
+        'can_manage_visibility': can_manage, 'can_delete': True,
+        'permissions': {'tags': True, 'favorite': True,
+                        'rename': row['status'] == 'finished', 'visibility': can_manage},
+    }
+
+
+def _authorized_visibility_receipt(conn, result, actor, row=None):
+    row = row if row is not None else _tag_visible_row(conn, result['id'], actor)
+    if row is None:
+        return None
+    if row['owner_user_id'] != actor['id'] and 'admin' not in actor['roles']:
+        return None
+    # Receipt correlation records the original outcome; current security values
+    # and permissions must come from one currently authorized snapshot.
+    return dict(result, **_visibility_snapshot(conn, result['id'], row, actor))
+
+
 def _publish_metadata_change(domain):
     # Private identities stay on authorized responses. Publication cannot undo
     # the already committed mutation and receipt.
@@ -1662,13 +1694,18 @@ def _execute_favorite_mutation(download_id, payload):
     return _execute_metadata_mutation(download_id, payload, 'POST', 'favorite')
 
 
+def _execute_visibility_mutation(download_id, payload):
+    return _execute_metadata_mutation(download_id, payload, 'POST', 'visibility')
+
+
 def _execute_metadata_mutation(download_id, payload, method, domain):
     # Only the route's trusted adapter selects a domain; all database-backed
     # metadata shares authorization, admission, receipt and commit ordering.
     is_tag = domain == 'tags'
-    snapshot = _tag_snapshot if is_tag else _favorite_snapshot
-    action = ('tag.add' if method == 'POST' else 'tag.remove') if is_tag else 'favorite.set'
-    revision_field = 'tags_revision' if is_tag else 'favorite_revision'
+    is_visibility = domain == 'visibility'
+    snapshot = _tag_snapshot if is_tag else _visibility_snapshot if is_visibility else _favorite_snapshot
+    action = ('tag.add' if method == 'POST' else 'tag.remove') if is_tag else domain + '.set'
+    revision_field = 'tags_revision' if is_tag else domain + '_revision'
     protocol = 'client_mutation_id' in payload or 'expected_revision' in payload
     mutation_id = payload.get('client_mutation_id')
     changed = False
@@ -1680,6 +1717,8 @@ def _execute_metadata_mutation(download_id, payload, method, domain):
         row = _tag_visible_row(conn, download_id, actor)
         if row is None:
             return {'error': 'Unknown download id'}, 404
+        if is_visibility and row['owner_user_id'] != actor['id'] and 'admin' not in actor['roles']:
+            return {'error': 'Only the downloader or an administrator can change visibility'}, 403
         state = snapshot(conn, download_id, row)
         error = None
         name = key = submitted_before = None
@@ -1690,6 +1729,12 @@ def _execute_metadata_mutation(download_id, payload, method, domain):
                 error = str(exc)
             value = key if key is not None else payload.get('tag')
             submitted_before = next((item for item in state['tag_items'] if item['key'] == key), None)
+        elif is_visibility:
+            value = payload.get('visibility')
+            if value not in ('public', 'private'):
+                error = 'Visibility must be public or private'
+            if set(payload) - {'visibility', 'client_mutation_id', 'expected_revision'}:
+                error = 'Unsupported visibility fields'
         else:
             value = payload.get('favorite')
             if not isinstance(value, bool):
@@ -1698,6 +1743,11 @@ def _execute_metadata_mutation(download_id, payload, method, domain):
         def apply():
             if is_tag:
                 return _apply_tag(conn, download_id, name, key, method)
+            if is_visibility:
+                if state['visibility'] == value:
+                    return False
+                conn.execute('UPDATE downloads SET visibility = ? WHERE id = ?', (value, download_id))
+                return True
             if state['favorite'] == value:
                 return False
             conn.execute('UPDATE downloads SET favorite = ? WHERE id = ?', (int(value), download_id))
@@ -1718,7 +1768,7 @@ def _execute_metadata_mutation(download_id, payload, method, domain):
                 return {'error': 'Invalid mutation identifier'}, 400
             expected = payload.get('expected_revision')
             fingerprint = hashlib.sha256(json.dumps(
-                [method, action, download_id, value, expected],
+                [method, action, download_id, value, expected] + ([payload] if is_visibility else []),
                 sort_keys=True, ensure_ascii=True, separators=(',', ':'),
             ).encode()).hexdigest()
             receipt = conn.execute(
@@ -1731,6 +1781,8 @@ def _execute_metadata_mutation(download_id, payload, method, domain):
                 result = json.loads(receipt['response'])
                 if is_tag:
                     result['available_tags'] = _tag_vocabulary(conn, actor)
+                elif is_visibility:
+                    result = _authorized_visibility_receipt(conn, result, actor, row)
                 return result, receipt['status']
             if conn.execute('SELECT 1 FROM rename_operations WHERE actor_id = ? AND mutation_id = ? AND phase != ?',
                             (actor['id'], mutation_id, 'done')).fetchone():
@@ -3235,6 +3287,12 @@ def db_clear_library():
 def db_list_downloads(user_id=None, is_admin=False, statuses=None):
     with db() as conn:
         conn.execute("BEGIN")
+        actor = {'id': user_id, 'roles': ['admin'] if is_admin else []}
+        if has_request_context() and user_id is not None:
+            actor = _tag_actor(conn)
+            if actor is None:
+                abort(401)
+            user_id, is_admin = actor['id'], 'admin' in actor['roles']
         conditions = []
         values = []
         if user_id is not None and not is_admin:
@@ -3254,7 +3312,7 @@ def db_list_downloads(user_id=None, is_admin=False, statuses=None):
             "filename, display_filename, resolution, filesize, speed, eta, title, finished_at, "
             "duration_seconds, media_metadata_probed, "
             "formats, requested_format, downloaded_bytes, total_bytes, favorite, "
-            "view_count, tags_revision, favorite_revision, rename_revision, command_revision, removal_revision, "
+            "view_count, tags_revision, favorite_revision, visibility_revision, rename_revision, command_revision, removal_revision, "
             "source_type, owner_user_id, visibility, browser_authenticated, "
             "(downloads.ingest_source_path IS NOT NULL) AS mounted_import, "
             "COALESCE(users.username, downloads.owner_username) "
@@ -3284,6 +3342,7 @@ def db_list_downloads(user_id=None, is_admin=False, statuses=None):
             if download["source_type"] == "upload":
                 download["upload"] = _upload_snapshot(conn, download["id"])
                 download["can_manage_upload"] = bool(user_id is not None and download["owner_user_id"] == user_id and conn.execute('SELECT 1 FROM upload_operations WHERE id=? AND actor_id=?', (download["id"], user_id)).fetchone())
+            download.update(_visibility_snapshot(conn, download['id'], download, actor))
             download["removal_revision"] = str(download["removal_revision"])
             download["rename_revision"] = str(download["rename_revision"])
             download.update(_serialize_favorite_state(
@@ -3303,9 +3362,6 @@ def db_list_downloads(user_id=None, is_admin=False, statuses=None):
                 download['id'], tags_by_download.get(download['id'], []),
                 download['tags_revision'],
             ))
-            download["can_manage_visibility"] = (
-                is_admin or download["owner_user_id"] == user_id
-            )
             # The stable account id is an authorization detail; clients only
             # need the display name and this derived capability.
             download.pop("owner_user_id")
@@ -4028,11 +4084,14 @@ def start_library_storage():
 def library_storage():
     with db() as conn:
         conn.execute('BEGIN')
+        actor = _tag_actor(conn)
+        if actor is None:
+            return jsonify({'error': 'Authentication required'}), 401
         snapshot = conn.execute('SELECT * FROM library_storage_snapshot').fetchone()
         measured_at = snapshot['measured_at']
         total = None
         if measured_at is not None:
-            is_admin = 'admin' in g.current_user['roles']
+            is_admin = 'admin' in actor['roles']
             # Authorize associations before collapsing aliases, so a private
             # alias cannot hide a shared file or expose its owner's collection.
             rows = conn.execute(
@@ -4041,7 +4100,7 @@ def library_storage():
                 'ON d.id = m.download_id AND d.created_at = m.entry_created_at '
                 "WHERE d.status = 'finished' AND (? OR d.visibility = 'public' "
                 'OR d.owner_user_id = ?) GROUP BY m.device, m.inode',
-                (is_admin, g.current_user['id']),
+                (is_admin, actor['id']),
             )
             total = sum(row['byte_size'] for row in rows)
         state = ('unavailable' if snapshot['failed'] or _storage_retry_at else 'calculating')
@@ -8131,7 +8190,7 @@ def _upload_result(conn, download_id, mutation_id=None, action=None):
             'favorite', 'view_count', 'source_type', 'visibility', 'browser_authenticated')}
         owner = conn.execute('SELECT username FROM users WHERE id=?', (row['owner_user_id'],)).fetchone()
         result['download']['downloaded_by'] = owner['username'] if owner else row['owner_username']
-        result['download']['can_manage_visibility'] = True
+        result['download'].update(_visibility_snapshot(conn, download_id, row))
         result['download']['can_manage_upload'] = True
         result['download'].update(_tag_snapshot(conn, download_id, row))
         result['download'].update(_favorite_snapshot(conn, download_id, row))
@@ -10082,28 +10141,14 @@ def release_playback_session(session_id):
 
 @app.route('/api/visibility/<download_id>', methods=['POST'])
 def set_download_visibility(download_id):
-    entry = _visible_download(download_id)
-    if entry is None:
-        return jsonify({"error": "Unknown download id"}), 404
-    if not _can_manage_download_visibility(entry):
-        return jsonify({
-            "error": (
-                "Only the downloader or an administrator can change "
-                "visibility"
-            )
-        }), 403
-
-    payload = request.get_json(silent=True) or {}
-    visibility = payload.get('visibility')
-    try:
-        changed = db_set_download_visibility(download_id, visibility)
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
-    return jsonify({
-        "id": download_id,
-        "visibility": visibility,
-        "changed": changed,
-    })
+    payload, error = _read_json_body(4096)
+    if error is not None:
+        return error
+    result, status = _execute_visibility_mutation(download_id, payload)
+    response = jsonify(result)
+    response.status_code = status
+    response.headers['Cache-Control'] = 'no-store'
+    return response
 
 
 @app.route('/api/favorite/<download_id>', methods=['POST'])
@@ -10138,7 +10183,7 @@ def record_download_view(download_id):
 @app.route('/api/client-capabilities', methods=['GET'])
 def client_capabilities():
     response = jsonify({
-        'mutation_protocol': 1, 'actions': ['tag.add', 'tag.remove', 'favorite.set', 'rename.set', 'preference.set', 'playlist.create', 'playlist.replace', 'playlist.add', 'playlist.delete', 'download.pause', 'download.unpause', 'download.stop', 'download.retry', 'download.resume', 'download.submit', 'upload.register', 'upload.cancel', 'entry.remove', 'history.clear', 'library.clear'],
+        'mutation_protocol': 1, 'actions': ['tag.add', 'tag.remove', 'favorite.set', 'visibility.set', 'rename.set', 'preference.set', 'playlist.create', 'playlist.replace', 'playlist.add', 'playlist.delete', 'download.pause', 'download.unpause', 'download.stop', 'download.retry', 'download.resume', 'download.submit', 'upload.register', 'upload.cancel', 'entry.remove', 'history.clear', 'library.clear'],
         'upload_recovery': 1, 'entry_removal': 1, 'bulk_clear': 1,
         'tag_identity_version': TAG_IDENTITY_VERSION,
         'server_time': int(time.time() * 1000),
@@ -10162,7 +10207,7 @@ def editable_download_state(download_id):
         result.update(_rename_snapshot(conn, download_id, row))
         result.update(_download_command_snapshot(conn, download_id, row))
         result['removal_revision'] = str(row['removal_revision'])
-        result['permissions'] = {'tags': True, 'favorite': True, 'rename': row['status'] == 'finished'}
+        result.update(_visibility_snapshot(conn, download_id, row, actor))
     response = jsonify(result)
     response.headers['Cache-Control'] = 'no-store'
     return response
@@ -10235,6 +10280,12 @@ def mutation_receipt(mutation_id):
                     match = MUTATION_ID_PATTERN.fullmatch(mutation_id)
                     final = bool(match and int(match.group(1)) / 1000 < time.time() - MUTATION_REPLAY_SECONDS)
                     return jsonify({'error': 'Mutation unavailable', 'final': final}), 404
+                if result.get('mutation', {}).get('domain') == 'visibility':
+                    result = _authorized_visibility_receipt(conn, result, actor)
+                    if result is None:
+                        match = MUTATION_ID_PATTERN.fullmatch(mutation_id)
+                        final = bool(match and int(match.group(1)) / 1000 < time.time() - MUTATION_REPLAY_SECONDS)
+                        return jsonify({'error': 'Mutation unavailable', 'final': final}), 404
                 if result.get('mutation', {}).get('domain') in ('download-command', 'download-submission'):
                     result = _command_receipt_state(conn, result)
                 if result.get('mutation', {}).get('domain') == 'tags':
@@ -10294,6 +10345,16 @@ def events():
                     # TCP connection from being reaped by intermediaries.
                     yield ": keepalive\n\n"
                     continue
+                if kind == 'change' and (payload or {}).get('id') is not None:
+                    # A queued public hint can outlive access. Authorize at
+                    # delivery so private workers do not disclose their IDs.
+                    with db() as conn:
+                        conn.execute('BEGIN')
+                        actor = _tag_actor(conn)
+                        if actor is None:
+                            return
+                        if _tag_visible_row(conn, payload['id'], actor) is None:
+                            payload = {'reason': payload.get('reason')}
                 if kind == 'assets':
                     user = db_get_user_by_id(user_id)
                     if (user is None or user['suspended']

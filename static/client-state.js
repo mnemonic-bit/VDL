@@ -10,6 +10,10 @@
         return value;
     }
     const revision = value => typeof value === 'string' && /^(0|[1-9]\d*)$/.test(value);
+    const validVisibilityState = value => !!value && ['public', 'private'].includes(value.visibility)
+        && revision(value.visibility_revision) && typeof value.can_manage_visibility === 'boolean'
+        && typeof value.can_delete === 'boolean' && !!value.permissions
+        && ['tags', 'favorite', 'rename', 'visibility'].every(key => typeof value.permissions[key] === 'boolean');
     const uploadPhases = new Set(['registered', 'transferring', 'processing', 'published', 'cancelled', 'failed']);
     const validUploadState = value => !!value && typeof value.id === 'string' && !!value.id
         && revision(value.revision) && BigInt(value.revision) > 0n && uploadPhases.has(value.phase)
@@ -36,6 +40,7 @@
         const intents = new Map();
         const fences = new Map();
         const removed = new Set();
+        const legacySecurity = new Map();
         const collections = new Map();
         const editOrders = new Map();
         const listeners = new Set();
@@ -65,6 +70,7 @@
             if (snapshot.removal_revision !== undefined && !revision(snapshot.removal_revision)) return false;
             if (snapshot.command_revision !== undefined && (!revision(snapshot.command_revision) || !(snapshot.current_attempt_id === null || typeof snapshot.current_attempt_id === 'string' && snapshot.current_attempt_id))) return false;
             if (Object.hasOwn(snapshot, 'job_id') && !(snapshot.job_id === null || typeof snapshot.job_id === 'string' && snapshot.job_id)) return false;
+            if (snapshot.visibility_revision !== undefined && !validVisibilityState(snapshot)) return false;
             if (snapshot.favorite_revision !== undefined && (!revision(snapshot.favorite_revision) || typeof snapshot.favorite !== 'boolean')) return false;
             if (snapshot.rename_revision !== undefined && (!revision(snapshot.rename_revision) || !(snapshot.filename === null || typeof snapshot.filename === 'string') || !(snapshot.display_filename == null || typeof snapshot.display_filename === 'string'))) return false;
             if (snapshot.preferences_revision !== undefined && (String(snapshot.id) !== 'installation' || !revision(snapshot.preferences_revision) || !preferenceValues(snapshot.values))) return false;
@@ -134,6 +140,26 @@
                 } else if (snapshot.command_revision === old.command_revision && snapshot.current_attempt_id !== old.current_attempt_id) return false;
                 else if (snapshot.current_attempt_id !== old.current_attempt_id && !Object.hasOwn(snapshot, 'job_id')) delete next.job_id;
             }
+            if (old && legacySecurity.has(id) && !revision(snapshot.visibility_revision)
+                    && (context.generation === undefined || context.generation < legacySecurity.get(id))) {
+                for (const field of ['visibility', 'can_manage_visibility', 'can_delete', 'permissions']) {
+                    if (Object.hasOwn(old, field)) next[field] = old[field];
+                    else delete next[field];
+                }
+            }
+            if (old && revision(old.visibility_revision)) {
+                const securityFields = ['visibility', 'visibility_revision', 'can_manage_visibility', 'can_delete', 'permissions'];
+                if (!revision(snapshot.visibility_revision) || BigInt(snapshot.visibility_revision) < BigInt(old.visibility_revision)) {
+                    for (const field of securityFields) next[field] = old[field];
+                } else if (snapshot.visibility_revision === old.visibility_revision) {
+                    if (snapshot.visibility !== old.visibility) return false;
+                    // A same-revision callback cannot restore authority removed
+                    // by a newer authorization check.
+                    next.can_manage_visibility = old.can_manage_visibility && snapshot.can_manage_visibility;
+                    next.can_delete = old.can_delete && snapshot.can_delete;
+                    next.permissions = Object.fromEntries(Object.keys(old.permissions).map(key => [key, key === 'rename' && next.status !== undefined ? next.status === 'finished' : old.permissions[key] && snapshot.permissions[key]]));
+                }
+            }
             if (old && revision(old.favorite_revision)) {
                 if (!revision(snapshot.favorite_revision) || BigInt(snapshot.favorite_revision) < BigInt(old.favorite_revision)) {
                     next.favorite = old.favorite;
@@ -198,6 +224,7 @@
             if (!download || fences.has(id)) return null;
             let favorite = Boolean(download.favorite);
             const favoriteIntents = [];
+            const visibilityIntents = [];
             const renameIntents = [];
             const preferenceIntents = [];
             const playlistIntents = [];
@@ -229,6 +256,7 @@
                     if (!['rejected', 'conflicted'].includes(intent.status)) requestedFilename = intent.value;
                     continue;
                 }
+                if (intent.kind === 'visibility.set') { visibilityIntents.push(copy(intent)); continue; }
                 if (intent.kind === 'favorite.set') {
                     favoriteIntents.push(copy(intent));
                     if (!['rejected', 'conflicted'].includes(intent.status)) favorite = intent.value;
@@ -253,7 +281,7 @@
                 rows.sort((a, b) => a.name.localeCompare(b.name));
             }
             const effective = rows.filter(tag => tag.effective).map(tag => ({ key: tag.key, name: tag.name }));
-            return freeze(copy({ ...download, bulk_intents: bulkIntents, removal_intents: removalIntents, upload_intents: uploadIntents, submission_intents: submissionIntents, command_intents: commandIntents, playlist_intents: playlistIntents, requested_filename: requestedFilename, rename_intents: renameIntents, preference_intents: preferenceIntents, favorite, favorite_intents: favoriteIntents, tags: effective.map(tag => tag.name), tag_items: effective, tag_chips: rows }));
+            return freeze(copy({ ...download, bulk_intents: bulkIntents, removal_intents: removalIntents, upload_intents: uploadIntents, submission_intents: submissionIntents, command_intents: commandIntents, playlist_intents: playlistIntents, requested_filename: requestedFilename, rename_intents: renameIntents, preference_intents: preferenceIntents, favorite, favorite_intents: favoriteIntents, visibility_intents: visibilityIntents, tags: effective.map(tag => tag.name), tag_items: effective, tag_chips: rows }));
         }
         function fence(id, terminal = false) {
             id = String(id);
@@ -262,6 +290,7 @@
             fences.set(id, ++generation);
             for (const collection of collections.values()) if (collection.ids) collection.ids = collection.ids.filter(member => member !== id);
             downloads.delete(id);
+            legacySecurity.delete(id);
             editOrders.delete(id);
             for (const [key, intent] of intents) if (intent.targetId === id) intents.delete(key);
             notify(id);
@@ -315,7 +344,7 @@
                 const ids = Array.from(downloads.keys());
                 epoch++;
                 generation++;
-                downloads.clear(); intents.clear(); fences.clear(); removed.clear(); collections.clear(); editOrders.clear();
+                downloads.clear(); intents.clear(); fences.clear(); removed.clear(); legacySecurity.clear(); collections.clear(); editOrders.clear();
                 transaction(() => ids.forEach(notify));
             },
             // Only coordinator and authorized snapshot adapters use this write seam.
@@ -323,6 +352,16 @@
                 transaction,
                 put(intent) { intents.set(intent.id, copy(intent)); notify(intent.targetId); },
                 remove(id) { const intent = intents.get(id); intents.delete(id); if (intent) notify(intent.targetId); },
+                acceptLegacyVisibility(snapshot, context = {}) {
+                    const id = String(snapshot?.id);
+                    const current = downloads.get(id);
+                    if (!current || fences.has(id) || revision(current.visibility_revision)
+                            || context.epoch !== epoch || !['public', 'private'].includes(snapshot.visibility)) return false;
+                    // Old servers supply no revision. Sequence the acknowledgement
+                    // against reads captured before the acknowledgement arrived.
+                    legacySecurity.set(id, ++generation);
+                    return acceptDownload({ ...current, visibility: snapshot.visibility }, { epoch, generation });
+                },
                 confirmed(id) { const value = downloads.get(String(id)); return value ? freeze(copy(value)) : null; },
                 forgetSubmission(id) {
                     id = String(id);
@@ -335,6 +374,7 @@
             }),
         });
     }
+    VDL.validVisibilityState = validVisibilityState;
     VDL.validUploadState = validUploadState;
     VDL.createClientState = createClientState;
     VDL.preferenceFields = preferenceFields;

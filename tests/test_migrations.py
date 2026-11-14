@@ -84,7 +84,7 @@ class SchemaMigrationTest(unittest.TestCase):
                     "downloaded_bytes", "total_bytes", "favorite", "favorite_revision",
                     "view_count",
                     "source_type", "owner_user_id", "owner_username",
-                    "visibility", "browser_authenticated",
+                    "visibility", "visibility_revision", "browser_authenticated",
                     "extension_request_id",
                     "duration_seconds", "media_metadata_probed",
                     "display_filename", "ingest_source_path", "tags_revision", "rename_revision",
@@ -113,6 +113,7 @@ class SchemaMigrationTest(unittest.TestCase):
                 )
                 self.assertIs(vdl.db_get_download("legacy1")["favorite"], False)
                 self.assertEqual(vdl.db_get_download("legacy1")["favorite_revision"], "0")
+                self.assertEqual(vdl.db_get_download("legacy1")["visibility_revision"], "0")
                 self.assertEqual(vdl.db_get_download("legacy1")["rename_revision"], "0")
                 self.assertEqual(vdl.db_get_download("legacy1")["command_revision"], "0")
                 removal_revision = vdl.db_get_download("legacy1")["removal_revision"]

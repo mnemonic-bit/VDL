@@ -2257,3 +2257,23 @@ body.history-open .create-playlist-button { display: none; }
 #bulk-clear-summary [data-bulk-clear-state="conflicted"] { color: var(--error-fg); }
 #bulk-clear-summary button:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
 #bulk-clear-summary .options-spinner { width: 14px; height: 14px; flex-shrink: 0; }
+
+.visibility-feedback {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    align-items: center;
+    margin-top: 0.4rem;
+    color: var(--muted);
+    overflow-wrap: anywhere;
+}
+.visibility-feedback:empty { display: none; }
+.visibility-feedback button, #visibilityMutationSummary button {
+    font: inherit;
+    color: var(--fg);
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 0.3rem;
+    padding: 0.2rem 0.4rem;
+    cursor: pointer;
+}

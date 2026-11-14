@@ -6,8 +6,8 @@ The shared coordinator registers `tag.add`, `tag.remove`, `favorite.set`,
 `rename.set`, `preference.set`, `playlist.create`, `playlist.replace`,
 `playlist.add`, `playlist.delete`, `download.pause`, `download.unpause`,
 `download.stop`, `download.retry`, `download.resume`, `download.submit`,
-`upload.register`, `upload.cancel`, `entry.remove`, `history.clear`, and
-`library.clear`.
+`upload.register`, `upload.cancel`, `entry.remove`, `history.clear`,
+`library.clear`, and `visibility.set`.
 An existing API call does not gain receipt recovery merely because the new
 scripts are loaded. Mutating requests are never retried by `apiFetch`'s GET
 contention recovery.
@@ -277,7 +277,35 @@ their parent and child recovery records. Unknown outcomes allow explicit checks
 and deliberate replay of the same frozen request, without automatic writes or
 a persistent browser queue. Unsupported servers retain conservative feedback
 without invented recovery support. `VDL.bulkClearMetrics()` exposes bounded,
-content-free aggregate diagnostics. Features 0062–0067 remain separate work.
+content-free aggregate diagnostics. Features 0063–0067 remain separate work.
+
+[Feature 0062: Visibility](../FEATURES/feature-0062-immediate-feedback-for-visibility-changes.md)
+adds `visibility.set` in the independent `visibility` domain. Pending text shows
+requested visibility beside confirmed visibility; the selector and permissions
+retain confirmed security state. Duplicate and contradictory visibility writes
+are guarded while unrelated metadata remains usable. Canonical acknowledgements
+confirm directly without SSE or collection reads. Unknown outcomes retain both
+values and explain that current server visibility may differ. Info and a
+summary expose recovery across navigation.
+
+The persistent decimal-string revision includes every visibility writer through
+a database trigger. Current authorization, conditional writing, and the receipt
+commit together. Legacy requests share the serialized authorization boundary.
+Lookup and identical-attempt replay reauthorize current access and management,
+retaining original mutation correlation while returning a current consistent
+security snapshot. Older reads and receipts cannot replace newer security state
+or lift access fences. Collection and storage reads recheck current roles within
+their snapshots; generic visibility hints contain no entry identity. Other
+entry hints check current access at SSE delivery, so queued public hints and
+subsequent private worker updates cannot disclose an inaccessible entry ID.
+
+Conflicts require explicit review. Unknown outcomes permit deliberate receipt
+checks and frozen-attempt replay under the shared expiry and quota rules.
+Resolution requires conditional-write or serialized-expiry finality, with a
+valid authorized state check after expired absence. No write automatically
+replays or survives reload in browser storage. Authentication reset clears
+private pending values. `VDL.visibilityMutationMetrics()` exposes bounded,
+content-free aggregates. Features 0063–0067 remain separate work.
 
 ## Remaining action adapters
 
@@ -287,12 +315,11 @@ remain in force. They need their own behavior and regression evidence before
 adopting automatic recovery.
 
 Each remaining row now has a proposed feature spec. These links allocate work;
-they do not mark any remaining adapter implemented. Features 0062–0067 inherit Feature
+they do not mark any remaining adapter implemented. Features 0063–0067 inherit Feature
 0051 and the shared requirements below.
 
 | Controls / production entry points in `static/app.js` | Existing mechanism | Required migration / recovery boundary | Feature spec |
 | --- | --- | --- | --- |
-| Visibility: `changeDownloadVisibility` | Explicit desired visibility; server permission checks | Display pending request beside confirmed security state. A pending grant must never enable authority. | [0062: Visibility](../FEATURES/feature-0062-immediate-feedback-for-visibility-changes.md) |
 | Pairing creation/invalidation: `createExtensionPairing`, `invalidateExtensionPairing` | Server response supplies or invalidates credential; current UI status | Pending controls and session-safe callbacks. Never persist recovery payloads containing credentials in browser storage. | [0063: Pairing](../FEATURES/feature-0063-immediate-feedback-for-extension-pairing.md) |
 | Connection revocation: `revokeExtensionConnection` | Confirmation, then server response and connection refresh | Pending state beside confirmed connection; no revoked announcement until acknowledgement. | [0064: Connection revocation](../FEATURES/feature-0064-immediate-feedback-for-connection-revocation.md) |
 | User creation/update/suspension/removal: `addUser`, `updateUser`, `setUserSuspended`, removal-dialog close handler | Local edit draft, server authorization and delete confirmation | Pending controls, duplicate guards, draft/epoch safety; pending role changes cannot authorize new actions. | [0065: User administration](../FEATURES/feature-0065-immediate-feedback-for-user-administration.md) |
@@ -924,3 +951,44 @@ Bulk-clear delivery does not complete Features 0062–0067. Browser intents rema
 in memory, and recovery never creates a new destructive scope or automatically
 replays a POST. Playback, progress writes, leases, asset demand, workers,
 uploads, and companion transport retain their specialized ownership contracts.
+
+Visibility verification commands for Feature 0062:
+
+```bash
+TMPDIR=/dev/shm VDL_PYTHON=/path/to/python3.12 ./tests/run-all.sh --unit
+VDL_PYTHON=/path/to/python3.12 node --test tests/*.test.cjs
+VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py visibility-feedback.spec.cjs tags.spec.cjs live-updates.spec.cjs
+VDL_TEST_BROWSER=firefox VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py visibility-feedback.spec.cjs tags.spec.cjs live-updates.spec.cjs
+```
+
+Feature 0062 verified on 2026-11-14 for version `0.65.0`:
+
+- Python 3.12.14 unit gate: **passed**, 885 tests, 9 skipped; `vdl.py` line
+  coverage **92.5%** (7831/8462; enforced minimum 90%). The 23 visibility
+  protocol tests, six independent service checks, and five new actual SSE
+  regressions cover conditional writes, all writers, migration and restart,
+  atomic receipts, simultaneous replay, response loss, authorization, quotas,
+  expiry and retention, consistent snapshots, storage aliases, prepared
+  playback, playlist redaction, rotation, and delivery-time hint privacy.
+- Node: **passed**, 279 tests, including 32 visibility checks. These exercise
+  conservative presentation, independent domains, strict response decoding,
+  frozen replay, conflict review, expiry finality, quota refusal, diagnostics,
+  authentication/access fences, legacy read sequencing, worker-derived rename
+  permission, and targeted availability reads before collection snapshots.
+- Chromium: **passed**, 216 distinct scenarios across broad runs and focused
+  follow-ups. Firefox: **passed**, 161 distinct scenarios across the broad run
+  and focused follow-up. All **22 visibility scenarios passed in each browser**.
+  Controlled gates cover feedback below 50 ms, canonical confirmation with
+  SSE unavailable, requested versus confirmed access, duplicate guards,
+  stale reads and acknowledgements, lost responses, deliberate recovery,
+  conflict review, actual account and administrator changes, two-user playback
+  and cached storage, true legacy responses, both themes, keyboard controls,
+  reduced motion, narrow layouts, and deduplicated announcements. The final
+  tag, visibility, and live-update group passed **45 checks in each browser**
+  after correcting the targeted-read filename representation race. Existing
+  assertions and deadlines were retained.
+
+Visibility delivery does not complete Features 0063–0067. Pending requests
+remain in memory, and recovery never automatically replays a write. Playback,
+progress writes, leases, asset demand, workers, uploads, and companion transport
+retain their specialized ownership contracts.

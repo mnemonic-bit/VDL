@@ -36,7 +36,7 @@ class TagMutationProtocolTest(AppCase):
         self.assertEqual(capabilities.json['mutation_protocol'], 1)
         self.assertEqual(capabilities.json['tag_identity_version'], vdl.TAG_IDENTITY_VERSION)
         self.assertEqual(set(capabilities.json['actions']),
-                         {'tag.add', 'tag.remove', 'favorite.set', 'rename.set', 'preference.set', 'playlist.create', 'playlist.replace', 'playlist.add', 'playlist.delete', 'download.pause', 'download.unpause', 'download.stop', 'download.retry', 'download.resume', 'download.submit', 'upload.register', 'upload.cancel', 'entry.remove', 'history.clear', 'library.clear'})
+                         {'tag.add', 'tag.remove', 'favorite.set', 'visibility.set', 'rename.set', 'preference.set', 'playlist.create', 'playlist.replace', 'playlist.add', 'playlist.delete', 'download.pause', 'download.unpause', 'download.stop', 'download.retry', 'download.resume', 'download.submit', 'upload.register', 'upload.cancel', 'entry.remove', 'history.clear', 'library.clear'})
         self.assertEqual(capabilities.json['upload_recovery'], 1)
         self.assertEqual(capabilities.json['entry_removal'], 1)
         payload = self.attempt('  Straße   Videos ')
@@ -53,7 +53,7 @@ class TagMutationProtocolTest(AppCase):
             self.assertEqual(state['tag_items'], body['tag_items'])
             self.assertEqual(state['tags_revision'], '1')
         self.assertEqual(self.state().json['permissions'], {
-            'tags': True, 'favorite': True, 'rename': False,
+            'tags': True, 'favorite': True, 'rename': False, 'visibility': True,
         })
 
     def test_legacy_noop_progress_remove_and_restart_revisions(self):

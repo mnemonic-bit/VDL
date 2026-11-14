@@ -1763,6 +1763,10 @@ VDL.renameMutationMetrics = () => Object.freeze({ ...renameMutationMetrics });
 const favoriteEditPositions = new Map();
 const compatibilityFavorites = new Map();
 const favoriteNotices = new Map();
+const compatibilityVisibility = new Map();
+const visibilityNotices = new Map();
+const visibilityMutationMetrics = { ...tagMutationMetrics };
+VDL.visibilityMutationMetrics = () => Object.freeze({ ...visibilityMutationMetrics });
 const favoriteMutationMetrics = { ...tagMutationMetrics };
 const mutationMetrics = { ...tagMutationMetrics };
 const preferenceMutationMetrics = { ...tagMutationMetrics };
@@ -1826,7 +1830,7 @@ const tagMutations = VDL.createMutations({
         return { status: response.status, body: await response.json().catch(() => null) };
     },
     onEvent: event => {
-        const domainMetrics = ['history.clear', 'library.clear'].includes(event.action) ? bulkClearMetrics : event.action === 'entry.remove' ? removalMutationMetrics : event.action.startsWith('upload.') ? uploadMutationMetrics : event.action === 'download.submit' ? downloadSubmissionMetrics : event.action.startsWith('download.') ? downloadCommandMetrics : event.action.startsWith('playlist.') ? playlistMutationMetrics : event.action === 'preference.set' ? preferenceMutationMetrics : event.action === 'rename.set' ? renameMutationMetrics : event.action === 'favorite.set' ? favoriteMutationMetrics : tagMutationMetrics;
+        const domainMetrics = ['history.clear', 'library.clear'].includes(event.action) ? bulkClearMetrics : event.action === 'entry.remove' ? removalMutationMetrics : event.action.startsWith('upload.') ? uploadMutationMetrics : event.action === 'download.submit' ? downloadSubmissionMetrics : event.action.startsWith('download.') ? downloadCommandMetrics : event.action.startsWith('playlist.') ? playlistMutationMetrics : event.action === 'preference.set' ? preferenceMutationMetrics : event.action === 'rename.set' ? renameMutationMetrics : event.action === 'visibility.set' ? visibilityMutationMetrics : event.action === 'favorite.set' ? favoriteMutationMetrics : tagMutationMetrics;
         for (const metrics of [domainMetrics, mutationMetrics]) {
             if (event.outcome === 'presented') metrics.submissions++;
             if (event.outcome === 'confirmed') {
@@ -1863,6 +1867,18 @@ const tagMutations = VDL.createMutations({
                 unconfirmed: 'Rename not confirmed. Check its status before replaying.',
             };
             if (messages[event.outcome]) announceTagStatus(messages[event.outcome]);
+        }
+        if (event.action === 'visibility.set') {
+            if (event.outcome === 'reconciliation') visibilityMutationMetrics.reconciliationReads++;
+            const messages = { presented: 'Changing visibility…', confirmed: 'Visibility change confirmed.',
+                rejected: 'Visibility change refused. Last confirmed visibility is retained.',
+                conflicted: 'Visibility changed elsewhere. Review current visibility before submitting again.',
+                unconfirmed: 'Visibility change not confirmed.' };
+            const intent = tagMutations.status(event.intentId);
+            if (intent && event.outcome === 'confirmed') visibilityNotices.set(intent.targetId, messages.confirmed);
+            if (messages[event.outcome]) announceTagStatus(messages[event.outcome]);
+            refreshVisibilityPresentations();
+            if (event.outcome === 'confirmed') fetchLibraryStorage();
         }
         if (event.action === 'favorite.set') {
             const messages = {
@@ -1937,6 +1953,9 @@ function resetTagSession() {
     favoriteEditPositions.clear();
     compatibilityFavorites.clear();
     favoriteNotices.clear();
+    for (const entry of compatibilityVisibility.values()) entry.timers.forEach(clearTimeout);
+    compatibilityVisibility.clear(); visibilityNotices.clear();
+    refreshVisibilityPresentations();
     announceTagStatus('');
     updateTagMutationSummary();
     collectionSnapshots.library = [];
@@ -1964,6 +1983,11 @@ function updateTagMutationSummary() {
     }
     const allIntents = mutationDiagnosticIntents();
     const intents = allIntents.filter(intent => intent.kind.startsWith('tag.'));
+    refreshVisibilityPresentations();
+    const visibilityIntents = allIntents.filter(intent => intent.kind === 'visibility.set');
+    visibilityMutationMetrics.pending = visibilityIntents.filter(intent => ['queued', 'sending', 'unconfirmed', 'conflicted'].includes(intent.status)).length;
+    visibilityMutationMetrics.unconfirmed = visibilityIntents.filter(intent => intent.status === 'unconfirmed').length;
+    visibilityMutationMetrics.conflicted = visibilityIntents.filter(intent => intent.status === 'conflicted').length;
     const favoriteIntents = allIntents.filter(intent => intent.kind === 'favorite.set');
     updateFavoriteMutationSummary(favoriteIntents);
     const renameIntents = allIntents.filter(intent => intent.kind === 'rename.set');
@@ -2001,6 +2025,8 @@ function projectTagEntry(info) {
     return { ...info, ...(projected.upload && (!info.upload || BigInt(info.upload.revision) < BigInt(projected.upload.revision)) ? { status: projected.upload.download_status, downloaded_bytes: projected.upload.downloaded_bytes, total_bytes: projected.upload.total_bytes, upload: projected.upload, upload_revision: projected.upload_revision } : {}), ...(info.current_attempt_id !== projected.current_attempt_id && typeof projected.command_revision === 'string' ? { status: projected.status, progress: projected.progress, speed: projected.speed, eta: projected.eta, downloaded_bytes: projected.downloaded_bytes, total_bytes: projected.total_bytes, finished_at: projected.finished_at } : {}), command_revision: projected.command_revision, current_attempt_id: projected.current_attempt_id, job_id: projected.job_id, filename: projected.filename, display_filename: projected.display_filename,
         removal_revision: projected.removal_revision, removal_intents: projected.removal_intents, rename_revision: projected.rename_revision, requested_filename: ['sending', 'unconfirmed'].includes(compatibilityRenames.get(String(info.id))?.status) ? compatibilityRenames.get(String(info.id)).value : projected.requested_filename, rename_intents: projected.rename_intents, tags: projected.tags, tag_items: projected.tag_items,
         tags_revision: projected.tags_revision, tag_chips: projected.tag_chips,
+        visibility: projected.visibility, visibility_revision: projected.visibility_revision, visibility_intents: projected.visibility_intents,
+        can_manage_visibility: projected.can_manage_visibility, can_delete: projected.can_delete, permissions: projected.permissions,
         favorite: projected.favorite, favorite_revision: projected.favorite_revision, favorite_intents: projected.favorite_intents };
 }
 
@@ -2083,6 +2109,8 @@ tagState.subscribe(ids => {
         favoriteEditPositions.delete(String(id));
         compatibilityFavorites.delete(String(id));
         favoriteNotices.delete(String(id));
+        compatibilityVisibility.get(String(id))?.timers.forEach(clearTimeout);
+        compatibilityVisibility.delete(String(id)); visibilityNotices.delete(String(id));
         editingTagIds.delete(String(id));
         tagDrafts.delete(String(id));
         tagEditPositions.delete(String(id));
@@ -2095,6 +2123,7 @@ tagState.subscribe(ids => {
         }
     }
     refreshDownloadCommandPresentations();
+    refreshVisibilityPresentations();
     if (acceptingTagSnapshots || tagRenderScheduled) return;
     tagRenderScheduled = true;
     queueMicrotask(() => {
@@ -2117,7 +2146,7 @@ tagState.subscribe(ids => {
 });
 
 window.addEventListener('beforeunload', event => {
-    if (![...droppedUploads.values()].some(upload => !upload.settled || upload.unknown || uploadIntent(upload)) && !playlistActions.size && !playlistSubmissions.size && !playlistRetainedDrafts.size && !(playlistEditorDraft && playlistEditorSnapshot() !== playlistEditorBaseline) && !preferenceDirty && !preferenceSubmission && !tagMutations.hasPending() && ![...tagDrafts.values()].some(value => value.trim()) && !renameDrafts.size && !compatibilityRenames.size && !compatibilityCommands.size && !compatibilityRemovals.size && ![...bulkClears.values()].some(entry => !['confirmed', 'rejected'].includes(bulkClearEntry(entry).status)) && !downloadSubmission?.legacy && !urlInput.value.trim()) return;
+    if (![...droppedUploads.values()].some(upload => !upload.settled || upload.unknown || uploadIntent(upload)) && !playlistActions.size && !playlistSubmissions.size && !playlistRetainedDrafts.size && !(playlistEditorDraft && playlistEditorSnapshot() !== playlistEditorBaseline) && !preferenceDirty && !preferenceSubmission && !tagMutations.hasPending() && ![...tagDrafts.values()].some(value => value.trim()) && !renameDrafts.size && !compatibilityVisibility.size && !compatibilityRenames.size && !compatibilityCommands.size && !compatibilityRemovals.size && ![...bulkClears.values()].some(entry => !['confirmed', 'rejected'].includes(bulkClearEntry(entry).status)) && !downloadSubmission?.legacy && !urlInput.value.trim()) return;
     event.preventDefault();
     event.returnValue = '';
 });
@@ -3571,31 +3600,152 @@ for (const eventName of ['focusout', 'pointerout']) document.addEventListener(ev
 });
 
 
+function hasVisibilityProtocol() {
+    return tagCapabilities?.mutation_protocol === 1 && tagCapabilities.actions?.includes('visibility.set');
+}
+function visibilityIntent(id) {
+    const intent = tagState.selectDownload(String(id))?.visibility_intents[0];
+    return intent ? tagMutations.status(intent.id) || intent : compatibilityVisibility.get(String(id));
+}
+function visibilityFeedback(info) {
+    const entry = visibilityIntent(info.id);
+    const label = value => value === 'private' ? 'Private' : 'Public';
+    if (!entry) return escapeHtml(visibilityNotices.get(String(info.id)) || '');
+    const confirmed = label(info.visibility);
+    const requested = label(entry.value);
+    let message = `${confirmed} · Changing to ${entry.value}…`;
+    if (entry.status === 'unconfirmed') message = `Visibility change not confirmed · Requested: ${requested} · Last confirmed: ${confirmed}. The current server visibility may differ.`;
+    else if (entry.status === 'conflicted') message = `Visibility changed elsewhere · Current confirmed: ${confirmed} · Requested: ${requested}. Review current visibility before submitting again.`;
+    else if (entry.status === 'rejected') message = `Visibility change refused · Last confirmed: ${confirmed} · Requested: ${requested}. ${entry.message || ''}`;
+    else if (entry.delayed) message += ' Still waiting for confirmation.';
+    const button = (action, text) => `<button type="button" data-visibility-recovery="${action}" data-intent-id="${escapeAttr(entry.id)}" data-download-id="${escapeAttr(info.id)}">${text}</button>`;
+    let recovery = '';
+    if (entry.status === 'unconfirmed') recovery = button('check', 'Check visibility change') + (!entry.legacy && !entry.replayExpired ? button('replay', 'Replay original request') : '') + (entry.canResolve ? button('dismiss', 'Use current visibility') : '');
+    if (entry.status === 'conflicted') recovery = button('review', 'Review current visibility');
+    if (entry.status === 'rejected') recovery = button('dismiss', 'Dismiss');
+    return `<span>${escapeHtml(message)}</span>${recovery}`;
+}
+function renderVisibilityControl(info) {
+    const id = String(info.id);
+    const visibility = info.visibility === 'private' ? 'private' : 'public';
+    const disabled = !info.can_manage_visibility || !!visibilityIntent(id);
+    return `<div class="history-info-section history-visibility-section" data-visibility-control="${escapeAttr(id)}">
+        <label class="history-info-label" for="visibility-${escapeAttr(id)}">Visibility</label>
+        <select id="visibility-${escapeAttr(id)}" class="history-visibility-select" data-visibility-select data-download-id="${escapeAttr(id)}" data-current="${visibility}" onchange="changeDownloadVisibility(this)"${disabled ? ' disabled' : ''}>
+            <option value="public"${visibility === 'public' ? ' selected' : ''}>Public</option>
+            <option value="private"${visibility === 'private' ? ' selected' : ''}>Private</option>
+        </select>
+        <div class="history-visibility-help">${visibilityIntent(id)?.status === 'unconfirmed' ? 'Last confirmed access: ' : ''}${visibility === 'public' ? 'Visible to all users' : 'Visible only to you and administrators'}</div>
+        <div class="visibility-feedback" data-visibility-feedback>${visibilityFeedback(info)}</div>
+    </div>`;
+}
+function refreshVisibilityPresentations() {
+    for (const section of document.querySelectorAll('[data-visibility-control]')) {
+        const id = section.dataset.visibilityControl;
+        const model = tagState.selectDownload(id);
+        if (!model) { section.replaceChildren(); continue; }
+        const select = section.querySelector('[data-visibility-select]');
+        if (!select) continue;
+        select.value = model.visibility;
+        select.dataset.current = model.visibility;
+        select.disabled = model.can_manage_visibility !== true || !!visibilityIntent(id) || removalBlocksWrites(id);
+        section.querySelector('.history-visibility-help').textContent = (visibilityIntent(id)?.status === 'unconfirmed' ? 'Last confirmed access: ' : '') + (model.visibility === 'private' ? 'Visible only to you and administrators' : 'Visible to all users');
+        const feedback = section.querySelector('[data-visibility-feedback]');
+        const html = visibilityFeedback(model);
+        if (feedback.innerHTML !== html) feedback.innerHTML = html;
+    }
+    const summary = document.getElementById('visibilityMutationSummary');
+    if (summary) {
+        const entries = tagMutations.pending().filter(intent => intent.kind === 'visibility.set').concat([...compatibilityVisibility.values()]);
+        summary.hidden = !entries.length;
+        const html = entries.map(entry => {
+            const model = tagState.selectDownload(entry.targetId);
+            return model ? `<div>${visibilityFeedback(model)}</div>` : '';
+        }).join('');
+        if (summary.innerHTML !== html) summary.innerHTML = html;
+    }
+}
 function changeDownloadVisibility(select) {
     if (select.disabled) return;
-    const id = select.dataset.downloadId;
-    if (removalBlocksWrites(id)) return;
-    const previous = select.dataset.current;
+    const id = String(select.dataset.downloadId);
+    const model = tagState.selectDownload(id);
     const visibility = select.value;
-    select.disabled = true;
-    apiAction('/api/visibility/' + encodeURIComponent(id), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ visibility }),
-    })
-        .then(() => {
-            select.dataset.current = visibility;
-            return fetchHistory();
-        })
-        .catch(() => {
-            select.value = previous;
-            select.disabled = false;
-            return fetchHistory();
-        }).finally(() => { select.disabled = false; });
+    if (!model || model.can_manage_visibility !== true || removalBlocksWrites(id) || visibilityIntent(id)) return;
+    select.value = model.visibility;
+    visibilityNotices.delete(id);
+    const startedAt = performance.now();
+    if (hasVisibilityProtocol()) {
+        const result = tagMutations.submit({ kind: 'visibility.set', targetId: id, value: visibility });
+        if (result.intentId) submittedTagIntents.add(result.intentId);
+        if (!result.accepted) { visibilityNotices.set(id, result.message); announceTagStatus(result.message); }
+        refreshVisibilityPresentations();
+        visibilityMutationMetrics.latestLocalFeedbackMs = performance.now() - startedAt;
+        mutationMetrics.latestLocalFeedbackMs = visibilityMutationMetrics.latestLocalFeedbackMs;
+        return;
+    }
+    if (visibility === model.visibility) return;
+    const epoch = tagSessionEpoch;
+    const context = tagState.capture();
+    const entry = { id: `legacy-visibility-${id}`, targetId: id, kind: 'visibility.set', value: visibility, status: 'sending', legacy: true, timers: [] };
+    compatibilityVisibility.set(id, entry);
+    refreshVisibilityPresentations();
+    visibilityMutationMetrics.latestLocalFeedbackMs = performance.now() - startedAt;
+    announceTagStatus('Changing visibility…');
+    const current = () => epoch === tagSessionEpoch && compatibilityVisibility.get(id) === entry && tagState.isAvailable(id);
+    const unknown = () => { if (current()) { entry.status = 'unconfirmed'; refreshVisibilityPresentations(); announceTagStatus('Visibility change not confirmed.'); } };
+    entry.timers.push(setTimeout(() => { if (current() && entry.status === 'sending') { entry.delayed = true; refreshVisibilityPresentations(); } }, 5000));
+    entry.timers.push(setTimeout(unknown, 30000));
+    apiFetch('/api/visibility/' + encodeURIComponent(id), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ visibility }),
+    }).then(async response => {
+        if (!current()) return;
+        if ([403, 404].includes(response.status)) { tagMutations.fence(id); return; }
+        const body = await response.json().catch(() => null);
+        if (!current()) return;
+        if (!response.ok) {
+            if (response.status >= 400 && response.status < 500 && typeof body?.error === 'string') {
+                entry.status = 'rejected'; entry.message = body.error; refreshVisibilityPresentations(); announceTagStatus('Visibility change refused.');
+            } else unknown();
+            return;
+        }
+        if (body?.id !== id || body.visibility !== visibility || typeof body.changed !== 'boolean') { unknown(); return; }
+        const snapshot = { id, visibility: body.visibility, can_manage_visibility: body.can_manage_visibility, can_delete: body.can_delete,
+            ...(body.permissions ? { permissions: body.permissions } : {}),
+            ...(VDL.validVisibilityState(body) ? { visibility_revision: body.visibility_revision } : {}) };
+        const confirmed = tagState.writer.confirmed(id);
+        const accepted = typeof confirmed.visibility_revision === 'string'
+            ? VDL.validVisibilityState(body) && tagState.acceptDownload(snapshot, context)
+            : tagState.writer.acceptLegacyVisibility(body, context);
+        if (!accepted) { unknown(); return; }
+        compatibilityVisibility.delete(id);
+        visibilityNotices.set(id, 'Visibility change confirmed.');
+        refreshVisibilityPresentations(); renderDownloadCollections(); fetchLibraryStorage(); announceTagStatus('Visibility change confirmed.');
+    }).catch(unknown).finally(() => entry.timers.forEach(clearTimeout));
 }
+document.addEventListener('click', async event => {
+    const button = event.target.closest('[data-visibility-recovery]');
+    if (!button) return;
+    const id = button.dataset.downloadId;
+    const intentId = button.dataset.intentId;
+    const action = button.dataset.visibilityRecovery;
+    const entry = compatibilityVisibility.get(id);
+    if (entry) {
+        if (action === 'check') await checkTagAvailability(id);
+        else if (entry.status === 'rejected') compatibilityVisibility.delete(id);
+    } else if (action === 'check') await tagMutations.recover(intentId);
+    else if (action === 'replay') await tagMutations.recover(intentId, { replay: true });
+    else if (action === 'review') {
+        // A conflict keeps the canonical state readable until explicit review.
+        if (tagMutations.status(intentId)?.status === 'conflicted') {
+            tagMutations.resolve(intentId);
+            announceTagStatus('Current visibility reviewed. Choose the desired visibility to submit a new request.');
+        }
+    } else tagMutations.resolve(intentId);
+    refreshVisibilityPresentations();
+});
 
 function mutationDiagnosticIntents() {
-    return tagMutations.pending().concat([...compatibilityRemovals.values()], uploadDiagnosticIntents(),
+    return tagMutations.pending().concat([...compatibilityVisibility.values()], [...compatibilityRemovals.values()], uploadDiagnosticIntents(),
         downloadSubmission?.legacy ? [{ ...downloadSubmission.legacy, kind: 'download.submit' }] : [],
         preferenceSubmission?.legacy ? [{ ...preferenceSubmission.legacy, kind: 'preference.set' }] : [],
         [...playlistSubmissions.values()].filter(entry => entry.legacy).map(entry => ({ ...entry.legacy, kind: entry.kind })),
@@ -5359,19 +5509,7 @@ function renderHistoryCard(info) {
                         </details>`;
     }
 
-    const visibility = info.visibility === 'private' ? 'private' : 'public';
-    const visibilityDisabled = info.can_manage_visibility
-        ? ''
-        : ' disabled title="Only the downloader or an administrator can change visibility"';
-    const visibilityControl = `
-                            <div class="history-info-section history-visibility-section">
-                                <label class="history-info-label" for="visibility-${escapeAttr(id)}">Visibility</label>
-                                <select id="visibility-${escapeAttr(id)}" data-visibility-select data-download-id="${escapeAttr(id)}" data-current="${visibility}" onchange="changeDownloadVisibility(this)"${visibilityDisabled}>
-                                    <option value="public"${visibility === 'public' ? ' selected' : ''}>Public</option>
-                                    <option value="private"${visibility === 'private' ? ' selected' : ''}>Private</option>
-                                </select>
-                                <div class="history-visibility-help">${visibility === 'public' ? 'Visible to all users' : 'Visible only to you and administrators'}</div>
-                            </div>`;
+    const visibilityControl = renderVisibilityControl(info);
 
     return `
                 <article class="history-card" id="history-item-${escapeAttr(id)}" data-row-id="${escapeAttr(id)}">
@@ -6283,6 +6421,7 @@ function fetchHistory({ sortFavorites = false } = {}) {
 async function checkTagAvailability(id, { authoritative = false } = {}) {
     if (checkingTagAvailability.has(id)) return;
     checkingTagAvailability.add(id);
+    if (tagState.selectDownload(String(id))?.visibility_revision || visibilityIntent(id)) visibilityMutationMetrics.reconciliationReads++;
     const epoch = tagSessionEpoch;
     const context = tagState.capture();
     mutationMetrics.reconciliationReads++;
@@ -6293,7 +6432,14 @@ async function checkTagAvailability(id, { authoritative = false } = {}) {
         else if (response.ok) {
             const snapshot = await response.json();
             if (epoch !== tagSessionEpoch) return;
-            if (tagState.acceptDownload(snapshot, { ...context, authoritative })) {
+            const known = tagState.writer.confirmed(String(id));
+            // Collections expose public basenames. A targeted read can arrive
+            // first; its physical path must not poison equal-revision merges.
+            const current = typeof snapshot.filename === 'string'
+                    && (!known || typeof known.filename !== 'string' || !/[/\\]/.test(known.filename))
+                ? { ...snapshot, filename: snapshot.display_filename || snapshot.filename.split('/').pop().split('\\').pop() }
+                : snapshot;
+            if (tagState.acceptDownload(current, { ...context, authoritative })) {
                 unavailableTagIds.delete(id);
             }
         }
@@ -6312,7 +6458,7 @@ function checkMissingTagTargets(previous, next) {
         const id = String(entry.id);
         if (present.has(id) || removalIntent(id)) continue;
         const model = tagState.selectDownload(id);
-        if (!model?.tag_chips.some(chip => chip.status !== 'confirmed') && !model?.favorite_intents.length && !model?.rename_intents.length && !model?.command_intents.length && !compatibilityCommands.has(id) && !compatibilityRenames.has(id) && !renameDrafts.has(id) && !editingTagIds.has(id)) continue;
+        if (!model?.visibility_revision && !model?.visibility_intents.length && !compatibilityVisibility.has(id) && !model?.tag_chips.some(chip => chip.status !== 'confirmed') && !model?.favorite_intents.length && !model?.rename_intents.length && !model?.command_intents.length && !compatibilityCommands.has(id) && !compatibilityRenames.has(id) && !renameDrafts.has(id) && !editingTagIds.has(id)) continue;
         checkTagAvailability(id);
     }
 }
@@ -6339,6 +6485,7 @@ function fetchDownloadCollection(key) {
         tagMutationMetrics.reconciliationReads++;
         renameMutationMetrics.reconciliationReads++;
         favoriteMutationMetrics.reconciliationReads++;
+        visibilityMutationMetrics.reconciliationReads++;
         mutationMetrics.reconciliationReads++;
         try {
             const snapshot = await readCollection(key === 'library'

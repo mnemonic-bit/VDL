@@ -1,8 +1,8 @@
 # Immediate feedback for visibility changes
 
 **Source:** Remaining Feature 0051 rollout item\
-**Status:** Proposed; not implemented\
-**Last refined:** 2026-11-08\
+**Status:** Implemented in 0.65.0\
+**Last refined:** 2026-11-14\
 **Extends:** [Feature 0051](feature-0051-immediate-feedback-for-server-backed-interactions.md), [Feature 0023, Authentication and users](feature-0023-require-authentication-and-manage-users.md)\
 **Rollout:** [Shared requirements and inventory](../ARCHITECTURE/feature-0051-rollout.md#shared-requirements-for-the-remaining-specs)
 
@@ -74,3 +74,61 @@ restoring visibility or privileged controls.
    occurs, and stale callbacks enable no authority.
 5. Test two-user visibility, playback/storage reconciliation, keyboard status,
    both themes, and shared verification including authorization regressions.
+
+## Implementation
+
+`visibility.set` uses the shared client store and mutation coordinator. The
+visibility selector retains the confirmed value while adjacent text shows the
+requested value. Unknown outcomes retain both values and explain that current
+server visibility may differ. A summary preserves recovery controls when Info
+is closed. Conflicts require explicit review before another submission.
+
+The server migrates `visibility_revision` and advances the revision through a
+database trigger on every actual visibility change. The serialized metadata
+transaction resolves the current actor, checks ownership or administration,
+compares the expected revision, and commits the change and actor-scoped receipt
+together. Legacy writes share the authorization boundary. Visibility hints
+contain no entry identity. Other entry hints recheck current access at SSE
+delivery, including hints queued before an entry becomes private.
+
+Acknowledgements contain `visibility`, decimal-string `visibility_revision`,
+`can_manage_visibility`, `can_delete`, and `permissions`. Receipt lookup and
+identical-attempt replay reauthorize access and return a current security
+snapshot. Their `mutation.revision` retains the original outcome revision;
+`visibility_revision` may be newer. The client checks both revisions and keeps
+newer confirmed state. Collection and storage reads resolve current
+authorization within their read snapshots.
+
+Recovery never automatically replays a write. A missing receipt does not
+confirm an outcome. Explicit resolution requires a newer revision that prevents
+the original conditional write, or a serialized expired-absence result followed
+by a valid authorized state check. Unsupported servers receive pending
+presentation without assumed revision or receipt support. Authentication reset
+and access fences clear pending private values and reject obsolete callbacks.
+
+## Verification
+
+Verified on 2026-11-14 for version `0.65.0`:
+
+- `./tests/run-all.sh --unit` with Python 3.12.14: **passed**, 885 tests,
+  9 skipped; `vdl.py` line coverage **92.5%** (7831/8462), above the enforced
+  90% minimum. Test databases used `TMPDIR=/dev/shm`.
+- `node --test tests/*.test.cjs`: **passed**, 279 tests, including 32 visibility
+  checks. Tests exercise the production store, coordinator, and availability
+  adapter, including targeted reads arriving before collection snapshots.
+- Chromium: **passed**, 216 distinct scenarios across the broad runs and
+  focused follow-ups. Firefox: **passed**, 161 distinct scenarios across the
+  broad run and focused follow-up. All 22 visibility scenarios passed in both
+  browsers. The final tag, visibility, and live-update group passed all
+  45 checks in each browser after the availability-read correction.
+
+Controlled requests cover immediate feedback below 50 ms, confirmed versus
+requested visibility, canonical acknowledgement without SSE or collection
+reads, stale responses, lost acknowledgements, identical-attempt replay,
+conflict review, definite rejection and quotas, access loss, account switching,
+two-user playback and cached storage, legacy servers, keyboard controls, both
+themes, reduced motion, narrow layouts, and deduplicated announcements.
+Transactional tests cover concurrent writes and replay, receipt rollback,
+fingerprints, retention and expiry, restart persistence, current authorization,
+and all visibility writers. Actual SSE tests verify delivery-time privacy for
+queued hints and private worker/view events, role changes, and session revocation.
