@@ -642,6 +642,7 @@
                             <p>The five-minute limit applies only to an unused pairing string. A successful connection remains active until you revoke it here or choose Unpair in the extension.</p>
                             <div id="extensionConnectionList"></div>
                             <p id="extensionNoConnections">No active companion connections.</p>
+                            <p id="extensionConnectionStatus" class="extension-live-status"></p>
                         </div>
                         <p id="extensionStatus" class="extension-live-status" role="status" aria-live="polite"></p>
                     </section>
@@ -1024,6 +1025,8 @@
         </div>
     </div>
 
+    <div id="extensionConnectionSummary" class="download-command-summary" hidden aria-live="off"></div>
+    <div id="extensionConnectionAnnouncement" class="visually-hidden" role="status" aria-live="polite" aria-atomic="true"></div>
     <div id="extensionPairingSummary" class="download-command-summary" hidden aria-live="off">
         <span></span>
         <button type="button" data-pairing-recovery="check" onclick="recoverExtensionPairing()">Check pairing request</button>
@@ -1065,6 +1068,7 @@
     <script src="{{ url_for('static', filename='client-state.js', v=ui_version) }}"></script>
     <script src="{{ url_for('static', filename='mutations.js', v=ui_version) }}"></script>
     <script src="{{ url_for('static', filename='extension-pairing.js', v=ui_version) }}"></script>
+    <script src="{{ url_for('static', filename='extension-connections.js', v=ui_version) }}"></script>
     <script src="{{ url_for('static', filename='app.js', v=ui_version) }}"></script>
 </body>
 </html>

@@ -738,6 +738,12 @@ def init_db():
                   );
             END;
         """)
+        connection_columns = {row['name'] for row in conn.execute('PRAGMA table_info(extension_tokens)')}
+        for name, definition in [('generation', "TEXT NOT NULL DEFAULT ''"),
+                                 ('revision', 'INTEGER NOT NULL DEFAULT 0')]:
+            if name not in connection_columns:
+                conn.execute(f'ALTER TABLE extension_tokens ADD COLUMN {name} {definition}')
+        conn.execute("UPDATE extension_tokens SET generation = lower(hex(randomblob(16))) WHERE generation = ''")
         # New tables are additive, so retained database volumes need no rebuild.
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS extension_pairing_state (
@@ -5561,6 +5567,97 @@ def _execute_pairing_mutation(payload, action, origin=None):
     return result, status
 
 
+def _connection_snapshot(row, status='connected'):
+    return {'id': row['id'], 'generation': row['generation'], 'status': status,
+            'revision': str(row['revision'] + (1 if status == 'revoked' else 0))}
+
+
+def _authorized_connection_receipt(receipt, actor):
+    # The retained identity authorizes recovery after deletion without retaining
+    # device metadata or relying on a credential that revocation has destroyed.
+    result = json.loads(receipt['response'])
+    expected = 'connection:' + str(actor['session_version']) + ':' + result['connection']['id']
+    if receipt['target_id'] != expected:
+        return None
+    result['server_time'] = int(time.time() * 1000)
+    return result
+
+
+def _execute_connection_revocation(connection_id, payload):
+    protocol = 'client_mutation_id' in payload
+    mutation_id = payload.get('client_mutation_id')
+    match = MUTATION_ID_PATTERN.fullmatch(mutation_id) if isinstance(mutation_id, str) else None
+    if protocol and match is None:
+        return {'error': 'Invalid mutation identifier'}, 400
+    fingerprint = hashlib.sha256(json.dumps(
+        ['connection.revoke', connection_id, payload], sort_keys=True, ensure_ascii=True,
+        separators=(',', ':'),
+    ).encode()).hexdigest()
+    with _db_lock, db() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        actor = _tag_actor(conn)
+        if actor is None:
+            return {'error': 'Authentication required'}, 401
+        if protocol:
+            receipt = conn.execute('SELECT * FROM mutation_receipts WHERE actor_id = ? AND mutation_id = ?',
+                                   (actor['id'], mutation_id)).fetchone()
+            if receipt is not None:
+                if receipt['fingerprint'] != fingerprint:
+                    return {'error': 'Mutation identifier already used', 'code': 'mutation_id_conflict'}, 409
+                result = _authorized_connection_receipt(receipt, actor)
+                if result is None:
+                    return {'error': 'Mutation unavailable'}, 404
+                return result, receipt['status']
+            if conn.execute("SELECT 1 FROM rename_operations WHERE actor_id = ? AND mutation_id = ? AND phase != 'done'",
+                            (actor['id'], mutation_id)).fetchone():
+                return {'error': 'Mutation identifier already used', 'code': 'mutation_id_conflict'}, 409
+        row = conn.execute('SELECT * FROM extension_tokens WHERE id = ? AND user_id = ? '
+                           'AND paired_session_version = ?',
+                           (connection_id, actor['id'], actor['session_version'])).fetchone()
+        if row is None:
+            return {'error': 'Unknown companion connection'}, 404
+        state = _connection_snapshot(row)
+        status, outcome, error = 200, 'committed', None
+        if protocol:
+            now = time.time()
+            _prune_mutation_receipts(conn, now)
+            counts = conn.execute('SELECT COUNT(*) AS total, COALESCE(SUM(recorded_at > ?), 0) AS recent '
+                                  'FROM mutation_receipts WHERE actor_id = ?', (now - 60, actor['id'])).fetchone()
+            active = conn.execute("SELECT COUNT(*) FROM rename_operations WHERE actor_id = ? AND (phase != 'done' OR NOT EXISTS "
+                                  '(SELECT 1 FROM mutation_receipts r WHERE r.actor_id = rename_operations.actor_id '
+                                  'AND r.mutation_id = rename_operations.mutation_id))', (actor['id'],)).fetchone()[0]
+            if counts['total'] + active >= MUTATION_ACTOR_RECEIPT_LIMIT or counts['recent'] + active >= MUTATION_ACTOR_MINUTE_LIMIT:
+                return {'error': 'Too many mutations; wait before submitting more', 'code': 'mutation_limit'}, 429
+            created = int(match.group(1)) / 1000
+            expected = payload.get('expected_revision')
+            generation = payload.get('generation')
+            if created < now - MUTATION_REPLAY_SECONDS or created > now + 300:
+                status, outcome, error = 400, 'rejected', 'Mutation identifier expired or clock is incorrect'
+            elif set(payload) != {'client_mutation_id', 'expected_revision', 'generation'}:
+                status, outcome, error = 400, 'rejected', 'Connection generation and expected revision are required'
+            elif not isinstance(expected, str) or not re.fullmatch(r'0|[1-9][0-9]{0,18}', expected):
+                status, outcome, error = 400, 'rejected', 'Expected revision must be a decimal string'
+            elif not isinstance(generation, str) or not re.fullmatch(r'[0-9a-f]{32}', generation):
+                status, outcome, error = 400, 'rejected', 'Invalid connection generation'
+            elif expected != state['revision'] or generation != state['generation']:
+                status, outcome, error = 409, 'conflicted', 'Connection changed; review current status before continuing'
+        if error is None:
+            conn.execute('DELETE FROM extension_tokens WHERE id = ? AND user_id = ? AND generation = ?',
+                         (connection_id, actor['id'], row['generation']))
+            state = _connection_snapshot(row, 'revoked')
+        result = {'connection': state, 'server_time': int(time.time() * 1000)}
+        if protocol:
+            result['mutation'] = {'id': mutation_id, 'domain': 'extension-connection',
+                                  'revision': state['revision'], 'outcome': outcome}
+            if error:
+                result['error'] = error
+            conn.execute('INSERT INTO mutation_receipts(actor_id,mutation_id,target_id,fingerprint,status,response,recorded_at) '
+                         'VALUES (?,?,?,?,?,?,?)', (actor['id'], mutation_id,
+                          'connection:' + str(actor['session_version']) + ':' + connection_id,
+                          fingerprint, status, json.dumps(result, separators=(',', ':')), now))
+    return result, status
+
+
 def _consume_pairing_code(code, origin):
     if (not isinstance(code, str)
             or not re.fullmatch(r'VDL1-[A-Za-z0-9_-]{22}', code)):
@@ -5595,12 +5692,12 @@ def _new_companion_token(user, device_label, extension_version):
         conn.execute(
             "INSERT INTO extension_tokens("
             "id, user_id, token_verifier, device_label, extension_version, "
-            "protocol_version, paired_session_version, created_at"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "protocol_version, paired_session_version, created_at, generation"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 token_id, user['id'], _credential_verifier(token),
                 device_label, extension_version, COMPANION_PROTOCOL,
-                user['session_version'], time.time(),
+                user['session_version'], time.time(), uuid.uuid4().hex,
             ),
         )
     return token_id, token
@@ -7944,15 +8041,19 @@ def extension_current_pairing_code():
 @app.route('/api/extension/connections', methods=['GET'])
 def extension_connections():
     with db() as conn:
+        conn.execute('BEGIN')
+        actor = _tag_actor(conn)
+        if actor is None:
+            return jsonify({'error': 'Authentication required'}), 401
         rows = conn.execute(
             "SELECT id, device_label, extension_version, protocol_version, "
-            "created_at, last_used_at FROM extension_tokens "
+            "created_at, last_used_at, generation, revision FROM extension_tokens "
             "WHERE user_id = ? AND paired_session_version = ? "
             "ORDER BY created_at DESC",
-            (g.current_user['id'], g.current_user['session_version']),
+            (actor['id'], actor['session_version']),
         ).fetchall()
     response = jsonify({
-        'connections': [dict(row) for row in rows],
+        'connections': [dict(row, **_connection_snapshot(row)) for row in rows],
         'bundled_extension': _bundled_extension(),
         'http_pairing_allowed': _companion_http_host_allowed(
             urlsplit(request.host_url).hostname
@@ -7962,17 +8063,32 @@ def extension_connections():
     return response
 
 
-@app.route('/api/extension/connections/<connection_id>', methods=['DELETE'])
+@app.route('/api/extension/connections/<connection_id>', methods=['GET', 'DELETE'])
 def extension_connection(connection_id):
-    with _db_lock, db() as conn:
-        cursor = conn.execute(
-            "DELETE FROM extension_tokens WHERE id = ? AND user_id = ?",
-            (connection_id, g.current_user['id']),
-        )
-        removed = cursor.rowcount == 1
-    if not removed:
-        return jsonify({'error': 'Unknown companion connection'}), 404
-    return '', 204
+    if request.method == 'GET':
+        with db() as conn:
+            conn.execute('BEGIN')
+            actor = _tag_actor(conn)
+            if actor is None:
+                return jsonify({'error': 'Authentication required'}), 401
+            row = conn.execute('SELECT * FROM extension_tokens WHERE id = ? AND user_id = ? '
+                               'AND paired_session_version = ?',
+                               (connection_id, actor['id'], actor['session_version'])).fetchone()
+            if row is None:
+                return jsonify({'error': 'Unknown companion connection'}), 404
+            result = {'connection': _connection_snapshot(row), 'server_time': int(time.time() * 1000)}
+        return jsonify(result)
+    if request.content_length is not None and request.content_length > 4096:
+        return _read_json_body(4096)[1]
+    payload = {}
+    if request.get_data():
+        payload, invalid = _read_json_body(4096)
+        if invalid is not None:
+            return invalid
+    result, status = _execute_connection_revocation(connection_id, payload)
+    if status == 200 and 'client_mutation_id' not in payload:
+        return '', 204
+    return jsonify(result), status
 
 
 def _companion_preflight(method):
@@ -10330,8 +10446,9 @@ def record_download_view(download_id):
 @app.route('/api/client-capabilities', methods=['GET'])
 def client_capabilities():
     response = jsonify({
-        'mutation_protocol': 1, 'actions': ['tag.add', 'tag.remove', 'favorite.set', 'visibility.set', 'rename.set', 'preference.set', 'playlist.create', 'playlist.replace', 'playlist.add', 'playlist.delete', 'download.pause', 'download.unpause', 'download.stop', 'download.retry', 'download.resume', 'download.submit', 'upload.register', 'upload.cancel', 'entry.remove', 'history.clear', 'library.clear', 'pairing.create', 'pairing.invalidate'],
+        'mutation_protocol': 1, 'actions': ['tag.add', 'tag.remove', 'favorite.set', 'visibility.set', 'rename.set', 'preference.set', 'playlist.create', 'playlist.replace', 'playlist.add', 'playlist.delete', 'download.pause', 'download.unpause', 'download.stop', 'download.retry', 'download.resume', 'download.submit', 'upload.register', 'upload.cancel', 'entry.remove', 'history.clear', 'library.clear', 'pairing.create', 'pairing.invalidate', 'connection.revoke'],
         'upload_recovery': 1, 'entry_removal': 1, 'bulk_clear': 1, 'extension_pairing': 1,
+        'extension_connection_revocation': 1,
         'tag_identity_version': TAG_IDENTITY_VERSION,
         'server_time': int(time.time() * 1000),
     })
@@ -10413,6 +10530,11 @@ def mutation_receipt(mutation_id):
                     result = _authorized_pairing_receipt(conn, receipt, actor)
                     if result is None:
                         return jsonify({'error': 'Mutation unavailable'}), 404
+                connection_receipt = result.get('mutation', {}).get('domain') == 'extension-connection'
+                if connection_receipt:
+                    result = _authorized_connection_receipt(receipt, actor)
+                    if result is None:
+                        return jsonify({'error': 'Mutation unavailable'}), 404
                 preference_receipt = result.get('mutation', {}).get('domain') == 'preferences' and receipt['target_id'] == 'installation'
                 playlist_receipt = result.get('mutation', {}).get('domain') == 'playlist'
                 submission_rejection = (result.get('mutation', {}).get('domain') == 'download-submission'
@@ -10428,7 +10550,7 @@ def mutation_receipt(mutation_id):
                         response.status_code = 404
                         response.headers['Cache-Control'] = 'no-store'
                         return response
-                if not pairing_receipt and not preference_receipt and not playlist_receipt and not submission_rejection and _tag_visible_row(conn, receipt['target_id'], actor) is None:
+                if not pairing_receipt and not connection_receipt and not preference_receipt and not playlist_receipt and not submission_rejection and _tag_visible_row(conn, receipt['target_id'], actor) is None:
                     match = MUTATION_ID_PATTERN.fullmatch(mutation_id)
                     final = bool(match and int(match.group(1)) / 1000 < time.time() - MUTATION_REPLAY_SECONDS)
                     return jsonify({'error': 'Mutation unavailable', 'final': final}), 404

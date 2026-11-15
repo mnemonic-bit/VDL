@@ -251,7 +251,9 @@ test('fullscreen edge preserves keyboard focus, slider drags and the open speed 
         if (id === 'playerVolume') await expect(slider).toBeVisible();
         await page.mouse.up();
     }
-    await page.locator('#playerSpeed').click();
+    // Firefox's fullscreen native select opens through its keyboard gesture.
+    await page.locator('#playerSpeed').focus();
+    await page.keyboard.press('Space');
     if (await page.evaluate(() => CSS.supports('selector(select:open)'))) {
         await expect.poll(() => page.locator('#playerSpeed').evaluate(node => node.matches(':open'))).toBe(true);
     }

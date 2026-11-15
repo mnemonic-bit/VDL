@@ -1,8 +1,8 @@
 # Immediate feedback for connection revocation
 
 **Source:** Remaining Feature 0051 rollout item\
-**Status:** Proposed; not implemented\
-**Last refined:** 2026-11-08\
+**Status:** Implemented in version `0.68.0`\
+**Last refined:** 2026-11-15\
 **Extends:** [Feature 0051](feature-0051-immediate-feedback-for-server-backed-interactions.md), [Feature 0026, Firefox companion](feature-0026-download-authenticated-pages-with-firefox.md)\
 **Rollout:** [Shared requirements and inventory](../ARCHITECTURE/feature-0051-rollout.md#shared-requirements-for-the-remaining-specs)
 
@@ -60,6 +60,8 @@ then, keep existing response/refresh semantics with truthful pending controls.
 Auth epoch reset clears private connection and pending state before callbacks
 can apply. Page-level recovery does not change extension request transport,
 accepted download work, or its independent authentication lifecycle.
+
+Implementation evidence is recorded in the [rollout verification](../ARCHITECTURE/feature-0051-rollout.md#connection-revocation-verification).
 
 ## Acceptance criteria
 

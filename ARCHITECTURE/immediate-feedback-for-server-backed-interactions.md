@@ -1,7 +1,7 @@
 # Architecture: immediate feedback for server-backed interactions
 
-**Status:** Foundation, tags, favorites, rename, preferences, playlist editor saves, playlist add/delete, download commands, new-download acceptance, uploads, entry removal, bulk clear, visibility changes, and extension pairing implemented; additional adapters remain proposed.\
-**Date:** 2026-11-14\
+**Status:** Foundation, tags, favorites, rename, preferences, playlist editor saves, playlist add/delete, download commands, new-download acceptance, uploads, entry removal, bulk clear, visibility changes, extension pairing, and connection revocation implemented; additional adapters remain proposed.\
+**Date:** 2026-11-15\
 **Requirements:** [Feature 0051](../FEATURES/feature-0051-immediate-feedback-for-server-backed-interactions.md)
 
 ## Purpose and document ownership
@@ -22,8 +22,8 @@ The implementation adds the shared modules, tag protocol, and independent
 `favorite.set`, `rename.set`, `preference.set`, `playlist.create`,
 `playlist.replace`, `playlist.add`, `playlist.delete`, `download.*`,
 `upload.register`, `upload.cancel`, `entry.remove`, `history.clear`,
-`library.clear`, `visibility.set`, `pairing.create`, and `pairing.invalidate` adapters described
-below. Other actions still use handlers and collection snapshots in
+`library.clear`, `visibility.set`, `pairing.create`, `pairing.invalidate`, and
+`connection.revoke` adapters described below. Other actions still use handlers and collection snapshots in
 `static/app.js`, server routes and persistence in `vdl.py`, and SSE hints that
 trigger collection reads. The [rollout inventory](feature-0051-rollout.md) records
 which adapters remain staged. Existing
@@ -624,6 +624,35 @@ responses require explicit invalidation followed by a separate deliberate
 creation. The page never automatically rotates a credential or replays a write.
 Authentication reset clears credentials before obsolete callbacks can execute.
 The companion extension retains its separate transport and token lifecycle.
+
+### Connection revocation and retained operation identity
+
+Feature 0064 registers `connection.revoke` in the per-connection
+`extension-connection` domain. The connection list owns device presentation and
+collection request generations. The shared store and coordinator own the
+minimal confirmed connection snapshot, status-only intent, frozen attempt, and
+receipt recovery. A pending attempt retains the connection row and confirmed
+status. Canonical acknowledgement removes the intended identity directly;
+collection and revision fences prevent older reads from restoring it.
+
+The existing `extension_tokens` table gains persistent generation and revision
+columns through migration. A serialized transaction resolves current session
+and ownership, checks the expected generation/revision, removes the credential,
+and commits a minimal actor-bound receipt. Legacy deletion uses the same
+transaction and authorization boundary. Replay returns the original outcome
+before target lookup, allowing recovery after removal without retaining device
+metadata or bearer credentials. A new connection receives a distinct identity
+and generation. Its credentials and already accepted work retain their existing
+companion transport and worker lifecycle.
+
+The complete protocol is advertised by `extension_connection_revocation: 1`.
+Unknown outcomes retain explicit receipt checks and deliberate frozen-attempt
+replay. Collection absence never confirms the original attempt. Expired absence
+requires the serialized receipt boundary plus an authorized current-state check
+before explicit resolution, without reporting a confirmed revocation. Unsupported
+servers get pending delivery feedback without receipt recovery or replay.
+Authentication reset clears private device presentation, pending state, and
+obsolete callbacks. Closing Settings preserves a compact recovery summary.
 
 ## Bootstrap, compatibility, and deployment
 

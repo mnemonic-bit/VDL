@@ -138,6 +138,10 @@
                     "reason": "extension-companion rechecks session identity, current authorization, or account reset before disclosing or changing protected state."
                 },
                 {
+                    "area": "extension-connection-revocation",
+                    "reason": "Connection revocation rechecks current session and ownership before mutation or receipt disclosure."
+                },
+                {
                     "area": "extension-pairing",
                     "reason": "extension-pairing rechecks session identity, current authorization, or account reset before disclosing or changing protected state."
                 },
@@ -277,6 +281,10 @@
                 {
                     "area": "entry-removal",
                     "reason": "entry-removal consumes canonical client snapshots or retains state across reconciliation and authentication reset."
+                },
+                {
+                    "area": "extension-connection-revocation",
+                    "reason": "Connection revocation consumes canonical revisions and authentication/reset fences."
                 },
                 {
                     "area": "extension-pairing",
@@ -488,6 +496,10 @@
                 {
                     "area": "extension-companion",
                     "reason": "extension-companion reads or publishes persistent application state through the shared database connection, transaction, or migration contract."
+                },
+                {
+                    "area": "extension-connection-revocation",
+                    "reason": "Connection revocation commits credential removal and its receipt through the serialized transaction boundary."
                 },
                 {
                     "area": "extension-pairing",
@@ -870,6 +882,39 @@
                 "browser": [
                     "tests/browser/extension-settings.spec.cjs",
                     "tests/browser/extension-user-gesture.spec.cjs"
+                ],
+                "media": [],
+                "container": []
+            },
+            "expands_to": []
+        },
+        "extension-connection-revocation": {
+            "summary": "Per-connection revocation, credential rejection, atomic actor receipts, generation fences, and recovery feedback.",
+            "source_hints": [
+                {
+                    "path": "vdl.py",
+                    "scope": "extension_connections, extension_connection, connection revocation transaction and receipt authorization"
+                },
+                {
+                    "path": "static/extension-connections.js",
+                    "scope": "Connection snapshots, pending revocation, list fences, and explicit receipt recovery"
+                },
+                {
+                    "path": "static/app.js",
+                    "scope": "Connection list presentation and revocation controls"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_connection_revocation.py",
+                    "tests/test_browser_extension.py"
+                ],
+                "node": [
+                    "tests/extension-connections.test.cjs"
+                ],
+                "browser": [
+                    "tests/browser/extension-revocation-feedback.spec.cjs",
+                    "tests/browser/extension-settings.spec.cjs"
                 ],
                 "media": [],
                 "container": []
@@ -1261,6 +1306,10 @@
                 {
                     "area": "entry-removal",
                     "reason": "entry-removal uses the common mutation admission, fingerprint, receipt, revision, quota, and ordering contract."
+                },
+                {
+                    "area": "extension-connection-revocation",
+                    "reason": "Connection revocation uses common admission, immutable fingerprints, receipts, quotas, and explicit replay."
                 },
                 {
                     "area": "extension-pairing",
@@ -1783,6 +1832,10 @@
                 {
                     "area": "extension-companion",
                     "reason": "extension-companion uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "extension-connection-revocation",
+                    "reason": "Connection revocation uses shared application and browser authentication fixtures."
                 },
                 {
                     "area": "extension-pairing",

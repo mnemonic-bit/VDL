@@ -1606,6 +1606,13 @@ details[open] > .history-summary::before { transform: rotate(90deg); }
 .extension-connection dl { display: grid; grid-template-columns: max-content 1fr; gap: 3px 9px; margin: 0; font-size: 0.85em; }
 .extension-connection dt { color: var(--muted); }
 .extension-connection dd { margin: 0; overflow-wrap: anywhere; }
+.extension-connection-confirmed, .extension-connection-status { display: block; margin-top: 6px; font-size: 0.85em; overflow-wrap: anywhere; }
+.extension-connection-confirmed { color: var(--muted); }
+.extension-connection-status:empty { display: none; }
+.extension-connection-recovery { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+.extension-connection button:disabled { cursor: default; opacity: 0.6; }
+.extension-connection [hidden], #extensionConnectionSummary [hidden] { display: none; }
+.extension-connection-recovery:has(> button:not([hidden])) { margin-top: 8px; }
 .extension-update-label { display: block; width: fit-content; margin-top: 4px; padding: 2px 6px; color: var(--brand); background: var(--surface-2); border-radius: 999px; font-size: 0.75em; }
 .extension-live-status { min-height: 1.5em; margin: 12px 0 0; color: var(--muted); }
 .firefox-session-label { display: inline-block; margin-left: 8px; padding: 2px 6px; color: var(--muted); background: var(--surface-2); border: 1px solid var(--border-soft); border-radius: 999px; font-size: 0.68em; font-weight: 500; vertical-align: middle; }

@@ -7,7 +7,8 @@ The shared coordinator registers `tag.add`, `tag.remove`, `favorite.set`,
 `playlist.add`, `playlist.delete`, `download.pause`, `download.unpause`,
 `download.stop`, `download.retry`, `download.resume`, `download.submit`,
 `upload.register`, `upload.cancel`, `entry.remove`, `history.clear`,
-`library.clear`, `visibility.set`, `pairing.create`, and `pairing.invalidate`.
+`library.clear`, `visibility.set`, `pairing.create`, `pairing.invalidate`, and
+`connection.revoke`.
 An existing API call does not gain receipt recovery merely because the new
 scripts are loaded. Mutating requests are never retried by `apiFetch`'s GET
 contention recovery.
@@ -331,8 +332,31 @@ and a separate deliberate creation resolve a lost credential response. Missing
 receipts retain uncertainty, and writes never replay automatically. Unsupported
 servers retain pending feedback through the legacy contract without invented
 recovery guarantees. Plaintext credentials remain outside SQLite, browser
-storage, generic client snapshots, diagnostics, and SSE. Connection revocation
-and the companion extension's separate transport remain separate work.
+storage, generic client snapshots, diagnostics, and SSE. The companion
+extension retains its separate transport contract.
+
+[Feature 0064: Connection revocation](../FEATURES/feature-0064-immediate-feedback-for-connection-revocation.md)
+adds `connection.revoke` in the per-connection `extension-connection` domain.
+After confirmation, the connection row retains its identity and confirmed
+status beside immediate revocation feedback. Duplicate submission is guarded
+per connection. A correlated canonical acknowledgement removes the intended
+row without SSE or a Settings refresh; older list responses cannot restore it.
+Pending and uncertain operations remain available when Settings closes.
+
+Credential removal and its actor-bound receipt share one serialized transaction.
+The attempt binds the stable connection ID, generation, and decimal-string
+revision. Current session and ownership checks gate execution and recovery,
+including legacy deletion. Receipts retain a minimal operation identity after
+the row is removed, without device metadata, bearer credentials, or verifiers.
+A replacement connection has its own identity; replay cannot revoke it.
+
+Unknown outcomes offer bounded receipt checking and deliberate replay of the
+same frozen attempt. Missing rows do not establish that an attempt committed.
+Expired attempts require an authorized state check and explicit resolution;
+unsupported servers retain pending feedback without receipt replay. Authentication
+reset clears private connection state and fences obsolete callbacks. Revocation
+rejects future authentication with that credential; already accepted work
+retains its existing lifecycle. Validation evidence is recorded below.
 
 ## Remaining action adapters
 
@@ -342,12 +366,11 @@ remain in force. They need their own behavior and regression evidence before
 adopting automatic recovery.
 
 Each remaining row now has a proposed feature spec. These links allocate work;
-they do not mark any remaining adapter implemented. Features 0064–0067 inherit Feature
+they do not mark any remaining adapter implemented. Features 0065–0067 inherit Feature
 0051 and the shared requirements below.
 
 | Controls / production entry points in `static/app.js` | Existing mechanism | Required migration / recovery boundary | Feature spec |
 | --- | --- | --- | --- |
-| Connection revocation: `revokeExtensionConnection` | Confirmation, then server response and connection refresh | Pending state beside confirmed connection; no revoked announcement until acknowledgement. | [0064: Connection revocation](../FEATURES/feature-0064-immediate-feedback-for-connection-revocation.md) |
 | User creation/update/suspension/removal: `addUser`, `updateUser`, `setUserSuspended`, removal-dialog close handler | Local edit draft, server authorization and delete confirmation | Pending controls, duplicate guards, draft/epoch safety; pending role changes cannot authorize new actions. | [0065: User administration](../FEATURES/feature-0065-immediate-feedback-for-user-administration.md) |
 | Duplicate-index refresh button | Disabled initiating button, server acceptance, background status | Keep acceptance separate from indexing completion; no automatic replay of an unknown job request. | [0066: Duplicate-index refresh](../FEATURES/feature-0066-immediate-feedback-for-duplicate-index-refresh.md) |
 | Login/logout forms | Normal browser form navigation and server session guards | Logout clears the client authentication epoch and private drafts; old callbacks cannot revive them. | [0067: Authentication lifecycle](../FEATURES/feature-0067-authentication-epoch-and-form-lifecycle.md) |
@@ -1057,3 +1080,94 @@ Feature 0063 verified on 2026-11-14 for version `0.66.0`:
 Pairing delivery does not complete Features 0064–0067. Credentials remain scoped
 to the authorized in-memory view lifecycle. Recovery never automatically replays
 a write, and the companion extension retains its own transport contract.
+
+### Connection revocation verification
+
+Feature 0064 verification commands for version `0.68.0`:
+
+```bash
+TMPDIR=/dev/shm VDL_PYTHON=/path/to/python3.12 ./tests/run-all.sh --unit
+VDL_PYTHON=/path/to/python3.12 node --test tests/*.test.cjs
+VDL_PYTHON=/path/to/python3.12 python3 tests/run-area.py \
+    extension-connection-revocation extension-companion client-state-core \
+    mutation-core request-security --layer python --layer node --layer browser
+VDL_TEST_BROWSER=firefox VDL_PYTHON=/path/to/python3.12 python3 tests/run-area.py \
+    extension-connection-revocation extension-companion client-state-core \
+    mutation-core request-security --layer browser
+VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py auth.spec.cjs
+VDL_TEST_BROWSER=firefox VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py auth.spec.cjs
+python3 tests/run-area.py --check
+```
+
+Evidence recorded on 2026-11-15:
+
+- Python 3.12.14 unit gate: **passed**, 961 tests, 9 documented media skips;
+  `vdl.py` line coverage **93.0%** (8081/8693; enforced minimum 90%). The 16
+  connection protocol tests cover atomic credential removal and receipt
+  rollback, actual credential rejection, concurrent replay, replacement
+  generation binding, fingerprint conflicts, current transaction authorization,
+  ownership and account changes, secret-free recovery, quotas, expiry,
+  serialized finality, restart, migration, and preservation of accepted work.
+- Node: **passed**, 341 tests, including 34 connection controller checks.
+  Controlled transports and clocks cover synchronous status-only feedback,
+  independent connections, immutable replay, minimal acknowledgement decoding,
+  stale lists and acknowledgements, missing receipts, expiry resolution,
+  invalidated absence observations, shared limits, authentication fences,
+  legacy behavior, and calibration of fresh attempts on long-lived pages.
+- Focused native checks: **passed**, 112 Python tests and 99 Node tests before
+  the additional clock-calibration regression; the final full Node run above
+  includes that regression. An outdated exact action inventory was updated to
+  include `connection.revoke`, retaining its exact-set assertion.
+
+- Browser coverage: **passed after focused follow-ups**, 691 distinct
+  Chromium checks and 689 distinct Firefox checks. Firefox retains two existing
+  engine-specific skips: resizing an active native fullscreen viewport and
+  observing native speed-popup dismissal without a rate change. All 29 new
+  revocation scenarios passed in each engine. The expanded 44-suite selection
+  covers shared state, mutations, authentication, pairing, refresh, History,
+  playback, preferences, and uploads. Firefox used a separate source copy with
+  matching production-file hashes and independent fixture data and artifacts.
+- Final sequential verification: **passed**, 34 revocation/Settings checks and
+  three corrected player checks per browser. Independent request contexts
+  self-unpair credentials created by the revocation suite, so later Settings
+  checks see their expected empty connection list even after account switches.
+  Idle feedback was 3.5 ms/light and 3.4 ms/dark in Chromium, and 2 ms in both
+  Firefox themes, below the 50 ms requirement.
+- Idle follow-ups: **passed**, the complete ten-case pagination suite and saved
+  fullscreen preference check in both engines, plus Chromium's History Retry
+  case. The initial concurrent broad runs exited nonzero: Chromium had 683
+  passes and eight failures; Firefox had 679 passes, ten failures, and two
+  skips. All initially failed cases passed after the test corrections or
+  sequential idle reruns; the broad commands themselves are not reported as
+  passing. No pagination or timing assertion was relaxed.
+
+The expanded runs exposed test assumptions in existing suites. The saved
+fullscreen preference check now waits for the canonical Saved state before
+playback; its trace had shown playback starting 30.2 ms before acknowledgement.
+Clean HEAD `715831d` reproduced three Firefox player failures. Those tests now
+use the actual fullscreen media-query viewport, normalize bounding-box values
+to five decimal places before enforcing 44 px touch targets, and open the native
+speed picker with focus plus Space. All original layout, picker-open, focus,
+slider, and playback assertions remain. Playback production code is unchanged.
+
+Exact focused follow-up commands:
+
+```bash
+VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py \
+    extension-revocation-feedback.spec.cjs extension-settings.spec.cjs
+VDL_TEST_BROWSER=firefox VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py \
+    extension-revocation-feedback.spec.cjs extension-settings.spec.cjs
+VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py history-pagination.spec.cjs
+VDL_TEST_BROWSER=firefox VDL_PYTHON=/path/to/python3.12 python3 tests/browser/run.py history-pagination.spec.cjs
+```
+
+The recorded commands and outcome artifacts also retain the targeted player,
+preference, and History Retry selections. Media processing and deployment
+behavior did not change; their optional layers were omitted. The image already
+copies the entire `static/` directory, including the new controller.
+
+Connection revocation does not complete Features 0065–0067. Recovery never
+replays a destructive request automatically or creates a replacement attempt
+for an unknown outcome. Credentials remain server-enforced; already accepted
+companion downloads retain their existing lifecycle. No assertion deadline or
+coverage threshold was relaxed.

@@ -1802,13 +1802,14 @@ let preferenceSavedTimer = null;
 VDL.favoriteMutationMetrics = () => Object.freeze({ ...favoriteMutationMetrics });
 VDL.mutationMetrics = () => {
     const pairing = extensionPairing.metrics();
-    return Object.freeze({ ...mutationMetrics, pending: mutationMetrics.pending + pairing.pending,
-        unconfirmed: mutationMetrics.unconfirmed + pairing.unconfirmed, conflicted: mutationMetrics.conflicted + pairing.conflicted });
+    const connections = extensionConnections.metrics();
+    return Object.freeze({ ...mutationMetrics, pending: mutationMetrics.pending + pairing.pending + connections.pending,
+        unconfirmed: mutationMetrics.unconfirmed + pairing.unconfirmed + connections.unconfirmed, conflicted: mutationMetrics.conflicted + pairing.conflicted + connections.conflicted });
 };
 const tagState = VDL.createClientState();
 const tagMutations = VDL.createMutations({
     state: tagState,
-    additionalPendingCount: () => extensionPairing.pendingCount(),
+    additionalPendingCount: () => extensionPairing.pendingCount() + extensionConnections.pendingCount(),
     transport: async ({ url, method, body }) => {
         if (method === 'POST' && url === '/api/playlists' || method === 'PUT' && /^\/api\/playlists\/[^/]+$/.test(url)) {
             const submission = [...playlistSubmissions.values()].find(entry => !entry.legacy && (method === 'POST' ? entry.kind === 'playlist.create' && !entry.mutationId : entry.key === decodeURIComponent(url.split('/')[3])));
@@ -1922,6 +1923,7 @@ const tagMutations = VDL.createMutations({
 function resetTagSession() {
     tagSessionEpoch += 1;
     extensionPairing.reset();
+    extensionConnections.reset();
     extensionPairingAllowed = false;
     const pairingDialog = document.getElementById('extensionPairingDialog');
     if (pairingDialog.open) pairingDialog.close();
@@ -2054,6 +2056,7 @@ async function loadTagCapabilities() {
         tagCapabilities = capabilities;
         tagMutations.setCapabilities(tagCapabilities);
         extensionPairing.setCapabilities(tagCapabilities);
+        extensionConnections.setCapabilities(tagCapabilities);
         extensionPairing.refresh();
         adoptServerUploads(collectionSnapshots.current);
         renderDroppedUploads();
@@ -2157,7 +2160,7 @@ tagState.subscribe(ids => {
 });
 
 window.addEventListener('beforeunload', event => {
-    if (![...droppedUploads.values()].some(upload => !upload.settled || upload.unknown || uploadIntent(upload)) && !playlistActions.size && !playlistSubmissions.size && !playlistRetainedDrafts.size && !(playlistEditorDraft && playlistEditorSnapshot() !== playlistEditorBaseline) && !preferenceDirty && !preferenceSubmission && !tagMutations.hasPending() && !extensionPairing.hasPending() && ![...tagDrafts.values()].some(value => value.trim()) && !renameDrafts.size && !compatibilityVisibility.size && !compatibilityRenames.size && !compatibilityCommands.size && !compatibilityRemovals.size && ![...bulkClears.values()].some(entry => !['confirmed', 'rejected'].includes(bulkClearEntry(entry).status)) && !downloadSubmission?.legacy && !urlInput.value.trim()) return;
+    if (![...droppedUploads.values()].some(upload => !upload.settled || upload.unknown || uploadIntent(upload)) && !playlistActions.size && !playlistSubmissions.size && !playlistRetainedDrafts.size && !(playlistEditorDraft && playlistEditorSnapshot() !== playlistEditorBaseline) && !preferenceDirty && !preferenceSubmission && !tagMutations.hasPending() && !extensionPairing.hasPending() && !extensionConnections.hasPending() && ![...tagDrafts.values()].some(value => value.trim()) && !renameDrafts.size && !compatibilityVisibility.size && !compatibilityRenames.size && !compatibilityCommands.size && !compatibilityRemovals.size && ![...bulkClears.values()].some(entry => !['confirmed', 'rejected'].includes(bulkClearEntry(entry).status)) && !downloadSubmission?.legacy && !urlInput.value.trim()) return;
     event.preventDefault();
     event.returnValue = '';
 });
@@ -6475,6 +6478,11 @@ function checkMissingTagTargets(previous, next) {
 }
 
 function recoverUnconfirmedTags() {
+    for (const connection of extensionConnections.snapshot().connections) {
+        if (connection.intent?.status !== 'unconfirmed' || !connection.supported || recoveredTagIntents.has(connection.intent.id + '-connection')) continue;
+        recoveredTagIntents.add(connection.intent.id + '-connection');
+        extensionConnections.recover(connection.id);
+    }
     for (const entry of tagMutations.pending().filter(entry => (entry.kind.startsWith('download.') || entry.kind === 'entry.remove') && entry.status === 'unconfirmed')) {
         if (recoveredTagIntents.has(entry.id)) continue;
         recoveredTagIntents.add(entry.id);
@@ -9891,7 +9899,7 @@ function setExtensionPairingCopied(copied) {
 }
 
 const extensionPairing = VDL.createExtensionPairing({
-    additionalPendingCount: () => tagMutations.pending().length,
+    additionalPendingCount: () => tagMutations.pending().length + extensionConnections.pendingCount(),
     transport: async ({ url, method, body }) => {
         const response = await apiFetch(url, { method,
             ...(body === undefined ? {} : { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
@@ -10097,28 +10105,144 @@ function formatConnectionTime(value) {
     return value ? new Date(value * 1000).toLocaleString() : 'Never';
 }
 
+const extensionConnections = VDL.createExtensionConnections({
+    additionalPendingCount: () => tagMutations.pending().length + extensionPairing.pendingCount(),
+    transport: async ({ url, method, body }) => {
+        const response = await apiFetch(url, { method,
+            ...(body === undefined ? {} : { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
+        });
+        return { status: response.status, body: await response.json().catch(() => null) };
+    },
+    onAuthLoss: resetTagSession,
+    refresh: loadExtensionConnections,
+    onChange: renderExtensionConnections,
+    onEvent: event => {
+        if (event.outcome === 'presented') { mutationMetrics.submissions++; mutationMetrics.latestLocalFeedbackMs = event.elapsedMs; }
+        if (event.outcome === 'confirmed') { mutationMetrics.acknowledgements++; mutationMetrics.latestAcknowledgementMs = event.elapsedMs; }
+        if (event.outcome === 'rejected') mutationMetrics.rejectedOutcomes++;
+        if (event.outcome === 'unconfirmed') mutationMetrics.unconfirmedOutcomes++;
+        if (event.outcome === 'conflicted') mutationMetrics.conflicts++;
+        if (event.outcome === 'reconciliation') mutationMetrics.reconciliationReads++;
+    },
+});
+VDL.extensionConnectionMetrics = () => extensionConnections.metrics();
+
+function connectionOperationMessage(connection) {
+    const intent = connection.intent;
+    if (!intent) return '';
+    if (['queued', 'sending'].includes(intent.status)) return 'Revoking connection…'
+        + (intent.delayed ? ' Still waiting for server confirmation. Closing Settings does not cancel the request.' : '');
+    return intent.message || '';
+}
+
 function renderExtensionConnection(connection) {
-    const update = bundledExtension && isNewerVersion(
-        bundledExtension.version, connection.extension_version,
-    ) ? '<span class="extension-update-label">Update available</span>' : '';
     return `<article class="extension-connection" data-connection-id="${escapeAttr(connection.id)}">
-                <div><strong>${escapeHtml(connection.device_label)}</strong>${update}</div>
+                <div><strong class="extension-device-label"></strong><span class="extension-update-label" hidden>Update available</span>
+                    <span class="extension-connection-confirmed">Last confirmed status: connected.</span>
+                    <span class="extension-connection-status"></span>
+                    <div class="extension-connection-recovery">
+                        <button type="button" data-connection-recovery="check" hidden>Check revocation status</button>
+                        <button type="button" data-connection-recovery="replay" hidden>Recover original revocation</button>
+                        <button type="button" data-connection-recovery="resolve" hidden>Use current status</button>
+                    </div>
+                </div>
                 <dl>
-                    <dt>Extension</dt><dd>${escapeHtml(connection.extension_version)}</dd>
-                    <dt>Paired</dt><dd>${formatConnectionTime(connection.created_at)}</dd>
-                    <dt>Last used</dt><dd>${formatConnectionTime(connection.last_used_at)}</dd>
+                    <dt>Extension</dt><dd class="extension-version"></dd>
+                    <dt>Paired</dt><dd class="extension-created"></dd>
+                    <dt>Last used</dt><dd class="extension-used"></dd>
                 </dl>
-                <button type="button" class="danger extension-revoke-button"
-                        aria-label="Revoke ${escapeAttr(connection.device_label)}"
-                        title="Revoke connection"
-                        onclick="revokeExtensionConnection('${escapeAttr(connection.id)}', this)">
+                <button type="button" class="danger extension-revoke-button" title="Revoke connection">
                     <svg aria-hidden="true"><use href="#i-trash"/></svg>
                 </button>
             </article>`;
 }
 
+function renderExtensionConnections() {
+    const model = extensionConnections.snapshot();
+    const list = document.getElementById('extensionConnectionList');
+    const existing = new Map(Array.from(list.children, node => [node.dataset.connectionId, node]));
+    const messages = [];
+    for (const connection of model.connections) {
+        let row = existing.get(connection.id);
+        if (!row) {
+            const template = document.createElement('template');
+            template.innerHTML = renderExtensionConnection(connection);
+            row = template.content.firstElementChild; list.appendChild(row);
+        }
+        existing.delete(connection.id);
+        const setText = (selector, text) => { const node = row.querySelector(selector); if (node.textContent !== text) node.textContent = text; };
+        setText('.extension-device-label', connection.device_label);
+        setText('.extension-version', connection.extension_version);
+        setText('.extension-created', formatConnectionTime(connection.created_at));
+        setText('.extension-used', formatConnectionTime(connection.last_used_at));
+        row.querySelector('.extension-update-label').hidden = !bundledExtension || !isNewerVersion(bundledExtension.version, connection.extension_version);
+        const status = connectionOperationMessage(connection);
+        setText('.extension-connection-status', status);
+        if (status) messages.push(`${connection.device_label}: ${status}`);
+        const button = row.querySelector('.extension-revoke-button');
+        button.disabled = !connection.canRevoke;
+        button.setAttribute('aria-label', `Revoke ${connection.device_label}`);
+        button.setAttribute('aria-busy', String(!!connection.intent && ['queued', 'sending'].includes(connection.intent.status)));
+        const recoverable = connection.intent?.status === 'unconfirmed';
+        for (const control of row.querySelectorAll('[data-connection-recovery]')) {
+            const action = control.dataset.connectionRecovery;
+            control.hidden = action === 'check' ? !recoverable : action === 'replay' ? !recoverable || !connection.supported || connection.intent.replayExpired
+                : !connection.intent || !['rejected', 'conflicted'].includes(connection.intent.status) && !(recoverable && connection.intent.canResolve);
+            control.disabled = connection.checking;
+        }
+    }
+    for (const row of existing.values()) row.remove();
+    document.getElementById('extensionNoConnections').hidden = model.connections.length > 0;
+    const status = document.getElementById('extensionConnectionStatus');
+    if (status.textContent !== model.message) status.textContent = model.message;
+    const announcement = document.getElementById('extensionConnectionAnnouncement');
+    const spoken = messages.join(' ') || model.message;
+    if (announcement.textContent !== spoken) announcement.textContent = spoken;
+    const summary = document.getElementById('extensionConnectionSummary');
+    summary.hidden = messages.length === 0;
+    const summaryText = messages.join(' ');
+    let summaryLabel = summary.querySelector(':scope > span');
+    if (!summaryLabel) { summaryLabel = document.createElement('span'); summary.appendChild(summaryLabel); }
+    if (summaryLabel.textContent !== summaryText) summaryLabel.textContent = summaryText;
+    const groups = new Map(Array.from(summary.querySelectorAll(':scope > [data-connection-id]'), node => [node.dataset.connectionId, node]));
+    for (const connection of model.connections.filter(value => value.intent)) {
+        let group = groups.get(connection.id);
+        if (!group) { group = document.createElement('div'); group.dataset.connectionId = connection.id; summary.appendChild(group); }
+        groups.delete(connection.id);
+        const row = Array.from(list.children).find(node => node.dataset.connectionId === connection.id);
+        for (const action of ['check', 'replay', 'resolve']) {
+            const original = row?.querySelector(`[data-connection-recovery="${action}"]`);
+            if (!original) continue;
+            let button = group.querySelector(`[data-connection-recovery="${action}"]`);
+            if (!button) { button = original.cloneNode(true); group.appendChild(button); }
+            button.hidden = original.hidden;
+            button.disabled = connection.checking;
+        }
+    }
+    for (const group of groups.values()) group.remove();
+}
+
+function handleExtensionConnectionAction(event) {
+    const button = event.target.closest('button');
+    const container = button?.closest('[data-connection-id]');
+    if (!button || !container || button.disabled) return;
+    const id = container.dataset.connectionId;
+    if (button.classList.contains('extension-revoke-button')) revokeExtensionConnection(id, button);
+    else if (button.dataset.connectionRecovery) recoverExtensionConnection(id, button.dataset.connectionRecovery);
+}
+document.getElementById('extensionConnectionList').addEventListener('click', handleExtensionConnectionAction);
+document.getElementById('extensionConnectionSummary').addEventListener('click', handleExtensionConnectionAction);
+
+async function recoverExtensionConnection(id, action = 'check') {
+    if (action === 'resolve') extensionConnections.resolve(id);
+    else await extensionConnections.recover(id, action === 'replay');
+    renderExtensionConnections();
+}
+
 function loadExtensionConnections() {
     const epoch = tagSessionEpoch;
+    extensionConnections.setCapabilities(tagCapabilities);
+    const connectionRead = extensionConnections.beginList();
     const create = document.getElementById('extensionCreatePairing');
     create.disabled = true;
     return apiFetch('/api/extension/connections').then(response => response.json()).then(data => {
@@ -10127,6 +10251,7 @@ function loadExtensionConnections() {
             window.location, Boolean(data.http_pairing_allowed),
         );
         extensionPairing.setCapabilities(tagCapabilities);
+        extensionConnections.setCapabilities(tagCapabilities);
         extensionPairing.refresh();
         const localHttp = window.location.protocol === 'http:' && extensionPairingAllowed;
         renderExtensionPairing();
@@ -10159,8 +10284,8 @@ function loadExtensionConnections() {
             document.getElementById('extensionInstallHint').textContent = 'The bundled extension failed its integrity check. Contact the VDL operator.';
         }
         const connections = data.connections || [];
-        document.getElementById('extensionConnectionList').innerHTML = connections.map(renderExtensionConnection).join('');
-        document.getElementById('extensionNoConnections').hidden = connections.length > 0;
+        extensionConnections.acceptList(connectionRead, connections);
+        renderExtensionConnections();
         const needsUpdate = connections.some(connection => bundledExtension && isNewerVersion(
             bundledExtension.version, connection.extension_version,
         ));
@@ -10173,14 +10298,11 @@ function loadExtensionConnections() {
 }
 
 function revokeExtensionConnection(connectionId, button) {
-    if (!window.confirm('Revoke this VDL Companion connection?')) return;
-    apiAction(`/api/extension/connections/${encodeURIComponent(connectionId)}`, {
-        method: 'DELETE',
-    }).then(() => loadExtensionConnections()).then(() => {
-        extensionStatus('Companion connection revoked.');
-        const next = document.querySelector('.extension-connection button');
-        (next || document.getElementById('extensionCreatePairing')).focus();
-    }).catch(() => { button.focus(); });
+    const connection = extensionConnections.snapshot().connections.find(value => value.id === connectionId);
+    if (!connection?.canRevoke) return;
+    if (!window.confirm(`Revoke the VDL Companion connection “${connection.device_label}”? Already accepted downloads follow their existing lifecycle.`)) return;
+    extensionConnections.revoke(connectionId);
+    renderExtensionConnections();
 }
 
 let managedRoles = [];

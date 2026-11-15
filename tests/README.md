@@ -217,6 +217,22 @@ node --test tests/library-storage-client.test.cjs
 python3 tests/browser/run.py library-storage.spec.cjs version-status.spec.cjs
 ```
 
+## Connection revocation
+
+Connection revocation has transactional receipt, credential rejection, client
+ordering, and real-UI recovery checks:
+
+```bash
+python3 tests/run-area.py extension-connection-revocation --layer python --layer node --layer browser
+VDL_TEST_BROWSER=firefox python3 tests/run-area.py extension-connection-revocation --layer browser
+```
+
+The browser suite holds revocation requests and committed responses to check
+retained connection rows, direct confirmation, explicit frozen-attempt recovery,
+authentication changes, and rejection of the revoked bearer credential. Shared
+mutation and client-state changes also require the expanded `mutation-core` and
+`client-state-core` selections. Run the unit coverage gate separately.
+
 ## Expected failures
 
 Open bugs assert desired behavior using `unittest.expectedFailure` or

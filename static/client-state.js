@@ -14,6 +14,10 @@
         && revision(value.visibility_revision) && typeof value.can_manage_visibility === 'boolean'
         && typeof value.can_delete === 'boolean' && !!value.permissions
         && ['tags', 'favorite', 'rename', 'visibility'].every(key => typeof value.permissions[key] === 'boolean');
+    const validConnectionState = value => !!value && typeof value.id === 'string' && !!value.id
+        && typeof value.generation === 'string' && /^[a-f0-9]{32}$/.test(value.generation)
+        && revision(value.revision) && ['connected', 'revoked'].includes(value.status)
+        && Object.keys(value).every(key => ['id', 'generation', 'status', 'revision'].includes(key));
     const validPairingState = value => !!value && revision(value.revision)
         && ['none', 'available', 'invalidated', 'expired', 'consumed', 'interrupted'].includes(value.status)
         && (value.generation === null || typeof value.generation === 'string' && !!value.generation)
@@ -73,6 +77,7 @@
         function acceptDownload(snapshot, context = {}) {
             if (!snapshot || snapshot.id == null || (context.epoch !== undefined && context.epoch !== epoch)) return false;
             if (snapshot.tags_revision !== undefined && (!revision(snapshot.tags_revision) || !Array.isArray(snapshot.tags) || !Array.isArray(snapshot.tag_items) || snapshot.tags.length !== snapshot.tag_items.length || snapshot.tag_items.some((tag, index) => !tag || typeof tag.key !== 'string' || typeof tag.name !== 'string' || tag.name !== snapshot.tags[index]) || new Set(snapshot.tag_items.map(tag => tag.key)).size !== snapshot.tag_items.length)) return false;
+            if (snapshot.connection_revision !== undefined && (!validConnectionState(snapshot.connection) || snapshot.connection.id !== String(snapshot.id) || snapshot.connection.revision !== snapshot.connection_revision)) return false;
             if (snapshot.pairing_revision !== undefined && (String(snapshot.id) !== 'pairing' || !validPairingState(snapshot.pairing) || snapshot.pairing.revision !== snapshot.pairing_revision)) return false;
             if (snapshot.bulk_revision !== undefined && (!revision(snapshot.bulk_revision) || !['bulk:history', 'bulk:library'].includes(String(snapshot.id)) || typeof snapshot.bulk_scope !== 'string')) return false;
             if (snapshot.removal_revision !== undefined && !revision(snapshot.removal_revision)) return false;
@@ -98,6 +103,12 @@
                 if (snapshot.bulk_scope === old.bulk_scope && BigInt(snapshot.bulk_revision) < BigInt(old.bulk_revision)) return false;
             }
             const next = { ...(old || {}), ...copy(snapshot), id };
+            if (old && revision(old.connection_revision)) {
+                if (!revision(snapshot.connection_revision) || BigInt(snapshot.connection_revision) < BigInt(old.connection_revision)) {
+                    next.connection_revision = old.connection_revision; next.connection = old.connection;
+                } else if (snapshot.connection.generation !== old.connection.generation
+                        || snapshot.connection_revision === old.connection_revision && snapshot.connection.status !== old.connection.status) return false;
+            }
             if (old && revision(old.pairing_revision)) {
                 if (!revision(snapshot.pairing_revision) || BigInt(snapshot.pairing_revision) < BigInt(old.pairing_revision)) {
                     next.pairing_revision = old.pairing_revision; next.pairing = old.pairing;
@@ -237,6 +248,7 @@
             if (!download || fences.has(id)) return null;
             let favorite = Boolean(download.favorite);
             const favoriteIntents = [];
+            const connectionIntents = [];
             const visibilityIntents = [];
             const renameIntents = [];
             const preferenceIntents = [];
@@ -271,6 +283,7 @@
                     if (!['rejected', 'conflicted'].includes(intent.status)) requestedFilename = intent.value;
                     continue;
                 }
+                if (intent.kind === 'connection.revoke') { connectionIntents.push(copy(intent)); continue; }
                 if (intent.kind === 'visibility.set') { visibilityIntents.push(copy(intent)); continue; }
                 if (intent.kind === 'favorite.set') {
                     favoriteIntents.push(copy(intent));
@@ -296,7 +309,7 @@
                 rows.sort((a, b) => a.name.localeCompare(b.name));
             }
             const effective = rows.filter(tag => tag.effective).map(tag => ({ key: tag.key, name: tag.name }));
-            return freeze(copy({ ...download, pairing_intents: pairingIntents, bulk_intents: bulkIntents, removal_intents: removalIntents, upload_intents: uploadIntents, submission_intents: submissionIntents, command_intents: commandIntents, playlist_intents: playlistIntents, requested_filename: requestedFilename, rename_intents: renameIntents, preference_intents: preferenceIntents, favorite, favorite_intents: favoriteIntents, visibility_intents: visibilityIntents, tags: effective.map(tag => tag.name), tag_items: effective, tag_chips: rows }));
+            return freeze(copy({ ...download, connection_intents: connectionIntents, pairing_intents: pairingIntents, bulk_intents: bulkIntents, removal_intents: removalIntents, upload_intents: uploadIntents, submission_intents: submissionIntents, command_intents: commandIntents, playlist_intents: playlistIntents, requested_filename: requestedFilename, rename_intents: renameIntents, preference_intents: preferenceIntents, favorite, favorite_intents: favoriteIntents, visibility_intents: visibilityIntents, tags: effective.map(tag => tag.name), tag_items: effective, tag_chips: rows }));
         }
         function fence(id, terminal = false) {
             id = String(id);
@@ -389,6 +402,7 @@
             }),
         });
     }
+    VDL.validConnectionState = validConnectionState;
     VDL.validPairingState = validPairingState;
     VDL.validVisibilityState = validVisibilityState;
     VDL.validUploadState = validUploadState;

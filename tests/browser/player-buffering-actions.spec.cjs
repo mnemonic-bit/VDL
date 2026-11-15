@@ -295,7 +295,9 @@ for (const { fullscreen, motion, theme, width } of [
         });
         await speaker.hover();
         await expect(volume).toBeVisible();
-        const finalWidth = width <= 640 ? 76 : 92;
+        // Native fullscreen may use the screen viewport instead of the requested viewport.
+        const compact = await page.evaluate(() => matchMedia('(max-width: 640px)').matches);
+        const finalWidth = compact ? 76 : 92;
         await expect(volume).toHaveCSS('width', `${finalWidth}px`);
         const button = await speaker.boundingBox();
         const slider = await volume.boundingBox();
@@ -438,8 +440,9 @@ test('touch can reveal volume and mute while narrow controls stay inside the pla
             const bounds = await control.boundingBox();
             expect(bounds.x).toBeGreaterThanOrEqual(player.x);
             expect(bounds.x + bounds.width).toBeLessThanOrEqual(player.x + player.width + 1);
-            expect(bounds.width).toBeGreaterThanOrEqual(44);
-            expect(bounds.height).toBeGreaterThanOrEqual(44);
+            // Firefox's bounding-box conversion can lose a few millionths of a CSS pixel.
+            expect(Number(bounds.width.toFixed(5))).toBeGreaterThanOrEqual(44);
+            expect(Number(bounds.height.toFixed(5))).toBeGreaterThanOrEqual(44);
         }
         await page.locator('#playerPlayPause').tap();
         await expect(volume).toBeHidden();

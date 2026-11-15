@@ -219,6 +219,7 @@ test('saved full-screen playback preference requests full screen for the overlay
     await openSettings(page);
     await page.locator('#prefStartFullscreen').check();
     await page.locator('#saveBtn').click();
+    await expect(page.locator('#saveBtn')).toContainText('Saved');
     await page.getByRole('button', { name: 'Back to videos', exact: true }).click();
     await page.locator('[data-row-id="fullscreen1"]')
         .getByRole('button', { name: 'Play', exact: true }).click();
