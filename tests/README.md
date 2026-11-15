@@ -4,6 +4,89 @@ The suite is deterministic and never contacts a public media site. Each layer
 uses temporary databases, download directories, generated media, dynamic
 ports, and uniquely named container resources.
 
+## Focused test selection
+
+Use the reviewed functional areas in [`areas.json`](areas.json) to select test
+files without rediscovering ownership. The map owns membership, source hints,
+and directed expansion reasons. Source hints guide selection; the runner does
+not infer impact from changed filenames or Git diffs.
+
+```bash
+python3 tests/run-area.py --list
+python3 tests/run-area.py rename --dry-run
+python3 tests/run-area.py rename --layer python
+python3 tests/run-area.py rename --layer node
+python3 tests/run-area.py rename entry-removal --layer browser
+python3 tests/run-area.py mutation-core --layer node --dry-run --json
+python3 tests/run-area.py --all-areas --layer python --layer node
+python3 tests/run-area.py --check
+```
+
+The default layers are `python` and `node`. Repeated `--layer` arguments replace
+those defaults with their union. The `browser`, `media`, and `container` layers
+require explicit selection. An explicitly selected empty layer is an error.
+Selectors identify complete files or fixed container checks, so a shared media
+module still runs all its cases. Native runners can narrow a failing case during
+editing; area selection does not isolate individual cases.
+
+Before code changes, identify affected leaf areas and every changed shared
+contract from the map's summaries and source hints. Record the selection and
+uncertainty in the progress update, then preview the expanded plan once. A leaf
+selection such as `rename` stays local. A shared selection such as
+`mutation-core` expands to the implemented adapters because admission, receipts,
+replay, and ordering are shared. Expansion is directional. If impact remains
+uncertain, broaden explicitly, including all areas in the affected layers when
+necessary.
+
+During editing, rerun the failing native regression or the affected area/layer.
+After the change stabilizes, run the union of affected areas and relevant
+layers. Browser-visible changes require the relevant browser checks;
+decoding/merge changes require media checks; deployment/dependency changes
+require the corresponding container checks. The default layers alone do not
+establish that omitted layers are irrelevant. Add or update memberships when
+tests move, appear, or disappear. Maintain source hints and expansion rules when
+shared contracts change, then run `--check`. New behavior needs an area before
+focused selection can validate that behavior. If the map or runner is invalid
+or unavailable, report the condition and use explicit native commands or the
+existing broader gates.
+
+Listing, dry runs, and map validation use only the Python standard library.
+`--check` recursively checks permanent test ownership, including nested tests,
+while excluding support, fixture, dependency, and generated-output directories.
+It does not import tests or start the application. Plans explain selected files,
+expansion reasons, exact argv, environment overrides, counts, and omitted layers.
+JSON plans are available only with `--dry-run --json`.
+
+Execution uses `VDL_PYTHON` or the interpreter running the focused runner. Install
+`requirements.txt` into that interpreter before Python, browser fixture, media,
+or Python-backed Node parity work. Node work also requires Node and root
+development dependencies (`npm ci`). Browser work requires installed Playwright
+and its selected browser (`VDL_TEST_BROWSER`, default Chromium); use the browser
+setup commands below. `PLAYWRIGHT_CLI` can select an existing CLI. Media work
+requires ffmpeg and ffprobe. The focused runner checks prerequisites for all
+selected layers before executing tests and never installs dependencies or uses
+a container fallback for native layers.
+
+Explicit container checks retain their existing engine handling, builds, and
+network requirements. `CONTAINER_ENGINE` and `VDL_IMAGE` select the engine and
+image. The preview-maintenance check requires an image built from the current
+sources; a tag alone does not establish freshness. Dependency-lock validation
+contacts the package index. Check the printed plan before running these layers.
+
+Layers execute sequentially and stop on failure; remaining commands are
+`not_run`. Summaries show exit codes and elapsed times. Exit `0` means selected
+commands passed, `1` means a prerequisite or test failure, and `2` means an
+invalid command, map, or selection. Interruptions return a nonzero status.
+Skipped cases remain visible in native output and do not establish exercised
+behavior.
+
+Report focused results separately from completion gates. Focused execution
+does not enforce coverage and cannot satisfy the completion requirement by
+itself. Run `./tests/run-all.sh --unit` and verify at least 90% `vdl.py` line
+coverage, using Python 3.12 for CI parity. Keep the existing broader CI/release
+checks. Rerun affected checks after implementation changes following a passed
+gate; an explanation-only edit does not require repeating a gate.
+
 ## Commands
 
 The existing fast command remains supported:

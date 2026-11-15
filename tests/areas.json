@@ -1,0 +1,2023 @@
+{
+    "schema_version": 1,
+    "areas": {
+        "asset-protocol": {
+            "summary": "Shared asset readiness, demand revisions, cache identity, publication, and reader leases.",
+            "source_hints": [
+                {
+                    "path": "asset_generation.py",
+                    "scope": "Shared asset readiness, demand, generation/publication identity"
+                },
+                {
+                    "path": "preview_maintenance.py",
+                    "scope": "Preview delivery identity and leases"
+                },
+                {
+                    "path": "static/app.js",
+                    "scope": "Asset demand and refresh-preserved media consumers"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_asset_api.py"
+                ],
+                "node": [],
+                "browser": [],
+                "media": [],
+                "container": []
+            },
+            "expands_to": [
+                {
+                    "area": "asset-queue",
+                    "reason": "asset-queue consumes readiness/publication identity or preserves displayed assets while canonical state refreshes."
+                },
+                {
+                    "area": "history",
+                    "reason": "history consumes readiness/publication identity or preserves displayed assets while canonical state refreshes."
+                },
+                {
+                    "area": "hover-previews",
+                    "reason": "hover-previews consumes readiness/publication identity or preserves displayed assets while canonical state refreshes."
+                },
+                {
+                    "area": "live-refresh",
+                    "reason": "live-refresh consumes readiness/publication identity or preserves displayed assets while canonical state refreshes."
+                },
+                {
+                    "area": "playlists",
+                    "reason": "playlists consumes readiness/publication identity or preserves displayed assets while canonical state refreshes."
+                },
+                {
+                    "area": "preview-maintenance",
+                    "reason": "preview-maintenance consumes readiness/publication identity or preserves displayed assets while canonical state refreshes."
+                },
+                {
+                    "area": "thumbnails",
+                    "reason": "thumbnails consumes readiness/publication identity or preserves displayed assets while canonical state refreshes."
+                }
+            ]
+        },
+        "asset-queue": {
+            "summary": "Durable asset scheduling, demand revisions, readiness, publication, identity, and failure budgets.",
+            "source_hints": [
+                {
+                    "path": "asset_generation.py",
+                    "scope": "AssetGenerationQueue registration, demand, generation, and finalization"
+                },
+                {
+                    "path": "vdl.py",
+                    "scope": "asset_demand, _asset_readiness_many, _notify_assets"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_asset_queue.py",
+                    "tests/test_asset_api.py"
+                ],
+                "node": [],
+                "browser": [
+                    "tests/browser/asset-demand.spec.cjs"
+                ],
+                "media": [
+                    "tests/integration/test_real_media.py"
+                ],
+                "container": []
+            },
+            "expands_to": []
+        },
+        "authentication": {
+            "summary": "Session identity, current role, account reset/deletion, and authorization epochs.",
+            "source_hints": [
+                {
+                    "path": "vdl.py",
+                    "scope": "Authentication request hooks, login/logout, db_update_user, db_delete_user"
+                },
+                {
+                    "path": "static/app.js",
+                    "scope": "Authentication epoch reset and private callback fencing"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_auth.py"
+                ],
+                "node": [],
+                "browser": [
+                    "tests/browser/auth.spec.cjs"
+                ],
+                "media": [],
+                "container": []
+            },
+            "expands_to": [
+                {
+                    "area": "asset-queue",
+                    "reason": "asset-queue rechecks session identity, current authorization, or account reset before disclosing or changing protected state."
+                },
+                {
+                    "area": "bulk-clear",
+                    "reason": "bulk-clear rechecks session identity, current authorization, or account reset before disclosing or changing protected state."
+                },
+                {
+                    "area": "download-commands",
+                    "reason": "download-commands rechecks session identity, current authorization, or account reset before disclosing or changing protected state."
+                },
+                {
+                    "area": "download-submissions",
+                    "reason": "download-submissions rechecks session identity, current authorization, or account reset before disclosing or changing protected state."
+                },
+                {
+                    "area": "duration-filter",
+                    "reason": "duration-filter rechecks session identity, current authorization, or account reset before disclosing or changing protected state."
+                },
+                {
+                    "area": "entry-removal",
+                    "reason": "entry-removal rechecks session identity, current authorization, or account reset before disclosing or changing protected state."
+                },
+                {
+                    "area": "extension-companion",
+                    "reason": "extension-companion rechecks session identity, current authorization, or account reset before disclosing or changing protected state."
+                },
+                {
+                    "area": "extension-pairing",
+                    "reason": "extension-pairing rechecks session identity, current authorization, or account reset before disclosing or changing protected state."
+                },
+                {
+                    "area": "favorites",
+                    "reason": "favorites rechecks session identity, current authorization, or account reset before disclosing or changing protected state."
+                },
+                {
+                    "area": "history",
+                    "reason": "history rechecks session identity, current authorization, or account reset before disclosing or changing protected state."
+                },
+                {
+                    "area": "hover-previews",
+                    "reason": "hover-previews rechecks session identity, current authorization, or account reset before disclosing or changing protected state."
+                },
+                {
+                    "area": "library-rotation",
+                    "reason": "library-rotation rechecks session identity, current authorization, or account reset before disclosing or changing protected state."
+                },
+                {
+                    "area": "library-storage",
+                    "reason": "library-storage rechecks session identity, current authorization, or account reset before disclosing or changing protected state."
+                },
+                {
+                    "area": "live-refresh",
+                    "reason": "live-refresh rechecks session identity, current authorization, or account reset before disclosing or changing protected state."
+                },
+                {
+                    "area": "playback",
+                    "reason": "playback rechecks session identity, current authorization, or account reset before disclosing or changing protected state."
+                },
+                {
+                    "area": "playlists",
+                    "reason": "playlists rechecks session identity, current authorization, or account reset before disclosing or changing protected state."
+                },
+                {
+                    "area": "preferences",
+                    "reason": "preferences rechecks session identity, current authorization, or account reset before disclosing or changing protected state."
+                },
+                {
+                    "area": "preview-maintenance",
+                    "reason": "preview-maintenance rechecks session identity, current authorization, or account reset before disclosing or changing protected state."
+                },
+                {
+                    "area": "rename",
+                    "reason": "rename rechecks session identity, current authorization, or account reset before disclosing or changing protected state."
+                },
+                {
+                    "area": "tags",
+                    "reason": "tags rechecks session identity, current authorization, or account reset before disclosing or changing protected state."
+                },
+                {
+                    "area": "thumbnails",
+                    "reason": "thumbnails rechecks session identity, current authorization, or account reset before disclosing or changing protected state."
+                },
+                {
+                    "area": "uploads",
+                    "reason": "uploads rechecks session identity, current authorization, or account reset before disclosing or changing protected state."
+                },
+                {
+                    "area": "visibility",
+                    "reason": "visibility rechecks session identity, current authorization, or account reset before disclosing or changing protected state."
+                }
+            ]
+        },
+        "bulk-clear": {
+            "summary": "Frozen Library/History clear scopes, child retirement, audit, authorization, and feedback.",
+            "source_hints": [
+                {
+                    "path": "vdl.py",
+                    "scope": "clear_library_preview, clear_library, clear_history_preview, clear_history"
+                },
+                {
+                    "path": "static/app.js",
+                    "scope": "Bulk-clear frozen scopes and recovery summaries"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_attempt_history.py",
+                    "tests/test_bulk_clear.py",
+                    "tests/test_bulk_clear_audit.py",
+                    "tests/test_bulk_clear_security.py",
+                    "tests/test_history_api.py"
+                ],
+                "node": [
+                    "tests/bulk-clear-client.test.cjs"
+                ],
+                "browser": [
+                    "tests/browser/bulk-clear-feedback.spec.cjs",
+                    "tests/browser/action-errors.spec.cjs",
+                    "tests/browser/history-actions.spec.cjs"
+                ],
+                "media": [],
+                "container": []
+            },
+            "expands_to": []
+        },
+        "client-state-core": {
+            "summary": "Canonical download/playlist/preference merging, projections, reset, and stale-response fencing.",
+            "source_hints": [
+                {
+                    "path": "static/client-state.js",
+                    "scope": "createClientState canonical store, projections, writer boundary, and session fences"
+                },
+                {
+                    "path": "static/app.js",
+                    "scope": "tagState snapshot adapters and retained consumer rendering"
+                }
+            ],
+            "tests": {
+                "python": [],
+                "node": [
+                    "tests/mutations-client.test.cjs"
+                ],
+                "browser": [],
+                "media": [],
+                "container": []
+            },
+            "expands_to": [
+                {
+                    "area": "asset-queue",
+                    "reason": "asset-queue consumes canonical client snapshots or retains state across reconciliation and authentication reset."
+                },
+                {
+                    "area": "bulk-clear",
+                    "reason": "bulk-clear consumes canonical client snapshots or retains state across reconciliation and authentication reset."
+                },
+                {
+                    "area": "download-commands",
+                    "reason": "download-commands consumes canonical client snapshots or retains state across reconciliation and authentication reset."
+                },
+                {
+                    "area": "download-submissions",
+                    "reason": "download-submissions consumes canonical client snapshots or retains state across reconciliation and authentication reset."
+                },
+                {
+                    "area": "entry-removal",
+                    "reason": "entry-removal consumes canonical client snapshots or retains state across reconciliation and authentication reset."
+                },
+                {
+                    "area": "extension-pairing",
+                    "reason": "extension-pairing consumes canonical client snapshots or retains state across reconciliation and authentication reset."
+                },
+                {
+                    "area": "favorites",
+                    "reason": "favorites consumes canonical client snapshots or retains state across reconciliation and authentication reset."
+                },
+                {
+                    "area": "history",
+                    "reason": "history consumes canonical client snapshots or retains state across reconciliation and authentication reset."
+                },
+                {
+                    "area": "hover-previews",
+                    "reason": "hover-previews consumes canonical client snapshots or retains state across reconciliation and authentication reset."
+                },
+                {
+                    "area": "library-rotation",
+                    "reason": "library-rotation consumes canonical client snapshots or retains state across reconciliation and authentication reset."
+                },
+                {
+                    "area": "library-storage",
+                    "reason": "library-storage consumes canonical client snapshots or retains state across reconciliation and authentication reset."
+                },
+                {
+                    "area": "live-refresh",
+                    "reason": "live-refresh consumes canonical client snapshots or retains state across reconciliation and authentication reset."
+                },
+                {
+                    "area": "playback",
+                    "reason": "playback consumes canonical client snapshots or retains state across reconciliation and authentication reset."
+                },
+                {
+                    "area": "playlists",
+                    "reason": "playlists consumes canonical client snapshots or retains state across reconciliation and authentication reset."
+                },
+                {
+                    "area": "preferences",
+                    "reason": "preferences consumes canonical client snapshots or retains state across reconciliation and authentication reset."
+                },
+                {
+                    "area": "rename",
+                    "reason": "rename consumes canonical client snapshots or retains state across reconciliation and authentication reset."
+                },
+                {
+                    "area": "tags",
+                    "reason": "tags consumes canonical client snapshots or retains state across reconciliation and authentication reset."
+                },
+                {
+                    "area": "thumbnails",
+                    "reason": "thumbnails consumes canonical client snapshots or retains state across reconciliation and authentication reset."
+                },
+                {
+                    "area": "uploads",
+                    "reason": "uploads consumes canonical client snapshots or retains state across reconciliation and authentication reset."
+                },
+                {
+                    "area": "visibility",
+                    "reason": "visibility consumes canonical client snapshots or retains state across reconciliation and authentication reset."
+                }
+            ]
+        },
+        "container-dependencies": {
+            "summary": "Hashed wheel coverage for both shipping architectures and dormant optional provider.",
+            "source_hints": [
+                {
+                    "path": "requirements-container.txt",
+                    "scope": "Hashed multi-platform container dependencies"
+                },
+                {
+                    "path": "tests/container/check-lock.sh",
+                    "scope": "Package-index wheel availability and hash verification"
+                }
+            ],
+            "tests": {
+                "python": [],
+                "node": [],
+                "browser": [],
+                "media": [],
+                "container": [
+                    "dependency-lock"
+                ]
+            },
+            "expands_to": []
+        },
+        "container-runtime": {
+            "summary": "Hardened image startup, persistent state, native media tools, and shutdown/recovery.",
+            "source_hints": [
+                {
+                    "path": "Dockerfile",
+                    "scope": "Runtime environment, native media tools, and process entrypoint"
+                },
+                {
+                    "path": "compose.yaml",
+                    "scope": "Persistent deployment volumes and optional provider"
+                }
+            ],
+            "tests": {
+                "python": [],
+                "node": [],
+                "browser": [],
+                "media": [],
+                "container": [
+                    "smoke"
+                ]
+            },
+            "expands_to": []
+        },
+        "crossfade": {
+            "summary": "Prepared media readiness, overlap handoff, outgoing retention, and shared transport controls.",
+            "source_hints": [
+                {
+                    "path": "static/app.js",
+                    "scope": "Standby media preparation, overlap clocks, fade cancellation, and adopted incoming playback"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_playback_sessions.py"
+                ],
+                "node": [],
+                "browser": [
+                    "tests/browser/crossfade.spec.cjs",
+                    "tests/browser/crossfade-media.spec.cjs",
+                    "tests/browser/custom-controls.spec.cjs",
+                    "tests/browser/player-buffering-actions.spec.cjs"
+                ],
+                "media": [],
+                "container": []
+            },
+            "expands_to": []
+        },
+        "database": {
+            "summary": "Shared WAL connections, bounded contention, transactions, migrations, and durable publication.",
+            "source_hints": [
+                {
+                    "path": "vdl.py",
+                    "scope": "Database connection/write serialization, init_db, and transactional publication"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_database_contention.py",
+                    "tests/test_migrations.py"
+                ],
+                "node": [
+                    "tests/database-busy-client.test.cjs"
+                ],
+                "browser": [
+                    "tests/browser/database-busy.spec.cjs"
+                ],
+                "media": [],
+                "container": []
+            },
+            "expands_to": [
+                {
+                    "area": "asset-queue",
+                    "reason": "asset-queue reads or publishes persistent application state through the shared database connection, transaction, or migration contract."
+                },
+                {
+                    "area": "authentication",
+                    "reason": "authentication reads or publishes persistent application state through the shared database connection, transaction, or migration contract."
+                },
+                {
+                    "area": "bulk-clear",
+                    "reason": "bulk-clear reads or publishes persistent application state through the shared database connection, transaction, or migration contract."
+                },
+                {
+                    "area": "download-bandwidth",
+                    "reason": "download-bandwidth reads or publishes persistent application state through the shared database connection, transaction, or migration contract."
+                },
+                {
+                    "area": "download-commands",
+                    "reason": "download-commands reads or publishes persistent application state through the shared database connection, transaction, or migration contract."
+                },
+                {
+                    "area": "download-concurrency",
+                    "reason": "download-concurrency reads or publishes persistent application state through the shared database connection, transaction, or migration contract."
+                },
+                {
+                    "area": "download-formats",
+                    "reason": "download-formats reads or publishes persistent application state through the shared database connection, transaction, or migration contract."
+                },
+                {
+                    "area": "download-lifecycle",
+                    "reason": "download-lifecycle reads or publishes persistent application state through the shared database connection, transaction, or migration contract."
+                },
+                {
+                    "area": "download-recovery",
+                    "reason": "download-recovery reads or publishes persistent application state through the shared database connection, transaction, or migration contract."
+                },
+                {
+                    "area": "download-submissions",
+                    "reason": "download-submissions reads or publishes persistent application state through the shared database connection, transaction, or migration contract."
+                },
+                {
+                    "area": "duplicates",
+                    "reason": "duplicates reads or publishes persistent application state through the shared database connection, transaction, or migration contract."
+                },
+                {
+                    "area": "duration-filter",
+                    "reason": "duration-filter reads or publishes persistent application state through the shared database connection, transaction, or migration contract."
+                },
+                {
+                    "area": "entry-removal",
+                    "reason": "entry-removal reads or publishes persistent application state through the shared database connection, transaction, or migration contract."
+                },
+                {
+                    "area": "extension-companion",
+                    "reason": "extension-companion reads or publishes persistent application state through the shared database connection, transaction, or migration contract."
+                },
+                {
+                    "area": "extension-pairing",
+                    "reason": "extension-pairing reads or publishes persistent application state through the shared database connection, transaction, or migration contract."
+                },
+                {
+                    "area": "favorites",
+                    "reason": "favorites reads or publishes persistent application state through the shared database connection, transaction, or migration contract."
+                },
+                {
+                    "area": "history",
+                    "reason": "history reads or publishes persistent application state through the shared database connection, transaction, or migration contract."
+                },
+                {
+                    "area": "hover-previews",
+                    "reason": "hover-previews reads or publishes persistent application state through the shared database connection, transaction, or migration contract."
+                },
+                {
+                    "area": "ingest",
+                    "reason": "ingest reads or publishes persistent application state through the shared database connection, transaction, or migration contract."
+                },
+                {
+                    "area": "library-rotation",
+                    "reason": "library-rotation reads or publishes persistent application state through the shared database connection, transaction, or migration contract."
+                },
+                {
+                    "area": "library-storage",
+                    "reason": "library-storage reads or publishes persistent application state through the shared database connection, transaction, or migration contract."
+                },
+                {
+                    "area": "live-refresh",
+                    "reason": "live-refresh reads or publishes persistent application state through the shared database connection, transaction, or migration contract."
+                },
+                {
+                    "area": "mutation-core",
+                    "reason": "mutation-core reads or publishes persistent application state through the shared database connection, transaction, or migration contract."
+                },
+                {
+                    "area": "playback",
+                    "reason": "playback reads or publishes persistent application state through the shared database connection, transaction, or migration contract."
+                },
+                {
+                    "area": "playlists",
+                    "reason": "playlists reads or publishes persistent application state through the shared database connection, transaction, or migration contract."
+                },
+                {
+                    "area": "preferences",
+                    "reason": "preferences reads or publishes persistent application state through the shared database connection, transaction, or migration contract."
+                },
+                {
+                    "area": "preview-maintenance",
+                    "reason": "preview-maintenance reads or publishes persistent application state through the shared database connection, transaction, or migration contract."
+                },
+                {
+                    "area": "rename",
+                    "reason": "rename reads or publishes persistent application state through the shared database connection, transaction, or migration contract."
+                },
+                {
+                    "area": "request-security",
+                    "reason": "request-security protects origin admission before persistent download and preference mutations through the shared database/authentication request path."
+                },
+                {
+                    "area": "startup-version",
+                    "reason": "startup-version reads or publishes persistent application state through the shared database connection, transaction, or migration contract."
+                },
+                {
+                    "area": "tags",
+                    "reason": "tags reads or publishes persistent application state through the shared database connection, transaction, or migration contract."
+                },
+                {
+                    "area": "thumbnails",
+                    "reason": "thumbnails reads or publishes persistent application state through the shared database connection, transaction, or migration contract."
+                },
+                {
+                    "area": "uploads",
+                    "reason": "uploads reads or publishes persistent application state through the shared database connection, transaction, or migration contract."
+                },
+                {
+                    "area": "visibility",
+                    "reason": "visibility reads or publishes persistent application state through the shared database connection, transaction, or migration contract."
+                }
+            ]
+        },
+        "download-bandwidth": {
+            "summary": "Aggregate native transport budget, external process guards, live settings, and resumed bytes.",
+            "source_hints": [
+                {
+                    "path": "download_bandwidth.py",
+                    "scope": "SharedBandwidth and govern_download transport adapters"
+                },
+                {
+                    "path": "vdl.py",
+                    "scope": "_bandwidth and worker downloader setup"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_download_bandwidth.py"
+                ],
+                "node": [],
+                "browser": [
+                    "tests/browser/preferences.spec.cjs"
+                ],
+                "media": [
+                    "tests/integration/test_real_media.py"
+                ],
+                "container": []
+            },
+            "expands_to": []
+        },
+        "download-commands": {
+            "summary": "Pause, stop, resume, and retry acceptance, worker generations, receipts, and feedback.",
+            "source_hints": [
+                {
+                    "path": "vdl.py",
+                    "scope": "_execute_download_command and _dispatch_download_command"
+                },
+                {
+                    "path": "static/app.js",
+                    "scope": "Download command intent queues and Current/History controls"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_download_commands.py",
+                    "tests/test_attempt_history.py",
+                    "tests/test_upload_recovery.py"
+                ],
+                "node": [
+                    "tests/download-commands-client.test.cjs"
+                ],
+                "browser": [
+                    "tests/browser/download-commands-feedback.spec.cjs",
+                    "tests/browser/action-errors.spec.cjs",
+                    "tests/browser/live-updates.spec.cjs",
+                    "tests/browser/history-actions.spec.cjs"
+                ],
+                "media": [
+                    "tests/integration/test_real_media.py"
+                ],
+                "container": []
+            },
+            "expands_to": []
+        },
+        "download-concurrency": {
+            "summary": "Global and per-server worker admission, queued cancellation, and slot release.",
+            "source_hints": [
+                {
+                    "path": "vdl.py",
+                    "scope": "_dispatch_worker_queue, enqueue_download, _acquire_worker_slot, _release_worker_slot"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_max_concurrent.py",
+                    "tests/test_download_lifecycle.py"
+                ],
+                "node": [],
+                "browser": [
+                    "tests/browser/preferences.spec.cjs",
+                    "tests/browser/download-commands-feedback.spec.cjs"
+                ],
+                "media": [],
+                "container": []
+            },
+            "expands_to": []
+        },
+        "download-formats": {
+            "summary": "Format probing, narrow unavailable-format fallback, audio/merge selection, and PO-token configuration.",
+            "source_hints": [
+                {
+                    "path": "vdl.py",
+                    "scope": "summarize_formats, pick_best_format_id, _is_format_unavailable_error, _background_download"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_formats.py",
+                    "tests/test_merged_download.py",
+                    "tests/test_pot_provider.py",
+                    "tests/test_download_requests.py"
+                ],
+                "node": [],
+                "browser": [
+                    "tests/browser/download-options.spec.cjs",
+                    "tests/browser/history-actions.spec.cjs"
+                ],
+                "media": [
+                    "tests/integration/test_real_media.py"
+                ],
+                "container": []
+            },
+            "expands_to": []
+        },
+        "download-lifecycle": {
+            "summary": "Worker publication, progress estimates, pause/cancel priority, and terminal outcomes.",
+            "source_hints": [
+                {
+                    "path": "vdl.py",
+                    "scope": "background_download, progress_hook, request_cancel, request_pause"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_download_lifecycle.py",
+                    "tests/test_history_api.py",
+                    "tests/test_merged_download.py"
+                ],
+                "node": [],
+                "browser": [
+                    "tests/browser/live-updates.spec.cjs",
+                    "tests/browser/worker-recovery.spec.cjs"
+                ],
+                "media": [
+                    "tests/integration/test_real_media.py"
+                ],
+                "container": []
+            },
+            "expands_to": []
+        },
+        "download-recovery": {
+            "summary": "Interrupted worker ownership, network waits, cancelled partial cleanup, and restart behavior.",
+            "source_hints": [
+                {
+                    "path": "vdl.py",
+                    "scope": "_persist_worker_outcome, _guard_download_network, background_download, init_db"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_worker_recovery.py",
+                    "tests/test_download_network_recovery.py",
+                    "tests/test_cancelled_cleanup.py",
+                    "tests/test_download_lifecycle.py"
+                ],
+                "node": [],
+                "browser": [
+                    "tests/browser/worker-recovery.spec.cjs",
+                    "tests/browser/download-commands-feedback.spec.cjs"
+                ],
+                "media": [
+                    "tests/integration/test_real_media.py"
+                ],
+                "container": []
+            },
+            "expands_to": []
+        },
+        "download-submissions": {
+            "summary": "URL request admission, options probing, immutable submission receipts, and form feedback.",
+            "source_hints": [
+                {
+                    "path": "vdl.py",
+                    "scope": "add_download, probe_url, _execute_download_submission"
+                },
+                {
+                    "path": "static/app.js",
+                    "scope": "Download form probing, draft retention, and submission recovery"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_download_requests.py",
+                    "tests/test_download_submissions.py"
+                ],
+                "node": [
+                    "tests/download-submissions-client.test.cjs"
+                ],
+                "browser": [
+                    "tests/browser/download-entry.spec.cjs",
+                    "tests/browser/download-form.spec.cjs",
+                    "tests/browser/download-options.spec.cjs",
+                    "tests/browser/download-submissions-feedback.spec.cjs"
+                ],
+                "media": [],
+                "container": []
+            },
+            "expands_to": []
+        },
+        "duplicates": {
+            "summary": "Byte-confirmed duplicate identity, aliases, import indexing, visibility, and refresh.",
+            "source_hints": [
+                {
+                    "path": "vdl.py",
+                    "scope": "_hash_final_file, get_duplicates, refresh_duplicates, _duplicate_backfill"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_duplicates.py"
+                ],
+                "node": [],
+                "browser": [
+                    "tests/browser/duplicates.spec.cjs"
+                ],
+                "media": [],
+                "container": []
+            },
+            "expands_to": []
+        },
+        "duration-filter": {
+            "summary": "Duration syntax, server/browser parity, library matching, and playback selection.",
+            "source_hints": [
+                {
+                    "path": "vdl.py",
+                    "scope": "Duration query parsing and create_playback_session filtering"
+                },
+                {
+                    "path": "static/app.js",
+                    "scope": "Duration filter parsing, validation, and playback launch availability"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_duration_filter.py"
+                ],
+                "node": [],
+                "browser": [
+                    "tests/browser/duration-filter.spec.cjs"
+                ],
+                "media": [],
+                "container": []
+            },
+            "expands_to": []
+        },
+        "entry-removal": {
+            "summary": "Entry/file retirement, ownership journals, authorization, canonical receipts, and recovery.",
+            "source_hints": [
+                {
+                    "path": "vdl.py",
+                    "scope": "remove_download and entry-removal journal/recovery helpers"
+                },
+                {
+                    "path": "static/app.js",
+                    "scope": "Pending removal summaries and canonical deletion fences"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_entry_removal.py",
+                    "tests/test_entry_removal_security.py",
+                    "tests/test_cancelled_cleanup.py"
+                ],
+                "node": [
+                    "tests/removal-client.test.cjs"
+                ],
+                "browser": [
+                    "tests/browser/entry-removal-feedback.spec.cjs",
+                    "tests/browser/action-errors.spec.cjs",
+                    "tests/browser/history-actions.spec.cjs"
+                ],
+                "media": [
+                    "tests/integration/test_real_media.py"
+                ],
+                "container": []
+            },
+            "expands_to": []
+        },
+        "extension-companion": {
+            "summary": "Firefox handoff, permission gestures, token ownership, cookies, and companion downloads.",
+            "source_hints": [
+                {
+                    "path": "vdl.py",
+                    "scope": "extension_pair, extension_status, extension_downloads, extension_token"
+                },
+                {
+                    "path": "browser-extension/src/background.js",
+                    "scope": "Page permission gesture and download handoff"
+                },
+                {
+                    "path": "browser-extension/src/onboarding.js",
+                    "scope": "Pairing gesture and failure feedback"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_browser_extension.py",
+                    "tests/test_attempt_history.py"
+                ],
+                "node": [],
+                "browser": [
+                    "tests/browser/extension-settings.spec.cjs",
+                    "tests/browser/extension-user-gesture.spec.cjs"
+                ],
+                "media": [],
+                "container": []
+            },
+            "expands_to": []
+        },
+        "extension-pairing": {
+            "summary": "Credential creation/invalidation, generation fences, actor receipts, and one-time presentation.",
+            "source_hints": [
+                {
+                    "path": "vdl.py",
+                    "scope": "extension_pairing_codes, extension_current_pairing_code, extension_pair"
+                },
+                {
+                    "path": "static/extension-pairing.js",
+                    "scope": "Credential presentation, copy lifecycle, and generation fencing"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_pairing_mutations.py",
+                    "tests/test_browser_extension.py"
+                ],
+                "node": [
+                    "tests/extension-pairing.test.cjs"
+                ],
+                "browser": [
+                    "tests/browser/extension-pairing-feedback.spec.cjs",
+                    "tests/browser/extension-settings.spec.cjs"
+                ],
+                "media": [],
+                "container": []
+            },
+            "expands_to": []
+        },
+        "extension-release": {
+            "summary": "Companion package integrity, synthetic signature states, staging, and release ordering.",
+            "source_hints": [
+                {
+                    "path": "scripts/extension_release.py",
+                    "scope": "Companion staging, versioning, signing-state checks, and release validation"
+                },
+                {
+                    "path": "scripts/verify_companion_xpi.py",
+                    "scope": "XPI payload, checksum, and archive identity"
+                },
+                {
+                    "path": ".github/workflows/main.yml",
+                    "scope": "Companion validation and publication gates"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_companion_package.py",
+                    "tests/test_extension_release.py",
+                    "tests/test_browser_extension.py"
+                ],
+                "node": [
+                    "tests/extension-workflow.test.cjs"
+                ],
+                "browser": [
+                    "tests/browser/extension-settings.spec.cjs"
+                ],
+                "media": [],
+                "container": [
+                    "companion-states"
+                ]
+            },
+            "expands_to": []
+        },
+        "favorites": {
+            "summary": "Explicit favorite intents, sorting, canonical revisions, receipt recovery, and account fences.",
+            "source_hints": [
+                {
+                    "path": "vdl.py",
+                    "scope": "set_download_favorite and favorite mutation helpers"
+                },
+                {
+                    "path": "static/mutations.js",
+                    "scope": "Favorite intent FIFO and response handling"
+                },
+                {
+                    "path": "static/app.js",
+                    "scope": "Favorite stars, filters, and stable card ordering"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_favorite_mutations.py",
+                    "tests/test_history_api.py"
+                ],
+                "node": [
+                    "tests/favorite-attempt-order.test.cjs"
+                ],
+                "browser": [
+                    "tests/browser/favorites-feedback.spec.cjs",
+                    "tests/browser/history-actions.spec.cjs",
+                    "tests/browser/tags.spec.cjs"
+                ],
+                "media": [],
+                "container": []
+            },
+            "expands_to": []
+        },
+        "file-ownership": {
+            "summary": "Trusted stored paths, aliases/inodes, exclusive retirement, and publication authority.",
+            "source_hints": [
+                {
+                    "path": "vdl.py",
+                    "scope": "_trusted_download_directories, _is_allowed_download_path, _file_identity, ownership journals"
+                },
+                {
+                    "path": "cache_retirement.py",
+                    "scope": "Captured source/destination identity and bounded safe retirement"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_cache_retirement.py"
+                ],
+                "node": [],
+                "browser": [],
+                "media": [],
+                "container": []
+            },
+            "expands_to": [
+                {
+                    "area": "asset-queue",
+                    "reason": "asset-queue relies on stored-path authorization and captured file identity before reading, publishing, or retiring bytes."
+                },
+                {
+                    "area": "bulk-clear",
+                    "reason": "bulk-clear relies on stored-path authorization and captured file identity before reading, publishing, or retiring bytes."
+                },
+                {
+                    "area": "download-recovery",
+                    "reason": "download-recovery relies on stored-path authorization and captured file identity before reading, publishing, or retiring bytes."
+                },
+                {
+                    "area": "duplicates",
+                    "reason": "duplicates relies on stored-path authorization and captured file identity before reading, publishing, or retiring bytes."
+                },
+                {
+                    "area": "entry-removal",
+                    "reason": "entry-removal relies on stored-path authorization and captured file identity before reading, publishing, or retiring bytes."
+                },
+                {
+                    "area": "hover-previews",
+                    "reason": "hover-previews relies on stored-path authorization and captured file identity before reading, publishing, or retiring bytes."
+                },
+                {
+                    "area": "ingest",
+                    "reason": "ingest relies on stored-path authorization and captured file identity before reading, publishing, or retiring bytes."
+                },
+                {
+                    "area": "library-storage",
+                    "reason": "library-storage relies on stored-path authorization and captured file identity before reading, publishing, or retiring bytes."
+                },
+                {
+                    "area": "playback",
+                    "reason": "playback relies on stored-path authorization and captured file identity before reading, publishing, or retiring bytes."
+                },
+                {
+                    "area": "preview-maintenance",
+                    "reason": "preview-maintenance relies on stored-path authorization and captured file identity before reading, publishing, or retiring bytes."
+                },
+                {
+                    "area": "rename",
+                    "reason": "rename relies on stored-path authorization and captured file identity before reading, publishing, or retiring bytes."
+                },
+                {
+                    "area": "thumbnails",
+                    "reason": "thumbnails relies on stored-path authorization and captured file identity before reading, publishing, or retiring bytes."
+                },
+                {
+                    "area": "uploads",
+                    "reason": "uploads relies on stored-path authorization and captured file identity before reading, publishing, or retiring bytes."
+                }
+            ]
+        },
+        "history": {
+            "summary": "Private attempt history, library catalogs, pagination, search, and committed lifecycle snapshots.",
+            "source_hints": [
+                {
+                    "path": "download_history.py",
+                    "scope": "Attempt history and query/filter persistence"
+                },
+                {
+                    "path": "vdl.py",
+                    "scope": "get_history, get_library, get_current_downloads"
+                },
+                {
+                    "path": "static/app.js",
+                    "scope": "Library/History rendering, filters, pagination, and retained interaction nodes"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_history_api.py",
+                    "tests/test_attempt_history.py"
+                ],
+                "node": [],
+                "browser": [
+                    "tests/browser/attempt-history.spec.cjs",
+                    "tests/browser/history-actions.spec.cjs",
+                    "tests/browser/history-pagination.spec.cjs",
+                    "tests/browser/tags.spec.cjs",
+                    "tests/browser/clipboard.spec.cjs"
+                ],
+                "media": [],
+                "container": []
+            },
+            "expands_to": []
+        },
+        "hover-previews": {
+            "summary": "Silent montage generation, hover ownership, source identity, range delivery, and reader leases.",
+            "source_hints": [
+                {
+                    "path": "vdl.py",
+                    "scope": "generate_video_preview, _preview_segments, stream_preview, renew_preview_lease"
+                },
+                {
+                    "path": "static/app.js",
+                    "scope": "Hover intent, preview readiness, and lease renewal"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_hover_previews.py",
+                    "tests/test_asset_api.py",
+                    "tests/test_preview_maintenance_api.py"
+                ],
+                "node": [],
+                "browser": [
+                    "tests/browser/history-actions.spec.cjs",
+                    "tests/browser/preview-handoff-media.spec.cjs",
+                    "tests/browser/system-logs.spec.cjs",
+                    "tests/browser/asset-demand.spec.cjs"
+                ],
+                "media": [
+                    "tests/integration/test_real_media.py"
+                ],
+                "container": []
+            },
+            "expands_to": []
+        },
+        "ingest": {
+            "summary": "Mounted folder traversal, verified source import, atomic publication, and startup recovery.",
+            "source_hints": [
+                {
+                    "path": "vdl.py",
+                    "scope": "IngestStartupImporter, _ingest_watched_file, start_ingest_import"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_ingest_folder.py",
+                    "tests/test_duplicates.py",
+                    "tests/test_attempt_history.py"
+                ],
+                "node": [],
+                "browser": [],
+                "media": [],
+                "container": []
+            },
+            "expands_to": []
+        },
+        "library-rotation": {
+            "summary": "Persisted rotation membership, deadlines, authorized order, and generation-aware handoff.",
+            "source_hints": [
+                {
+                    "path": "vdl.py",
+                    "scope": "Library rotation persistence, scheduling, and _library_session_step_locked"
+                },
+                {
+                    "path": "static/app.js",
+                    "scope": "Rotation catalog generation, pagination, and deferred interaction refresh"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_library_rotation.py",
+                    "tests/test_rotation_access.py",
+                    "tests/test_rotation_playback.py",
+                    "tests/test_visibility_security.py"
+                ],
+                "node": [],
+                "browser": [
+                    "tests/browser/library-rotation.spec.cjs"
+                ],
+                "media": [],
+                "container": []
+            },
+            "expands_to": []
+        },
+        "library-storage": {
+            "summary": "Persisted authorized storage measurement, alias accounting, refresh hints, and footer status.",
+            "source_hints": [
+                {
+                    "path": "vdl.py",
+                    "scope": "Library storage measurement, cached authorized totals, and storage change hints"
+                },
+                {
+                    "path": "static/app.js",
+                    "scope": "Storage footer status, authorization reset, and refresh scheduling"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_library_storage.py",
+                    "tests/test_visibility_security.py"
+                ],
+                "node": [
+                    "tests/library-storage-client.test.cjs"
+                ],
+                "browser": [
+                    "tests/browser/library-storage.spec.cjs",
+                    "tests/browser/version-status.spec.cjs"
+                ],
+                "media": [],
+                "container": []
+            },
+            "expands_to": []
+        },
+        "live-refresh": {
+            "summary": "SSE authorization/coalescing, refresh health, stale-response fences, and bounded reconciliation.",
+            "source_hints": [
+                {
+                    "path": "vdl.py",
+                    "scope": "EventBus, events, and authorized change publication"
+                },
+                {
+                    "path": "static/app.js",
+                    "scope": "Event stream reconnect, refresh scheduling, and canonical state reconciliation"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_sse.py",
+                    "tests/test_live_refresh.py"
+                ],
+                "node": [],
+                "browser": [
+                    "tests/browser/live-updates.spec.cjs",
+                    "tests/browser/live-refresh-overload.spec.cjs",
+                    "tests/browser/asset-demand.spec.cjs",
+                    "tests/browser/library-storage.spec.cjs",
+                    "tests/browser/database-busy.spec.cjs"
+                ],
+                "media": [],
+                "container": []
+            },
+            "expands_to": []
+        },
+        "mutation-core": {
+            "summary": "Common mutation admission, immutable fingerprints, receipts, revisions, quotas, and FIFO coordination.",
+            "source_hints": [
+                {
+                    "path": "static/mutations.js",
+                    "scope": "Shared coordinator admission, serialization, receipt interpretation, and recovery"
+                },
+                {
+                    "path": "vdl.py",
+                    "scope": "Shared mutation payload validation, fingerprinting, receipts, and quotas"
+                }
+            ],
+            "tests": {
+                "python": [],
+                "node": [
+                    "tests/mutations-client.test.cjs"
+                ],
+                "browser": [],
+                "media": [],
+                "container": []
+            },
+            "expands_to": [
+                {
+                    "area": "bulk-clear",
+                    "reason": "bulk-clear uses the common mutation admission, fingerprint, receipt, revision, quota, and ordering contract."
+                },
+                {
+                    "area": "download-commands",
+                    "reason": "download-commands uses the common mutation admission, fingerprint, receipt, revision, quota, and ordering contract."
+                },
+                {
+                    "area": "download-submissions",
+                    "reason": "download-submissions uses the common mutation admission, fingerprint, receipt, revision, quota, and ordering contract."
+                },
+                {
+                    "area": "entry-removal",
+                    "reason": "entry-removal uses the common mutation admission, fingerprint, receipt, revision, quota, and ordering contract."
+                },
+                {
+                    "area": "extension-pairing",
+                    "reason": "extension-pairing uses the common mutation admission, fingerprint, receipt, revision, quota, and ordering contract."
+                },
+                {
+                    "area": "favorites",
+                    "reason": "favorites uses the common mutation admission, fingerprint, receipt, revision, quota, and ordering contract."
+                },
+                {
+                    "area": "playlists",
+                    "reason": "playlists uses the common mutation admission, fingerprint, receipt, revision, quota, and ordering contract."
+                },
+                {
+                    "area": "preferences",
+                    "reason": "preferences uses the common mutation admission, fingerprint, receipt, revision, quota, and ordering contract."
+                },
+                {
+                    "area": "rename",
+                    "reason": "rename uses the common mutation admission, fingerprint, receipt, revision, quota, and ordering contract."
+                },
+                {
+                    "area": "tags",
+                    "reason": "tags uses the common mutation admission, fingerprint, receipt, revision, quota, and ordering contract."
+                },
+                {
+                    "area": "uploads",
+                    "reason": "uploads uses the common mutation admission, fingerprint, receipt, revision, quota, and ordering contract."
+                },
+                {
+                    "area": "visibility",
+                    "reason": "visibility uses the common mutation admission, fingerprint, receipt, revision, quota, and ordering contract."
+                }
+            ]
+        },
+        "playback": {
+            "summary": "Stored-path delivery, authorized sessions, handoff, controls, fullscreen, and view counting.",
+            "source_hints": [
+                {
+                    "path": "vdl.py",
+                    "scope": "stream_file, create_playback_session, prepare_playback_session, advance_playback_session"
+                },
+                {
+                    "path": "static/app.js",
+                    "scope": "Player lifecycle, controls, seek, fullscreen, and session handoff"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_playback.py",
+                    "tests/test_playback_sessions.py",
+                    "tests/test_duration_filter.py"
+                ],
+                "node": [],
+                "browser": [
+                    "tests/browser/playback.spec.cjs",
+                    "tests/browser/custom-controls.spec.cjs",
+                    "tests/browser/player-buffering-actions.spec.cjs",
+                    "tests/browser/player-fullscreen-shortcut.spec.cjs",
+                    "tests/browser/player-interactions.spec.cjs",
+                    "tests/browser/fullscreen-fit.spec.cjs",
+                    "tests/browser/history-actions.spec.cjs"
+                ],
+                "media": [
+                    "tests/integration/test_real_media.py"
+                ],
+                "container": []
+            },
+            "expands_to": []
+        },
+        "playback-core": {
+            "summary": "Shared session stepping, media loading, seek, handoff, and player lifecycle.",
+            "source_hints": [
+                {
+                    "path": "vdl.py",
+                    "scope": "_library_session_step_locked and playback session prepare/advance/select"
+                },
+                {
+                    "path": "static/app.js",
+                    "scope": "Shared player loading, active/standby media, and seek lifecycle"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_playback_sessions.py"
+                ],
+                "node": [],
+                "browser": [],
+                "media": [],
+                "container": []
+            },
+            "expands_to": [
+                {
+                    "area": "crossfade",
+                    "reason": "crossfade relies on shared session stepping, media loading, seek, player lifecycle, or handoff state."
+                },
+                {
+                    "area": "duration-filter",
+                    "reason": "duration-filter relies on shared session stepping, media loading, seek, player lifecycle, or handoff state."
+                },
+                {
+                    "area": "library-rotation",
+                    "reason": "library-rotation relies on shared session stepping, media loading, seek, player lifecycle, or handoff state."
+                },
+                {
+                    "area": "playback",
+                    "reason": "playback relies on shared session stepping, media loading, seek, player lifecycle, or handoff state."
+                },
+                {
+                    "area": "playlists",
+                    "reason": "playlists relies on shared session stepping, media loading, seek, player lifecycle, or handoff state."
+                },
+                {
+                    "area": "shuffle-clips",
+                    "reason": "shuffle-clips relies on shared session stepping, media loading, seek, player lifecycle, or handoff state."
+                },
+                {
+                    "area": "skip-video-edges",
+                    "reason": "skip-video-edges relies on shared session stepping, media loading, seek, player lifecycle, or handoff state."
+                }
+            ]
+        },
+        "playlists": {
+            "summary": "Personal playlists, ordered editor saves, quick-add/delete, membership authorization, and progress.",
+            "source_hints": [
+                {
+                    "path": "vdl.py",
+                    "scope": "playlist_collection, playlist_resource, playlist_items, playlist_progress"
+                },
+                {
+                    "path": "static/app.js",
+                    "scope": "Playlist editor, mutation actions, shelf merging, and queue UI"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_playlists.py",
+                    "tests/test_playlist_mutations.py"
+                ],
+                "node": [
+                    "tests/playlists-client.test.cjs"
+                ],
+                "browser": [
+                    "tests/browser/playlists.spec.cjs",
+                    "tests/browser/playlists-feedback.spec.cjs",
+                    "tests/browser/playlists-actions-feedback.spec.cjs",
+                    "tests/browser/custom-controls.spec.cjs",
+                    "tests/browser/player-interactions.spec.cjs"
+                ],
+                "media": [],
+                "container": []
+            },
+            "expands_to": []
+        },
+        "preferences": {
+            "summary": "Preference validation, atomic revisions, runtime application, draft retention, and receipts.",
+            "source_hints": [
+                {
+                    "path": "vdl.py",
+                    "scope": "_validated_preferences, _execute_preference_mutation, preferences"
+                },
+                {
+                    "path": "static/app.js",
+                    "scope": "Preference draft editor and canonical mutation feedback"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_preferences.py",
+                    "tests/test_preference_mutations.py"
+                ],
+                "node": [
+                    "tests/preferences-client.test.cjs"
+                ],
+                "browser": [
+                    "tests/browser/preferences-feedback.spec.cjs",
+                    "tests/browser/preferences.spec.cjs"
+                ],
+                "media": [],
+                "container": []
+            },
+            "expands_to": []
+        },
+        "preview-maintenance": {
+            "summary": "Persisted recipe upgrades, old-reader leases, cache inventory/retirement, logs, and recovery.",
+            "source_hints": [
+                {
+                    "path": "preview_maintenance.py",
+                    "scope": "Upgrade state, recipe provenance, reader leases, and system event records"
+                },
+                {
+                    "path": "cache_inventory.py",
+                    "scope": "Read-only cache inventory and bounded pagination"
+                },
+                {
+                    "path": "cache_retirement.py",
+                    "scope": "Captured ownership and safe deferred retirement"
+                },
+                {
+                    "path": "vdl.py",
+                    "scope": "preview_maintenance and system_logs routes"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_preview_maintenance_api.py",
+                    "tests/test_preview_maintenance_queue.py",
+                    "tests/test_cache_inventory.py",
+                    "tests/test_cache_retirement.py"
+                ],
+                "node": [],
+                "browser": [
+                    "tests/browser/system-logs.spec.cjs",
+                    "tests/browser/preview-handoff-media.spec.cjs"
+                ],
+                "media": [
+                    "tests/integration/test_real_media.py"
+                ],
+                "container": [
+                    "preview-maintenance"
+                ]
+            },
+            "expands_to": []
+        },
+        "rename": {
+            "summary": "Rename validation, canonical identity, filesystem recovery, and UI feedback.",
+            "source_hints": [
+                {
+                    "path": "vdl.py",
+                    "scope": "_execute_rename_mutation and rename recovery helpers"
+                },
+                {
+                    "path": "static/app.js",
+                    "scope": "Inline rename editor and mutation feedback"
+                },
+                {
+                    "path": "static/mutations.js",
+                    "scope": "Rename-specific admission and response handling"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_rename.py",
+                    "tests/test_rename_mutations.py"
+                ],
+                "node": [
+                    "tests/rename-client.test.cjs"
+                ],
+                "browser": [
+                    "tests/browser/rename-feedback.spec.cjs"
+                ],
+                "media": [
+                    "tests/integration/test_real_media.py"
+                ],
+                "container": []
+            },
+            "expands_to": []
+        },
+        "request-security": {
+            "summary": "Same-origin mutation admission, Fetch Metadata guards, and narrow companion CORS.",
+            "source_hints": [
+                {
+                    "path": "vdl.py",
+                    "scope": "Request origin/Fetch Metadata checks and _companion_preflight"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_request_security.py",
+                    "tests/test_browser_extension.py",
+                    "tests/test_upload_security.py",
+                    "tests/test_entry_removal_security.py",
+                    "tests/test_bulk_clear_audit.py"
+                ],
+                "node": [],
+                "browser": [],
+                "media": [],
+                "container": []
+            },
+            "expands_to": []
+        },
+        "settings-ui": {
+            "summary": "Settings navigation, theme bootstrap, native controls, responsive layout, and account menu.",
+            "source_hints": [
+                {
+                    "path": "static/app.js",
+                    "scope": "Settings search/navigation, theme selection, and account menu"
+                },
+                {
+                    "path": "static/styles.css",
+                    "scope": "Theme properties, Settings layout, and native controls"
+                },
+                {
+                    "path": "templates/index.html",
+                    "scope": "Theme bootstrap and Settings page markup"
+                }
+            ],
+            "tests": {
+                "python": [],
+                "node": [],
+                "browser": [
+                    "tests/browser/preferences.spec.cjs",
+                    "tests/browser/settings-controls.spec.cjs",
+                    "tests/browser/settings-regressions.spec.cjs",
+                    "tests/browser/history-actions.spec.cjs"
+                ],
+                "media": [],
+                "container": []
+            },
+            "expands_to": []
+        },
+        "shuffle-clips": {
+            "summary": "Sampled excerpt bounds, occurrence identity, repeat, continuity, and bounded recovery.",
+            "source_hints": [
+                {
+                    "path": "vdl.py",
+                    "scope": "Shuffle playback selection and ffprobe_media_metadata"
+                },
+                {
+                    "path": "static/app.js",
+                    "scope": "Shuffle Clips sampling, preload, occurrence bounds, and continuity"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_shuffle_metadata.py",
+                    "tests/test_playback_sessions.py"
+                ],
+                "node": [],
+                "browser": [
+                    "tests/browser/shuffle-clips.spec.cjs",
+                    "tests/browser/shuffle-clips-continuity.spec.cjs",
+                    "tests/browser/crossfade-media.spec.cjs",
+                    "tests/browser/player-interactions.spec.cjs",
+                    "tests/browser/playback.spec.cjs",
+                    "tests/browser/custom-controls.spec.cjs"
+                ],
+                "media": [],
+                "container": []
+            },
+            "expands_to": []
+        },
+        "skip-video-edges": {
+            "summary": "Configured intro/outro bounds, explicit seeks, preload timing, and original-time progress.",
+            "source_hints": [
+                {
+                    "path": "vdl.py",
+                    "scope": "_validated_preferences skip_video_edges setting"
+                },
+                {
+                    "path": "static/app.js",
+                    "scope": "Effective playback bounds and metadata/seek fallback"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_preferences.py",
+                    "tests/test_playback_sessions.py"
+                ],
+                "node": [],
+                "browser": [
+                    "tests/browser/skip-video-edges.spec.cjs",
+                    "tests/browser/skip-video-edges-media.spec.cjs",
+                    "tests/browser/custom-controls.spec.cjs",
+                    "tests/browser/player-buffering-actions.spec.cjs"
+                ],
+                "media": [],
+                "container": []
+            },
+            "expands_to": []
+        },
+        "startup-version": {
+            "summary": "Startup/shutdown checkpoints, CLI ports, VERSION parsing, health/uptime, and asset versioning.",
+            "source_hints": [
+                {
+                    "path": "vdl.py",
+                    "scope": "parse_startup_args, main, health, and VERSION loading"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_startup.py",
+                    "tests/test_version.py"
+                ],
+                "node": [],
+                "browser": [
+                    "tests/browser/version-status.spec.cjs"
+                ],
+                "media": [],
+                "container": []
+            },
+            "expands_to": []
+        },
+        "tags": {
+            "summary": "Tag normalization, canonical identity, attachment revisions, receipts, and inline editing.",
+            "source_hints": [
+                {
+                    "path": "vdl.py",
+                    "scope": "download_tags and tag mutation helpers"
+                },
+                {
+                    "path": "static/tag-identity.js",
+                    "scope": "Python-compatible Unicode identity and validation"
+                },
+                {
+                    "path": "static/mutations.js",
+                    "scope": "Tag-specific admission, projection, and receipt handling"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_tags.py",
+                    "tests/test_tag_mutations.py"
+                ],
+                "node": [
+                    "tests/mutations-client.test.cjs",
+                    "tests/tag-identity-parity.test.cjs"
+                ],
+                "browser": [
+                    "tests/browser/tags.spec.cjs",
+                    "tests/browser/immediate-feedback.spec.cjs"
+                ],
+                "media": [],
+                "container": []
+            },
+            "expands_to": []
+        },
+        "test-support": {
+            "summary": "Shared application fixtures, fake downloader, local media server, and browser fixture/support contracts.",
+            "source_hints": [
+                {
+                    "path": "tests/support/app_case.py",
+                    "scope": "Isolated AppCase database, users, workers, and media paths"
+                },
+                {
+                    "path": "tests/support/fake_ytdlp.py",
+                    "scope": "Deterministic downloader transitions and faults"
+                },
+                {
+                    "path": "tests/support/fixture_server.py",
+                    "scope": "Local HTTP/DASH fixtures"
+                },
+                {
+                    "path": "tests/browser/fixture_app.py",
+                    "scope": "Deterministic application fixture endpoints"
+                },
+                {
+                    "path": "tests/browser/support.cjs",
+                    "scope": "Browser reset, seed, refresh, and UI helpers"
+                }
+            ],
+            "tests": {
+                "python": [],
+                "node": [],
+                "browser": [],
+                "media": [],
+                "container": []
+            },
+            "expands_to": [
+                {
+                    "area": "asset-queue",
+                    "reason": "asset-queue uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "authentication",
+                    "reason": "authentication uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "bulk-clear",
+                    "reason": "bulk-clear uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "crossfade",
+                    "reason": "crossfade uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "database",
+                    "reason": "database uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "download-bandwidth",
+                    "reason": "download-bandwidth uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "download-commands",
+                    "reason": "download-commands uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "download-concurrency",
+                    "reason": "download-concurrency uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "download-formats",
+                    "reason": "download-formats uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "download-lifecycle",
+                    "reason": "download-lifecycle uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "download-recovery",
+                    "reason": "download-recovery uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "download-submissions",
+                    "reason": "download-submissions uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "duplicates",
+                    "reason": "duplicates uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "duration-filter",
+                    "reason": "duration-filter uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "entry-removal",
+                    "reason": "entry-removal uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "extension-companion",
+                    "reason": "extension-companion uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "extension-pairing",
+                    "reason": "extension-pairing uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "extension-release",
+                    "reason": "extension-release uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "favorites",
+                    "reason": "favorites uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "history",
+                    "reason": "history uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "hover-previews",
+                    "reason": "hover-previews uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "ingest",
+                    "reason": "ingest uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "library-rotation",
+                    "reason": "library-rotation uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "library-storage",
+                    "reason": "library-storage uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "live-refresh",
+                    "reason": "live-refresh uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "playback",
+                    "reason": "playback uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "playlists",
+                    "reason": "playlists uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "preferences",
+                    "reason": "preferences uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "preview-maintenance",
+                    "reason": "preview-maintenance uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "rename",
+                    "reason": "rename uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "request-security",
+                    "reason": "request-security uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "settings-ui",
+                    "reason": "settings-ui uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "shuffle-clips",
+                    "reason": "shuffle-clips uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "skip-video-edges",
+                    "reason": "skip-video-edges uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "startup-version",
+                    "reason": "startup-version uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "tags",
+                    "reason": "tags uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "thumbnails",
+                    "reason": "thumbnails uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "uploads",
+                    "reason": "uploads uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                },
+                {
+                    "area": "visibility",
+                    "reason": "visibility uses shared AppCase/local-media fixtures or the shared browser fixture and UI support; retain the entire area when changing that support contract."
+                }
+            ]
+        },
+        "test-tooling": {
+            "summary": "Test-area map schema, inventory ownership, deterministic planning, prerequisites, and adapters.",
+            "source_hints": [
+                {
+                    "path": "tests/run-area.py",
+                    "scope": "Map validation, expansion, planning, preflight, and execution"
+                },
+                {
+                    "path": "tests/areas.json",
+                    "scope": "Authoritative selector memberships and directed expansion reasons"
+                },
+                {
+                    "path": "tests/coverage_gate.py",
+                    "scope": "Full Python coverage completion gate"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_area_runner.py"
+                ],
+                "node": [],
+                "browser": [],
+                "media": [],
+                "container": []
+            },
+            "expands_to": []
+        },
+        "thumbnails": {
+            "summary": "Thumbnail extraction, versioned sidecar adoption/retirement, and cached delivery.",
+            "source_hints": [
+                {
+                    "path": "vdl.py",
+                    "scope": "generate_video_thumbnail, _thumbnail_path, stream_thumbnail"
+                },
+                {
+                    "path": "asset_generation.py",
+                    "scope": "Thumbnail generation and publication"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_thumbnails.py",
+                    "tests/test_asset_api.py"
+                ],
+                "node": [],
+                "browser": [
+                    "tests/browser/history-actions.spec.cjs",
+                    "tests/browser/asset-demand.spec.cjs"
+                ],
+                "media": [
+                    "tests/integration/test_real_media.py"
+                ],
+                "container": []
+            },
+            "expands_to": []
+        },
+        "uploads": {
+            "summary": "Upload registration, transfer ownership, durable cancellation, safe publication, and recovery.",
+            "source_hints": [
+                {
+                    "path": "vdl.py",
+                    "scope": "start_video_upload, receive_video_upload, _cancel_upload, _recover_upload_operations"
+                },
+                {
+                    "path": "static/app.js",
+                    "scope": "Upload registration, byte progress, drop overlay, and recovery"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_uploads.py",
+                    "tests/test_upload_recovery.py",
+                    "tests/test_upload_security.py",
+                    "tests/test_attempt_history.py"
+                ],
+                "node": [
+                    "tests/uploads-client.test.cjs"
+                ],
+                "browser": [
+                    "tests/browser/upload-drop.spec.cjs",
+                    "tests/browser/uploads-feedback.spec.cjs"
+                ],
+                "media": [],
+                "container": []
+            },
+            "expands_to": []
+        },
+        "visibility": {
+            "summary": "Authorized publication/privacy transitions, canonical security snapshots, and UI feedback.",
+            "source_hints": [
+                {
+                    "path": "vdl.py",
+                    "scope": "set_download_visibility and visibility mutation authorization"
+                },
+                {
+                    "path": "static/app.js",
+                    "scope": "Visibility intents and current permission fences"
+                }
+            ],
+            "tests": {
+                "python": [
+                    "tests/test_visibility.py",
+                    "tests/test_visibility_mutations.py",
+                    "tests/test_visibility_security.py"
+                ],
+                "node": [
+                    "tests/visibility-mutations.test.cjs"
+                ],
+                "browser": [
+                    "tests/browser/visibility-feedback.spec.cjs",
+                    "tests/browser/history-actions.spec.cjs"
+                ],
+                "media": [],
+                "container": []
+            },
+            "expands_to": []
+        },
+        "workflow-validation": {
+            "summary": "Pinned CodeQL actions and deterministic validation/release ordering.",
+            "source_hints": [
+                {
+                    "path": ".github/workflows/validation.yml",
+                    "scope": "Deterministic gate setup and validation ordering"
+                },
+                {
+                    "path": "scripts/check-codeql-pins.cjs",
+                    "scope": "Pinned CodeQL revision validation"
+                }
+            ],
+            "tests": {
+                "python": [],
+                "node": [
+                    "tests/codeql-pins.test.cjs",
+                    "tests/validation-workflow.test.cjs"
+                ],
+                "browser": [],
+                "media": [],
+                "container": []
+            },
+            "expands_to": []
+        }
+    }
+}

@@ -60,6 +60,7 @@ Flask + `yt-dlp` video-downloader UI. **Single-process, single-file backend** ([
 - **History tab** shows: `finished` + `error` only
 
 ## CONVENTIONS
+- **Focused test selection:** before code changes, follow the development loop in [`tests/README.md`](tests/README.md#focused-test-selection) and consult [`tests/areas.json`](tests/areas.json). Record affected leaf areas, changed shared contracts, and impact uncertainty; preview the expanded plan once and broaden uncertain selections explicitly. During editing, rerun affected regressions. After stabilization, run the affected area/layer union, including browser, media, and deployment checks when their behavior changes. Maintain memberships and expansion rules with test/shared-contract changes and run `python tests/run-area.py --check`. Report focused results separately from completion gates. If the map/runner is unavailable or invalid, report the condition and use explicit native commands or broader gates.
 - **Keep codebase-memory in sync:** if the `codebase-memory-mcp` index is stale or otherwise out of sync with the current repository, immediately re-index the current repository before relying on graph results.
 - **Comment culture**: rationale-not-what. Existing comments explain *why* (e.g. why `speed=0.0` not `None`, why `continuedl=True` is explicit, why we drop the head on full queue). Match this register.
 - **Frontend has NO build step**: `app.js` loads raw. No `import`/`export`, no bundler, no transpiler. Browser globals only.
